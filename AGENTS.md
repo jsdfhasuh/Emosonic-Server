@@ -27,6 +27,7 @@ Evidence files:
 - If any of these are added later, apply the more specific rule first, then treat this file as fallback guidance.
 
 ## Setup
+Linux/macOS virtualenv:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
@@ -34,6 +35,17 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 pip install -r ci-requirements.txt
 ```
+Windows local Conda environment:
+```powershell
+conda activate supysonic
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+pip install -r ci-requirements.txt
+```
+- On this Windows workspace, prefer the existing Conda environment named
+  `supysonic` at `C:\Users\jsdfhasuh\.conda\envs\supysonic`.
+- If activation is unreliable, call the interpreter directly:
+  `C:\Users\jsdfhasuh\.conda\envs\supysonic\python.exe`.
 - `ci-requirements.txt` includes `-e .`, `coverage`, and `lxml`.
 - Some tests require `lxml`.
 
@@ -82,6 +94,7 @@ flask run
 ```
 Flask dev server on Windows PowerShell:
 ```bash
+conda activate supysonic
 $env:FLASK_APP="supysonic.web:create_application()"
 $env:FLASK_ENV="development"
 flask run
@@ -92,6 +105,22 @@ supysonic-cli --help
 supysonic-server
 supysonic-daemon
 ```
+
+## Windows Local Debugging Scope
+- Treat this Windows workspace as frontend display/debug only by default.
+- Use the in-app browser and localhost pages to inspect UI rendering,
+  interaction behavior, templates, CSS, and static assets.
+- Do not proactively debug or change backend runtime behavior, database data,
+  schema migrations, library scanning, daemon watcher behavior, transcoding, or
+  music-library path migration while working on Windows.
+- Do not run commands that mutate the media library or database state, including
+  folder scans, path migration scripts, daemon watcher runs, or release upload
+  workflows, unless the user explicitly asks for that operation.
+- `supysonic.conf` is a private local runtime file and may contain secrets. Do
+  not print, commit, or broadly rewrite it. Only adjust local Windows paths such
+  as cache, logs, socket, and upload directories when explicitly requested.
+- If a frontend issue needs backend context, prefer read-only inspection and
+  focused frontend render tests before considering broader backend commands.
 
 ## Lint / Formatting Status
 - No official config detected for `ruff`, `flake8`, `black`, `isort`, or `mypy`.
