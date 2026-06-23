@@ -6,50 +6,52 @@
 -#}
 {% extends "layout.html" %}
 {% block title %}Add User · Emosonic Server{% endblock %}
+{% block document_title_en %}Add User · Emosonic Server{% endblock %}
+{% block document_title_zh %}新增用户 · Emosonic Server{% endblock %}
 {% block navbar_users %}
-<a class="nav-link active" aria-current="page" href="{{ url_for('frontend.user_index') }}">Users</a>
+<a class="nav-link active" aria-current="page" href="{{ url_for('frontend.user_index') }}"><span data-i18n-en="Users" data-i18n-zh="用户">Users</span></a>
 {% endblock %}
-{% block page_title %}Add user{% endblock %}
-{% block page_subtitle %}Create a new Emosonic Server account, assign administrative access when needed, and define the initial contact details.{% endblock %}
+{% block page_title %}<span data-i18n-en="Add user" data-i18n-zh="新增用户">Add user</span>{% endblock %}
+{% block page_subtitle %}<span data-i18n-en="Create a new Emosonic Server account, assign administrative access when needed, and define the initial contact details." data-i18n-zh="创建新的 Emosonic Server 账号，按需分配管理员权限并设置初始联系信息。">Create a new Emosonic Server account, assign administrative access when needed, and define the initial contact details.</span>{% endblock %}
 {% block body %}
 <div class="row justify-content-center">
   <div class="col-xl-8">
     <div class="card">
-      <div class="card-header">Account configuration</div>
+      <div class="card-header"><span data-i18n-en="Account configuration" data-i18n-zh="账号配置">Account configuration</span></div>
       <div class="card-body">
         <form method="post" class="d-flex flex-column gap-4">
           <div>
-            <label class="form-label" for="user">Username</label>
-            <input type="text" class="form-control" id="user" name="user" value="{{ request.form.user }}" placeholder="Choose a username">
+            <label class="form-label" for="user"><span data-i18n-en="Username" data-i18n-zh="用户名">Username</span></label>
+            <input type="text" class="form-control" id="user" name="user" value="{{ request.form.user }}" placeholder="Choose a username" data-i18n-en="Choose a username" data-i18n-zh="设置用户名" data-i18n-attr="placeholder">
           </div>
 
           <div class="form-check form-switch border rounded-4 p-3">
             <input type="checkbox" class="form-check-input" role="switch" id="admin" name="admin" {{ 'checked="checked"' if 'admin' in request.form }}>
             <label class="form-check-label ms-2" for="admin">
-              <strong>Grant administrator access</strong><br>
-              <small class="console-muted">Administrators can manage users, folders, devices, and server operations.</small>
+              <strong data-i18n-en="Grant administrator access" data-i18n-zh="授予管理员权限">Grant administrator access</strong><br>
+              <small class="console-muted" data-i18n-en="Administrators can manage users, folders, devices, and server operations." data-i18n-zh="管理员可以管理用户、文件夹、设备和服务器操作。">Administrators can manage users, folders, devices, and server operations.</small>
             </label>
           </div>
 
           <div class="row g-3">
             <div class="col-md-6">
-              <label class="form-label" for="passwd">Password</label>
-              <input type="password" class="form-control" id="passwd" name="passwd" placeholder="Set an initial password">
+              <label class="form-label" for="passwd"><span data-i18n-en="Password" data-i18n-zh="密码">Password</span></label>
+              <input type="password" class="form-control" id="passwd" name="passwd" placeholder="Set an initial password" data-i18n-en="Set an initial password" data-i18n-zh="设置初始密码" data-i18n-attr="placeholder">
             </div>
             <div class="col-md-6">
-              <label class="form-label" for="passwd_confirm">Confirm password</label>
-              <input type="password" class="form-control" id="passwd_confirm" name="passwd_confirm" placeholder="Repeat the password">
+              <label class="form-label" for="passwd_confirm"><span data-i18n-en="Confirm password" data-i18n-zh="确认密码">Confirm password</span></label>
+              <input type="password" class="form-control" id="passwd_confirm" name="passwd_confirm" placeholder="Repeat the password" data-i18n-en="Repeat the password" data-i18n-zh="再次输入密码" data-i18n-attr="placeholder">
             </div>
           </div>
 
           <div>
-            <label class="form-label" for="mail">Email</label>
-            <input type="text" class="form-control" id="mail" name="mail" value="{{ request.form.mail }}" placeholder="Optional email address">
+            <label class="form-label" for="mail"><span data-i18n-en="Email" data-i18n-zh="邮箱">Email</span></label>
+            <input type="text" class="form-control" id="mail" name="mail" value="{{ request.form.mail }}" placeholder="Optional email address" data-i18n-en="Optional email address" data-i18n-zh="可选邮箱地址" data-i18n-attr="placeholder">
           </div>
 
           <div class="d-flex gap-2 justify-content-end">
-            <a href="{{ url_for('frontend.user_index') }}" class="btn btn-outline-dark">Cancel</a>
-            <button class="btn btn-dark" type="submit">Create user</button>
+            <a href="{{ url_for('frontend.user_index') }}" class="btn btn-outline-dark"><span data-i18n-en="Cancel" data-i18n-zh="取消">Cancel</span></a>
+            <button class="btn btn-dark" type="submit"><span data-i18n-en="Create user" data-i18n-zh="创建用户">Create user</span></button>
           </div>
         </form>
       </div>

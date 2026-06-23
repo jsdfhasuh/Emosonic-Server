@@ -6,6 +6,8 @@
 -#}
 {% extends "layout.html" %}
 {% block title %}Music requests · Emosonic Server{% endblock %}
+{% block document_title_en %}Music requests · Emosonic Server{% endblock %}
+{% block document_title_zh %}音乐登记 · Emosonic Server{% endblock %}
 {% block navbar_music_requests %}
 <a class="nav-link active" aria-current="page" href="{{ url_for('frontend.music_request_index') }}"><span data-i18n-en="Requests" data-i18n-zh="登记板">Requests</span></a>
 {% endblock %}
@@ -58,7 +60,7 @@
       </div>
       <div>
         <label class="form-label" for="tracks"><span data-i18n-en="Tracks" data-i18n-zh="曲目">Tracks</span></label>
-        <textarea class="form-control" id="tracks" name="tracks" rows="4" placeholder="One track title per line"></textarea>
+        <textarea class="form-control" id="tracks" name="tracks" rows="4" placeholder="One track title per line" data-i18n-en="One track title per line" data-i18n-zh="每行一个曲目标题" data-i18n-attr="placeholder"></textarea>
       </div>
       <div>
         <label class="form-label" for="note"><span data-i18n-en="Note" data-i18n-zh="备注">Note</span></label>
@@ -74,7 +76,7 @@
 <div class="card console-section-spacer">
   <div class="card-header d-flex justify-content-between align-items-center gap-3 flex-wrap">
     <span data-i18n-en="Request board" data-i18n-zh="登记列表">Request board</span>
-    <div class="btn-group btn-group-sm" role="group" aria-label="Filter requests by status">
+    <div class="btn-group btn-group-sm" role="group" aria-label="Filter requests by status" data-i18n-en="Filter requests by status" data-i18n-zh="按状态筛选登记" data-i18n-attr="aria-label">
       <a class="btn btn-outline-dark {% if not status_filter %}active{% endif %}" href="{{ url_for('frontend.music_request_index') }}"><span data-i18n-en="All" data-i18n-zh="全部">All</span></a>
       {% for status in statuses %}
       <a class="btn btn-outline-dark {% if status_filter == status %}active{% endif %}" href="{{ url_for('frontend.music_request_index', status=status) }}">{{ status }}</a>
@@ -131,12 +133,12 @@
               <div class="d-flex gap-2 flex-wrap">
                 {% if request.user.admin %}
                 <form method="post" action="{{ url_for('frontend.music_request_update_status', uid=record.id) }}" class="d-flex gap-2">
-                  <select class="form-select form-select-sm" name="status" aria-label="Request status">
+                  <select class="form-select form-select-sm" name="status" aria-label="Request status" data-i18n-en="Request status" data-i18n-zh="登记状态" data-i18n-attr="aria-label">
                     {% for status in statuses %}
                     <option value="{{ status }}" {% if record.status == status %}selected{% endif %}>{{ status }}</option>
                     {% endfor %}
                   </select>
-                  <input class="form-control form-control-sm" type="text" name="status_note" value="{{ record.status_note or '' }}" placeholder="Status note">
+                  <input class="form-control form-control-sm" type="text" name="status_note" value="{{ record.status_note or '' }}" placeholder="Status note" data-i18n-en="Status note" data-i18n-zh="状态备注" data-i18n-attr="placeholder">
                   <button class="btn btn-outline-dark btn-sm" type="submit"><span data-i18n-en="Update" data-i18n-zh="更新">Update</span></button>
                 </form>
                 {% endif %}

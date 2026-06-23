@@ -1,99 +1,102 @@
 <div class="card console-section-spacer">
   <div class="card-header d-flex justify-content-between align-items-center">
-    <span>Album wall</span>
-    <span class="console-chip">Metadata operations</span>
+    <span data-i18n-en="Album wall" data-i18n-zh="专辑墙">Album wall</span>
+    <span class="console-chip" data-i18n-en="Metadata operations" data-i18n-zh="元数据操作">Metadata operations</span>
   </div>
   <div class="card-body">
     <div class="album-search-bar">
       <div class="album-search-field">
-        <label for="albumSearchInput">Search albums</label>
+        <label for="albumSearchInput" data-i18n-en="Search albums" data-i18n-zh="搜索专辑">Search albums</label>
         <input
           type="search"
           id="albumSearchInput"
           placeholder="Search albums..."
+          data-i18n-en="Search albums..."
+          data-i18n-zh="搜索专辑..."
+          data-i18n-attr="placeholder"
           autocomplete="off"
         >
       </div>
-      <div id="albumSearchCount" class="album-search-count">Loading albums...</div>
+      <div id="albumSearchCount" class="album-search-count" data-i18n-en="Loading albums..." data-i18n-zh="正在加载专辑...">Loading albums...</div>
     </div>
     <div id="artist-wall" class="artist-wall">
-      <div class="loading">Loading album data...</div>
+      <div class="loading" data-i18n-en="Loading album data..." data-i18n-zh="正在加载专辑数据...">Loading album data...</div>
     </div>
   </div>
 </div>
 
 <div id="editModal" class="modal">
   <div class="modal-content">
-    <h2>Edit album details</h2>
+    <h2 data-i18n-en="Edit album details" data-i18n-zh="编辑专辑详情">Edit album details</h2>
     <form id="editForm">
       <input type="hidden" id="albumId">
       <div class="tabs">
-        <button type="button" id="tab-album" class="tab-btn active">Album</button>
-        <button type="button" id="tab-tracks" class="tab-btn">Tracks</button>
+        <button type="button" id="tab-album" class="tab-btn active" data-i18n-en="Album" data-i18n-zh="专辑">Album</button>
+        <button type="button" id="tab-tracks" class="tab-btn" data-i18n-en="Tracks" data-i18n-zh="曲目">Tracks</button>
       </div>
 
       <div id="pane-album" class="tab-pane active">
         <div class="form-group">
-          <label for="albumname">Album name:</label>
+          <label for="albumname" data-i18n-en="Album name:" data-i18n-zh="专辑名称：">Album name:</label>
           <input type="text" id="albumname" required>
         </div>
         <div class="form-group">
-          <label for="artistname">Artist name:</label>
+          <label for="artistname" data-i18n-en="Artist name:" data-i18n-zh="艺人名称：">Artist name:</label>
           <input type="text" id="artistname" required>
         </div>
         <div class="form-group">
-          <label for="year">Release year:</label>
+          <label for="year" data-i18n-en="Release year:" data-i18n-zh="发行年份：">Release year:</label>
           <input type="text" id="year" required>
         </div>
         <div class="form-group">
-          <h3>External enrichment</h3>
-          <p class="text-body-secondary">Read-only fields filled by MusicBrainz or optional Discogs enrichment.</p>
+          <h3 data-i18n-en="External enrichment" data-i18n-zh="外部补充信息">External enrichment</h3>
+          <p class="text-body-secondary" data-i18n-en="Read-only fields filled by MusicBrainz or optional Discogs enrichment." data-i18n-zh="由 MusicBrainz 或可选 Discogs 补充信息填充的只读字段。">Read-only fields filled by MusicBrainz or optional Discogs enrichment.</p>
         </div>
         <div class="form-group">
-          <label for="releaseDate">Release date:</label>
+          <label for="releaseDate" data-i18n-en="Release date:" data-i18n-zh="发行日期：">Release date:</label>
           <input type="text" id="releaseDate" readonly disabled>
         </div>
         <div class="form-group">
-          <label for="releaseType">Release type:</label>
+          <label for="releaseType" data-i18n-en="Release type:" data-i18n-zh="发行类型：">Release type:</label>
           <input type="text" id="releaseType" readonly disabled>
         </div>
         <div class="form-group">
-          <label for="styles">Styles:</label>
+          <label for="styles" data-i18n-en="Styles:" data-i18n-zh="风格：">Styles:</label>
           <input type="text" id="styles" readonly disabled>
         </div>
         <div class="form-group">
-          <label for="externalIds">External IDs:</label>
+          <label for="externalIds" data-i18n-en="External IDs:" data-i18n-zh="外部 ID：">External IDs:</label>
           <input type="text" id="externalIds" readonly disabled>
         </div>
       </div>
 
       <div id="pane-tracks" class="tab-pane">
         <div class="form-group">
-          <label>Track list:</label>
+          <label data-i18n-en="Track list:" data-i18n-zh="曲目列表：">Track list:</label>
           <div id="trackList" style="max-height: 240px; overflow-y: auto; border: 1px solid #ccc; padding: 10px;">
             <table class="tracks-table">
               <thead>
                 <tr>
                   <th style="width:80px;">No.</th>
-                  <th>Title</th>
-                  <th>Artist</th>
-                  <th class="actions">Actions</th>
+                  <th data-i18n-en="Title" data-i18n-zh="标题">Title</th>
+                  <th data-i18n-en="Artist" data-i18n-zh="艺人">Artist</th>
+                  <th class="actions" data-i18n-en="Actions" data-i18n-zh="操作">Actions</th>
                 </tr>
               </thead>
               <tbody id="trackTbody">
-                <tr><td colspan="4" style="text-align:center;color:#888;">Loading tracks...</td></tr>
+                <tr><td colspan="4" style="text-align:center;color:#888;" data-i18n-en="Loading tracks..." data-i18n-zh="正在加载曲目...">Loading tracks...</td></tr>
               </tbody>
             </table>
           </div>
           <div style="margin-top:8px;">
-            <button type="button" id="addTrackBtn">Add track</button>
+            <button type="button" id="addTrackBtn" data-i18n-en="Add track" data-i18n-zh="添加曲目">Add track</button>
           </div>
         </div>
       </div>
 
       <div class="form-actions">
-        <button type="submit" class="btn-primary">Save</button>
-        <button type="button" class="btn-secondary" onclick="closeModal()">Cancel</button>
+        <button type="submit" class="btn-primary" data-i18n-en="Save" data-i18n-zh="保存">Save</button>
+        <button type="button" class="btn-secondary" onclick="closeModal()" data-i18n-en="Cancel" data-i18n-zh="取消">Cancel</button>
       </div>
     </form>
   </div>
@@ -102,7 +105,7 @@
 <div id="successToast" class="toast">
   <div class="toast-content">
     <i class="toast-icon">✓</i>
-    <span class="toast-message">Saved successfully.</span>
+    <span class="toast-message" data-i18n-en="Saved successfully." data-i18n-zh="保存成功。">Saved successfully.</span>
   </div>
 </div>
 
@@ -116,6 +119,13 @@ albumurl = {{ url_for('api.album_list_id3')|tojson }};
 albumidurl = {{ url_for('api.album_info')|tojson }};
 image_base_url = {{ url_for('api.cover_art')|tojson }} ;
 const albumSearchInput = document.getElementById('albumSearchInput');
+function metadataAlbumI18nText(enText, zhText) {
+    if (typeof i18nText === 'function') {
+        return i18nText(enText, zhText);
+    }
+    return enText || zhText || '';
+}
+
 albumSearchInput.addEventListener('input', filterAlbumCards);
 async function loadData() {
     try {
@@ -127,7 +137,7 @@ async function loadData() {
     } catch (error) {
         console.error('Error loading data:', error);
         document.getElementById('artist-wall').innerHTML =
-            '<div style="text-align:center;color:red;padding:30px;">Error loading album data: ' + error.message + '</div>';
+            `<div style="text-align:center;color:red;padding:30px;">${metadataAlbumI18nText('Error loading album data:', '加载专辑数据失败：')} ${error.message}</div>`;
     }
 }
 
@@ -188,7 +198,10 @@ function filterAlbumCards() {
 }
 
 function updateAlbumSearchCount(visibleCount, totalCount) {
-    document.getElementById('albumSearchCount').textContent = `${visibleCount} / ${totalCount} albums`;
+    document.getElementById('albumSearchCount').textContent = metadataAlbumI18nText(
+        `${visibleCount} / ${totalCount} albums`,
+        `${visibleCount} / ${totalCount} 张专辑`
+    );
 }
 
 function renderPage(albumArray) {
@@ -196,7 +209,7 @@ function renderPage(albumArray) {
     container.innerHTML = '';
 
     if (!albumArray.length) {
-        container.innerHTML = '<div class="loading">No matching albums found.</div>';
+        container.innerHTML = `<div class="loading">${metadataAlbumI18nText('No matching albums found.', '未找到匹配的专辑。')}</div>`;
         return;
     }
 
@@ -250,7 +263,7 @@ function addTrackRow(container, track = {}) {
     if (!tbody) {
         const table = document.createElement('table');
         table.className = 'tracks-table';
-        table.innerHTML = '<thead><tr><th style="width:80px;">No.</th><th>Title</th><th>Artist</th><th class="actions">Actions</th></tr></thead><tbody id="trackTbody"></tbody>';
+        table.innerHTML = `<thead><tr><th style="width:80px;">No.</th><th>${metadataAlbumI18nText('Title', '标题')}</th><th>${metadataAlbumI18nText('Artist', '艺人')}</th><th class="actions">${metadataAlbumI18nText('Actions', '操作')}</th></tr></thead><tbody id="trackTbody"></tbody>`;
         container.innerHTML = '';
         container.appendChild(table);
         tbody = document.getElementById('trackTbody');
@@ -273,7 +286,7 @@ function addTrackRow(container, track = {}) {
     title.type = 'text';
     title.className = 'track-title';
     title.value = track.title || '';
-    title.placeholder = 'Track title';
+    title.placeholder = metadataAlbumI18nText('Track title', '曲目标题');
     tdTitle.appendChild(title);
 
     const tdArtist = document.createElement('td');
@@ -281,14 +294,14 @@ function addTrackRow(container, track = {}) {
     tartist.type = 'text';
     tartist.className = 'track-artist';
     tartist.value = track.artist || '';
-    tartist.placeholder = 'Artist';
+    tartist.placeholder = metadataAlbumI18nText('Artist', '艺人');
     tdArtist.appendChild(tartist);
 
     const tdActions = document.createElement('td');
     tdActions.className = 'actions';
     const removeBtn = document.createElement('button');
     removeBtn.type = 'button';
-    removeBtn.textContent = 'Remove';
+    removeBtn.textContent = metadataAlbumI18nText('Remove', '移除');
     removeBtn.onclick = () => row.remove();
     tdActions.appendChild(removeBtn);
 
@@ -309,7 +322,7 @@ function openEditModal(album) {
     document.getElementById('releaseType').value = album.releaseType || '';
     document.getElementById('styles').value = formatAlbumEnrichmentList(album.styles);
     document.getElementById('externalIds').value = formatAlbumExternalIds(album);
-    document.getElementById('trackTbody').innerHTML = '<tr><td colspan="4" style="text-align:center;color:#888;">Loading tracks...</td></tr>';
+    document.getElementById('trackTbody').innerHTML = `<tr><td colspan="4" style="text-align:center;color:#888;">${metadataAlbumI18nText('Loading tracks...', '正在加载曲目...')}</td></tr>`;
     modal.classList.add('show');
 }
 
@@ -323,6 +336,12 @@ window.onclick = function(event) {
         closeModal();
     }
 };
+
+document.querySelectorAll('[data-language-toggle]').forEach((button) => {
+    button.addEventListener('click', () => {
+        window.setTimeout(filterAlbumCards, 0);
+    });
+});
 
 loadData();
 </script>

@@ -1,56 +1,59 @@
 <div class="card console-section-spacer">
   <div class="card-header d-flex justify-content-between align-items-center">
-    <span>Artist wall</span>
-    <span class="console-chip">Metadata operations</span>
+    <span data-i18n-en="Artist wall" data-i18n-zh="艺人墙">Artist wall</span>
+    <span class="console-chip" data-i18n-en="Metadata operations" data-i18n-zh="元数据操作">Metadata operations</span>
   </div>
   <div class="card-body">
     <div class="artist-search-bar">
       <div class="artist-search-field">
-        <label for="artistSearchInput">Search artists</label>
+        <label for="artistSearchInput" data-i18n-en="Search artists" data-i18n-zh="搜索艺人">Search artists</label>
         <input
           type="search"
           id="artistSearchInput"
           placeholder="Search artists..."
+          data-i18n-en="Search artists..."
+          data-i18n-zh="搜索艺人..."
+          data-i18n-attr="placeholder"
           autocomplete="off"
         >
       </div>
-      <div id="artistSearchCount" class="artist-search-count">Loading artists...</div>
+      <div id="artistSearchCount" class="artist-search-count" data-i18n-en="Loading artists..." data-i18n-zh="正在加载艺人...">Loading artists...</div>
     </div>
     <div id="artist-wall" class="artist-wall">
-      <div class="loading">Loading artist data...</div>
+      <div class="loading" data-i18n-en="Loading artist data..." data-i18n-zh="正在加载艺人数据...">Loading artist data...</div>
     </div>
   </div>
 </div>
 
 <div id="editModal" class="modal">
   <div class="modal-content">
-    <h2>Set primary artist</h2>
+    <h2 data-i18n-en="Set primary artist" data-i18n-zh="设置主要艺人">Set primary artist</h2>
     <form id="editForm">
       <input type="hidden" id="artistId">
       <div class="form-group">
-        <label for="artistName">Artist name:</label>
+        <label for="artistName" data-i18n-en="Artist name:" data-i18n-zh="艺人名称：">Artist name:</label>
         <input type="text" id="artistName" readonly>
       </div>
       <div class="form-group">
-        <label for="primaryArtist">Primary artist name:</label>
-        <input type="text" id="primaryArtist" placeholder="Primary artist name" autocomplete="off">
+        <label for="primaryArtist" data-i18n-en="Primary artist name:" data-i18n-zh="主要艺人名称：">Primary artist name:</label>
+        <input type="text" id="primaryArtist" placeholder="Primary artist name" data-i18n-en="Primary artist name" data-i18n-zh="主要艺人名称" data-i18n-attr="placeholder" autocomplete="off">
         <div id="primary-artist-suggestions" class="list-group mt-2 d-none"></div>
       </div>
       <div class="form-group">
-        <label for="biography">Biography:</label>
-        <textarea id="biography" rows="6" placeholder="Artist biography"></textarea>
+        <label for="biography" data-i18n-en="Biography:" data-i18n-zh="艺人简介：">Biography:</label>
+        <textarea id="biography" rows="6" placeholder="Artist biography" data-i18n-en="Artist biography" data-i18n-zh="艺人简介" data-i18n-attr="placeholder"></textarea>
       </div>
       <div class="form-group">
-        <label>Current photo:</label>
-        <img id="artistPhotoPreview" class="artist-photo-preview" alt="Artist photo preview">
+        <label data-i18n-en="Current photo:" data-i18n-zh="当前照片：">Current photo:</label>
+        <img id="artistPhotoPreview" class="artist-photo-preview" alt="Artist photo preview" data-i18n-en="Artist photo preview" data-i18n-zh="艺人照片预览" data-i18n-attr="alt">
       </div>
       <div class="form-group">
-        <label for="artistPhoto">Artist photo:</label>
+        <label for="artistPhoto" data-i18n-en="Artist photo:" data-i18n-zh="艺人照片：">Artist photo:</label>
         <input type="file" id="artistPhoto" accept="image/*">
       </div>
       <div class="form-actions">
-        <button type="submit" class="btn-primary">Apply</button>
-        <button type="button" class="btn-secondary" onclick="closeModal()">Cancel</button>
+        <button type="submit" class="btn-primary" data-i18n-en="Apply" data-i18n-zh="应用">Apply</button>
+        <button type="button" class="btn-secondary" onclick="closeModal()" data-i18n-en="Cancel" data-i18n-zh="取消">Cancel</button>
       </div>
     </form>
   </div>
@@ -59,7 +62,7 @@
 <div id="successToast" class="toast">
   <div class="toast-content">
     <i class="toast-icon">✓</i>
-    <span class="toast-message">Saved successfully.</span>
+    <span class="toast-message" data-i18n-en="Saved successfully." data-i18n-zh="保存成功。">Saved successfully.</span>
   </div>
 </div>
 
@@ -70,6 +73,13 @@ artistInfoUrl = {{ url_for('api.artist_info2')|tojson }};
 artistSuggestionsUrl = {{ url_for('frontend.metadata_artist_suggestions')|tojson }};
 let activeArtistAutocomplete = null;
 let allArtists = [];
+function metadataArtistI18nText(enText, zhText) {
+    if (typeof i18nText === 'function') {
+        return i18nText(enText, zhText);
+    }
+    return enText || zhText || '';
+}
+
 async function loadData() {
     try {
         artistsurl = {{ url_for('api.list_artists')|tojson }};
@@ -89,7 +99,7 @@ async function loadData() {
     } catch (error) {
         console.error('Error loading data:', error);
         document.getElementById('artist-wall').innerHTML =
-            '<div style="text-align:center;color:red;padding:30px;">Error loading artist data: ' + error.message + '</div>';
+            `<div style="text-align:center;color:red;padding:30px;">${metadataArtistI18nText('Error loading artist data:', '加载艺人数据失败：')} ${error.message}</div>`;
     }
 }
 
@@ -188,7 +198,10 @@ function filterArtistCards() {
 }
 
 function updateArtistSearchCount(visibleCount, totalCount) {
-    document.getElementById('artistSearchCount').textContent = `${visibleCount} / ${totalCount} artists`;
+    document.getElementById('artistSearchCount').textContent = metadataArtistI18nText(
+        `${visibleCount} / ${totalCount} artists`,
+        `${visibleCount} / ${totalCount} 位艺人`
+    );
 }
 
 function renderArtistCards(artistsArray) {
@@ -196,7 +209,7 @@ function renderArtistCards(artistsArray) {
     container.innerHTML = '';
 
     if (!artistsArray.length) {
-        container.innerHTML = '<div class="loading">No matching artists found.</div>';
+        container.innerHTML = `<div class="loading">${metadataArtistI18nText('No matching artists found.', '未找到匹配的艺人。')}</div>`;
         return;
     }
 
@@ -289,7 +302,7 @@ function openEditModal(artist) {
     loadArtistMetadataForModal(artist);
 }
 
-function showSuccessToast(message = 'Saved successfully.') {
+function showSuccessToast(message = metadataArtistI18nText('Saved successfully.', '保存成功。')) {
     const toast = document.getElementById('successToast');
     const messageEl = toast.querySelector('.toast-message');
     messageEl.textContent = message;
@@ -329,7 +342,7 @@ document.getElementById('editForm').onsubmit = async function(e) {
 
         if (!response.ok) {
             const errorData = await response.json();
-            throw new Error(errorData.message || 'Save failed');
+            throw new Error(errorData.message || metadataArtistI18nText('Save failed', '保存失败'));
         }
         const successData = await response.json();
         applyArtistModalChanges(successData);
@@ -338,7 +351,7 @@ document.getElementById('editForm').onsubmit = async function(e) {
 
     } catch (error) {
         console.error('Save failed:', error);
-        alert('Save failed: ' + error.message);
+        alert(metadataArtistI18nText('Save failed:', '保存失败：') + ' ' + error.message);
     }
 };
 
@@ -358,6 +371,12 @@ window.onclick = function(event) {
         closeModal();
     }
 };
+
+document.querySelectorAll('[data-language-toggle]').forEach((button) => {
+    button.addEventListener('click', () => {
+        window.setTimeout(filterArtistCards, 0);
+    });
+});
 
 loadData();
 </script>

@@ -2,16 +2,16 @@
   <div class="metadata-review-track-context" data-review-track-context>
     <img src="{{ reviewSummary.cover_art_url }}" alt="{{ reviewAlbum.name }} cover" class="metadata-review-track-context-cover">
     <div class="metadata-review-track-context-body">
-      <p class="console-eyebrow mb-2">Track editor</p>
+      <p class="console-eyebrow mb-2" data-i18n-en="Track editor" data-i18n-zh="曲目编辑器">Track editor</p>
       <h3 class="h4 mb-2">{{ reviewAlbum.name }}</h3>
-      <p class="mb-3 text-body-secondary">Review and normalize track numbering, titles, and credited artists for this album.</p>
+      <p class="mb-3 text-body-secondary" data-i18n-en="Review and normalize track numbering, titles, and credited artists for this album." data-i18n-zh="审核并规范化这张专辑的曲目编号、标题和署名艺人。">Review and normalize track numbering, titles, and credited artists for this album.</p>
       <div class="d-flex flex-wrap gap-2 metadata-review-track-context-chips">
         <span class="console-chip">{{ reviewAlbum.artist.get_artist_name() }}</span>
         {% if reviewAlbum.year %}
           <span class="console-chip">{{ reviewAlbum.year }}</span>
         {% endif %}
-        <span class="console-chip">Track count: {{ reviewTracks|length }}</span>
-        <span class="console-chip">Total duration: {{ reviewSummary.total_duration }}</span>
+        <span class="console-chip"><span data-i18n-en="Track count" data-i18n-zh="曲目数">Track count</span>: {{ reviewTracks|length }}</span>
+        <span class="console-chip"><span data-i18n-en="Total duration" data-i18n-zh="总时长">Total duration</span>: {{ reviewSummary.total_duration }}</span>
       </div>
     </div>
   </div>
@@ -21,10 +21,10 @@
       <aside class="metadata-review-track-sequence-shell">
         <div class="metadata-review-track-sequence-head">
           <div>
-            <p class="console-eyebrow mb-1">Track sequence</p>
-            <h4 class="h6 mb-0">Select a track to edit</h4>
+            <p class="console-eyebrow mb-1" data-i18n-en="Track sequence" data-i18n-zh="曲目序列">Track sequence</p>
+            <h4 class="h6 mb-0" data-i18n-en="Select a track to edit" data-i18n-zh="选择要编辑的曲目">Select a track to edit</h4>
           </div>
-          <span class="console-chip">{{ reviewTracks|length }} entries</span>
+          <span class="console-chip" data-i18n-en="{{ reviewTracks|length }} entries" data-i18n-zh="{{ reviewTracks|length }} 个条目">{{ reviewTracks|length }} entries</span>
         </div>
 
         <div class="metadata-review-track-sequence" data-review-track-sequence>
@@ -46,39 +46,39 @@
           <section class="metadata-review-track-editor-panel{% if loop.first %} is-active{% endif %}" data-review-track-editor-panel data-review-track-panel="{{ track.id }}" data-review-track-row="{{ track.id }}"{% if not loop.first %} hidden{% endif %}>
             <div class="metadata-review-track-editor-header">
               <div>
-                <p class="console-eyebrow mb-2">Track {{ "%02d"|format(track.number or loop.index) }}</p>
+                <p class="console-eyebrow mb-2"><span data-i18n-en="Track" data-i18n-zh="曲目">Track</span> {{ "%02d"|format(track.number or loop.index) }}</p>
                 <h4 class="h5 mb-1" data-review-track-panel-title>{{ track.title }}</h4>
-                <p class="mb-0 text-body-secondary">Normalize the selected track without leaving this album review task.</p>
+                <p class="mb-0 text-body-secondary" data-i18n-en="Normalize the selected track without leaving this album review task." data-i18n-zh="不离开当前专辑审核任务即可规范化所选曲目。">Normalize the selected track without leaving this album review task.</p>
               </div>
               <div class="metadata-review-track-editor-summary">
-                <span class="console-chip">Focused editor</span>
+                <span class="console-chip" data-i18n-en="Focused editor" data-i18n-zh="聚焦编辑器">Focused editor</span>
                 <span class="console-chip">{{ "%02d:%02d"|format((track.duration or 0) // 60, (track.duration or 0) % 60) }}</span>
               </div>
             </div>
 
             <div class="metadata-review-track-editor-grid">
               <div class="metadata-review-track-field metadata-review-track-field-compact metadata-review-track-number-group">
-                <label class="metadata-review-track-label" for="review-track-number-{{ track.id }}">Number</label>
+                <label class="metadata-review-track-label" for="review-track-number-{{ track.id }}"><span data-i18n-en="Number" data-i18n-zh="编号">Number</span></label>
                 <input id="review-track-number-{{ track.id }}" class="form-control metadata-review-track-input metadata-review-track-number" data-track-number type="number" value="{{ track.number }}" min="1"{% if not reviewIsEditable %} disabled{% endif %}>
               </div>
 
               <div class="metadata-review-track-field metadata-review-track-field-compact metadata-review-track-duration-group" data-review-track-duration>
-                <span class="metadata-review-track-label">Duration</span>
+                <span class="metadata-review-track-label" data-i18n-en="Duration" data-i18n-zh="时长">Duration</span>
                 <div class="metadata-review-track-inline-note metadata-review-track-duration-value">{{ "%02d:%02d"|format((track.duration or 0) // 60, (track.duration or 0) % 60) }}</div>
               </div>
 
               <div class="metadata-review-track-field metadata-review-track-field-wide">
-                <label class="metadata-review-track-label" for="review-track-title-{{ track.id }}">Title</label>
+                <label class="metadata-review-track-label" for="review-track-title-{{ track.id }}"><span data-i18n-en="Title" data-i18n-zh="标题">Title</span></label>
                 <input id="review-track-title-{{ track.id }}" class="form-control metadata-review-track-input metadata-review-track-title" data-track-title type="text" value="{{ track.title }}"{% if not reviewIsEditable %} disabled{% endif %}>
               </div>
 
               <div class="metadata-review-track-field metadata-review-track-field-wide">
-                <span class="metadata-review-track-label">Album</span>
+                <span class="metadata-review-track-label" data-i18n-en="Album" data-i18n-zh="专辑">Album</span>
                 <div class="metadata-review-track-inline-note metadata-review-track-album-note" data-review-track-album-note>{{ reviewAlbum.name }}</div>
               </div>
 
               <div class="metadata-review-track-field metadata-review-track-field-wide">
-                <label class="metadata-review-track-label" for="review-track-artist-{{ track.id }}">Artist</label>
+                <label class="metadata-review-track-label" for="review-track-artist-{{ track.id }}"><span data-i18n-en="Artist" data-i18n-zh="艺人">Artist</span></label>
                 <input id="review-track-artist-{{ track.id }}" class="form-control metadata-review-track-input metadata-review-track-artist" data-track-artist type="text" value="{{ track.artist.get_artist_name() }}" autocomplete="off"{% if not reviewIsEditable %} disabled{% endif %}>
                 <div class="list-group mt-2 d-none" data-track-artist-suggestions></div>
               </div>
@@ -90,7 +90,7 @@
 
     {% if reviewIsEditable %}
       <div class="form-actions">
-        <button type="submit" class="btn btn-primary">Save track changes</button>
+        <button type="submit" class="btn btn-primary"><span data-i18n-en="Save track changes" data-i18n-zh="保存曲目修改">Save track changes</span></button>
       </div>
     {% endif %}
   </form>

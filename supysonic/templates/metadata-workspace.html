@@ -1,7 +1,9 @@
 {% extends "layout.html" %}
 {% block title %}Metadata · Emosonic Server{% endblock %}
-{% block page_title %}Metadata{% endblock %}
-{% block page_subtitle %}Review pending library tasks, then inspect artist and album editing tools inside one metadata workspace.{% endblock %}
+{% block document_title_en %}Metadata · Emosonic Server{% endblock %}
+{% block document_title_zh %}元数据 · Emosonic Server{% endblock %}
+{% block page_title %}<span data-i18n-en="Metadata" data-i18n-zh="元数据">Metadata</span>{% endblock %}
+{% block page_subtitle %}<span data-i18n-en="Review pending library tasks, then inspect artist and album editing tools inside one metadata workspace." data-i18n-zh="在一个元数据工作区中处理待审曲库任务，并查看艺人与专辑编辑工具。">Review pending library tasks, then inspect artist and album editing tools inside one metadata workspace.</span>{% endblock %}
 {% block body %}
 <style>
   .metadata-workspace-panel {
@@ -10,20 +12,20 @@
 </style>
 <div class="metadata-workspace-panel console-section-spacer">
   <div class="d-flex justify-content-between align-items-center mb-3 px-1">
-    <h2 class="h4 mb-0">Metadata workspace</h2>
-    <span class="console-chip">Review and edit</span>
+    <h2 class="h4 mb-0" data-i18n-en="Metadata workspace" data-i18n-zh="元数据工作区">Metadata workspace</h2>
+    <span class="console-chip" data-i18n-en="Review and edit" data-i18n-zh="审核与编辑">Review and edit</span>
   </div>
   <div class="card mb-4">
     <div class="card-body">
     <ul class="nav nav-tabs" id="metadata-workspace-tabs" role="tablist">
       <li class="nav-item" role="presentation">
-        <a class="nav-link {% if activeTab == 'inbox' %}active{% endif %}" href="{{ url_for('frontend.metadata', tab='inbox') }}" id="inbox-tab">Inbox</a>
+        <a class="nav-link {% if activeTab == 'inbox' %}active{% endif %}" href="{{ url_for('frontend.metadata', tab='inbox') }}" id="inbox-tab"><span data-i18n-en="Inbox" data-i18n-zh="收件箱">Inbox</span></a>
       </li>
       <li class="nav-item" role="presentation">
-        <a class="nav-link {% if activeTab == 'artists' %}active{% endif %}" href="{{ url_for('frontend.metadata', tab='artists') }}" id="artists-tab">Artists</a>
+        <a class="nav-link {% if activeTab == 'artists' %}active{% endif %}" href="{{ url_for('frontend.metadata', tab='artists') }}" id="artists-tab"><span data-i18n-en="Artists" data-i18n-zh="艺人">Artists</span></a>
       </li>
       <li class="nav-item" role="presentation">
-        <a class="nav-link {% if activeTab == 'albums' %}active{% endif %}" href="{{ url_for('frontend.metadata', tab='albums') }}" id="albums-tab">Albums</a>
+        <a class="nav-link {% if activeTab == 'albums' %}active{% endif %}" href="{{ url_for('frontend.metadata', tab='albums') }}" id="albums-tab"><span data-i18n-en="Albums" data-i18n-zh="专辑">Albums</span></a>
       </li>
     </ul>
     </div>

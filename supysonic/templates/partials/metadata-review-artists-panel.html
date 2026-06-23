@@ -1,8 +1,8 @@
 <section>
   <div class="d-flex justify-content-between align-items-center mb-3">
     <div>
-      <h3 class="h5 mb-1">Artists and roles</h3>
-      <p class="mb-0 text-body-secondary">Review only the artists connected to this album task.</p>
+      <h3 class="h5 mb-1" data-i18n-en="Artists and roles" data-i18n-zh="艺人与角色">Artists and roles</h3>
+      <p class="mb-0 text-body-secondary" data-i18n-en="Review only the artists connected to this album task." data-i18n-zh="仅审核与该专辑任务关联的艺人。">Review only the artists connected to this album task.</p>
     </div>
   </div>
   <div class="d-grid gap-3">
@@ -12,32 +12,32 @@
           <img src="{{ artist.image_url }}" alt="{{ artist.display_name }}" class="metadata-review-artist-image" data-review-artist-image-preview>
           <div class="flex-grow-1">
             {% if artist.is_cover_art_fallback %}
-              <p class="mb-3 text-warning-emphasis">Showing album cover fallback. Add a dedicated artist image to resolve this task.</p>
+              <p class="mb-3 text-warning-emphasis" data-i18n-en="Showing album cover fallback. Add a dedicated artist image to resolve this task." data-i18n-zh="当前显示专辑封面兜底图。添加专用艺人图片即可解决该任务。">Showing album cover fallback. Add a dedicated artist image to resolve this task.</p>
             {% endif %}
             <div class="row g-3">
               <div class="col-md-6">
-                <label class="form-label">Artist name</label>
+                <label class="form-label" data-i18n-en="Artist name" data-i18n-zh="艺人名称">Artist name</label>
                 <input class="form-control" type="text" value="{{ artist.name }}" readonly>
               </div>
               <div class="col-md-6">
-                <label class="form-label">Primary artist mapping</label>
-                <input class="form-control" name="primary_name" type="text" value="{{ artist.display_name if artist.display_name != artist.name else '' }}" placeholder="Primary artist name"{% if not reviewIsEditable %} disabled{% endif %}>
+                <label class="form-label" data-i18n-en="Primary artist mapping" data-i18n-zh="主要艺人映射">Primary artist mapping</label>
+                <input class="form-control" name="primary_name" type="text" value="{{ artist.display_name if artist.display_name != artist.name else '' }}" placeholder="Primary artist name" data-i18n-en="Primary artist name" data-i18n-zh="主要艺人名称" data-i18n-attr="placeholder"{% if not reviewIsEditable %} disabled{% endif %}>
                 <div class="list-group mt-2 d-none" data-review-primary-artist-suggestions></div>
               </div>
               <div class="col-12">
-                <label class="form-label">Biography</label>
-                <textarea class="form-control" name="biography" rows="4" placeholder="Artist biography"{% if not reviewIsEditable %} disabled{% endif %}>{{ artist.biography }}</textarea>
+                <label class="form-label" data-i18n-en="Biography" data-i18n-zh="简介">Biography</label>
+                <textarea class="form-control" name="biography" rows="4" placeholder="Artist biography" data-i18n-en="Artist biography" data-i18n-zh="艺人简介" data-i18n-attr="placeholder"{% if not reviewIsEditable %} disabled{% endif %}>{{ artist.biography }}</textarea>
               </div>
               <div class="col-12">
-                <label class="form-label">Artist photo</label>
+                <label class="form-label" data-i18n-en="Artist photo" data-i18n-zh="艺人照片">Artist photo</label>
                 <input class="form-control" name="artist_photo" type="file" accept="image/*"{% if not reviewIsEditable %} disabled{% endif %}>
               </div>
             </div>
             {% if reviewIsEditable %}
               <div class="form-actions">
-                <button type="submit" class="btn btn-primary">Save artist changes</button>
+                <button type="submit" class="btn btn-primary"><span data-i18n-en="Save artist changes" data-i18n-zh="保存艺人修改">Save artist changes</span></button>
                 {% if artist.can_remove %}
-                  <button type="button" class="btn btn-outline-danger" data-review-artist-remove data-review-artist-remove-action="{{ url_for('frontend.remove_metadata_review_task_artist', task_id=reviewTask.id, artist_id=artist.id) }}">Remove artist</button>
+                  <button type="button" class="btn btn-outline-danger" data-review-artist-remove data-review-artist-remove-action="{{ url_for('frontend.remove_metadata_review_task_artist', task_id=reviewTask.id, artist_id=artist.id) }}"><span data-i18n-en="Remove artist" data-i18n-zh="移除艺人">Remove artist</span></button>
                 {% endif %}
               </div>
             {% endif %}

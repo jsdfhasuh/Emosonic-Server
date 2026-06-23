@@ -1,30 +1,32 @@
 {% extends "layout.html" %}
 {% block title %}Playlist Import · Emosonic Server{% endblock %}
+{% block document_title_en %}Playlist Import · Emosonic Server{% endblock %}
+{% block document_title_zh %}播放列表导入 · Emosonic Server{% endblock %}
 {% block navbar_playlists %}
 <a class="nav-link active" aria-current="page" href="{{ url_for('frontend.playlist_index') }}"><span data-i18n-en="Playlists" data-i18n-zh="播放列表">Playlists</span></a>
 {% endblock %}
-{% block page_title %}Playlist import{% endblock %}
-{% block page_subtitle %}Prepare external playlist data for import and compare it with tracks resolved inside the Emosonic Server library.{% endblock %}
+{% block page_title %}<span data-i18n-en="Playlist import" data-i18n-zh="播放列表导入">Playlist import</span>{% endblock %}
+{% block page_subtitle %}<span data-i18n-en="Prepare external playlist data for import and compare it with tracks resolved inside the Emosonic Server library." data-i18n-zh="准备外部播放列表数据，并与 Emosonic Server 曲库中解析到的曲目进行比对。">Prepare external playlist data for import and compare it with tracks resolved inside the Emosonic Server library.</span>{% endblock %}
 {% block body %}
 <div class="row g-3">
   <div class="col-xl-6">
     <div class="card h-100">
-      <div class="card-header">Incoming playlist file</div>
+      <div class="card-header"><span data-i18n-en="Incoming playlist file" data-i18n-zh="待导入播放列表文件">Incoming playlist file</span></div>
       <div class="card-body d-flex flex-column gap-3">
-        <div class="console-muted">Upload the external playlist content you want to map to the current library.</div>
-        <div class="border rounded-4 p-3 bg-body-tertiary">No playlist preview available yet.</div>
+        <div class="console-muted" data-i18n-en="Upload the external playlist content you want to map to the current library." data-i18n-zh="上传要映射到当前曲库的外部播放列表内容。">Upload the external playlist content you want to map to the current library.</div>
+        <div class="border rounded-4 p-3 bg-body-tertiary" data-i18n-en="No playlist preview available yet." data-i18n-zh="暂无播放列表预览。">No playlist preview available yet.</div>
         <input type="file" id="fileInput" class="form-control" />
-        <button id="importButton" class="btn btn-dark">Import playlist</button>
+        <button id="importButton" class="btn btn-dark" data-i18n-en="Import playlist" data-i18n-zh="导入播放列表">Import playlist</button>
       </div>
     </div>
   </div>
   <div class="col-xl-6">
     <div class="card h-100">
-      <div class="card-header">Resolved server matches</div>
+      <div class="card-header"><span data-i18n-en="Resolved server matches" data-i18n-zh="服务端匹配结果">Resolved server matches</span></div>
       <div class="card-body d-flex flex-column gap-3">
-        <div class="console-muted">Matched tracks from the server library will be listed here after the import pipeline is implemented.</div>
-        <div class="border rounded-4 p-3 bg-body-tertiary">No resolved tracks yet.</div>
-        <button id="playButton" class="btn btn-outline-dark">Resolve against library</button>
+        <div class="console-muted" data-i18n-en="Matched tracks from the server library will be listed here after the import pipeline is implemented." data-i18n-zh="导入流程实现后，服务端曲库匹配到的曲目会显示在这里。">Matched tracks from the server library will be listed here after the import pipeline is implemented.</div>
+        <div class="border rounded-4 p-3 bg-body-tertiary" data-i18n-en="No resolved tracks yet." data-i18n-zh="暂无已解析曲目。">No resolved tracks yet.</div>
+        <button id="playButton" class="btn btn-outline-dark" data-i18n-en="Resolve against library" data-i18n-zh="与曲库匹配">Resolve against library</button>
       </div>
     </div>
   </div>

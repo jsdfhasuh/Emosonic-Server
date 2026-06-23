@@ -32,21 +32,78 @@ function setTheme(theme) {
   }
 }
 
+function normalizeLanguage(language) {
+  return language === 'zh' ? 'zh' : 'en';
+}
+
+function getStoredPreference(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch (error) {
+    return null;
+  }
+}
+
+function setStoredPreference(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch (error) {
+    // Ignore storage failures so language and theme controls still work.
+  }
+}
+
+function getBrowserLanguage() {
+  const browserLanguages = navigator.languages && navigator.languages.length
+    ? navigator.languages
+    : [navigator.language || navigator.userLanguage || ''];
+  return browserLanguages.some(function (language) {
+    return String(language).toLowerCase().startsWith('zh');
+  }) ? 'zh' : 'en';
+}
+
+function getInitialLanguage() {
+  const savedLanguage = getStoredPreference('language');
+  if (savedLanguage === 'en' || savedLanguage === 'zh') {
+    return savedLanguage;
+  }
+  return getBrowserLanguage();
+}
+
+function i18nText(enText, zhText) {
+  return getLanguage() === 'zh'
+    ? (zhText || enText || '')
+    : (enText || zhText || '');
+}
+
 function applyLanguage(language) {
-  const activeLanguage = language === 'zh' ? 'zh' : 'en';
+  const activeLanguage = normalizeLanguage(language);
   document.documentElement.lang = activeLanguage === 'zh' ? 'zh-Hans' : 'en';
   document.body.setAttribute('data-language', activeLanguage);
 
   document.querySelectorAll('[data-i18n-en][data-i18n-zh]').forEach(function (node) {
-    const attr = node.getAttribute('data-i18n-attr');
+    if (node.matches('meta[name="i18n-title"]')) {
+      return;
+    }
+
+    const attrs = (node.getAttribute('data-i18n-attr') || '')
+      .split(',')
+      .map(function (attr) { return attr.trim(); })
+      .filter(Boolean);
     const text = activeLanguage === 'zh' ? node.getAttribute('data-i18n-zh') : node.getAttribute('data-i18n-en');
     if (!text) {
       return;
     }
 
-    if (attr) {
-      node.setAttribute(attr, text);
-      if (attr === 'placeholder' && node.getAttribute('aria-label') === node.getAttribute('data-i18n-en')) {
+    if (attrs.length) {
+      attrs.forEach(function (attr) {
+        node.setAttribute(attr, text);
+      });
+      const ariaLabel = node.getAttribute('aria-label');
+      if (
+        attrs.includes('placeholder')
+        && !attrs.includes('aria-label')
+        && (ariaLabel === node.getAttribute('data-i18n-en') || ariaLabel === node.getAttribute('data-i18n-zh'))
+      ) {
         node.setAttribute('aria-label', text);
       }
       return;
@@ -60,6 +117,14 @@ function applyLanguage(language) {
     button.classList.toggle('active', isActive);
     button.setAttribute('aria-pressed', isActive ? 'true' : 'false');
   });
+
+  const titleNode = document.querySelector('meta[name="i18n-title"][data-i18n-en][data-i18n-zh]');
+  if (titleNode) {
+    const titleText = activeLanguage === 'zh' ? titleNode.getAttribute('data-i18n-zh') : titleNode.getAttribute('data-i18n-en');
+    if (titleText) {
+      document.title = titleText;
+    }
+  }
 }
 
 function getLanguage() {
@@ -305,8 +370,8 @@ function initLogDownloadConsole() {
   });
 }
 
-const savedTheme = localStorage.getItem('theme') || 'light';
-const savedLanguage = localStorage.getItem('language') || 'en';
+const savedTheme = getStoredPreference('theme') || 'light';
+const savedLanguage = getInitialLanguage();
 const themeInput = document.querySelector(`input[value="${savedTheme}"]`);
 if (themeInput) {
   themeInput.checked = true;
@@ -317,15 +382,15 @@ applyLanguage(savedLanguage);
 document.querySelectorAll('input[name="theme"]').forEach(function (radio) {
   radio.addEventListener('change', function () {
     const selectedTheme = this.value;
-    localStorage.setItem('theme', selectedTheme);
+    setStoredPreference('theme', selectedTheme);
     setTheme(selectedTheme);
   });
 });
 
 document.querySelectorAll('[data-language-toggle]').forEach(function (button) {
   button.addEventListener('click', function () {
-    const selectedLanguage = this.getAttribute('data-language-toggle') || 'en';
-    localStorage.setItem('language', selectedLanguage);
+    const selectedLanguage = normalizeLanguage(this.getAttribute('data-language-toggle'));
+    setStoredPreference('language', selectedLanguage);
     applyLanguage(selectedLanguage);
   });
 });
@@ -333,7 +398,7 @@ document.querySelectorAll('[data-language-toggle]').forEach(function (button) {
 initLogDownloadConsole();
 
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
-  if (localStorage.getItem('theme') === 'auto') {
+  if (getStoredPreference('theme') === 'auto') {
     setTheme('auto');
   }
 });

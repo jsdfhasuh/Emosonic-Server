@@ -1,59 +1,59 @@
 <section>
   <div class="d-flex justify-content-between align-items-center mb-3">
     <div>
-      <h3 class="h5 mb-1">Core metadata</h3>
-      <p class="mb-0 text-body-secondary">Update the album identity fields without leaving this review task.</p>
+      <h3 class="h5 mb-1" data-i18n-en="Core metadata" data-i18n-zh="核心元数据">Core metadata</h3>
+      <p class="mb-0 text-body-secondary" data-i18n-en="Update the album identity fields without leaving this review task." data-i18n-zh="不离开当前审核任务即可更新专辑身份字段。">Update the album identity fields without leaving this review task.</p>
     </div>
   </div>
   {% if not reviewIsEditable %}
-    <div class="alert alert-secondary">This review task is resolved and now read-only.</div>
+    <div class="alert alert-secondary" data-i18n-en="This review task is resolved and now read-only." data-i18n-zh="该审核任务已解决，现在为只读状态。">This review task is resolved and now read-only.</div>
   {% endif %}
   <form id="review-album-form" action="{{ url_for('frontend.update_metadata_review_task_album', task_id=reviewTask.id) }}">
     <div class="row g-3">
       <div class="col-md-6">
-        <label class="form-label" for="review-album-name">Album title</label>
+        <label class="form-label" for="review-album-name"><span data-i18n-en="Album title" data-i18n-zh="专辑标题">Album title</span></label>
         <input class="form-control" id="review-album-name" type="text" value="{{ reviewAlbum.name }}"{% if not reviewIsEditable %} disabled{% endif %}>
       </div>
       <div class="col-md-6">
-        <label class="form-label" for="review-album-artist">Primary artist</label>
+        <label class="form-label" for="review-album-artist"><span data-i18n-en="Primary artist" data-i18n-zh="主要艺人">Primary artist</span></label>
         <input class="form-control" id="review-album-artist" type="text" value="{{ reviewAlbum.artist.get_artist_name() }}" autocomplete="off"{% if not reviewIsEditable %} disabled{% endif %}>
         <div id="review-album-artist-suggestions" class="list-group mt-2 d-none"></div>
       </div>
       <div class="col-md-4">
-        <label class="form-label" for="review-album-year">Release year</label>
+        <label class="form-label" for="review-album-year"><span data-i18n-en="Release year" data-i18n-zh="发行年份">Release year</span></label>
         <input class="form-control" id="review-album-year" type="text" value="{{ reviewAlbum.year or '' }}"{% if not reviewIsEditable %} disabled{% endif %}>
       </div>
       <div class="col-md-8">
-        <label class="form-label">Task context</label>
-        <div class="metadata-review-inline-note">This task is scoped to one album. Changes here should only normalize this release.</div>
+        <label class="form-label" data-i18n-en="Task context" data-i18n-zh="任务上下文">Task context</label>
+        <div class="metadata-review-inline-note" data-i18n-en="This task is scoped to one album. Changes here should only normalize this release." data-i18n-zh="该任务限定于一张专辑。这里的修改只应规范化这张发行。">This task is scoped to one album. Changes here should only normalize this release.</div>
       </div>
     </div>
     {% if reviewIsEditable %}
       <div class="form-actions">
-        <button type="submit" class="btn btn-primary">Save album changes</button>
+        <button type="submit" class="btn btn-primary"><span data-i18n-en="Save album changes" data-i18n-zh="保存专辑修改">Save album changes</span></button>
       </div>
     {% endif %}
   </form>
   {% set albumEnrichment = reviewSummary.album_enrichment %}
   {% if albumEnrichment and albumEnrichment.has_enrichment %}
     <div class="card mt-4">
-      <div class="card-header">External enrichment</div>
+      <div class="card-header"><span data-i18n-en="External enrichment" data-i18n-zh="外部补全">External enrichment</span></div>
       <div class="card-body">
         <ul class="console-info-list mb-0">
           {% if albumEnrichment.release_date %}
-            <li><span>Release date</span><strong>{{ albumEnrichment.release_date }}</strong></li>
+            <li><span data-i18n-en="Release date" data-i18n-zh="发行日期">Release date</span><strong>{{ albumEnrichment.release_date }}</strong></li>
           {% endif %}
           {% if albumEnrichment.release_type %}
-            <li><span>Release type</span><strong>{{ albumEnrichment.release_type }}</strong></li>
+            <li><span data-i18n-en="Release type" data-i18n-zh="发行类型">Release type</span><strong>{{ albumEnrichment.release_type }}</strong></li>
           {% endif %}
           {% if albumEnrichment.styles_label %}
-            <li><span>Styles</span><strong>{{ albumEnrichment.styles_label }}</strong></li>
+            <li><span data-i18n-en="Styles" data-i18n-zh="风格">Styles</span><strong>{{ albumEnrichment.styles_label }}</strong></li>
           {% endif %}
           {% if albumEnrichment.providers_label %}
-            <li><span>Providers</span><strong>{{ albumEnrichment.providers_label }}</strong></li>
+            <li><span data-i18n-en="Providers" data-i18n-zh="提供方">Providers</span><strong>{{ albumEnrichment.providers_label }}</strong></li>
           {% endif %}
           {% if albumEnrichment.primary_genre %}
-            <li><span>Primary genre</span><strong>{{ albumEnrichment.primary_genre }}</strong></li>
+            <li><span data-i18n-en="Primary genre" data-i18n-zh="主要流派">Primary genre</span><strong>{{ albumEnrichment.primary_genre }}</strong></li>
           {% endif %}
         </ul>
       </div>

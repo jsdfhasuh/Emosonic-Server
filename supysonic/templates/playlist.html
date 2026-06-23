@@ -6,6 +6,8 @@
 -#}
 {% extends "layout.html" %}
 {% block title %}Playlist · Emosonic Server{% endblock %}
+{% block document_title_en %}Playlist · Emosonic Server{% endblock %}
+{% block document_title_zh %}播放列表 · Emosonic Server{% endblock %}
 {% block navbar_playlists %}
 <a class="nav-link active" aria-current="page" href="{{ url_for('frontend.playlist_index') }}"><span data-i18n-en="Playlists" data-i18n-zh="播放列表">Playlists</span></a>
 {% endblock %}
@@ -35,7 +37,7 @@
     <div class="card console-metric-card">
       <div class="card-header"><span data-i18n-en="Visibility" data-i18n-zh="可见性">Visibility</span></div>
       <div class="card-body">
-        <div class="console-metric-value">{{ 'PUBLIC' if playlist.public else 'PRIVATE' }}</div>
+        <div class="console-metric-value" data-i18n-en="{{ 'PUBLIC' if playlist.public else 'PRIVATE' }}" data-i18n-zh="{{ '公开' if playlist.public else '私有' }}">{{ 'PUBLIC' if playlist.public else 'PRIVATE' }}</div>
         <div class="console-metric-caption" data-i18n-en="Publication state exposed to other users." data-i18n-zh="是否向其他用户公开。">Publication state exposed to other users.</div>
       </div>
     </div>
@@ -71,7 +73,13 @@
   <div class="table-responsive">
     <table class="table table-hover align-middle mb-0">
       <thead>
-        <tr><th>Artist</th><th>Title</th><th>Album</th><th>Length</th><th>Share</th></tr>
+        <tr>
+          <th data-i18n-en="Artist" data-i18n-zh="艺人">Artist</th>
+          <th data-i18n-en="Title" data-i18n-zh="标题">Title</th>
+          <th data-i18n-en="Album" data-i18n-zh="专辑">Album</th>
+          <th data-i18n-en="Length" data-i18n-zh="时长">Length</th>
+          <th data-i18n-en="Share" data-i18n-zh="分享">Share</th>
+        </tr>
       </thead>
       <tbody>
         {% for t in playlist.get_tracks() %}
@@ -103,7 +111,7 @@
     <div class="modal-content">
       <div class="modal-header">
         <h1 class="modal-title fs-5" id="confirm-share-label"><span data-i18n-en="Create public share link?" data-i18n-zh="创建公开分享链接？">Create public share link?</span></h1>
-        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close" data-i18n-en="Close" data-i18n-zh="关闭" data-i18n-attr="aria-label"></button>
       </div>
       <div class="modal-body">
         <p class="mb-2" data-i18n-en="You are about to create a public listening link for this track:" data-i18n-zh="你即将为这首曲目创建公开收听链接：">You are about to create a public listening link for this track:</p>
@@ -126,7 +134,7 @@
     <div class="modal-content">
       <div class="modal-header">
         <h1 class="modal-title fs-5" id="share-created-label"><span data-i18n-en="Share link ready" data-i18n-zh="分享链接已生成">Share link ready</span></h1>
-        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close" data-i18n-en="Close" data-i18n-zh="关闭" data-i18n-attr="aria-label"></button>
       </div>
       <div class="modal-body">
         <p class="mb-2"><span data-i18n-en="Use this public link to share " data-i18n-zh="使用这个公开链接分享 ">Use this public link to share </span><strong id="share-created-title">track</strong><span data-i18n-en=" with anyone." data-i18n-zh=" 给任何人。"> with anyone.</span></p>
@@ -180,13 +188,20 @@
           if (!copied) {
             throw new Error('copy failed');
           }
-          status.textContent = 'Share link copied to clipboard.';
+          status.textContent = i18nText('Share link copied to clipboard.', '分享链接已复制到剪贴板。');
         } catch (error) {
           field.select();
           field.setSelectionRange(0, field.value.length);
-          status.textContent = 'Clipboard access unavailable. The link is selected for manual copy.';
+          status.textContent = i18nText('Clipboard access unavailable. The link is selected for manual copy.', '无法访问剪贴板，链接已选中，可手动复制。');
         }
       });
+    }
+
+    function setConfirmShareLinkLabel(enText, zhText) {
+      const label = confirmShareLink.querySelector('[data-i18n-en][data-i18n-zh]') || confirmShareLink;
+      label.setAttribute('data-i18n-en', enText);
+      label.setAttribute('data-i18n-zh', zhText);
+      label.textContent = i18nText(enText, zhText);
     }
 
     document.querySelectorAll('.open-share-modal').forEach((button) => {
@@ -206,7 +221,7 @@
       }
 
       this.classList.add('disabled');
-      this.textContent = 'Creating...';
+      setConfirmShareLinkLabel('Creating...', '正在创建...');
       try {
         const response = await fetch(createUrl, {
           method: 'POST',
@@ -214,20 +229,20 @@
         });
         const payload = await response.json();
         if (!response.ok || payload.status !== 'success') {
-          throw new Error(payload.message || 'Failed to create share link');
+          throw new Error(payload.message || i18nText('Failed to create share link', '创建分享链接失败'));
         }
 
         document.getElementById('share-link-field').value = payload.shareUrl;
         shareCreatedTitle.textContent = payload.trackTitle || 'track';
         openShareLink.href = payload.shareUrl;
-        document.getElementById('share-link-status').textContent = 'Anyone with this URL can stream the shared track.';
+        document.getElementById('share-link-status').textContent = i18nText('Anyone with this URL can stream the shared track.', '任何拥有此链接的人都可以播放这首分享曲目。');
         shareModal.hide();
         shareCreatedModal.show();
       } catch (error) {
         alert(error.message);
       } finally {
         this.classList.remove('disabled');
-        this.textContent = 'Create link';
+        setConfirmShareLinkLabel('Create link', '创建链接');
       }
     });
   });

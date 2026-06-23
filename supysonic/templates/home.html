@@ -6,6 +6,8 @@ Distributed under terms of the GNU AGPLv3 license.
 -#}
 {% extends "layout.html" %}
 {% block title %}Overview · Emosonic Server{% endblock %}
+{% block document_title_en %}Overview · Emosonic Server{% endblock %}
+{% block document_title_zh %}概览 · Emosonic Server{% endblock %}
 {% block navbar_index %}
 <a class="nav-link active" aria-current="page" href="{{ url_for('frontend.index') }}"><span data-i18n-en="Overview" data-i18n-zh="概览">Overview</span></a>
 {% endblock %}
@@ -15,28 +17,28 @@ Distributed under terms of the GNU AGPLv3 license.
 <div class="row row-cols-1 row-cols-md-3 g-3 console-section-spacer">
   <div class="col">
     <div class="card console-metric-card">
-      <div class="card-header">Artists indexed</div>
+      <div class="card-header"><span data-i18n-en="Artists indexed" data-i18n-zh="已索引艺人">Artists indexed</span></div>
       <div class="card-body">
         <div class="console-metric-value">{{ stats.artists }}</div>
-        <div class="console-metric-caption">Library entities available for browsing and metadata enrichment.</div>
+        <div class="console-metric-caption" data-i18n-en="Library entities available for browsing and metadata enrichment." data-i18n-zh="可用于浏览和元数据补全的曲库实体。">Library entities available for browsing and metadata enrichment.</div>
       </div>
     </div>
   </div>
   <div class="col">
     <div class="card console-metric-card">
-      <div class="card-header">Albums indexed</div>
+      <div class="card-header"><span data-i18n-en="Albums indexed" data-i18n-zh="已索引专辑">Albums indexed</span></div>
       <div class="card-body">
         <div class="console-metric-value">{{ stats.albums }}</div>
-        <div class="console-metric-caption">Structured release catalog tracked by the server.</div>
+        <div class="console-metric-caption" data-i18n-en="Structured release catalog tracked by the server." data-i18n-zh="服务器跟踪的结构化发行目录。">Structured release catalog tracked by the server.</div>
       </div>
     </div>
   </div>
   <div class="col">
     <div class="card console-metric-card">
-      <div class="card-header">Tracks indexed</div>
+      <div class="card-header"><span data-i18n-en="Tracks indexed" data-i18n-zh="已索引曲目">Tracks indexed</span></div>
       <div class="card-body">
         <div class="console-metric-value">{{ stats.tracks }}</div>
-        <div class="console-metric-caption">Streamable media assets currently available to clients.</div>
+        <div class="console-metric-caption" data-i18n-en="Streamable media assets currently available to clients." data-i18n-zh="当前可供客户端播放的媒体资源。">Streamable media assets currently available to clients.</div>
       </div>
     </div>
   </div>
@@ -46,27 +48,27 @@ Distributed under terms of the GNU AGPLv3 license.
   <div class="col-xl-8">
     <div class="card h-100">
       <div class="card-header d-flex justify-content-between align-items-center">
-        <span>Operations highlights</span>
-        <span class="console-chip">Control plane</span>
+        <span data-i18n-en="Operations highlights" data-i18n-zh="操作重点">Operations highlights</span>
+        <span class="console-chip" data-i18n-en="Control plane" data-i18n-zh="控制平面">Control plane</span>
       </div>
       <div class="card-body">
         <div class="row g-3">
           <div class="col-md-6">
             <div class="p-3 rounded-4 border h-100" style="border-color: var(--console-border); background: linear-gradient(135deg, rgba(82, 168, 255, 0.12), rgba(110, 214, 255, 0.08));">
-              <p class="console-eyebrow mb-2">Live supervision</p>
-              <h5 class="mb-2">Track active devices and sessions</h5>
-              <p class="console-muted mb-3">Open the devices panel to review playback state, queue depth, session activity, and last update times.</p>
-              <a class="btn btn-dark btn-sm" href="{{ url_for('frontend.device_index') }}">Open device monitor</a>
+              <p class="console-eyebrow mb-2" data-i18n-en="Live supervision" data-i18n-zh="实时监控">Live supervision</p>
+              <h5 class="mb-2" data-i18n-en="Track active devices and sessions" data-i18n-zh="跟踪活跃设备与会话">Track active devices and sessions</h5>
+              <p class="console-muted mb-3" data-i18n-en="Open the devices panel to review playback state, queue depth, session activity, and last update times." data-i18n-zh="打开设备面板，查看播放状态、队列深度、会话活动和最近更新时间。">Open the devices panel to review playback state, queue depth, session activity, and last update times.</p>
+              <a class="btn btn-dark btn-sm" href="{{ url_for('frontend.device_index') }}"><span data-i18n-en="Open device monitor" data-i18n-zh="打开设备监控">Open device monitor</span></a>
             </div>
           </div>
           <div class="col-md-6">
             <div class="p-3 rounded-4 border h-100" style="border-color: var(--console-border); background: linear-gradient(135deg, rgba(142, 137, 255, 0.1), rgba(82, 168, 255, 0.08));">
-              <p class="console-eyebrow mb-2">Library operations</p>
-              <h5 class="mb-2">Keep folders and metadata organized</h5>
-              <p class="console-muted mb-3">Manage source folders, trigger scans, and curate metadata from the administrative surfaces.</p>
+              <p class="console-eyebrow mb-2" data-i18n-en="Library operations" data-i18n-zh="曲库操作">Library operations</p>
+              <h5 class="mb-2" data-i18n-en="Keep folders and metadata organized" data-i18n-zh="整理文件夹与元数据">Keep folders and metadata organized</h5>
+              <p class="console-muted mb-3" data-i18n-en="Manage source folders, trigger scans, and curate metadata from the administrative surfaces." data-i18n-zh="在管理界面中维护来源文件夹、触发扫描并整理元数据。">Manage source folders, trigger scans, and curate metadata from the administrative surfaces.</p>
               <div class="d-flex flex-wrap gap-2">
-                <a class="btn btn-outline-dark btn-sm" href="{{ url_for('frontend.folder_index') }}">Manage folders</a>
-                <a class="btn btn-outline-dark btn-sm" href="{{ url_for('frontend.metadata_artists') }}">Browse artists</a>
+                <a class="btn btn-outline-dark btn-sm" href="{{ url_for('frontend.folder_index') }}"><span data-i18n-en="Manage folders" data-i18n-zh="管理文件夹">Manage folders</span></a>
+                <a class="btn btn-outline-dark btn-sm" href="{{ url_for('frontend.metadata_artists') }}"><span data-i18n-en="Browse artists" data-i18n-zh="浏览艺人">Browse artists</span></a>
               </div>
             </div>
           </div>
@@ -76,24 +78,24 @@ Distributed under terms of the GNU AGPLv3 license.
   </div>
   <div class="col-xl-4">
     <div class="card h-100">
-      <div class="card-header">Quick actions</div>
+      <div class="card-header"><span data-i18n-en="Quick actions" data-i18n-zh="快捷操作">Quick actions</span></div>
       <div class="card-body">
         <ul class="console-info-list">
           <li>
-            <span>Playlists</span>
-            <a href="{{ url_for('frontend.playlist_index') }}">Open</a>
+            <span data-i18n-en="Playlists" data-i18n-zh="播放列表">Playlists</span>
+            <a href="{{ url_for('frontend.playlist_index') }}"><span data-i18n-en="Open" data-i18n-zh="打开">Open</span></a>
           </li>
           <li>
-            <span>User administration</span>
-            <a href="{{ url_for('frontend.user_index') }}">Open</a>
+            <span data-i18n-en="User administration" data-i18n-zh="用户管理">User administration</span>
+            <a href="{{ url_for('frontend.user_index') }}"><span data-i18n-en="Open" data-i18n-zh="打开">Open</span></a>
           </li>
           <li>
-            <span>Folder management</span>
-            <a href="{{ url_for('frontend.folder_index') }}">Open</a>
+            <span data-i18n-en="Folder management" data-i18n-zh="文件夹管理">Folder management</span>
+            <a href="{{ url_for('frontend.folder_index') }}"><span data-i18n-en="Open" data-i18n-zh="打开">Open</span></a>
           </li>
           <li>
-            <span>Profile settings</span>
-            <a href="{{ url_for('frontend.user_profile', uid = 'me') }}">Open</a>
+            <span data-i18n-en="Profile settings" data-i18n-zh="个人设置">Profile settings</span>
+            <a href="{{ url_for('frontend.user_profile', uid = 'me') }}"><span data-i18n-en="Open" data-i18n-zh="打开">Open</span></a>
           </li>
         </ul>
       </div>
@@ -105,22 +107,22 @@ Distributed under terms of the GNU AGPLv3 license.
   <div class="col-xl-7">
     <div class="card h-100">
       <div class="card-header d-flex justify-content-between align-items-center">
-        <span>Library footprint</span>
-        <span class="console-density-note text-body-secondary">Content inventory</span>
+        <span data-i18n-en="Library footprint" data-i18n-zh="曲库规模">Library footprint</span>
+        <span class="console-density-note text-body-secondary" data-i18n-en="Content inventory" data-i18n-zh="内容库存">Content inventory</span>
       </div>
       <div class="card-body">
         <div class="row g-3 text-center">
           <div class="col-md-4">
             <div class="stats mb-3"><p>{{ stats.artists }}</p></div>
-            <a href="{{ url_for('frontend.metadata_artists') }}"><strong>artists</strong></a>
+            <a href="{{ url_for('frontend.metadata_artists') }}"><strong data-i18n-en="artists" data-i18n-zh="艺人">artists</strong></a>
           </div>
           <div class="col-md-4">
             <div class="stats mb-3"><p>{{ stats.albums }}</p></div>
-            <a href="{{ url_for('frontend.metadata_album') }}"><strong>albums</strong></a>
+            <a href="{{ url_for('frontend.metadata_album') }}"><strong data-i18n-en="albums" data-i18n-zh="专辑">albums</strong></a>
           </div>
           <div class="col-md-4">
             <div class="stats mb-3"><p>{{ stats.tracks }}</p></div>
-            <strong>tracks</strong>
+            <strong data-i18n-en="tracks" data-i18n-zh="曲目">tracks</strong>
           </div>
         </div>
       </div>
@@ -129,7 +131,7 @@ Distributed under terms of the GNU AGPLv3 license.
   {% if client_release_downloads %}
   <div class="col-xl-5">
     <div class="card h-100">
-      <div class="card-header">Client downloads</div>
+      <div class="card-header"><span data-i18n-en="Client downloads" data-i18n-zh="客户端下载">Client downloads</span></div>
       <div class="card-body">
         <div class="row g-3">
           {% for platform, label in [('android', 'Android'), ('windows', 'Windows')] %}
@@ -141,18 +143,18 @@ Distributed under terms of the GNU AGPLv3 license.
               <p class="mb-1"><strong>{{ release.version }}</strong></p>
               <p class="console-muted mb-2">{{ release.file_type|upper }} · {{ release.created.strftime('%Y-%m-%d') }}</p>
               <div class="d-flex gap-2 flex-wrap">
-                <a class="btn btn-dark btn-sm" href="{{ url_for('client_releases.download_release', release_id=release.id) }}">Download {{ label }}</a>
-                <a class="btn btn-outline-dark btn-sm" href="{{ url_for('client_releases.release_history', platform=platform) }}">History</a>
+                <a class="btn btn-dark btn-sm" href="{{ url_for('client_releases.download_release', release_id=release.id) }}"><span data-i18n-en="Download {{ label }}" data-i18n-zh="下载 {{ label }}">Download {{ label }}</span></a>
+                <a class="btn btn-outline-dark btn-sm" href="{{ url_for('client_releases.release_history', platform=platform) }}"><span data-i18n-en="History" data-i18n-zh="历史">History</span></a>
               </div>
               {% else %}
-              <p class="console-muted mb-0">Not available</p>
+              <p class="console-muted mb-0" data-i18n-en="Not available" data-i18n-zh="暂无可用版本">Not available</p>
               {% endif %}
             </div>
           </div>
           {% endfor %}
         </div>
         <div class="mt-3 pt-3 border-top">
-          <h6>Other compatible clients</h6>
+          <h6 data-i18n-en="Other compatible clients" data-i18n-zh="其他兼容客户端">Other compatible clients</h6>
           <div class="d-flex flex-wrap gap-2">
             <a href="https://github.com/peguerosdc/subplayer">Subplayer</a>
             <a href="https://github.com/tsquillario/Jamstash">Jamstash</a>
@@ -171,13 +173,13 @@ Distributed under terms of the GNU AGPLv3 license.
 <div class="row g-3">
   <div class="col-xl-5">
     <div class="card h-100">
-      <div class="card-header">Live device health</div>
+      <div class="card-header"><span data-i18n-en="Live device health" data-i18n-zh="实时设备状态">Live device health</span></div>
       <div class="card-body">
         <ul class="console-info-list">
-          <li><span>Online devices</span><strong>{{ device_summary.onlineDevices }}</strong></li>
-          <li><span>Active sessions</span><strong>{{ device_summary.activeSessions }}</strong></li>
-          <li><span>Playing devices</span><strong>{{ device_summary.playingDevices }}</strong></li>
-          <li><span>Recently updated devices</span><strong>{{ device_summary.recentlyUpdated }}</strong></li>
+          <li><span data-i18n-en="Online devices" data-i18n-zh="在线设备">Online devices</span><strong>{{ device_summary.onlineDevices }}</strong></li>
+          <li><span data-i18n-en="Active sessions" data-i18n-zh="活跃会话">Active sessions</span><strong>{{ device_summary.activeSessions }}</strong></li>
+          <li><span data-i18n-en="Playing devices" data-i18n-zh="播放中的设备">Playing devices</span><strong>{{ device_summary.playingDevices }}</strong></li>
+          <li><span data-i18n-en="Recently updated devices" data-i18n-zh="最近更新设备">Recently updated devices</span><strong>{{ device_summary.recentlyUpdated }}</strong></li>
         </ul>
       </div>
     </div>
@@ -185,17 +187,17 @@ Distributed under terms of the GNU AGPLv3 license.
   <div class="col-xl-7">
     <div class="card h-100">
       <div class="card-header d-flex justify-content-between align-items-center">
-        <span>Recent connected devices</span>
-        <a href="{{ url_for('frontend.device_index') }}">Full monitor</a>
+        <span data-i18n-en="Recent connected devices" data-i18n-zh="最近连接设备">Recent connected devices</span>
+        <a href="{{ url_for('frontend.device_index') }}"><span data-i18n-en="Full monitor" data-i18n-zh="完整监控">Full monitor</span></a>
       </div>
       <div class="table-responsive">
         <table class="table table-hover align-middle mb-0">
           <thead>
             <tr>
-              <th>Device</th>
-              <th>User</th>
-              <th>Playback</th>
-              <th>Queue</th>
+              <th data-i18n-en="Device" data-i18n-zh="设备">Device</th>
+              <th data-i18n-en="User" data-i18n-zh="用户">User</th>
+              <th data-i18n-en="Playback" data-i18n-zh="播放">Playback</th>
+              <th data-i18n-en="Queue" data-i18n-zh="队列">Queue</th>
             </tr>
           </thead>
           <tbody>
@@ -213,7 +215,7 @@ Distributed under terms of the GNU AGPLv3 license.
             </tr>
             {% else %}
             <tr>
-              <td colspan="4" class="text-center text-body-secondary">No devices online.</td>
+              <td colspan="4" class="text-center text-body-secondary" data-i18n-en="No devices online." data-i18n-zh="暂无在线设备。">No devices online.</td>
             </tr>
             {% endfor %}
           </tbody>

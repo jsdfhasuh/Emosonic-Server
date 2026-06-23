@@ -6,9 +6,11 @@
 -#}
 {% extends "layout.html" %}
 {% block title %}Update Email · Emosonic Server{% endblock %}
+{% block document_title_en %}Update Email · Emosonic Server{% endblock %}
+{% block document_title_zh %}更新邮箱 · Emosonic Server{% endblock %}
 {% block navbar_users %}
 {% if request.user.id != user.id %}
-<a class="nav-link active" aria-current="page" href="{{ url_for('frontend.user_index') }}">Users</a>
+<a class="nav-link active" aria-current="page" href="{{ url_for('frontend.user_index') }}"><span data-i18n-en="Users" data-i18n-zh="用户">Users</span></a>
 {% else %}
 {{ super() }}
 {% endif %}
@@ -20,22 +22,22 @@
 {{ super() }}
 {% endif %}
 {% endblock %}
-{% block page_title %}Update email{% endblock %}
-{% block page_subtitle %}Change the primary email address used for account identification and notifications for {{ user.name }}.{% endblock %}
+{% block page_title %}<span data-i18n-en="Update email" data-i18n-zh="更新邮箱">Update email</span>{% endblock %}
+{% block page_subtitle %}<span data-i18n-en="Change the primary email address used for account identification and notifications for {{ user.name }}." data-i18n-zh="修改 {{ user.name }} 用于身份识别和通知的主要邮箱地址。">Change the primary email address used for account identification and notifications for {{ user.name }}.</span>{% endblock %}
 {% block body %}
 <div class="row justify-content-center">
   <div class="col-xl-7">
     <div class="card">
-      <div class="card-header">Email configuration</div>
+      <div class="card-header"><span data-i18n-en="Email configuration" data-i18n-zh="邮箱配置">Email configuration</span></div>
       <div class="card-body">
         <form method="post" class="d-flex flex-column gap-4">
           <div>
-            <label class="form-label" for="mail">Email</label>
+            <label class="form-label" for="mail"><span data-i18n-en="Email" data-i18n-zh="邮箱">Email</span></label>
             <input type="text" class="form-control" id="mail" name="mail" value="{{ request.form.mail or user.mail }}" placeholder="name@example.com">
           </div>
           <div class="d-flex gap-2 justify-content-end">
-            <a href="{{ url_for('frontend.user_profile', uid = 'me' if request.user.id == user.id else user.id) }}" class="btn btn-outline-dark">Cancel</a>
-            <button class="btn btn-dark" type="submit">Update email</button>
+            <a href="{{ url_for('frontend.user_profile', uid = 'me' if request.user.id == user.id else user.id) }}" class="btn btn-outline-dark"><span data-i18n-en="Cancel" data-i18n-zh="取消">Cancel</span></a>
+            <button class="btn btn-dark" type="submit"><span data-i18n-en="Update email" data-i18n-zh="更新邮箱">Update email</span></button>
           </div>
         </form>
       </div>

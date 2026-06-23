@@ -6,34 +6,36 @@
 -#}
 {% extends "layout.html" %}
 {% block title %}Update Identity · Emosonic Server{% endblock %}
+{% block document_title_en %}Update Identity · Emosonic Server{% endblock %}
+{% block document_title_zh %}更新身份信息 · Emosonic Server{% endblock %}
 {% block navbar_users %}
-<a class="nav-link active" aria-current="page" href="{{ url_for('frontend.user_index') }}">Users</a>
+<a class="nav-link active" aria-current="page" href="{{ url_for('frontend.user_index') }}"><span data-i18n-en="Users" data-i18n-zh="用户">Users</span></a>
 {% endblock %}
-{% block page_title %}Update user identity{% endblock %}
-{% block page_subtitle %}Change the username and administrative access level for {{ user.name }} from the Emosonic Server control plane.{% endblock %}
+{% block page_title %}<span data-i18n-en="Update user identity" data-i18n-zh="更新用户身份">Update user identity</span>{% endblock %}
+{% block page_subtitle %}<span data-i18n-en="Change the username and administrative access level for {{ user.name }} from the Emosonic Server control plane." data-i18n-zh="在 Emosonic Server 控制台中修改 {{ user.name }} 的用户名和管理员权限级别。">Change the username and administrative access level for {{ user.name }} from the Emosonic Server control plane.</span>{% endblock %}
 {% block body %}
 <div class="row justify-content-center">
   <div class="col-xl-7">
     <div class="card">
-      <div class="card-header">Identity settings</div>
+      <div class="card-header"><span data-i18n-en="Identity settings" data-i18n-zh="身份设置">Identity settings</span></div>
       <div class="card-body">
         <form method="post" class="d-flex flex-column gap-4">
           <div>
-            <label class="form-label" for="user">Username</label>
-            <input type="text" class="form-control" id="user" name="user" value="{{ user.name }}" placeholder="Username">
+            <label class="form-label" for="user"><span data-i18n-en="Username" data-i18n-zh="用户名">Username</span></label>
+            <input type="text" class="form-control" id="user" name="user" value="{{ user.name }}" placeholder="Username" data-i18n-en="Username" data-i18n-zh="用户名" data-i18n-attr="placeholder">
           </div>
 
           <div class="form-check form-switch border rounded-4 p-3">
             <input type="checkbox" class="form-check-input" role="switch" id="admin" name="admin" {{ 'checked="checked"' if user.admin }}>
             <label class="form-check-label ms-2" for="admin">
-              <strong>Administrator access</strong><br>
-              <small class="console-muted">Enable this to grant full operational privileges.</small>
+              <strong data-i18n-en="Administrator access" data-i18n-zh="管理员权限">Administrator access</strong><br>
+              <small class="console-muted" data-i18n-en="Enable this to grant full operational privileges." data-i18n-zh="启用后将授予完整的运维管理权限。">Enable this to grant full operational privileges.</small>
             </label>
           </div>
 
           <div class="d-flex gap-2 justify-content-end">
-            <a href="{{ url_for('frontend.user_profile', uid = user.id) }}" class="btn btn-outline-dark">Cancel</a>
-            <button class="btn btn-dark" type="submit">Update user</button>
+            <a href="{{ url_for('frontend.user_profile', uid = user.id) }}" class="btn btn-outline-dark"><span data-i18n-en="Cancel" data-i18n-zh="取消">Cancel</span></a>
+            <button class="btn btn-dark" type="submit"><span data-i18n-en="Update user" data-i18n-zh="更新用户">Update user</span></button>
           </div>
         </form>
       </div>

@@ -17,16 +17,16 @@
           </div>
         {% endif %}
         {% if task.entity_type == 'artist' and task.is_cover_art_fallback %}
-          <p class="mb-3 text-warning-emphasis">Showing album cover fallback. Artist image is still missing.</p>
+          <p class="mb-3 text-warning-emphasis" data-i18n-en="Showing album cover fallback. Artist image is still missing." data-i18n-zh="当前显示专辑封面兜底图，艺人图片仍缺失。">Showing album cover fallback. Artist image is still missing.</p>
         {% endif %}
-        <p class="mb-3 text-body-secondary"><span>Expires</span> <strong>{% if task.expires_at %}{{ task.expires_at.strftime('%Y-%m-%d %H:%M:%S') }}{% else %}No expiry{% endif %}</strong></p>
+        <p class="mb-3 text-body-secondary"><span data-i18n-en="Expires" data-i18n-zh="过期时间">Expires</span> <strong>{% if task.expires_at %}{{ task.expires_at.strftime('%Y-%m-%d %H:%M:%S') }}{% else %}<span data-i18n-en="No expiry" data-i18n-zh="无过期时间">No expiry</span>{% endif %}</strong></p>
         <div class="d-flex flex-wrap gap-2">
-          <a class="btn btn-sm btn-primary" href="/metadata/review-tasks/{{ task.id }}">Review</a>
+          <a class="btn btn-sm btn-primary" href="/metadata/review-tasks/{{ task.id }}"><span data-i18n-en="Review" data-i18n-zh="审核">Review</span></a>
           <form method="post" action="{{ url_for('frontend.confirm_metadata_review_task', task_id=task.id) }}">
-            <button type="submit" class="btn btn-sm btn-outline-success">Confirm</button>
+            <button type="submit" class="btn btn-sm btn-outline-success"><span data-i18n-en="Confirm" data-i18n-zh="确认">Confirm</span></button>
           </form>
           <form method="post" action="{{ url_for('frontend.dismiss_metadata_review_task', task_id=task.id) }}">
-            <button type="submit" class="btn btn-sm btn-outline-secondary">Dismiss</button>
+            <button type="submit" class="btn btn-sm btn-outline-secondary"><span data-i18n-en="Dismiss" data-i18n-zh="忽略">Dismiss</span></button>
           </form>
         </div>
       </div>
@@ -44,10 +44,10 @@
 <div class="row g-4 align-items-start">
   <div class="col-xl-8">
     <div class="d-flex flex-wrap gap-2 mb-4">
-      <a class="btn btn-sm {% if selectedInboxStatus == 'pending' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="{{ url_for('frontend.metadata', tab='inbox', status='pending') }}">Pending</a>
-      <a class="btn btn-sm {% if selectedInboxStatus == 'confirmed' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="{{ url_for('frontend.metadata', tab='inbox', status='confirmed') }}">Confirmed</a>
-      <a class="btn btn-sm {% if selectedInboxStatus == 'dismissed' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="{{ url_for('frontend.metadata', tab='inbox', status='dismissed') }}">Dismissed</a>
-      <a class="btn btn-sm {% if selectedInboxStatus == 'all' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="{{ url_for('frontend.metadata', tab='inbox', status='all') }}">All</a>
+      <a class="btn btn-sm {% if selectedInboxStatus == 'pending' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="{{ url_for('frontend.metadata', tab='inbox', status='pending') }}"><span data-i18n-en="Pending" data-i18n-zh="待处理">Pending</span></a>
+      <a class="btn btn-sm {% if selectedInboxStatus == 'confirmed' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="{{ url_for('frontend.metadata', tab='inbox', status='confirmed') }}"><span data-i18n-en="Confirmed" data-i18n-zh="已确认">Confirmed</span></a>
+      <a class="btn btn-sm {% if selectedInboxStatus == 'dismissed' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="{{ url_for('frontend.metadata', tab='inbox', status='dismissed') }}"><span data-i18n-en="Dismissed" data-i18n-zh="已忽略">Dismissed</span></a>
+      <a class="btn btn-sm {% if selectedInboxStatus == 'all' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="{{ url_for('frontend.metadata', tab='inbox', status='all') }}"><span data-i18n-en="All" data-i18n-zh="全部">All</span></a>
     </div>
 
     {% if inboxTasks %}
@@ -55,7 +55,7 @@
       {% if albumInboxTasks %}
         <section class="mb-4">
           <div class="d-flex justify-content-between align-items-center mb-3 px-1">
-            <h3 class="h5 mb-0">Album tasks ({{ albumInboxTasks|length }})</h3>
+            <h3 class="h5 mb-0" data-i18n-en="Album tasks ({{ albumInboxTasks|length }})" data-i18n-zh="专辑任务 ({{ albumInboxTasks|length }})">Album tasks ({{ albumInboxTasks|length }})</h3>
           </div>
           <div class="d-grid gap-3">
             {% for task in albumInboxTasks %}
@@ -68,7 +68,7 @@
       {% if artistInboxTasks %}
         <section>
           <div class="d-flex justify-content-between align-items-center mb-3 px-1">
-            <h3 class="h5 mb-0">Artist tasks ({{ artistInboxTasks|length }})</h3>
+            <h3 class="h5 mb-0" data-i18n-en="Artist tasks ({{ artistInboxTasks|length }})" data-i18n-zh="艺人任务 ({{ artistInboxTasks|length }})">Artist tasks ({{ artistInboxTasks|length }})</h3>
           </div>
           <div class="d-grid gap-3">
             {% for task in artistInboxTasks %}
@@ -81,8 +81,8 @@
     {% else %}
       <div class="card">
         <div class="card-body border rounded-4 p-4 text-center text-body-secondary">
-          <h5 class="mb-2">Inbox</h5>
-          <p class="mb-0">{{ empty_message_map.get(selectedInboxStatus, 'No review tasks yet') }}</p>
+          <h5 class="mb-2" data-i18n-en="Inbox" data-i18n-zh="收件箱">Inbox</h5>
+          <p class="mb-0" data-i18n-en="{{ empty_message_map.get(selectedInboxStatus, 'No review tasks yet') }}" data-i18n-zh="{% if selectedInboxStatus == 'pending' %}暂无待处理审核任务{% elif selectedInboxStatus == 'confirmed' %}暂无已确认审核任务{% elif selectedInboxStatus == 'dismissed' %}暂无已忽略审核任务{% else %}暂无审核任务{% endif %}">{{ empty_message_map.get(selectedInboxStatus, 'No review tasks yet') }}</p>
         </div>
       </div>
     {% endif %}
@@ -90,13 +90,13 @@
 
   <div class="col-xl-4">
     <div class="card">
-      <div class="card-header">Inbox summary</div>
+      <div class="card-header"><span data-i18n-en="Inbox summary" data-i18n-zh="收件箱摘要">Inbox summary</span></div>
       <div class="card-body">
         <ul class="console-info-list">
-          <li><span>Pending tasks</span><strong>{{ inboxSummary.pending }}</strong></li>
-          <li><span>Confirmed</span><strong>{{ inboxSummary.confirmed }}</strong></li>
-          <li><span>Dismissed</span><strong>{{ inboxSummary.dismissed }}</strong></li>
-          <li><span>Total tasks</span><strong>{{ inboxSummary.all }}</strong></li>
+          <li><span data-i18n-en="Pending tasks" data-i18n-zh="待处理任务">Pending tasks</span><strong>{{ inboxSummary.pending }}</strong></li>
+          <li><span data-i18n-en="Confirmed" data-i18n-zh="已确认">Confirmed</span><strong>{{ inboxSummary.confirmed }}</strong></li>
+          <li><span data-i18n-en="Dismissed" data-i18n-zh="已忽略">Dismissed</span><strong>{{ inboxSummary.dismissed }}</strong></li>
+          <li><span data-i18n-en="Total tasks" data-i18n-zh="任务总数">Total tasks</span><strong>{{ inboxSummary.all }}</strong></li>
         </ul>
       </div>
     </div>

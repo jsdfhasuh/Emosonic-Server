@@ -1,26 +1,28 @@
 {% extends "layout.html" %}
 {% block title %}Artist Review Task - Emosonic Server{% endblock %}
-{% block page_title %}Artist Review Task{% endblock %}
-{% block page_subtitle %}Review one artist task at a time. Artist edits stay scoped to the current review task.{% endblock %}
+{% block document_title_en %}Artist Review Task - Emosonic Server{% endblock %}
+{% block document_title_zh %}艺人审核任务 - Emosonic Server{% endblock %}
+{% block page_title %}<span data-i18n-en="Artist Review Task" data-i18n-zh="艺人审核任务">Artist Review Task</span>{% endblock %}
+{% block page_subtitle %}<span data-i18n-en="Review one artist task at a time. Artist edits stay scoped to the current review task." data-i18n-zh="一次审核一个艺人任务。艺人编辑限定在当前审核任务内。">Review one artist task at a time. Artist edits stay scoped to the current review task.</span>{% endblock %}
 {% block body %}
 <link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='css/metadata.css') }}">
 <div class="console-section-spacer" data-review-editable="{{ 'true' if reviewIsEditable else 'false' }}">
   <div class="metadata-review-return-bar">
     <a href="{{ url_for('frontend.metadata', tab='inbox') }}" class="btn btn-primary metadata-review-back-link">
-      <span data-i18n-en="Back to Metadata Inbox" data-i18n-zh="返回 Metadata Inbox">Back to Metadata Inbox</span>
+      <span data-i18n-en="Back to Metadata Inbox" data-i18n-zh="返回元数据收件箱">Back to Metadata Inbox</span>
     </a>
-    <span class="text-body-secondary">Return to the metadata inbox and review queue.</span>
+    <span class="text-body-secondary" data-i18n-en="Return to the metadata inbox and review queue." data-i18n-zh="返回元数据收件箱和审核队列。">Return to the metadata inbox and review queue.</span>
   </div>
 
   <div class="card mb-4 metadata-review-hero-card">
     <div class="card-body">
-      <p class="console-eyebrow mb-2">Metadata / Inbox / Artist Review Task</p>
+      <p class="console-eyebrow mb-2" data-i18n-en="Metadata / Inbox / Artist Review Task" data-i18n-zh="元数据 / 收件箱 / 艺人审核任务">Metadata / Inbox / Artist Review Task</p>
       <div class="d-flex flex-wrap gap-4 align-items-start justify-content-between metadata-review-hero">
         <div class="d-flex gap-3 align-items-start metadata-review-hero-main">
           <img src="{{ reviewSummary.cover_art_url }}" alt="{{ reviewArtist.get_artist_name() }} cover" class="metadata-review-cover">
           <div>
             <h2 class="h3 mb-1">{{ reviewArtist.get_artist_name() }}</h2>
-            <p class="mb-2 text-body-secondary">Artist metadata review</p>
+            <p class="mb-2 text-body-secondary" data-i18n-en="Artist metadata review" data-i18n-zh="艺人元数据审核">Artist metadata review</p>
             <div class="d-flex flex-wrap gap-2 mb-3">
               <span class="console-chip text-uppercase">{{ reviewTask.status }}</span>
               <span class="console-chip">{{ reviewTask.reason.replace('_', ' ') }}</span>
@@ -31,7 +33,7 @@
               {% endfor %}
             </div>
             {% if reviewSummary.is_cover_art_fallback %}
-              <p class="mt-3 mb-0 text-warning-emphasis">Showing album cover fallback. Artist image is still missing.</p>
+              <p class="mt-3 mb-0 text-warning-emphasis" data-i18n-en="Showing album cover fallback. Artist image is still missing." data-i18n-zh="当前显示专辑封面兜底图，艺人图片仍缺失。">Showing album cover fallback. Artist image is still missing.</p>
             {% endif %}
           </div>
         </div>
@@ -39,7 +41,7 @@
     </div>
   </div>
 
-  <div class="alert alert-info mb-4 metadata-review-scope-alert">Edits are scoped to this artist review task.</div>
+  <div class="alert alert-info mb-4 metadata-review-scope-alert" data-i18n-en="Edits are scoped to this artist review task." data-i18n-zh="编辑内容限定在当前艺人审核任务内。">Edits are scoped to this artist review task.</div>
 
   <div class="row g-4 align-items-start">
     <div class="col-xl-8">
@@ -52,16 +54,16 @@
 
     <div class="col-xl-4">
       <div class="card metadata-review-summary-card">
-        <div class="card-header">Review summary</div>
+        <div class="card-header"><span data-i18n-en="Review summary" data-i18n-zh="审核摘要">Review summary</span></div>
         <div class="card-body">
           <ul class="console-info-list mb-4">
-            <li><span>Status</span><strong>{{ reviewTask.status }}</strong></li>
-            <li><span>Created</span><strong>{{ reviewTask.created.strftime('%Y-%m-%d %H:%M:%S') }}</strong></li>
-            <li><span>Expires</span><strong>{% if reviewSummary.expires_at %}{{ reviewSummary.expires_at.strftime('%Y-%m-%d %H:%M:%S') }}{% else %}No expiry{% endif %}</strong></li>
-            <li><span>Related artists</span><strong>{{ reviewSummary.related_artist_count }}</strong></li>
+            <li><span data-i18n-en="Status" data-i18n-zh="状态">Status</span><strong>{{ reviewTask.status }}</strong></li>
+            <li><span data-i18n-en="Created" data-i18n-zh="创建时间">Created</span><strong>{{ reviewTask.created.strftime('%Y-%m-%d %H:%M:%S') }}</strong></li>
+            <li><span data-i18n-en="Expires" data-i18n-zh="过期时间">Expires</span><strong>{% if reviewSummary.expires_at %}{{ reviewSummary.expires_at.strftime('%Y-%m-%d %H:%M:%S') }}{% else %}<span data-i18n-en="No expiry" data-i18n-zh="无过期时间">No expiry</span>{% endif %}</strong></li>
+            <li><span data-i18n-en="Related artists" data-i18n-zh="相关艺人">Related artists</span><strong>{{ reviewSummary.related_artist_count }}</strong></li>
           </ul>
           <div class="mb-4">
-            <h3 class="h6 mb-2">Detected issues</h3>
+            <h3 class="h6 mb-2" data-i18n-en="Detected issues" data-i18n-zh="检测到的问题">Detected issues</h3>
             <ul class="metadata-review-summary-issues mb-0">
               {% for issue in reviewSummary.issues %}
                 <li>{{ issue }}</li>
@@ -69,23 +71,23 @@
             </ul>
           </div>
           <div class="mb-4">
-            <h3 class="h6 mb-2">Issue status</h3>
-            <p class="text-body-secondary mb-2" data-review-ready-to-confirm>Waiting for changes</p>
+            <h3 class="h6 mb-2" data-i18n-en="Issue status" data-i18n-zh="问题状态">Issue status</h3>
+            <p class="text-body-secondary mb-2" data-review-ready-to-confirm data-i18n-en="Waiting for changes" data-i18n-zh="等待修改">Waiting for changes</p>
             <ul class="metadata-review-summary-issues mb-3" data-review-issue-status-list></ul>
-            <div class="alert alert-success{% if not reviewSummary.ready_to_confirm %} d-none{% endif %} mb-0" data-review-ready-to-confirm-banner>Ready to confirm</div>
+            <div class="alert alert-success{% if not reviewSummary.ready_to_confirm %} d-none{% endif %} mb-0" data-review-ready-to-confirm-banner data-i18n-en="Ready to confirm" data-i18n-zh="可以确认">Ready to confirm</div>
           </div>
           <div id="metadata-review-feedback" class="alert d-none" role="status"></div>
           <div class="d-flex flex-wrap gap-2">
             {% if reviewIsEditable %}
               <form method="post" action="{{ url_for('frontend.confirm_metadata_review_task', task_id=reviewTask.id) }}">
-                <button type="submit" class="btn btn-primary">Confirm Task</button>
+                <button type="submit" class="btn btn-primary"><span data-i18n-en="Confirm Task" data-i18n-zh="确认任务">Confirm Task</span></button>
               </form>
               <form method="post" action="{{ url_for('frontend.dismiss_metadata_review_task', task_id=reviewTask.id) }}">
-                <button type="submit" class="btn btn-outline-secondary">Dismiss Task</button>
+                <button type="submit" class="btn btn-outline-secondary"><span data-i18n-en="Dismiss Task" data-i18n-zh="忽略任务">Dismiss Task</span></button>
               </form>
             {% else %}
               <form method="post" action="{{ url_for('frontend.reopen_metadata_review_task', task_id=reviewTask.id) }}?redirect=1&amp;section=artists">
-                <button type="submit" class="btn btn-warning">Reopen Task</button>
+                <button type="submit" class="btn btn-warning"><span data-i18n-en="Reopen Task" data-i18n-zh="重新打开任务">Reopen Task</span></button>
               </form>
             {% endif %}
           </div>
@@ -135,24 +137,24 @@
       issueStatusListNode.innerHTML = '';
       if (!issueStatus.length) {
         const itemNode = document.createElement('li');
-        itemNode.textContent = 'No blocking issues detected.';
+        itemNode.textContent = i18nText('No blocking issues detected.', '未检测到阻塞问题。');
         issueStatusListNode.appendChild(itemNode);
       } else {
         issueStatus.forEach((issue) => {
           const itemNode = document.createElement('li');
-          let statusLabel = 'Waiting for changes';
+          let statusLabel = i18nText('Waiting for changes', '等待修改');
           if (issue.pending_save) {
-            statusLabel = 'Will resolve after save';
+            statusLabel = i18nText('Will resolve after save', '保存后将解决');
           } else if (issue.resolved) {
-            statusLabel = 'Resolved';
+            statusLabel = i18nText('Resolved', '已解决');
           }
           itemNode.textContent = `${issue.label}: ${statusLabel}`;
           issueStatusListNode.appendChild(itemNode);
         });
       }
       readyToConfirmNode.textContent = readyToConfirm
-        ? 'All detected issues are resolved. You can confirm this task now.'
-        : 'Waiting for changes';
+        ? i18nText('All detected issues are resolved. You can confirm this task now.', '所有检测到的问题都已解决，现在可以确认该任务。')
+        : i18nText('Waiting for changes', '等待修改');
       readyToConfirmBanner.classList.toggle('d-none', !readyToConfirm);
     }
 

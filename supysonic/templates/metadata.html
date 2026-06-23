@@ -1,7 +1,9 @@
 {% extends "layout.html" %}
 {% block title %}Artist Metadata · Emosonic Server{% endblock %}
-{% block page_title %}Artist metadata{% endblock %}
-{% block page_subtitle %}Browse the artist wall, review artwork, and map aliases to a primary artist directly from the Emosonic Server metadata workspace.{% endblock %}
+{% block document_title_en %}Artist Metadata · Emosonic Server{% endblock %}
+{% block document_title_zh %}艺人元数据 · Emosonic Server{% endblock %}
+{% block page_title %}<span data-i18n-en="Artist metadata" data-i18n-zh="艺人元数据">Artist metadata</span>{% endblock %}
+{% block page_subtitle %}<span data-i18n-en="Browse the artist wall, review artwork, and map aliases to a primary artist directly from the Emosonic Server metadata workspace." data-i18n-zh="浏览艺人墙、查看图片，并在 Emosonic Server 元数据工作区中将别名映射到主要艺人。">Browse the artist wall, review artwork, and map aliases to a primary artist directly from the Emosonic Server metadata workspace.</span>{% endblock %}
 {% block body %}
 <link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='css/metadata.css') }}">
 <script src="{{ url_for('static', filename='js/get_api.js') }}"></script>

@@ -6,6 +6,8 @@
 -#}
 {% extends "layout.html" %}
 {% block title %}Users · Emosonic Server{% endblock %}
+{% block document_title_en %}Users · Emosonic Server{% endblock %}
+{% block document_title_zh %}用户 · Emosonic Server{% endblock %}
 {% block navbar_users %}
 <a class="nav-link active" aria-current="page" href="{{ url_for('frontend.user_index') }}"><span data-i18n-en="Users" data-i18n-zh="用户">Users</span></a>
 {% endblock %}
@@ -51,11 +53,11 @@
     <table class="table table-hover align-middle mb-0">
       <thead>
         <tr>
-          <th>User</th>
-          <th>Email</th>
-          <th>Role</th>
-          <th>Last play</th>
-          <th class="text-end">Actions</th>
+          <th data-i18n-en="User" data-i18n-zh="用户">User</th>
+          <th data-i18n-en="Email" data-i18n-zh="邮箱">Email</th>
+          <th data-i18n-en="Role" data-i18n-zh="角色">Role</th>
+          <th data-i18n-en="Last play" data-i18n-zh="最近播放">Last play</th>
+          <th class="text-end" data-i18n-en="Actions" data-i18n-zh="操作">Actions</th>
         </tr>
       </thead>
       <tbody>
@@ -69,20 +71,20 @@
               <a href="{{ url_for('frontend.user_profile', uid = user.id) }}">{{ user.name }}</a>
               {% endif %}
             </div>
-            <small class="console-muted">{% if request.user.id == user.id %}Current operator{% else %}Managed account{% endif %}</small>
+            <small class="console-muted" data-i18n-en="{% if request.user.id == user.id %}Current operator{% else %}Managed account{% endif %}" data-i18n-zh="{% if request.user.id == user.id %}当前操作员{% else %}受管账号{% endif %}">{% if request.user.id == user.id %}Current operator{% else %}Managed account{% endif %}</small>
           </td>
           <td>{{ user.mail or '-' }}</td>
           <td>
-            <span class="console-status status-{{ 'playing' if user.admin else 'unknown' }}">{{ 'administrator' if user.admin else 'standard' }}</span>
+            <span class="console-status status-{{ 'playing' if user.admin else 'unknown' }}" data-i18n-en="{{ 'administrator' if user.admin else 'standard' }}" data-i18n-zh="{{ '管理员' if user.admin else '标准用户' }}">{{ 'administrator' if user.admin else 'standard' }}</span>
           </td>
           <td>{{ user.last_play_date or '-' }}</td>
           <td class="text-end">
             {% if request.user.id != user.id %}
-            <button class="btn btn-outline-danger btn-sm" data-href="{{ url_for('frontend.del_user', uid = user.id) }}" data-bs-toggle="modal" data-bs-target="#confirm-delete" aria-label="Delete user">
-              Delete
+            <button class="btn btn-outline-danger btn-sm" data-href="{{ url_for('frontend.del_user', uid = user.id) }}" data-bs-toggle="modal" data-bs-target="#confirm-delete" aria-label="Delete user" data-i18n-en="Delete user" data-i18n-zh="删除用户" data-i18n-attr="aria-label">
+              <span data-i18n-en="Delete" data-i18n-zh="删除">Delete</span>
             </button>
             {% else %}
-            <span class="console-muted">Protected</span>
+            <span class="console-muted" data-i18n-en="Protected" data-i18n-zh="受保护">Protected</span>
             {% endif %}
           </td>
         </tr>
@@ -97,7 +99,7 @@
     <div class="modal-content">
       <div class="modal-header">
         <h1 class="modal-title fs-5" id="confirm-delete-label"><span data-i18n-en="Remove account?" data-i18n-zh="移除账号？">Remove account?</span></h1>
-        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close" data-i18n-en="Close" data-i18n-zh="关闭" data-i18n-attr="aria-label"></button>
       </div>
       <div class="modal-body">
         <p data-i18n-en="The selected user will lose access to Emosonic Server." data-i18n-zh="该用户将失去对 Emosonic Server 的访问权限。">The selected user will lose access to Emosonic Server.</p>

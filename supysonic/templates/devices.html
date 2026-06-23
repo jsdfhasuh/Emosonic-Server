@@ -6,6 +6,8 @@
 -#}
 {% extends "layout.html" %}
 {% block title %}Devices · Emosonic Server{% endblock %}
+{% block document_title_en %}Devices · Emosonic Server{% endblock %}
+{% block document_title_zh %}设备 · Emosonic Server{% endblock %}
 {% block page_container_class %}console-container-wide{% endblock %}
 {% block navbar_devices %}
 <a class="nav-link active" aria-current="page" href="{{ url_for('frontend.device_index') }}"><span data-i18n-en="Devices" data-i18n-zh="设备">Devices</span></a>
@@ -59,7 +61,7 @@
     <div class="card h-100">
       <div class="card-header d-flex justify-content-between align-items-center">
         <span data-i18n-en="Connected clients" data-i18n-zh="已连接客户端">Connected clients</span>
-        <small class="console-muted" id="device-count-label">{{ devices|length }} online</small>
+        <small class="console-muted" id="device-count-label" data-i18n-en="{{ devices|length }} online" data-i18n-zh="{{ devices|length }} 在线">{{ devices|length }} online</small>
       </div>
       <div class="card-body p-2">
         <div class="console-device-list" id="device-card-list">
@@ -83,7 +85,7 @@
             <div class="console-device-card-session">{{ device.sessionId }}</div>
           </button>
           {% else %}
-          <div class="text-center text-body-secondary p-4">No devices connected.</div>
+          <div class="text-center text-body-secondary p-4" data-i18n-en="No devices connected." data-i18n-zh="暂无设备连接。">No devices connected.</div>
           {% endfor %}
         </div>
       </div>
@@ -95,9 +97,9 @@
       <div class="card-header d-flex justify-content-between align-items-center">
         <span data-i18n-en="Selected client details" data-i18n-zh="选中客户端详情">Selected client details</span>
         <div class="d-flex gap-2 flex-wrap">
-          <span class="console-scope-badge scope-device">Device</span>
-          <span class="console-scope-badge scope-session">Session</span>
-          <span class="console-scope-badge scope-local">Local</span>
+          <span class="console-scope-badge scope-device" data-i18n-en="Device" data-i18n-zh="设备">Device</span>
+          <span class="console-scope-badge scope-session" data-i18n-en="Session" data-i18n-zh="会话">Session</span>
+          <span class="console-scope-badge scope-local" data-i18n-en="Local" data-i18n-zh="本地">Local</span>
         </div>
       </div>
       <div class="card-body" id="device-detail-panel">
@@ -109,6 +111,7 @@
 
 <script>
   const initialDevices = {{ devices|tojson }};
+  let devicesSummaryState = {{ summary|tojson }};
   let devicesState = initialDevices;
   let selectedClientId = initialDevices.length ? initialDevices[0].clientId : null;
   let lastInteractionAt = 0;
@@ -173,18 +176,19 @@
   }
 
   function updateSummary(summary) {
+    devicesSummaryState = summary || {};
     document.getElementById("summary-online").textContent = summary.onlineDevices || 0;
     document.getElementById("summary-sessions").textContent = summary.activeSessions || 0;
     document.getElementById("summary-playing").textContent = summary.playingDevices || 0;
     document.getElementById("summary-recent").textContent = summary.recentlyUpdated || 0;
     document.getElementById("last-refresh").textContent = new Date().toLocaleTimeString();
-    document.getElementById("device-count-label").textContent = `${summary.onlineDevices || 0} online`;
+    document.getElementById("device-count-label").textContent = i18nText(`${summary.onlineDevices || 0} online`, `${summary.onlineDevices || 0} 在线`);
   }
 
   function renderDeviceCards(devices) {
     const list = document.getElementById("device-card-list");
     if (!devices.length) {
-      list.innerHTML = '<div class="text-center text-body-secondary p-4">No devices connected.</div>';
+      list.innerHTML = `<div class="text-center text-body-secondary p-4">${i18nText("No devices connected.", "暂无设备连接。")}</div>`;
       return;
     }
 
@@ -226,7 +230,7 @@
     `).join("");
 
     const more = safeEntries.length > 4
-      ? `<details class="console-queue-more"><summary>+${safeEntries.length - 4} more</summary><div class="console-queue-more-body">${hiddenEntries}</div></details>`
+      ? `<details class="console-queue-more"><summary>${i18nText(`+${safeEntries.length - 4} more`, `还有 ${safeEntries.length - 4} 项`)}</summary><div class="console-queue-more-body">${hiddenEntries}</div></details>`
       : "";
 
     return `<div class="console-queue-list">${first}${more}</div>`;
@@ -235,7 +239,7 @@
   function renderDeviceDetail(device) {
     const panel = document.getElementById("device-detail-panel");
     if (!device) {
-      panel.innerHTML = '<div class="text-body-secondary">Select a client to inspect playback and queue data.</div>';
+      panel.innerHTML = `<div class="text-body-secondary">${i18nText("Select a client to inspect playback and queue data.", "选择一个客户端以查看播放与队列数据。")}</div>`;
       return;
     }
 
@@ -245,45 +249,45 @@
     const hasDuration = Number.isFinite(playbackDurationMs) && playbackDurationMs > 0;
 
     const trackBlock = device.trackLabel
-      ? `<div class="console-track-preview">${device.trackCoverUrl ? `<img class="console-cover-thumb" src="${escapeHtml(device.trackCoverUrl)}" alt="cover art">` : ""}<div class="console-queue-preview"><div><strong>${escapeHtml(device.trackLabel)}</strong></div><small class="console-muted">${escapeHtml(device.trackId || "")}</small></div></div>`
-      : '<div class="text-body-secondary">No current track metadata.</div>';
+      ? `<div class="console-track-preview">${device.trackCoverUrl ? `<img class="console-cover-thumb" src="${escapeHtml(device.trackCoverUrl)}" alt="${i18nText("cover art", "封面图")}">` : ""}<div class="console-queue-preview"><div><strong>${escapeHtml(device.trackLabel)}</strong></div><small class="console-muted">${escapeHtml(device.trackId || "")}</small></div></div>`
+      : `<div class="text-body-secondary">${i18nText("No current track metadata.", "暂无当前曲目元数据。")}</div>`;
 
     const currentQueueBlock = device.currentQueueSongLabel || device.currentQueueSongId
-      ? `<div class="console-track-preview mb-3">${device.currentQueueSongCoverUrl ? `<img class="console-cover-thumb" src="${escapeHtml(device.currentQueueSongCoverUrl)}" alt="current queue cover">` : ""}<div class="console-queue-preview"><div><strong>${escapeHtml(device.currentQueueSongLabel || device.currentQueueSongId)}</strong></div><small class="console-muted">Current queue item</small></div></div>`
+      ? `<div class="console-track-preview mb-3">${device.currentQueueSongCoverUrl ? `<img class="console-cover-thumb" src="${escapeHtml(device.currentQueueSongCoverUrl)}" alt="${i18nText("current queue cover", "当前队列封面")}">` : ""}<div class="console-queue-preview"><div><strong>${escapeHtml(device.currentQueueSongLabel || device.currentQueueSongId)}</strong></div><small class="console-muted">${i18nText("Current queue item", "当前队列项目")}</small></div></div>`
       : "";
 
     const currentLocalQueueBlock = device.localCurrentQueueSongLabel || device.localCurrentQueueSongId
-      ? `<div class="console-track-preview mb-3">${device.localCurrentQueueSongCoverUrl ? `<img class="console-cover-thumb" src="${escapeHtml(device.localCurrentQueueSongCoverUrl)}" alt="current local queue cover">` : ""}<div class="console-queue-preview"><div><strong>${escapeHtml(device.localCurrentQueueSongLabel || device.localCurrentQueueSongId)}</strong></div><small class="console-muted">Current local queue item</small></div></div>`
+      ? `<div class="console-track-preview mb-3">${device.localCurrentQueueSongCoverUrl ? `<img class="console-cover-thumb" src="${escapeHtml(device.localCurrentQueueSongCoverUrl)}" alt="${i18nText("current local queue cover", "当前本地队列封面")}">` : ""}<div class="console-queue-preview"><div><strong>${escapeHtml(device.localCurrentQueueSongLabel || device.localCurrentQueueSongId)}</strong></div><small class="console-muted">${i18nText("Current local queue item", "当前本地队列项目")}</small></div></div>`
       : "";
 
     panel.innerHTML = `
       <div class="row g-3">
         <div class="col-lg-6">
           <div class="card h-100">
-              <div class="card-header">Device playback</div>
+              <div class="card-header">${i18nText("Device playback", "设备播放")}</div>
               <div class="card-body">
-                <p class="console-section-lead">Live device-scoped state for the selected client. This is the most direct view of what that player reports right now.</p>
+                <p class="console-section-lead">${i18nText("Live device-scoped state for the selected client. This is the most direct view of what that player reports right now.", "所选客户端的实时设备状态，这是查看该播放器当前上报内容的最直接视图。")}</p>
                 <div class="console-signal-panel mb-3">
                   <div class="console-signal-panel-body">
                     <div class="console-signal-grid">
                       <div class="console-signal-cell">
-                        <span class="console-signal-label">Device</span>
+                        <span class="console-signal-label">${i18nText("Device", "设备")}</span>
                         <div class="console-signal-value">${escapeHtml(device.deviceName || "-")}</div>
                       </div>
                       <div class="console-signal-cell">
-                        <span class="console-signal-label">Playback</span>
+                        <span class="console-signal-label">${i18nText("Playback", "播放")}</span>
                         <div class="console-signal-value"><span class="console-status status-${escapeHtml(device.state || "unknown")}">${escapeHtml(device.state || "unknown")}</span></div>
                       </div>
                       <div class="console-signal-cell">
-                        <span class="console-signal-label">Position</span>
+                        <span class="console-signal-label">${i18nText("Position", "位置")}</span>
                         <div class="console-signal-value" data-playback-position>${formatPosition(playbackPositionMs)}</div>
                       </div>
                       <div class="console-signal-cell">
-                        <span class="console-signal-label">Duration</span>
+                        <span class="console-signal-label">${i18nText("Duration", "时长")}</span>
                         <div class="console-signal-value" data-playback-duration>${hasDuration ? formatPosition(playbackDurationMs) : "-"}</div>
                       </div>
                       <div class="console-signal-cell">
-                        <span class="console-signal-label">Volume</span>
+                        <span class="console-signal-label">${i18nText("Volume", "音量")}</span>
                         <div class="console-signal-value">${device.volume ?? "-"}</div>
                       </div>
                     </div>
@@ -294,16 +298,16 @@
                     <span data-playback-progress-label>${hasDuration ? `${formatPosition(playbackPositionMs)} / ${formatPosition(playbackDurationMs)}` : formatPosition(playbackPositionMs)}</span>
                     <span data-playback-progress-percent>${playbackProgressPercent === null ? "-" : `${Math.round(playbackProgressPercent)}%`}</span>
                   </div>
-                  <div class="progress console-progress" role="progressbar" aria-label="Playback progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${playbackProgressPercent === null ? 0 : Math.round(playbackProgressPercent)}">
+                  <div class="progress console-progress" role="progressbar" aria-label="${i18nText("Playback progress", "播放进度")}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${playbackProgressPercent === null ? 0 : Math.round(playbackProgressPercent)}">
                     <div class="progress-bar console-progress-bar" data-playback-progress-bar style="width: ${playbackProgressPercent === null ? 0 : playbackProgressPercent}%"></div>
                   </div>
                 </div>
                 <ul class="console-info-list">
-                  <li><span>Session</span><code>${escapeHtml(device.sessionId || "")}</code></li>
-                  <li><span>Playback source</span><code>${escapeHtml(device.playbackSourceClientId || device.clientId || "")}</code></li>
-                  <li><span>Connected</span><strong>${formatTimestamp(device.connectedAt)}</strong></li>
-                  <li><span>Last seen</span><strong>${formatTimestamp(device.lastSeenAt)}</strong></li>
-                  <li><span>Playback update</span><strong>${formatTimestamp(device.playbackUpdatedAt)}</strong></li>
+                  <li><span>${i18nText("Session", "会话")}</span><code>${escapeHtml(device.sessionId || "")}</code></li>
+                  <li><span>${i18nText("Playback source", "播放来源")}</span><code>${escapeHtml(device.playbackSourceClientId || device.clientId || "")}</code></li>
+                  <li><span>${i18nText("Connected", "连接时间")}</span><strong>${formatTimestamp(device.connectedAt)}</strong></li>
+                  <li><span>${i18nText("Last seen", "最后在线")}</span><strong>${formatTimestamp(device.lastSeenAt)}</strong></li>
+                  <li><span>${i18nText("Playback update", "播放更新")}</span><strong>${formatTimestamp(device.playbackUpdatedAt)}</strong></li>
                 </ul>
                 <div class="mt-3">${trackBlock}</div>
               </div>
@@ -311,39 +315,39 @@
         </div>
         <div class="col-lg-6">
           <div class="card h-100">
-              <div class="card-header">Queue inspection</div>
+              <div class="card-header">${i18nText("Queue inspection", "队列检查")}</div>
               <div class="card-body">
                 <div class="mb-4">
                   <div class="console-panel-subhead">
-                    <strong>Shared room queue</strong>
-                    <span class="console-scope-badge scope-session">Session</span>
+                    <strong>${i18nText("Shared room queue", "共享房间队列")}</strong>
+                    <span class="console-scope-badge scope-session">${i18nText("Session", "会话")}</span>
                   </div>
-                  <p class="console-section-lead">Shared across devices that sit in the same room session.</p>
+                  <p class="console-section-lead">${i18nText("Shared across devices that sit in the same room session.", "同一房间会话中的设备共享该队列。")}</p>
                   <ul class="console-info-list mb-3">
-                    <li><span>Queue size</span><strong>${device.queueCount ?? "-"}</strong></li>
-                    <li><span>Current index</span><strong>${device.currentIndex ?? "-"}</strong></li>
-                    <li><span>Queue position</span><strong>${formatPosition(device.queuePositionMs)}</strong></li>
-                    <li><span>Queue source</span><code>${escapeHtml(device.queueSourceClientId || "")}</code></li>
-                    <li><span>Queue update</span><strong>${formatTimestamp(device.queueUpdatedAt)}</strong></li>
+                    <li><span>${i18nText("Queue size", "队列数量")}</span><strong>${device.queueCount ?? "-"}</strong></li>
+                    <li><span>${i18nText("Current index", "当前索引")}</span><strong>${device.currentIndex ?? "-"}</strong></li>
+                    <li><span>${i18nText("Queue position", "队列位置")}</span><strong>${formatPosition(device.queuePositionMs)}</strong></li>
+                    <li><span>${i18nText("Queue source", "队列来源")}</span><code>${escapeHtml(device.queueSourceClientId || "")}</code></li>
+                    <li><span>${i18nText("Queue update", "队列更新")}</span><strong>${formatTimestamp(device.queueUpdatedAt)}</strong></li>
                   </ul>
                   ${currentQueueBlock}
-                  ${renderQueueEntries(device.queueEntries, "No shared room queue available for this session.")}
+                  ${renderQueueEntries(device.queueEntries, i18nText("No shared room queue available for this session.", "该会话暂无共享房间队列。"))}
                 </div>
                 <div>
                   <div class="console-panel-subhead">
-                    <strong>Device local queue</strong>
-                    <span class="console-scope-badge scope-local">Local</span>
+                    <strong>${i18nText("Device local queue", "设备本地队列")}</strong>
+                    <span class="console-scope-badge scope-local">${i18nText("Local", "本地")}</span>
                   </div>
-                  <p class="console-section-lead">Private queue state that belongs only to this selected client.</p>
+                  <p class="console-section-lead">${i18nText("Private queue state that belongs only to this selected client.", "仅属于当前所选客户端的私有队列状态。")}</p>
                   <ul class="console-info-list mb-3">
-                    <li><span>Queue size</span><strong>${device.localQueueCount ?? "-"}</strong></li>
-                    <li><span>Current index</span><strong>${device.localCurrentIndex ?? "-"}</strong></li>
-                    <li><span>Queue position</span><strong>${formatPosition(device.localQueuePositionMs)}</strong></li>
-                    <li><span>Queue source</span><code>${escapeHtml(device.localQueueSourceClientId || device.clientId || "")}</code></li>
-                    <li><span>Queue update</span><strong>${formatTimestamp(device.localQueueUpdatedAt)}</strong></li>
+                    <li><span>${i18nText("Queue size", "队列数量")}</span><strong>${device.localQueueCount ?? "-"}</strong></li>
+                    <li><span>${i18nText("Current index", "当前索引")}</span><strong>${device.localCurrentIndex ?? "-"}</strong></li>
+                    <li><span>${i18nText("Queue position", "队列位置")}</span><strong>${formatPosition(device.localQueuePositionMs)}</strong></li>
+                    <li><span>${i18nText("Queue source", "队列来源")}</span><code>${escapeHtml(device.localQueueSourceClientId || device.clientId || "")}</code></li>
+                    <li><span>${i18nText("Queue update", "队列更新")}</span><strong>${formatTimestamp(device.localQueueUpdatedAt)}</strong></li>
                   </ul>
                   ${currentLocalQueueBlock}
-                  ${renderQueueEntries(device.localQueueEntries, "No device local queue available for this client.")}
+                  ${renderQueueEntries(device.localQueueEntries, i18nText("No device local queue available for this client.", "该客户端暂无设备本地队列。"))}
                 </div>
               </div>
             </div>
@@ -452,6 +456,14 @@
 
   renderDevices(initialDevices);
   document.getElementById("refresh-now").addEventListener("click", refreshDevices);
+  document.querySelectorAll("[data-language-toggle]").forEach((button) => {
+    button.addEventListener("click", () => {
+      window.setTimeout(() => {
+        updateSummary(devicesSummaryState);
+        renderDevices(devicesState);
+      }, 0);
+    });
+  });
   window.setInterval(refreshDevices, 5000);
   window.setInterval(refreshSelectedPlaybackProgress, 500);
 </script>

@@ -1,5 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}Control · Emosonic Server{% endblock %}
+{% block document_title_en %}Control · Emosonic Server{% endblock %}
+{% block document_title_zh %}控制台 · Emosonic Server{% endblock %}
 {% block page_container_class %}console-container-wide{% endblock %}
 {% block navbar_control %}
 <a class="nav-link active" aria-current="page" href="{{ url_for('frontend.control_index') }}"><span data-i18n-en="Control" data-i18n-zh="控制台">Control</span></a>
@@ -10,37 +12,37 @@
 <div class="row row-cols-1 row-cols-md-4 g-3 mb-3">
   <div class="col">
     <div class="card text-center h-100 console-metric-card console-control-accent">
-      <div class="card-header">Connection</div>
+      <div class="card-header"><span data-i18n-en="Connection" data-i18n-zh="连接">Connection</span></div>
       <div class="card-body">
         <div class="console-metric-value" id="control-connection-state">OFFLINE</div>
-        <div class="console-metric-caption">Socket.IO session health.</div>
+        <div class="console-metric-caption" data-i18n-en="Socket.IO session health." data-i18n-zh="Socket.IO 会话健康状态。">Socket.IO session health.</div>
       </div>
     </div>
   </div>
   <div class="col">
     <div class="card text-center h-100 console-metric-card console-control-accent">
-      <div class="card-header">Players online</div>
+      <div class="card-header"><span data-i18n-en="Players online" data-i18n-zh="在线播放器">Players online</span></div>
       <div class="card-body">
         <div class="console-metric-value" id="control-player-count">0</div>
-        <div class="console-metric-caption">Playable target devices visible to this user.</div>
+        <div class="console-metric-caption" data-i18n-en="Playable target devices visible to this user." data-i18n-zh="该用户可见的可播放目标设备。">Playable target devices visible to this user.</div>
       </div>
     </div>
   </div>
   <div class="col">
     <div class="card text-center h-100 console-metric-card console-control-accent">
-      <div class="card-header">Selected target</div>
+      <div class="card-header"><span data-i18n-en="Selected target" data-i18n-zh="已选目标">Selected target</span></div>
       <div class="card-body">
         <div class="console-metric-value" id="control-target-name">-</div>
-        <div class="console-metric-caption">Current command destination.</div>
+        <div class="console-metric-caption" data-i18n-en="Current command destination." data-i18n-zh="当前命令发送目标。">Current command destination.</div>
       </div>
     </div>
   </div>
   <div class="col">
     <div class="card text-center h-100 console-metric-card console-control-accent">
-      <div class="card-header">Playback state</div>
+      <div class="card-header"><span data-i18n-en="Playback state" data-i18n-zh="播放状态">Playback state</span></div>
       <div class="card-body">
         <div class="console-metric-value" id="control-playback-state">-</div>
-        <div class="console-metric-caption">Latest reported state for the selected session.</div>
+        <div class="console-metric-caption" data-i18n-en="Latest reported state for the selected session." data-i18n-zh="所选会话最近上报的状态。">Latest reported state for the selected session.</div>
       </div>
     </div>
   </div>
@@ -50,15 +52,15 @@
   <div class="col-xl-4">
     <div class="card h-100">
       <div class="card-header d-flex justify-content-between align-items-center">
-        <span>Online players</span>
+        <span data-i18n-en="Online players" data-i18n-zh="在线播放器">Online players</span>
         <div class="d-flex align-items-center gap-2">
-          <small class="console-muted" id="control-player-label">0 available</small>
-          <button type="button" class="btn btn-light btn-sm" id="control-refresh-devices">Refresh</button>
+          <small class="console-muted" id="control-player-label" data-i18n-en="0 available" data-i18n-zh="0 个可用">0 available</small>
+          <button type="button" class="btn btn-light btn-sm" id="control-refresh-devices"><span data-i18n-en="Refresh" data-i18n-zh="刷新">Refresh</span></button>
         </div>
       </div>
       <div class="card-body p-2">
         <div class="console-device-list" id="control-player-list">
-          <div class="text-body-secondary p-4">Waiting for device list...</div>
+          <div class="text-body-secondary p-4" data-i18n-en="Waiting for device list..." data-i18n-zh="正在等待设备列表...">Waiting for device list...</div>
         </div>
       </div>
     </div>
@@ -67,52 +69,52 @@
   <div class="col-xl-5">
     <div class="card h-100">
       <div class="card-header d-flex justify-content-between align-items-center">
-        <span>Target playback context</span>
-        <span class="console-scope-badge scope-device">Device</span>
+        <span data-i18n-en="Target playback context" data-i18n-zh="目标播放上下文">Target playback context</span>
+        <span class="console-scope-badge scope-device" data-i18n-en="Device" data-i18n-zh="设备">Device</span>
       </div>
       <div class="card-body" id="control-target-panel">
-        <div class="text-body-secondary">Select an online player to inspect live state.</div>
+        <div class="text-body-secondary" data-i18n-en="Select an online player to inspect live state." data-i18n-zh="选择一个在线播放器以查看实时状态。">Select an online player to inspect live state.</div>
       </div>
     </div>
   </div>
 
   <div class="col-xl-3">
     <div class="card h-100">
-      <div class="card-header">Transport controls</div>
+      <div class="card-header"><span data-i18n-en="Transport controls" data-i18n-zh="播放控制">Transport controls</span></div>
       <div class="card-body d-flex flex-column gap-3">
         <div class="control-selected-banner" id="control-selected-banner">
-          <div class="console-muted">No player selected.</div>
+          <div class="console-muted" data-i18n-en="No player selected." data-i18n-zh="尚未选择播放器。">No player selected.</div>
         </div>
         <div class="console-auth-note">
           <strong data-i18n-en="Emosonic signal flow" data-i18n-zh="Emosonic 播放链路">Emosonic signal flow</strong>
           <div class="console-muted mt-1" data-i18n-en="Pick a player, shape the queue, and inspect how session playback and local device state move through the current Emosonic workspace." data-i18n-zh="选定播放器，编排队列，查看播放会话与设备状态是如何在 Emosonic 中流转的。">Pick a player, shape the queue, and inspect how session playback and local device state move through the current Emosonic workspace.</div>
         </div>
         <div class="d-grid gap-2 control-grid-2">
-          <button type="button" class="btn btn-dark control-command" data-action="player.play">Play</button>
-          <button type="button" class="btn btn-outline-dark control-command" data-action="player.pause">Pause</button>
-          <button type="button" class="btn btn-outline-dark control-command" data-action="player.prev">Previous</button>
-          <button type="button" class="btn btn-outline-dark control-command" data-action="player.next">Next</button>
+          <button type="button" class="btn btn-dark control-command" data-action="player.play"><span data-i18n-en="Play" data-i18n-zh="播放">Play</span></button>
+          <button type="button" class="btn btn-outline-dark control-command" data-action="player.pause"><span data-i18n-en="Pause" data-i18n-zh="暂停">Pause</span></button>
+          <button type="button" class="btn btn-outline-dark control-command" data-action="player.prev"><span data-i18n-en="Previous" data-i18n-zh="上一首">Previous</span></button>
+          <button type="button" class="btn btn-outline-dark control-command" data-action="player.next"><span data-i18n-en="Next" data-i18n-zh="下一首">Next</span></button>
         </div>
         <div>
-          <label class="form-label" for="seek-position">Seek to (ms)</label>
+          <label class="form-label" for="seek-position"><span data-i18n-en="Seek to (ms)" data-i18n-zh="跳转到 (毫秒)">Seek to (ms)</span></label>
           <div class="input-group">
             <input type="number" class="form-control" id="seek-position" min="0" step="1000" value="0">
-            <button type="button" class="btn btn-outline-dark" id="send-seek">Seek</button>
+            <button type="button" class="btn btn-outline-dark" id="send-seek"><span data-i18n-en="Seek" data-i18n-zh="跳转">Seek</span></button>
           </div>
         </div>
         <div>
-          <label class="form-label" for="volume-level">Volume</label>
+          <label class="form-label" for="volume-level"><span data-i18n-en="Volume" data-i18n-zh="音量">Volume</span></label>
           <div class="input-group">
             <input type="number" class="form-control" id="volume-level" min="0" max="100" step="1" value="70">
-            <button type="button" class="btn btn-outline-dark" id="send-volume">Set</button>
+            <button type="button" class="btn btn-outline-dark" id="send-volume"><span data-i18n-en="Set" data-i18n-zh="设置">Set</span></button>
           </div>
         </div>
         <div class="console-control-hint">
-          Commands are routed to the selected <code>clientId</code>. Playback and queue state are rendered from the selected <code>sessionId</code>.
+          <span data-i18n-en="Commands are routed to the selected" data-i18n-zh="命令会发送到所选的">Commands are routed to the selected</span> <code>clientId</code>. <span data-i18n-en="Playback and queue state are rendered from the selected" data-i18n-zh="播放与队列状态来自所选的">Playback and queue state are rendered from the selected</span> <code>sessionId</code>.
         </div>
         <div class="control-command-status" id="control-command-status">
-          <strong>Command status</strong>
-          <div class="console-muted" id="control-command-status-text">No commands sent yet.</div>
+          <strong data-i18n-en="Command status" data-i18n-zh="命令状态">Command status</strong>
+          <div class="console-muted" id="control-command-status-text" data-i18n-en="No commands sent yet." data-i18n-zh="尚未发送命令。">No commands sent yet.</div>
         </div>
       </div>
     </div>
@@ -123,49 +125,49 @@
   <div class="col-xl-6">
     <div class="card h-100">
       <div class="card-header d-flex justify-content-between align-items-center">
-        <span>Queue surfaces</span>
+        <span data-i18n-en="Queue surfaces" data-i18n-zh="队列面板">Queue surfaces</span>
         <div class="d-flex gap-2 flex-wrap">
-          <span class="console-scope-badge scope-session">Session</span>
-          <span class="console-scope-badge scope-local">Local</span>
+          <span class="console-scope-badge scope-session" data-i18n-en="Session" data-i18n-zh="会话">Session</span>
+          <span class="console-scope-badge scope-local" data-i18n-en="Local" data-i18n-zh="本地">Local</span>
         </div>
       </div>
       <div class="card-body" id="control-queue-panel">
-        <div class="text-body-secondary">Queue details will appear when the selected player reports a session queue.</div>
+        <div class="text-body-secondary" data-i18n-en="Queue details will appear when the selected player reports a session queue." data-i18n-zh="所选播放器上报会话队列后，这里会显示队列详情。">Queue details will appear when the selected player reports a session queue.</div>
       </div>
     </div>
   </div>
   <div class="col-xl-6">
     <div class="card h-100 mb-3">
-      <div class="card-header">Local queue editor</div>
+      <div class="card-header"><span data-i18n-en="Local queue editor" data-i18n-zh="本地队列编辑器">Local queue editor</span></div>
       <div class="card-body d-flex flex-column gap-3">
         <div>
-          <label class="form-label" for="queue-song-ids">Song IDs</label>
-          <textarea class="form-control control-queue-editor" id="queue-song-ids" rows="6" placeholder="One songId per line"></textarea>
-          <div class="form-text">Paste one `songId` per line. This editor represents the selected device local queue.</div>
+          <label class="form-label" for="queue-song-ids"><span data-i18n-en="Song IDs" data-i18n-zh="歌曲 ID">Song IDs</span></label>
+          <textarea class="form-control control-queue-editor" id="queue-song-ids" rows="6" placeholder="One songId per line" data-i18n-en="One songId per line" data-i18n-zh="每行一个 songId" data-i18n-attr="placeholder"></textarea>
+          <div class="form-text" data-i18n-en="Paste one `songId` per line. This editor represents the selected device local queue." data-i18n-zh="每行粘贴一个 `songId`。该编辑器表示所选设备的本地队列。">Paste one `songId` per line. This editor represents the selected device local queue.</div>
         </div>
         <div class="row g-2">
           <div class="col-md-6">
-            <label class="form-label" for="queue-current-index">Current index</label>
+            <label class="form-label" for="queue-current-index"><span data-i18n-en="Current index" data-i18n-zh="当前索引">Current index</span></label>
             <input type="number" class="form-control" id="queue-current-index" min="0" step="1" value="0">
           </div>
           <div class="col-md-6">
-            <label class="form-label" for="queue-position-ms">Position (ms)</label>
+            <label class="form-label" for="queue-position-ms"><span data-i18n-en="Position (ms)" data-i18n-zh="位置 (毫秒)">Position (ms)</span></label>
             <input type="number" class="form-control" id="queue-position-ms" min="0" step="1000" value="0">
           </div>
         </div>
         <div class="d-flex gap-2 justify-content-end">
-          <button type="button" class="btn btn-outline-dark" id="load-local-queue">Load local queue</button>
-          <button type="button" class="btn btn-outline-dark" id="load-current-queue">Load current queue</button>
-          <button type="button" class="btn btn-outline-dark" id="send-local-queue">Save local</button>
-          <button type="button" class="btn btn-dark" id="send-queue-sync">Submit queue</button>
+          <button type="button" class="btn btn-outline-dark" id="load-local-queue"><span data-i18n-en="Load local queue" data-i18n-zh="载入本地队列">Load local queue</span></button>
+          <button type="button" class="btn btn-outline-dark" id="load-current-queue"><span data-i18n-en="Load current queue" data-i18n-zh="载入当前队列">Load current queue</span></button>
+          <button type="button" class="btn btn-outline-dark" id="send-local-queue"><span data-i18n-en="Save local" data-i18n-zh="保存本地">Save local</span></button>
+          <button type="button" class="btn btn-dark" id="send-queue-sync"><span data-i18n-en="Submit queue" data-i18n-zh="提交队列">Submit queue</span></button>
         </div>
       </div>
     </div>
 
     <div class="card h-100">
       <div class="card-header d-flex justify-content-between align-items-center">
-        <span>Realtime event log</span>
-        <button type="button" class="btn btn-light btn-sm" id="clear-control-log">Clear</button>
+        <span data-i18n-en="Realtime event log" data-i18n-zh="实时事件日志">Realtime event log</span>
+        <button type="button" class="btn btn-light btn-sm" id="clear-control-log"><span data-i18n-en="Clear" data-i18n-zh="清空">Clear</span></button>
       </div>
       <div class="card-body">
         <div class="console-log-view" id="control-event-log"></div>
@@ -372,7 +374,7 @@
   function updateSummary() {
     const players = getPlayers();
     document.getElementById('control-player-count').textContent = players.length;
-    document.getElementById('control-player-label').textContent = `${players.length} available`;
+    document.getElementById('control-player-label').textContent = i18nText(`${players.length} available`, `${players.length} 个可用`);
 
     const target = players.find((device) => device.clientId === controlState.selectedClientId);
     document.getElementById('control-target-name').textContent = target ? target.deviceName : '-';
@@ -384,7 +386,7 @@
       `;
       selectedBanner.classList.add('is-active');
     } else {
-      selectedBanner.innerHTML = '<div class="console-muted">No player selected.</div>';
+      selectedBanner.innerHTML = `<div class="console-muted">${i18nText('No player selected.', '尚未选择播放器。')}</div>`;
       selectedBanner.classList.remove('is-active');
     }
 
@@ -419,7 +421,7 @@
     const players = getPlayers();
     const list = document.getElementById('control-player-list');
     if (!players.length) {
-      list.innerHTML = '<div class="text-body-secondary p-4">No online playback device available.</div>';
+      list.innerHTML = `<div class="text-body-secondary p-4">${i18nText('No online playback device available.', '暂无可用的在线播放设备。')}</div>`;
       return;
     }
 
@@ -427,7 +429,7 @@
       const active = device.clientId === controlState.selectedClientId ? 'is-active' : '';
       const playback = controlState.playbackByClientSession[getPlaybackKey(device.sessionId, device.clientId)] || {};
       const status = playback.state || 'unknown';
-      const trackLabel = playback.trackLabel || controlState.trackMeta[playback.trackId]?.label || playback.trackId || 'No track';
+      const trackLabel = playback.trackLabel || controlState.trackMeta[playback.trackId]?.label || playback.trackId || i18nText('No track', '暂无曲目');
       return `
         <button type="button" class="console-device-card ${active}" data-client-id="${escapeHtml(device.clientId)}">
           <div class="console-device-card-top">
@@ -494,7 +496,7 @@
 
   function sendQueuePlayItem(queueScope, index) {
     if (!controlState.selectedSessionId || !controlState.selectedClientId) {
-      setCommandStatus('Queue play failed: no target player selected.', 'error');
+      setCommandStatus(i18nText('Queue play failed: no target player selected.', '队列播放失败：尚未选择目标播放器。'), 'error');
       return;
     }
 
@@ -502,11 +504,11 @@
       ? (getLocalQueueKey() ? controlState.localQueueByClientSession[getLocalQueueKey()] : null)
       : controlState.queueBySession[controlState.selectedSessionId];
     if (!queue || !Array.isArray(queue.queueSongIds) || !queue.queueSongIds.length) {
-      setCommandStatus(`Queue play failed: no ${queueScope} queue available.`, 'error');
+      setCommandStatus(i18nText(`Queue play failed: no ${queueScope} queue available.`, `队列播放失败：没有可用的 ${queueScope} 队列。`), 'error');
       return;
     }
     if (index < 0 || index >= queue.queueSongIds.length) {
-      setCommandStatus('Queue play failed: invalid queue index.', 'error');
+      setCommandStatus(i18nText('Queue play failed: invalid queue index.', '队列播放失败：队列索引无效。'), 'error');
       return;
     }
 
@@ -534,53 +536,53 @@
     const queuePanel = document.getElementById('control-queue-panel');
 
     if (!target) {
-      targetPanel.innerHTML = '<div class="text-body-secondary">Select an online player to inspect live state.</div>';
-      queuePanel.innerHTML = '<div class="text-body-secondary">Queue details will appear when the selected player reports a session queue.</div>';
+      targetPanel.innerHTML = `<div class="text-body-secondary">${i18nText('Select an online player to inspect live state.', '选择一个在线播放器以查看实时状态。')}</div>`;
+      queuePanel.innerHTML = `<div class="text-body-secondary">${i18nText('Queue details will appear when the selected player reports a session queue.', '所选播放器上报会话队列后，这里会显示队列详情。')}</div>`;
       return;
     }
 
     const trackMeta = playback?.trackId ? controlState.trackMeta[playback.trackId] : null;
-    const trackLabel = playback?.trackLabel || trackMeta?.label || playback?.trackId || 'No current track';
+    const trackLabel = playback?.trackLabel || trackMeta?.label || playback?.trackId || i18nText('No current track', '暂无当前曲目');
     const coverUrl = trackMeta?.coverUrl || '';
     const playbackPositionMs = getComputedPlaybackPosition(playback);
     const playbackDurationMs = getPlaybackDurationMs(playback);
     const playbackProgressPercent = getComputedPlaybackProgressPercent(playback);
     const hasDuration = Boolean(playbackDurationMs);
     const trackBlock = playback?.trackId
-      ? `<div class="console-track-preview mt-3">${coverUrl ? `<img class="console-cover-thumb" src="${escapeHtml(coverUrl)}" alt="cover art">` : ''}<div class="console-queue-preview"><div><strong>${escapeHtml(trackLabel)}</strong></div><small class="console-muted">${escapeHtml(playback.trackId || '')}</small></div></div>`
-      : '<div class="text-body-secondary mt-3">No current track metadata.</div>';
+      ? `<div class="console-track-preview mt-3">${coverUrl ? `<img class="console-cover-thumb" src="${escapeHtml(coverUrl)}" alt="${i18nText('cover art', '封面图')}">` : ''}<div class="console-queue-preview"><div><strong>${escapeHtml(trackLabel)}</strong></div><small class="console-muted">${escapeHtml(playback.trackId || '')}</small></div></div>`
+      : `<div class="text-body-secondary mt-3">${i18nText('No current track metadata.', '暂无当前曲目元数据。')}</div>`;
 
     targetPanel.innerHTML = `
-      <p class="console-section-lead">Selected target signal path. Device state is live, while queue state below is split between the room session and this player's local queue.</p>
+      <p class="console-section-lead">${i18nText("Selected target signal path. Device state is live, while queue state below is split between the room session and this player's local queue.", "所选目标的播放链路。设备状态为实时状态，下方队列状态会区分房间会话队列和该播放器的本地队列。")}</p>
       <div class="console-signal-panel mb-3">
         <div class="console-signal-panel-body">
           <div class="console-signal-grid">
             <div class="console-signal-cell">
-              <span class="console-signal-label">Device</span>
+              <span class="console-signal-label">${i18nText('Device', '设备')}</span>
               <div class="console-signal-value">${escapeHtml(target.deviceName)}</div>
             </div>
             <div class="console-signal-cell">
-              <span class="console-signal-label">Client ID</span>
+              <span class="console-signal-label">${i18nText('Client ID', '客户端 ID')}</span>
               <div class="console-signal-value"><code>${escapeHtml(target.clientId)}</code></div>
             </div>
             <div class="console-signal-cell">
-              <span class="console-signal-label">Session</span>
+              <span class="console-signal-label">${i18nText('Session', '会话')}</span>
               <div class="console-signal-value"><code>${escapeHtml(target.sessionId || '')}</code></div>
             </div>
             <div class="console-signal-cell">
-              <span class="console-signal-label">Playback</span>
+              <span class="console-signal-label">${i18nText('Playback', '播放')}</span>
               <div class="console-signal-value"><span class="console-status status-${escapeHtml(playback?.state || 'unknown')}">${escapeHtml(playback?.state || 'unknown')}</span></div>
             </div>
             <div class="console-signal-cell">
-              <span class="console-signal-label">Position</span>
+              <span class="console-signal-label">${i18nText('Position', '位置')}</span>
               <div class="console-signal-value" data-control-playback-position>${formatPosition(playbackPositionMs)}</div>
             </div>
             <div class="console-signal-cell">
-              <span class="console-signal-label">Duration</span>
+              <span class="console-signal-label">${i18nText('Duration', '时长')}</span>
               <div class="console-signal-value" data-control-playback-duration>${hasDuration ? formatPosition(playbackDurationMs) : '-'}</div>
             </div>
             <div class="console-signal-cell">
-              <span class="console-signal-label">Volume</span>
+              <span class="console-signal-label">${i18nText('Volume', '音量')}</span>
               <div class="console-signal-value">${playback?.volume ?? '-'}</div>
             </div>
           </div>
@@ -591,13 +593,13 @@
           <span data-control-playback-progress-label>${hasDuration ? `${formatPosition(playbackPositionMs)} / ${formatPosition(playbackDurationMs)}` : formatPosition(playbackPositionMs)}</span>
           <span data-control-playback-progress-percent>${playbackProgressPercent === null ? '-' : `${Math.round(playbackProgressPercent)}%`}</span>
         </div>
-        <div class="progress console-progress" role="progressbar" aria-label="Playback progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${playbackProgressPercent === null ? 0 : Math.round(playbackProgressPercent)}">
+        <div class="progress console-progress" role="progressbar" aria-label="${i18nText('Playback progress', '播放进度')}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${playbackProgressPercent === null ? 0 : Math.round(playbackProgressPercent)}">
           <div class="progress-bar console-progress-bar" data-control-playback-progress-bar style="width: ${playbackProgressPercent === null ? 0 : playbackProgressPercent}%"></div>
         </div>
       </div>
       <ul class="console-info-list">
-        <li><span>Connected</span><strong>${formatTimestamp(target.connectedAt)}</strong></li>
-        <li><span>Track source</span><code>${escapeHtml(playback?.sourceClientId || target.clientId)}</code></li>
+        <li><span>${i18nText('Connected', '连接时间')}</span><strong>${formatTimestamp(target.connectedAt)}</strong></li>
+        <li><span>${i18nText('Track source', '曲目来源')}</span><code>${escapeHtml(playback?.sourceClientId || target.clientId)}</code></li>
       </ul>
       ${trackBlock}
     `;
@@ -611,7 +613,7 @@
     const currentQueueMeta = currentQueueSongId ? controlState.trackMeta[currentQueueSongId] : null;
     const currentQueueCoverUrl = currentQueueMeta?.coverUrl || '';
     const currentQueueBlock = currentQueueSongId
-      ? `<div class="console-track-preview mb-3">${currentQueueCoverUrl ? `<img class="console-cover-thumb" src="${escapeHtml(currentQueueCoverUrl)}" alt="current queue cover">` : ''}<div class="console-queue-preview"><div><strong>${escapeHtml(currentQueueMeta?.label || currentQueueSongId)}</strong></div><small class="console-muted">Current queue item</small></div></div>`
+      ? `<div class="console-track-preview mb-3">${currentQueueCoverUrl ? `<img class="console-cover-thumb" src="${escapeHtml(currentQueueCoverUrl)}" alt="${i18nText('current queue cover', '当前队列封面')}">` : ''}<div class="console-queue-preview"><div><strong>${escapeHtml(currentQueueMeta?.label || currentQueueSongId)}</strong></div><small class="console-muted">${i18nText('Current queue item', '当前队列项目')}</small></div></div>`
       : '';
 
     const currentLocalQueueSongId = Array.isArray(localQueue?.queueSongIds) && Number.isInteger(localQueue?.currentIndex)
@@ -621,39 +623,39 @@
     const currentLocalQueueMeta = currentLocalQueueSongId ? controlState.trackMeta[currentLocalQueueSongId] : null;
     const currentLocalQueueCoverUrl = currentLocalQueueMeta?.coverUrl || '';
     const currentLocalQueueBlock = currentLocalQueueSongId
-      ? `<div class="console-track-preview mb-3">${currentLocalQueueCoverUrl ? `<img class="console-cover-thumb" src="${escapeHtml(currentLocalQueueCoverUrl)}" alt="current local queue cover">` : ''}<div class="console-queue-preview"><div><strong>${escapeHtml(currentLocalQueueMeta?.label || currentLocalQueueSongId)}</strong></div><small class="console-muted">Current local queue item</small></div></div>`
+      ? `<div class="console-track-preview mb-3">${currentLocalQueueCoverUrl ? `<img class="console-cover-thumb" src="${escapeHtml(currentLocalQueueCoverUrl)}" alt="${i18nText('current local queue cover', '当前本地队列封面')}">` : ''}<div class="console-queue-preview"><div><strong>${escapeHtml(currentLocalQueueMeta?.label || currentLocalQueueSongId)}</strong></div><small class="console-muted">${i18nText('Current local queue item', '当前本地队列项目')}</small></div></div>`
       : '';
 
     queuePanel.innerHTML = `
       <div class="mb-4">
         <div class="console-panel-subhead">
-          <strong>Shared room queue</strong>
-          <span class="console-scope-badge scope-session">Session</span>
+          <strong>${i18nText('Shared room queue', '共享房间队列')}</strong>
+          <span class="console-scope-badge scope-session">${i18nText('Session', '会话')}</span>
         </div>
-        <p class="console-section-lead">Authority shared by every device in this room. Clicking an item asks the selected player to resolve playback from the session queue.</p>
+        <p class="console-section-lead">${i18nText('Authority shared by every device in this room. Clicking an item asks the selected player to resolve playback from the session queue.', '该房间内所有设备共享的队列。点击项目会让所选播放器从会话队列解析播放。')}</p>
         <ul class="console-info-list mb-3">
-          <li><span>Queue size</span><strong>${queue?.queueSongIds?.length ?? 0}</strong></li>
-          <li><span>Current index</span><strong>${queue?.currentIndex ?? '-'}</strong></li>
-          <li><span>Queue position</span><strong>${formatPosition(queue?.positionMs)}</strong></li>
-          <li><span>Last update</span><strong>${formatTimestamp(queue?.updatedAt)}</strong></li>
+          <li><span>${i18nText('Queue size', '队列数量')}</span><strong>${queue?.queueSongIds?.length ?? 0}</strong></li>
+          <li><span>${i18nText('Current index', '当前索引')}</span><strong>${queue?.currentIndex ?? '-'}</strong></li>
+          <li><span>${i18nText('Queue position', '队列位置')}</span><strong>${formatPosition(queue?.positionMs)}</strong></li>
+          <li><span>${i18nText('Last update', '最近更新')}</span><strong>${formatTimestamp(queue?.updatedAt)}</strong></li>
         </ul>
         ${currentQueueBlock}
-        ${renderQueueEntries(queue, 'session', 'No session queue available for this player.')}
+        ${renderQueueEntries(queue, 'session', i18nText('No session queue available for this player.', '该播放器暂无会话队列。'))}
       </div>
       <div>
         <div class="console-panel-subhead">
-          <strong>Device local queue</strong>
-          <span class="console-scope-badge scope-local">Local</span>
+          <strong>${i18nText('Device local queue', '设备本地队列')}</strong>
+          <span class="console-scope-badge scope-local">${i18nText('Local', '本地')}</span>
         </div>
-        <p class="console-section-lead">Private to the selected player. Use this when the device should follow its own queue instead of the shared room queue.</p>
+        <p class="console-section-lead">${i18nText('Private to the selected player. Use this when the device should follow its own queue instead of the shared room queue.', '仅属于所选播放器。设备需要跟随自己的队列而不是共享房间队列时使用它。')}</p>
         <ul class="console-info-list mb-3">
-          <li><span>Queue size</span><strong>${localQueue?.queueSongIds?.length ?? 0}</strong></li>
-          <li><span>Current index</span><strong>${localQueue?.currentIndex ?? '-'}</strong></li>
-          <li><span>Queue position</span><strong>${formatPosition(localQueue?.positionMs)}</strong></li>
-          <li><span>Last update</span><strong>${formatTimestamp(localQueue?.updatedAt)}</strong></li>
+          <li><span>${i18nText('Queue size', '队列数量')}</span><strong>${localQueue?.queueSongIds?.length ?? 0}</strong></li>
+          <li><span>${i18nText('Current index', '当前索引')}</span><strong>${localQueue?.currentIndex ?? '-'}</strong></li>
+          <li><span>${i18nText('Queue position', '队列位置')}</span><strong>${formatPosition(localQueue?.positionMs)}</strong></li>
+          <li><span>${i18nText('Last update', '最近更新')}</span><strong>${formatTimestamp(localQueue?.updatedAt)}</strong></li>
         </ul>
         ${currentLocalQueueBlock}
-        ${renderQueueEntries(localQueue, 'local', 'No local queue available for this player.')}
+        ${renderQueueEntries(localQueue, 'local', i18nText('No local queue available for this player.', '该播放器暂无本地队列。'))}
       </div>
     `;
   }
@@ -718,7 +720,7 @@
 
   function sendCommand(action, payload = {}) {
     if (!controlState.selectedClientId) {
-      pushEventLine('No target player selected.', 'error');
+      pushEventLine(i18nText('No target player selected.', '尚未选择目标播放器。'), 'error');
       return;
     }
 
@@ -733,13 +735,13 @@
       timestamp: Date.now() / 1000,
     });
     pushEventLine(`Sent ${action} to ${controlState.selectedClientId}`, 'info');
-    setCommandStatus(`Sending ${action}...`, 'pending');
+    setCommandStatus(i18nText(`Sending ${action}...`, `正在发送 ${action}...`), 'pending');
   }
 
   function sendQueueSync() {
     if (!controlState.selectedSessionId) {
-      pushEventLine('No session selected for queue sync.', 'error');
-      setCommandStatus('Queue sync failed: no target session selected.', 'error');
+      pushEventLine(i18nText('No session selected for queue sync.', '尚未选择用于队列同步的会话。'), 'error');
+      setCommandStatus(i18nText('Queue sync failed: no target session selected.', '队列同步失败：尚未选择目标会话。'), 'error');
       return;
     }
 
@@ -751,12 +753,12 @@
     const positionMs = parseInt(document.getElementById('queue-position-ms').value, 10) || 0;
 
     if (queueSongIds.length === 0 && (currentIndex !== 0 || positionMs !== 0)) {
-      setCommandStatus('Queue sync failed: empty queue must use currentIndex=0 and positionMs=0.', 'error');
+      setCommandStatus(i18nText('Queue sync failed: empty queue must use currentIndex=0 and positionMs=0.', '队列同步失败：空队列必须使用 currentIndex=0 且 positionMs=0。'), 'error');
       return;
     }
 
     if (queueSongIds.length > 0 && (currentIndex < 0 || currentIndex >= queueSongIds.length)) {
-      setCommandStatus('Queue sync failed: current index is out of bounds.', 'error');
+      setCommandStatus(i18nText('Queue sync failed: current index is out of bounds.', '队列同步失败：当前索引超出范围。'), 'error');
       return;
     }
 
@@ -775,12 +777,12 @@
       timestamp: Date.now() / 1000,
     });
     pushEventLine(`Submitted queue.session.sync for ${controlState.selectedSessionId} (${queueSongIds.length} items).`, 'info');
-    setCommandStatus('Sending queue.session.sync...', 'pending');
+    setCommandStatus(i18nText('Sending queue.session.sync...', '正在发送 queue.session.sync...'), 'pending');
   }
 
   function sendLocalQueue() {
     if (!controlState.selectedSessionId || !controlState.selectedClientId) {
-      setCommandStatus('Local queue update failed: no target player selected.', 'error');
+      setCommandStatus(i18nText('Local queue update failed: no target player selected.', '本地队列更新失败：尚未选择目标播放器。'), 'error');
       return;
     }
 
@@ -792,11 +794,11 @@
     const positionMs = parseInt(document.getElementById('queue-position-ms').value, 10) || 0;
 
     if (queueSongIds.length === 0 && (currentIndex !== 0 || positionMs !== 0)) {
-      setCommandStatus('Local queue update failed: empty queue must use currentIndex=0 and positionMs=0.', 'error');
+      setCommandStatus(i18nText('Local queue update failed: empty queue must use currentIndex=0 and positionMs=0.', '本地队列更新失败：空队列必须使用 currentIndex=0 且 positionMs=0。'), 'error');
       return;
     }
     if (queueSongIds.length > 0 && (currentIndex < 0 || currentIndex >= queueSongIds.length)) {
-      setCommandStatus('Local queue update failed: current index is out of bounds.', 'error');
+      setCommandStatus(i18nText('Local queue update failed: current index is out of bounds.', '本地队列更新失败：当前索引超出范围。'), 'error');
       return;
     }
 
@@ -816,7 +818,7 @@
       timestamp: Date.now() / 1000,
     });
     pushEventLine(`Updated local queue for ${controlState.selectedClientId} (${queueSongIds.length} items).`, 'info');
-    setCommandStatus('Sending queue.local.set...', 'pending');
+    setCommandStatus(i18nText('Sending queue.local.set...', '正在发送 queue.local.set...'), 'pending');
   }
 
   function requestLocalQueue() {
@@ -838,7 +840,7 @@
   socket.on('connect', () => {
     updateConnectionState('ONLINE');
     startHeartbeat();
-    pushEventLine('Socket connected.', 'success');
+    pushEventLine(i18nText('Socket connected.', 'Socket 已连接。'), 'success');
     socket.emit('message', {
       type: 'auth',
       action: 'auth.login',
@@ -851,12 +853,12 @@
   socket.on('disconnect', () => {
     stopHeartbeat();
     updateConnectionState('OFFLINE');
-    pushEventLine('Socket disconnected.', 'error');
+    pushEventLine(i18nText('Socket disconnected.', 'Socket 已断开。'), 'error');
   });
 
   socket.on('connect_error', (error) => {
     updateConnectionState('ERROR');
-    pushEventLine(`Connection error: ${error.message}`, 'error');
+    pushEventLine(i18nText(`Connection error: ${error.message}`, `连接错误：${error.message}`), 'error');
   });
 
   socket.on('message', (message) => {
@@ -874,13 +876,13 @@
         },
         timestamp: Date.now() / 1000,
       });
-      pushEventLine('Authenticated using browser session.', 'success');
+      pushEventLine(i18nText('Authenticated using browser session.', '已使用浏览器会话完成认证。'), 'success');
       return;
     }
 
     if (action === 'system.ack' && message.requestId === 'web-register-1') {
       sendDeviceListRequest();
-      pushEventLine('Registered browser control client.', 'success');
+      pushEventLine(i18nText('Registered browser control client.', '已注册浏览器控制客户端。'), 'success');
       return;
     }
 
@@ -981,9 +983,10 @@
       const pendingAction = controlState.pendingCommands.get(message.requestId);
       if (pendingAction) {
         controlState.pendingCommands.delete(message.requestId);
-        setCommandStatus(`${pendingAction} failed: ${message.payload?.message || 'Unknown error'}`, 'error');
+        const errorMessage = message.payload?.message || i18nText('Unknown error', '未知错误');
+        setCommandStatus(i18nText(`${pendingAction} failed: ${errorMessage}`, `${pendingAction} 失败：${errorMessage}`), 'error');
       }
-      pushEventLine(`Error: ${message.payload?.message || 'Unknown error'}`, 'error');
+      pushEventLine(i18nText(`Error: ${message.payload?.message || 'Unknown error'}`, `错误：${message.payload?.message || '未知错误'}`), 'error');
       return;
     }
 
@@ -1003,7 +1006,7 @@
       const pendingAction = controlState.pendingCommands.get(message.requestId);
       if (pendingAction) {
         controlState.pendingCommands.delete(message.requestId);
-        setCommandStatus(`${pendingAction} acknowledged by server.`, 'success');
+        setCommandStatus(i18nText(`${pendingAction} acknowledged by server.`, `服务器已确认 ${pendingAction}。`), 'success');
       }
       pushEventLine(`Ack: ${message.requestId || 'command'}`, 'success');
     }
@@ -1021,7 +1024,7 @@
   document.getElementById('send-volume').addEventListener('click', () => {
     const volume = parseInt(document.getElementById('volume-level').value, 10);
     if (Number.isNaN(volume)) {
-      pushEventLine('Invalid volume value.', 'error');
+      pushEventLine(i18nText('Invalid volume value.', '音量值无效。'), 'error');
       return;
     }
     sendCommand('player.setVolume', { volume });
@@ -1034,7 +1037,7 @@
     document.getElementById('queue-song-ids').value = (queue?.queueSongIds || []).join('\n');
     document.getElementById('queue-current-index').value = queue?.currentIndex ?? 0;
     document.getElementById('queue-position-ms').value = queue?.positionMs ?? 0;
-    setCommandStatus('Loaded current session queue into the editor.', 'success');
+    setCommandStatus(i18nText('Loaded current session queue into the editor.', '已将当前会话队列载入编辑器。'), 'success');
   });
   document.getElementById('load-local-queue').addEventListener('click', requestLocalQueue);
 
@@ -1049,6 +1052,16 @@
       return;
     }
     sendQueuePlayItem(chip.dataset.queueScope || 'session', parseInt(chip.dataset.queueIndex, 10));
+  });
+
+  document.querySelectorAll('[data-language-toggle]').forEach((button) => {
+    button.addEventListener('click', () => {
+      window.setTimeout(() => {
+        renderPlayerCards();
+        renderTargetPanels();
+        updateSummary();
+      }, 0);
+    });
   });
 
   updateSummary();

@@ -3,6 +3,8 @@
 <a class="nav-link active" aria-current="page" href="{{ url_for('emo.list_logs') }}"><span data-i18n-en="Logs" data-i18n-zh="日志">Logs</span></a>
 {% endblock %}
 {% block title %}Log Viewer · Emosonic Server{% endblock %}
+{% block document_title_en %}{{ filename }} · Emosonic Server{% endblock %}
+{% block document_title_zh %}{{ filename }} · Emosonic Server{% endblock %}
 {% block page_title %}{{ filename }}{% endblock %}
 {% block page_subtitle %}<span data-i18n-en="Inspect raw diagnostic output captured from Emo clients or related upload endpoints." data-i18n-zh="查看来自 Emo 客户端或相关上传端点的原始诊断输出。">Inspect raw diagnostic output captured from Emo clients or related upload endpoints.</span>{% endblock %}
 {% block body %}
@@ -16,7 +18,7 @@
       <div class="console-table-title" data-download-file>-</div>
       <div class="console-metric-caption" data-download-status data-i18n-en="Waiting to start download." data-i18n-zh="等待开始下载。">Waiting to start download.</div>
     </div>
-    <div class="progress console-progress" role="progressbar" aria-label="Download progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+    <div class="progress console-progress" role="progressbar" aria-label="Download progress" data-i18n-en="Download progress" data-i18n-zh="下载进度" data-i18n-attr="aria-label" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
       <div class="progress-bar console-progress-bar" data-download-bar style="width: 0%"></div>
     </div>
     <div class="d-flex justify-content-between gap-3 flex-wrap console-metric-caption">

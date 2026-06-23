@@ -1,12 +1,14 @@
 {% extends "layout.html" %}
 {% block title %}Release History · Emosonic Server{% endblock %}
-{% block page_title %}Release history{% endblock %}
-{% block page_subtitle %}Browse previously published {{ platform_label }} client versions and download any available installer package.{% endblock %}
+{% block document_title_en %}Release History · Emosonic Server{% endblock %}
+{% block document_title_zh %}发布历史 · Emosonic Server{% endblock %}
+{% block page_title %}<span data-i18n-en="Release history" data-i18n-zh="发布历史">Release history</span>{% endblock %}
+{% block page_subtitle %}<span data-i18n-en="Browse previously published {{ platform_label }} client versions and download any available installer package." data-i18n-zh="浏览已发布的 {{ platform_label }} 客户端版本，并下载可用的安装包。">Browse previously published {{ platform_label }} client versions and download any available installer package.</span>{% endblock %}
 {% block body %}
 <div class="card console-section-spacer">
   <div class="card-header d-flex justify-content-between align-items-center">
     <span>{{ platform_label }}</span>
-    <a class="btn btn-outline-dark btn-sm" href="{{ url_for('frontend.index') }}">Back to overview</a>
+    <a class="btn btn-outline-dark btn-sm" href="{{ url_for('frontend.index') }}"><span data-i18n-en="Back to overview" data-i18n-zh="返回概览">Back to overview</span></a>
   </div>
   <div class="card-body">
     {% if releases %}
@@ -21,13 +23,13 @@
           {% if release.release_notes %}
           <small class="console-muted">{{ release.release_notes }}</small>
           {% endif %}
-          <a class="btn btn-primary btn-sm" href="{{ url_for('client_releases.download_release', release_id=release.id) }}">Download</a>
+          <a class="btn btn-primary btn-sm" href="{{ url_for('client_releases.download_release', release_id=release.id) }}"><span data-i18n-en="Download" data-i18n-zh="下载">Download</span></a>
         </div>
       </div>
       {% endfor %}
     </div>
     {% else %}
-    <div class="text-body-secondary">No release history is available for {{ platform_label }}.</div>
+    <div class="text-body-secondary" data-i18n-en="No release history is available for {{ platform_label }}." data-i18n-zh="暂无 {{ platform_label }} 发布历史。">No release history is available for {{ platform_label }}.</div>
     {% endif %}
   </div>
 </div>

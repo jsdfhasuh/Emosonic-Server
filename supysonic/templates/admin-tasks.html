@@ -6,6 +6,8 @@
 -#}
 {% extends "layout.html" %}
 {% block title %}Background Tasks · Emosonic Server{% endblock %}
+{% block document_title_en %}Background Tasks · Emosonic Server{% endblock %}
+{% block document_title_zh %}后台任务 · Emosonic Server{% endblock %}
 {% block navbar_admin_tasks %}
 <a class="nav-link active" aria-current="page" href="{{ url_for('frontend.admin_tasks') }}"><span data-i18n-en="Tasks" data-i18n-zh="任务">Tasks</span></a>
 {% endblock %}
@@ -15,38 +17,38 @@
 <div class="row row-cols-1 row-cols-md-4 g-3 mb-3">
   <div class="col">
     <div class="card text-center h-100 console-metric-card">
-      <div class="card-header">Pending</div>
+      <div class="card-header"><span data-i18n-en="Pending" data-i18n-zh="等待中">Pending</span></div>
       <div class="card-body">
         <div class="console-metric-value" id="summary-pending">{{ summary.pending }}</div>
-        <div class="console-metric-caption">Submitted and waiting or running.</div>
+        <div class="console-metric-caption" data-i18n-en="Submitted and waiting or running." data-i18n-zh="已提交，正在等待或运行。">Submitted and waiting or running.</div>
       </div>
     </div>
   </div>
   <div class="col">
     <div class="card text-center h-100 console-metric-card">
-      <div class="card-header">Completed</div>
+      <div class="card-header"><span data-i18n-en="Completed" data-i18n-zh="已完成">Completed</span></div>
       <div class="card-body">
         <div class="console-metric-value" id="summary-completed">{{ summary.completed }}</div>
-        <div class="console-metric-caption">Finished without errors.</div>
+        <div class="console-metric-caption" data-i18n-en="Finished without errors." data-i18n-zh="已无错误完成。">Finished without errors.</div>
       </div>
     </div>
   </div>
   <div class="col">
     <div class="card text-center h-100 console-metric-card">
-      <div class="card-header">Failed</div>
+      <div class="card-header"><span data-i18n-en="Failed" data-i18n-zh="失败">Failed</span></div>
       <div class="card-body">
         <div class="console-metric-value" id="summary-failed">{{ summary.failed }}</div>
-        <div class="console-metric-caption">Terminated with an exception.</div>
+        <div class="console-metric-caption" data-i18n-en="Terminated with an exception." data-i18n-zh="因异常而终止。">Terminated with an exception.</div>
       </div>
     </div>
   </div>
   <div class="col">
     <div class="card text-center h-100 console-metric-card">
-      <div class="card-header">Total</div>
+      <div class="card-header"><span data-i18n-en="Total" data-i18n-zh="总数">Total</span></div>
       <div class="card-body">
         <div class="console-metric-value" id="summary-total">{{ summary.total }}</div>
-        <div class="console-metric-caption mb-2">All known task results in this process.</div>
-        <div class="small text-body-secondary" id="last-refresh">just now</div>
+        <div class="console-metric-caption mb-2" data-i18n-en="All known task results in this process." data-i18n-zh="当前进程中记录的所有任务结果。">All known task results in this process.</div>
+        <div class="small text-body-secondary" id="last-refresh" data-i18n-en="just now" data-i18n-zh="刚刚">just now</div>
         <button type="button" class="btn btn-light btn-sm mt-2" id="refresh-now"><span data-i18n-en="Refresh now" data-i18n-zh="立即刷新">Refresh now</span></button>
       </div>
     </div>
@@ -55,19 +57,19 @@
 
 <div class="card">
   <div class="card-header d-flex justify-content-between align-items-center">
-    <span>Tasks</span>
-    <small class="text-body-secondary">Auto-refresh every <span id="refresh-countdown">5</span>s</small>
+    <span data-i18n-en="Tasks" data-i18n-zh="任务">Tasks</span>
+    <small class="text-body-secondary"><span data-i18n-en="Auto-refresh every" data-i18n-zh="每">Auto-refresh every</span> <span id="refresh-countdown">5</span><span data-i18n-en="s" data-i18n-zh=" 秒自动刷新">s</span></small>
   </div>
   <div class="card-body p-0">
     <div class="table-responsive">
       <table class="table table-hover mb-0">
         <thead class="table-light">
           <tr>
-            <th>Task ID</th>
-            <th>Status</th>
-            <th>Updated At</th>
-            <th>Result</th>
-            <th>Error</th>
+            <th data-i18n-en="Task ID" data-i18n-zh="任务 ID">Task ID</th>
+            <th data-i18n-en="Status" data-i18n-zh="状态">Status</th>
+            <th data-i18n-en="Updated At" data-i18n-zh="更新时间">Updated At</th>
+            <th data-i18n-en="Result" data-i18n-zh="结果">Result</th>
+            <th data-i18n-en="Error" data-i18n-zh="错误">Error</th>
           </tr>
         </thead>
         <tbody id="tasks-tbody">
@@ -81,7 +83,7 @@
           </tr>
           {% else %}
           <tr>
-            <td colspan="5" class="text-center text-body-secondary py-4">No background tasks recorded yet.</td>
+            <td colspan="5" class="text-center text-body-secondary py-4" data-i18n-en="No background tasks recorded yet." data-i18n-zh="暂无后台任务记录。">No background tasks recorded yet.</td>
           </tr>
           {% endfor %}
         </tbody>
@@ -120,7 +122,7 @@
 
     function updateTable(tasks) {
       if (!tasks.length) {
-        tbody.innerHTML = '<tr><td colspan="5" class="text-center text-body-secondary py-4">No background tasks recorded yet.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5" class="text-center text-body-secondary py-4">' + i18nText('No background tasks recorded yet.', '暂无后台任务记录。') + '</td></tr>';
         return;
       }
       var rows = "";
@@ -147,10 +149,10 @@
         .then(function (data) {
           updateSummary(data.summary);
           updateTable(data.tasks);
-          lastRefreshEl.textContent = "just now";
+          lastRefreshEl.textContent = i18nText("just now", "刚刚");
         })
         .catch(function () {
-          lastRefreshEl.textContent = "refresh failed";
+          lastRefreshEl.textContent = i18nText("refresh failed", "刷新失败");
         });
     }
 

@@ -6,6 +6,8 @@
 -#}
 {% extends "layout.html" %}
 {% block title %}Playlists · Emosonic Server{% endblock %}
+{% block document_title_en %}Playlists · Emosonic Server{% endblock %}
+{% block document_title_zh %}播放列表 · Emosonic Server{% endblock %}
 {% block navbar_playlists %}
 <a class="nav-link active" aria-current="page" href="{{ url_for('frontend.playlist_index') }}"><span data-i18n-en="Playlists" data-i18n-zh="播放列表">Playlists</span></a>
 {% endblock %}
@@ -51,16 +53,22 @@
     <div class="table-responsive">
       <table class="table table-hover align-middle mb-0">
         <thead>
-          <tr><th>Playlist</th><th>Tracks</th><th>Visibility</th><th>Export</th><th>Delete</th></tr>
+          <tr>
+            <th data-i18n-en="Playlist" data-i18n-zh="播放列表">Playlist</th>
+            <th data-i18n-en="Tracks" data-i18n-zh="曲目">Tracks</th>
+            <th data-i18n-en="Visibility" data-i18n-zh="可见性">Visibility</th>
+            <th data-i18n-en="Export" data-i18n-zh="导出">Export</th>
+            <th data-i18n-en="Delete" data-i18n-zh="删除">Delete</th>
+          </tr>
         </thead>
         <tbody>
           {% for p in mine %}
           <tr>
             <td><a href="{{ url_for('frontend.playlist_details', uid = p.id) }}">{{ p.name }}</a></td>
             <td>{{ p.get_tracks()|length }}</td>
-            <td><span class="console-status status-{{ 'playing' if p.public else 'unknown' }}">{{ 'public' if p.public else 'private' }}</span></td>
-            <td><button class="btn btn-outline-dark btn-sm" data-href="{{ url_for('frontend.playlist_export', uid = p.id) }}" data-bs-toggle="modal" data-bs-target="#confirm-export">Export</button></td>
-            <td><button class="btn btn-outline-danger btn-sm" data-href="{{ url_for('frontend.playlist_delete', uid = p.id) }}" data-bs-toggle="modal" data-bs-target="#confirm-delete">Delete</button></td>
+            <td><span class="console-status status-{{ 'playing' if p.public else 'unknown' }}" data-i18n-en="{{ 'public' if p.public else 'private' }}" data-i18n-zh="{{ '公开' if p.public else '私有' }}">{{ 'public' if p.public else 'private' }}</span></td>
+            <td><button class="btn btn-outline-dark btn-sm" data-href="{{ url_for('frontend.playlist_export', uid = p.id) }}" data-bs-toggle="modal" data-bs-target="#confirm-export"><span data-i18n-en="Export" data-i18n-zh="导出">Export</span></button></td>
+            <td><button class="btn btn-outline-danger btn-sm" data-href="{{ url_for('frontend.playlist_delete', uid = p.id) }}" data-bs-toggle="modal" data-bs-target="#confirm-delete"><span data-i18n-en="Delete" data-i18n-zh="删除">Delete</span></button></td>
           </tr>
           {% endfor %}
         </tbody>
@@ -76,7 +84,11 @@
   <div class="table-responsive">
     <table class="table table-hover align-middle mb-0">
       <thead>
-        <tr><th>Playlist</th><th>Owner</th><th>Tracks</th></tr>
+        <tr>
+          <th data-i18n-en="Playlist" data-i18n-zh="播放列表">Playlist</th>
+          <th data-i18n-en="Owner" data-i18n-zh="拥有者">Owner</th>
+          <th data-i18n-en="Tracks" data-i18n-zh="曲目">Tracks</th>
+        </tr>
       </thead>
       <tbody>
         {% for p in others %}
@@ -97,7 +109,7 @@
     <div class="modal-content">
       <div class="modal-header">
         <h1 class="modal-title fs-5" id="confirm-export-label"><span data-i18n-en="Export warning" data-i18n-zh="导出提醒">Export warning</span></h1>
-        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close" data-i18n-en="Close" data-i18n-zh="关闭" data-i18n-attr="aria-label"></button>
       </div>
       <div class="modal-body">
         <p data-i18n-en="The exported playlist uses the local filesystem paths seen by the server, so it will only be directly usable on the same host." data-i18n-zh="导出的播放列表使用服务端可见的本地文件系统路径，因此通常只能在同一主机上直接使用。">The exported playlist uses the local filesystem paths seen by the server, so it will only be directly usable on the same host.</p>
@@ -114,7 +126,7 @@
     <div class="modal-content">
       <div class="modal-header">
         <h1 class="modal-title fs-5" id="confirm-delete-label"><span data-i18n-en="Delete playlist?" data-i18n-zh="删除播放列表？">Delete playlist?</span></h1>
-        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close" data-i18n-en="Close" data-i18n-zh="关闭" data-i18n-attr="aria-label"></button>
       </div>
       <div class="modal-body">
         <p data-i18n-en="Are you sure that you want to delete this playlist?" data-i18n-zh="你确定要删除这个播放列表吗？">Are you sure that you want to delete this playlist?</p>

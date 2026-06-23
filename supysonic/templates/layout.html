@@ -11,12 +11,46 @@
     <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}Emosonic Server{% endblock %}</title>
+    <meta name="i18n-title" data-i18n-en="{% block document_title_en %}{% endblock %}" data-i18n-zh="{% block document_title_zh %}{% endblock %}">
 
     <link rel="icon" href="{{ url_for('static', filename='img/vinyl.svg') }}" type="image/svg+xml">
     <link href="{{ url_for('static', filename='css/bootstrap.min.css') }}" rel="stylesheet">
     <link href="{{ url_for('static', filename='css/supysonic.css') }}" rel="stylesheet">
   </head>
   <body>
+    <script>
+      (function () {
+        function readStoredLanguage() {
+          try {
+            var language = localStorage.getItem('language');
+            return language === 'zh' || language === 'en' ? language : null;
+          } catch (error) {
+            return null;
+          }
+        }
+
+        function browserLanguage() {
+          var languages = navigator.languages && navigator.languages.length
+            ? navigator.languages
+            : [navigator.language || navigator.userLanguage || ''];
+          return languages.some(function (language) {
+            return String(language).toLowerCase().indexOf('zh') === 0;
+          }) ? 'zh' : 'en';
+        }
+
+        var initialLanguage = readStoredLanguage() || browserLanguage();
+        document.documentElement.lang = initialLanguage === 'zh' ? 'zh-Hans' : 'en';
+        document.body.setAttribute('data-language', initialLanguage);
+        window.getLanguage = function () {
+          return document.body.getAttribute('data-language') === 'zh' ? 'zh' : 'en';
+        };
+        window.i18nText = function (enText, zhText) {
+          return window.getLanguage() === 'zh'
+            ? (zhText || enText || '')
+            : (enText || zhText || '');
+        };
+      })();
+    </script>
     <div class="console-shell">
       <nav class="navbar navbar-expand-xl console-navbar fixed-top">
         <div class="container-fluid console-container {% block page_container_class %}{% endblock %} px-3 px-xl-4">
@@ -28,7 +62,7 @@
             </span>
           </a>
           {% if session.userid %}
-          <button class="navbar-toggler console-navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#EmosonicNavbar" aria-controls="EmosonicNavbar" aria-expanded="false" aria-label="Toggle navigation">
+          <button class="navbar-toggler console-navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#EmosonicNavbar" aria-controls="EmosonicNavbar" aria-expanded="false" aria-label="Toggle navigation" data-i18n-en="Toggle navigation" data-i18n-zh="展开或收起导航" data-i18n-attr="aria-label">
             <span class="navbar-toggler-icon"></span>
           </button>
           <div class="collapse navbar-collapse" id="EmosonicNavbar">
@@ -94,11 +128,11 @@
               {% endif %}
             </ul>
             <div class="console-toolbar ms-xl-auto">
-              <div class="console-locale-switch btn-group" role="group" aria-label="Toggle language">
+              <div class="console-locale-switch btn-group" role="group" aria-label="Toggle language" data-i18n-en="Toggle language" data-i18n-zh="切换语言" data-i18n-attr="aria-label">
                 <button type="button" class="btn btn-sm btn-outline-secondary" data-language-toggle="en">EN</button>
                 <button type="button" class="btn btn-sm btn-outline-secondary" data-language-toggle="zh">中文</button>
               </div>
-              <div class="console-theme-switch btn-group" role="group" aria-label="Toggle theme">
+              <div class="console-theme-switch btn-group" role="group" aria-label="Toggle theme" data-i18n-en="Toggle theme" data-i18n-zh="切换主题" data-i18n-attr="aria-label">
                 <input type="radio" class="btn-check" name="theme" id="light" value="light" autocomplete="off">
                 <label class="btn btn-sm btn-outline-secondary" for="light"><span data-i18n-en="Light" data-i18n-zh="浅色">Light</span></label>
                 <input type="radio" class="btn-check" name="theme" id="dark" value="dark" autocomplete="off">
@@ -128,7 +162,7 @@
           </div>
           {% else %}
           <div class="console-toolbar ms-auto">
-            <div class="console-locale-switch btn-group" role="group" aria-label="Toggle language">
+            <div class="console-locale-switch btn-group" role="group" aria-label="Toggle language" data-i18n-en="Toggle language" data-i18n-zh="切换语言" data-i18n-attr="aria-label">
               <button type="button" class="btn btn-sm btn-outline-secondary" data-language-toggle="en">EN</button>
               <button type="button" class="btn btn-sm btn-outline-secondary" data-language-toggle="zh">中文</button>
             </div>

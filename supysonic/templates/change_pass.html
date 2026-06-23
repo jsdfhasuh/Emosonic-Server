@@ -6,9 +6,11 @@
 -#}
 {% extends "layout.html" %}
 {% block title %}Change Password · Emosonic Server{% endblock %}
+{% block document_title_en %}Change Password · Emosonic Server{% endblock %}
+{% block document_title_zh %}修改密码 · Emosonic Server{% endblock %}
 {% block navbar_users %}
 {% if request.user.id != user.id %}
-<a class="nav-link active" aria-current="page" href="{{ url_for('frontend.user_index') }}">Users</a>
+<a class="nav-link active" aria-current="page" href="{{ url_for('frontend.user_index') }}"><span data-i18n-en="Users" data-i18n-zh="用户">Users</span></a>
 {% else %}
 {{ super() }}
 {% endif %}
@@ -20,34 +22,34 @@
 {{ super() }}
 {% endif %}
 {% endblock %}
-{% block page_title %}Change password{% endblock %}
-{% block page_subtitle %}Update the password for {{ user.name }} and keep access credentials aligned with your current security policy.{% endblock %}
+{% block page_title %}<span data-i18n-en="Change password" data-i18n-zh="修改密码">Change password</span>{% endblock %}
+{% block page_subtitle %}<span data-i18n-en="Update the password for {{ user.name }} and keep access credentials aligned with your current security policy." data-i18n-zh="更新 {{ user.name }} 的密码，让访问凭据符合当前安全策略。">Update the password for {{ user.name }} and keep access credentials aligned with your current security policy.</span>{% endblock %}
 {% block body %}
 <div class="row justify-content-center">
   <div class="col-xl-7">
     <div class="card">
-      <div class="card-header">Credential update</div>
+      <div class="card-header"><span data-i18n-en="Credential update" data-i18n-zh="凭据更新">Credential update</span></div>
       <div class="card-body">
         <form method="post" class="d-flex flex-column gap-4">
           {% if request.user.id == user.id %}
           <div>
-            <label class="form-label" for="current">Current password</label>
-            <input type="password" class="form-control" id="current" name="current" placeholder="Enter the current password">
+            <label class="form-label" for="current"><span data-i18n-en="Current password" data-i18n-zh="当前密码">Current password</span></label>
+            <input type="password" class="form-control" id="current" name="current" placeholder="Enter the current password" data-i18n-en="Enter the current password" data-i18n-zh="输入当前密码" data-i18n-attr="placeholder">
           </div>
           {% endif %}
           <div class="row g-3">
             <div class="col-md-6">
-              <label class="form-label" for="new">New password</label>
-              <input type="password" class="form-control" id="new" name="new" placeholder="Choose a new password">
+              <label class="form-label" for="new"><span data-i18n-en="New password" data-i18n-zh="新密码">New password</span></label>
+              <input type="password" class="form-control" id="new" name="new" placeholder="Choose a new password" data-i18n-en="Choose a new password" data-i18n-zh="设置新密码" data-i18n-attr="placeholder">
             </div>
             <div class="col-md-6">
-              <label class="form-label" for="confirm">Confirm password</label>
-              <input type="password" class="form-control" id="confirm" name="confirm" placeholder="Repeat the new password">
+              <label class="form-label" for="confirm"><span data-i18n-en="Confirm password" data-i18n-zh="确认密码">Confirm password</span></label>
+              <input type="password" class="form-control" id="confirm" name="confirm" placeholder="Repeat the new password" data-i18n-en="Repeat the new password" data-i18n-zh="再次输入新密码" data-i18n-attr="placeholder">
             </div>
           </div>
           <div class="d-flex gap-2 justify-content-end">
-            <a href="{{ url_for('frontend.user_profile', uid = 'me' if request.user.id == user.id else user.id) }}" class="btn btn-outline-dark">Cancel</a>
-            <button class="btn btn-dark" type="submit">Update password</button>
+            <a href="{{ url_for('frontend.user_profile', uid = 'me' if request.user.id == user.id else user.id) }}" class="btn btn-outline-dark"><span data-i18n-en="Cancel" data-i18n-zh="取消">Cancel</span></a>
+            <button class="btn btn-dark" type="submit"><span data-i18n-en="Update password" data-i18n-zh="更新密码">Update password</span></button>
           </div>
         </form>
       </div>

@@ -6,6 +6,8 @@
 -#}
 {% extends "layout.html" %}
 {% block title %}Profile · Emosonic Server{% endblock %}
+{% block document_title_en %}Profile · Emosonic Server{% endblock %}
+{% block document_title_zh %}个人资料 · Emosonic Server{% endblock %}
 {% block navbar_users %}
 {% if request.user.id != user.id %}
 <a class="nav-link active" aria-current="page" href="{{ url_for('frontend.user_index') }}"><span data-i18n-en="Users" data-i18n-zh="用户">Users</span></a>
@@ -28,7 +30,7 @@
     <div class="card console-metric-card">
       <div class="card-header"><span data-i18n-en="Account role" data-i18n-zh="账号角色">Account role</span></div>
       <div class="card-body">
-        <div class="console-metric-value">{{ 'ADMIN' if user.admin else 'USER' }}</div>
+        <div class="console-metric-value" data-i18n-en="{{ 'ADMIN' if user.admin else 'USER' }}" data-i18n-zh="{{ '管理员' if user.admin else '用户' }}">{{ 'ADMIN' if user.admin else 'USER' }}</div>
         <div class="console-metric-caption" data-i18n-en="Privilege level assigned to this account." data-i18n-zh="该账号当前的权限级别。">Privilege level assigned to this account.</div>
       </div>
     </div>
@@ -37,7 +39,7 @@
     <div class="card console-metric-card">
       <div class="card-header"><span data-i18n-en="Email status" data-i18n-zh="邮箱状态">Email status</span></div>
       <div class="card-body">
-        <div class="console-metric-value">{{ 'SET' if user.mail else 'NONE' }}</div>
+        <div class="console-metric-value" data-i18n-en="{{ 'SET' if user.mail else 'NONE' }}" data-i18n-zh="{{ '已设置' if user.mail else '无' }}">{{ 'SET' if user.mail else 'NONE' }}</div>
         <div class="console-metric-caption" data-i18n-en="Primary contact and notification address." data-i18n-zh="主要联系与通知邮箱。">Primary contact and notification address.</div>
       </div>
     </div>
@@ -46,8 +48,8 @@
     <div class="card console-metric-card">
       <div class="card-header">Last.fm</div>
       <div class="card-body">
-        <div class="console-metric-value">{{ 'LINKED' if user.lastfm_session else 'OFF' }}</div>
-        <div class="console-metric-caption">Scrobbling status for the external profile.</div>
+        <div class="console-metric-value" data-i18n-en="{{ 'LINKED' if user.lastfm_session else 'OFF' }}" data-i18n-zh="{{ '已关联' if user.lastfm_session else '关闭' }}">{{ 'LINKED' if user.lastfm_session else 'OFF' }}</div>
+        <div class="console-metric-caption" data-i18n-en="Scrobbling status for the external profile." data-i18n-zh="外部资料的听歌记录同步状态。">Scrobbling status for the external profile.</div>
       </div>
     </div>
   </div>
@@ -55,8 +57,8 @@
     <div class="card console-metric-card">
       <div class="card-header">ListenBrainz</div>
       <div class="card-body">
-        <div class="console-metric-value">{{ 'LINKED' if user.listenbrainz_session else 'OFF' }}</div>
-        <div class="console-metric-caption">Brainz integration and playback reporting state.</div>
+        <div class="console-metric-value" data-i18n-en="{{ 'LINKED' if user.listenbrainz_session else 'OFF' }}" data-i18n-zh="{{ '已关联' if user.listenbrainz_session else '关闭' }}">{{ 'LINKED' if user.listenbrainz_session else 'OFF' }}</div>
+        <div class="console-metric-caption" data-i18n-en="Brainz integration and playback reporting state." data-i18n-zh="Brainz 集成和播放上报状态。">Brainz integration and playback reporting state.</div>
       </div>
     </div>
   </div>
@@ -68,10 +70,10 @@
       <div class="card-header"><span data-i18n-en="Identity" data-i18n-zh="身份信息">Identity</span></div>
       <div class="card-body">
         <ul class="console-info-list">
-          <li><span>Username</span><strong>{{ user.name }}</strong></li>
-          <li><span>Email</span><strong>{{ user.mail or '-' }}</strong></li>
-          <li><span>Admin access</span><span class="console-status status-{{ 'playing' if user.admin else 'unknown' }}">{{ 'enabled' if user.admin else 'disabled' }}</span></li>
-          <li><span>Last play</span><strong>{{ user.last_play_date or '-' }}</strong></li>
+          <li><span data-i18n-en="Username" data-i18n-zh="用户名">Username</span><strong>{{ user.name }}</strong></li>
+          <li><span data-i18n-en="Email" data-i18n-zh="邮箱">Email</span><strong>{{ user.mail or '-' }}</strong></li>
+          <li><span data-i18n-en="Admin access" data-i18n-zh="管理员权限">Admin access</span><span class="console-status status-{{ 'playing' if user.admin else 'unknown' }}" data-i18n-en="{{ 'enabled' if user.admin else 'disabled' }}" data-i18n-zh="{{ '已启用' if user.admin else '已停用' }}">{{ 'enabled' if user.admin else 'disabled' }}</span></li>
+          <li><span data-i18n-en="Last play" data-i18n-zh="最近播放">Last play</span><strong>{{ user.last_play_date or '-' }}</strong></li>
         </ul>
       </div>
     </div>
@@ -100,14 +102,14 @@
       <div class="card-body d-flex flex-column gap-3">
         {% if api_key != None %}
           {% if user.lastfm_session %}
-          <div class="console-status status-{{ 'playing' if user.lastfm_status else 'paused' }}">{{ 'Linked' if user.lastfm_status else 'Invalid session' }}</div>
-          <a href="{% if request.user.id == user.id %}{{ url_for('frontend.lastfm_unreg', uid = 'me') }}{% else %}{{ url_for('frontend.lastfm_unreg', uid = user.id) }}{% endif %}" class="btn btn-outline-dark btn-sm">Unlink Last.fm</a>
+          <div class="console-status status-{{ 'playing' if user.lastfm_status else 'paused' }}" data-i18n-en="{{ 'Linked' if user.lastfm_status else 'Invalid session' }}" data-i18n-zh="{{ '已关联' if user.lastfm_status else '会话无效' }}">{{ 'Linked' if user.lastfm_status else 'Invalid session' }}</div>
+          <a href="{% if request.user.id == user.id %}{{ url_for('frontend.lastfm_unreg', uid = 'me') }}{% else %}{{ url_for('frontend.lastfm_unreg', uid = user.id) }}{% endif %}" class="btn btn-outline-dark btn-sm"><span data-i18n-en="Unlink Last.fm" data-i18n-zh="解除 Last.fm 关联">Unlink Last.fm</span></a>
           {% else %}
-          <div class="console-status status-unknown">Unlinked</div>
-          <a href="https://www.last.fm/api/auth/?api_key={{ api_key }}&cb={% if request.user.id == user.id %}{{ request.url_root[:-(request.script_root|length+1)] + url_for('frontend.lastfm_reg', uid = 'me') }}{% else %}{{ request.url_root[:-(request.script_root|length+1)] + url_for('frontend.lastfm_reg', uid = user.id) }}{% endif %}" class="btn btn-outline-dark btn-sm">Link Last.fm</a>
+          <div class="console-status status-unknown" data-i18n-en="Unlinked" data-i18n-zh="未关联">Unlinked</div>
+          <a href="https://www.last.fm/api/auth/?api_key={{ api_key }}&cb={% if request.user.id == user.id %}{{ request.url_root[:-(request.script_root|length+1)] + url_for('frontend.lastfm_reg', uid = 'me') }}{% else %}{{ request.url_root[:-(request.script_root|length+1)] + url_for('frontend.lastfm_reg', uid = user.id) }}{% endif %}" class="btn btn-outline-dark btn-sm"><span data-i18n-en="Link Last.fm" data-i18n-zh="关联 Last.fm">Link Last.fm</span></a>
           {% endif %}
         {% else %}
-        <div class="console-status status-unknown">Unavailable</div>
+        <div class="console-status status-unknown" data-i18n-en="Unavailable" data-i18n-zh="不可用">Unavailable</div>
         {% endif %}
       </div>
     </div>
@@ -117,14 +119,14 @@
       <div class="card-header"><span data-i18n-en="ListenBrainz integration" data-i18n-zh="ListenBrainz 集成">ListenBrainz integration</span></div>
       <div class="card-body d-flex flex-column gap-3">
         {% if user.listenbrainz_session %}
-        <div class="console-status status-{{ 'playing' if user.listenbrainz_status else 'paused' }}">{{ 'Linked' if user.listenbrainz_status else 'Invalid token' }}</div>
-        <a href="{% if request.user.id == user.id %}{{ url_for('frontend.listenbrainz_unreg', uid = 'me') }}{% else %}{{ url_for('frontend.listenbrainz_unreg', uid = user.id) }}{% endif %}" class="btn btn-outline-dark btn-sm">Unlink ListenBrainz</a>
+        <div class="console-status status-{{ 'playing' if user.listenbrainz_status else 'paused' }}" data-i18n-en="{{ 'Linked' if user.listenbrainz_status else 'Invalid token' }}" data-i18n-zh="{{ '已关联' if user.listenbrainz_status else '令牌无效' }}">{{ 'Linked' if user.listenbrainz_status else 'Invalid token' }}</div>
+        <a href="{% if request.user.id == user.id %}{{ url_for('frontend.listenbrainz_unreg', uid = 'me') }}{% else %}{{ url_for('frontend.listenbrainz_unreg', uid = user.id) }}{% endif %}" class="btn btn-outline-dark btn-sm"><span data-i18n-en="Unlink ListenBrainz" data-i18n-zh="解除 ListenBrainz 关联">Unlink ListenBrainz</span></a>
         {% else %}
         <form>
-          <label class="form-label" for="listenbrainz">Auth token</label>
+          <label class="form-label" for="listenbrainz"><span data-i18n-en="Auth token" data-i18n-zh="认证令牌">Auth token</span></label>
           <div class="input-group">
-            <input type="text" class="form-control" name="token" id="listenbrainz" placeholder="Insert auth token" maxlength="36" aria-label="ListenBrainz auth token">
-            <button class="btn btn-dark" type="submit" formaction="{% if request.user.id == user.id %}{{ url_for('frontend.listenbrainz_reg', uid = 'me') }}{% else %}{{ url_for('frontend.listenbrainz_reg', uid = user.id) }}{% endif %}">Link</button>
+            <input type="text" class="form-control" name="token" id="listenbrainz" placeholder="Insert auth token" maxlength="36" aria-label="ListenBrainz auth token" data-i18n-en="Insert auth token" data-i18n-zh="输入认证令牌" data-i18n-attr="placeholder">
+            <button class="btn btn-dark" type="submit" formaction="{% if request.user.id == user.id %}{{ url_for('frontend.listenbrainz_reg', uid = 'me') }}{% else %}{{ url_for('frontend.listenbrainz_reg', uid = user.id) }}{% endif %}"><span data-i18n-en="Link" data-i18n-zh="关联">Link</span></button>
           </div>
         </form>
         {% endif %}
@@ -142,7 +144,12 @@
       <div class="table-responsive">
         <table id="clients" class="table table-hover align-middle mb-0">
           <thead>
-            <tr><th>Client</th><th>Format</th><th>Max bitrate</th><th>Forget</th></tr>
+            <tr>
+              <th data-i18n-en="Client" data-i18n-zh="客户端">Client</th>
+              <th data-i18n-en="Format" data-i18n-zh="格式">Format</th>
+              <th data-i18n-en="Max bitrate" data-i18n-zh="最高码率">Max bitrate</th>
+              <th data-i18n-en="Forget" data-i18n-zh="忘记">Forget</th>
+            </tr>
           </thead>
           <tbody>
             {% for client in clients %}

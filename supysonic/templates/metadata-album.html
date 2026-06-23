@@ -1,7 +1,9 @@
 {% extends "layout.html" %}
 {% block title %}Album Metadata · Emosonic Server{% endblock %}
-{% block page_title %}Album metadata{% endblock %}
-{% block page_subtitle %}Inspect album artwork, review track lists, and edit album metadata from the Emosonic Server catalogue workspace.{% endblock %}
+{% block document_title_en %}Album Metadata · Emosonic Server{% endblock %}
+{% block document_title_zh %}专辑元数据 · Emosonic Server{% endblock %}
+{% block page_title %}<span data-i18n-en="Album metadata" data-i18n-zh="专辑元数据">Album metadata</span>{% endblock %}
+{% block page_subtitle %}<span data-i18n-en="Inspect album artwork, review track lists, and edit album metadata from the Emosonic Server catalogue workspace." data-i18n-zh="在 Emosonic Server 编目工作区中查看专辑封面、检查曲目列表并编辑专辑元数据。">Inspect album artwork, review track lists, and edit album metadata from the Emosonic Server catalogue workspace.</span>{% endblock %}
 {% block body %}
 <link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='css/metadata.css') }}">
 <script src="{{ url_for('static', filename='js/get_api.js') }}"></script>

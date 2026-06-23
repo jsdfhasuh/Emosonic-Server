@@ -6,30 +6,32 @@
 -#}
 {% extends "layout.html" %}
 {% block title %}Add Folder · Emosonic Server{% endblock %}
+{% block document_title_en %}Add Folder · Emosonic Server{% endblock %}
+{% block document_title_zh %}新增文件夹 · Emosonic Server{% endblock %}
 {% block navbar_folders %}
-<a class="nav-link active" aria-current="page" href="{{ url_for('frontend.folder_index') }}">Folders</a>
+<a class="nav-link active" aria-current="page" href="{{ url_for('frontend.folder_index') }}"><span data-i18n-en="Folders" data-i18n-zh="文件夹">Folders</span></a>
 {% endblock %}
-{% block page_title %}Add library source{% endblock %}
-{% block page_subtitle %}Register a new root folder so Emosonic Server can ingest, scan, and serve music from that filesystem path.{% endblock %}
+{% block page_title %}<span data-i18n-en="Add library source" data-i18n-zh="新增曲库来源">Add library source</span>{% endblock %}
+{% block page_subtitle %}<span data-i18n-en="Register a new root folder so Emosonic Server can ingest, scan, and serve music from that filesystem path." data-i18n-zh="登记新的根目录文件夹，让 Emosonic Server 从该路径导入、扫描并提供音乐。">Register a new root folder so Emosonic Server can ingest, scan, and serve music from that filesystem path.</span>{% endblock %}
 {% block body %}
 <div class="row justify-content-center">
   <div class="col-xl-8">
     <div class="card">
-      <div class="card-header">Folder registration</div>
+      <div class="card-header"><span data-i18n-en="Folder registration" data-i18n-zh="文件夹登记">Folder registration</span></div>
       <div class="card-body">
         <form method="post" class="d-flex flex-column gap-4">
           <div>
-            <label class="form-label" for="name">Folder name</label>
-            <input type="text" class="form-control" id="name" name="name" value="{{ request.form.name }}" placeholder="Display name for this library source">
+            <label class="form-label" for="name"><span data-i18n-en="Folder name" data-i18n-zh="文件夹名称">Folder name</span></label>
+            <input type="text" class="form-control" id="name" name="name" value="{{ request.form.name }}" placeholder="Display name for this library source" data-i18n-en="Display name for this library source" data-i18n-zh="这个曲库来源的显示名称" data-i18n-attr="placeholder">
           </div>
           <div>
-            <label class="form-label" for="path">Filesystem path</label>
-            <input type="text" class="form-control" id="path" name="path" value="{{ request.form.path }}" placeholder="Absolute path to the media root">
-            <div class="form-text">Use a path accessible by the server process.</div>
+            <label class="form-label" for="path"><span data-i18n-en="Filesystem path" data-i18n-zh="文件系统路径">Filesystem path</span></label>
+            <input type="text" class="form-control" id="path" name="path" value="{{ request.form.path }}" placeholder="Absolute path to the media root" data-i18n-en="Absolute path to the media root" data-i18n-zh="媒体根目录的绝对路径" data-i18n-attr="placeholder">
+            <div class="form-text" data-i18n-en="Use a path accessible by the server process." data-i18n-zh="请使用服务器进程可以访问的路径。">Use a path accessible by the server process.</div>
           </div>
           <div class="d-flex gap-2 justify-content-end">
-            <a href="{{ url_for('frontend.folder_index') }}" class="btn btn-outline-dark">Cancel</a>
-            <button class="btn btn-dark" type="submit">Add folder</button>
+            <a href="{{ url_for('frontend.folder_index') }}" class="btn btn-outline-dark"><span data-i18n-en="Cancel" data-i18n-zh="取消">Cancel</span></a>
+            <button class="btn btn-dark" type="submit"><span data-i18n-en="Add folder" data-i18n-zh="添加文件夹">Add folder</span></button>
           </div>
         </form>
       </div>

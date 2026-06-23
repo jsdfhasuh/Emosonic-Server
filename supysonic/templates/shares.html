@@ -1,15 +1,17 @@
 {% extends "layout.html" %}
 {% block title %}Shares · Emosonic Server{% endblock %}
+{% block document_title_en %}Shares · Emosonic Server{% endblock %}
+{% block document_title_zh %}分享 · Emosonic Server{% endblock %}
 {% block navbar_playlists %}
 <a class="nav-link active" aria-current="page" href="{{ url_for('frontend.playlist_index') }}"><span data-i18n-en="Playlists" data-i18n-zh="播放列表">Playlists</span></a>
 {% endblock %}
-{% block page_title %}Shared tracks{% endblock %}
-{% block page_subtitle %}Review public listening links you created, copy them again, or disable them when they are no longer needed.{% endblock %}
+{% block page_title %}<span data-i18n-en="Shared tracks" data-i18n-zh="已分享曲目">Shared tracks</span>{% endblock %}
+{% block page_subtitle %}<span data-i18n-en="Review public listening links you created, copy them again, or disable them when they are no longer needed." data-i18n-zh="查看你创建的公开收听链接，重新复制，或在不再需要时关闭它们。">Review public listening links you created, copy them again, or disable them when they are no longer needed.</span>{% endblock %}
 {% block body %}
 <div class="card console-section-spacer">
   <div class="card-header d-flex justify-content-between align-items-center">
-    <span>Share inventory</span>
-    <a href="{{ url_for('frontend.playlist_index') }}" class="btn btn-outline-dark btn-sm">Back to playlists</a>
+    <span data-i18n-en="Share inventory" data-i18n-zh="分享清单">Share inventory</span>
+    <a href="{{ url_for('frontend.playlist_index') }}" class="btn btn-outline-dark btn-sm"><span data-i18n-en="Back to playlists" data-i18n-zh="返回播放列表">Back to playlists</span></a>
   </div>
   <div class="card-body p-0">
     {% if links %}
@@ -17,11 +19,11 @@
       <table class="table table-hover align-middle mb-0">
         <thead>
           <tr>
-            <th>Track</th>
-            <th>Status</th>
-            <th>Created</th>
-            <th>Share URL</th>
-            <th class="text-end">Actions</th>
+            <th data-i18n-en="Track" data-i18n-zh="曲目">Track</th>
+            <th data-i18n-en="Status" data-i18n-zh="状态">Status</th>
+            <th data-i18n-en="Created" data-i18n-zh="创建时间">Created</th>
+            <th data-i18n-en="Share URL" data-i18n-zh="分享 URL">Share URL</th>
+            <th class="text-end" data-i18n-en="Actions" data-i18n-zh="操作">Actions</th>
           </tr>
         </thead>
         <tbody>
@@ -31,16 +33,16 @@
               <div class="console-table-title">{{ link.trackTitle }}</div>
               <small class="console-muted">{{ link.artistName }} - {{ link.albumName }}</small>
             </td>
-            <td><span class="console-status status-{{ 'playing' if link.enabled else 'paused' }}">{{ 'active' if link.enabled else 'disabled' }}</span></td>
+            <td><span class="console-status status-{{ 'playing' if link.enabled else 'paused' }}" data-i18n-en="{{ 'active' if link.enabled else 'disabled' }}" data-i18n-zh="{{ '启用' if link.enabled else '已停用' }}">{{ 'active' if link.enabled else 'disabled' }}</span></td>
             <td>{{ link.createdAt }}</td>
             <td>
               <input type="text" class="form-control" value="{{ link.shareUrl }}" readonly>
             </td>
             <td class="text-end">
               <div class="d-flex justify-content-end gap-2">
-                <button type="button" class="btn btn-outline-dark btn-sm copy-share-link" data-link="{{ link.shareUrl }}">Copy</button>
+                <button type="button" class="btn btn-outline-dark btn-sm copy-share-link" data-link="{{ link.shareUrl }}"><span data-i18n-en="Copy" data-i18n-zh="复制">Copy</span></button>
                 {% if link.enabled %}
-                <a href="{{ url_for('frontend.disable_track_share', token=link.token) }}" class="btn btn-outline-danger btn-sm">Disable</a>
+                <a href="{{ url_for('frontend.disable_track_share', token=link.token) }}" class="btn btn-outline-danger btn-sm"><span data-i18n-en="Disable" data-i18n-zh="停用">Disable</span></a>
                 {% endif %}
               </div>
             </td>
@@ -50,7 +52,7 @@
       </table>
     </div>
     {% else %}
-    <div class="p-4 text-body-secondary">You have not created any shared track links yet.</div>
+    <div class="p-4 text-body-secondary" data-i18n-en="You have not created any shared track links yet." data-i18n-zh="你还没有创建任何曲目分享链接。">You have not created any shared track links yet.</div>
     {% endif %}
   </div>
 </div>
@@ -72,6 +74,13 @@
   }
 
   document.querySelectorAll('.copy-share-link').forEach((button) => {
+    function setCopyButtonLabel(enText, zhText) {
+      const label = button.querySelector('[data-i18n-en][data-i18n-zh]') || button;
+      label.setAttribute('data-i18n-en', enText);
+      label.setAttribute('data-i18n-zh', zhText);
+      label.textContent = i18nText(enText, zhText);
+    }
+
     button.addEventListener('click', async () => {
       const link = button.dataset.link;
       const input = button.closest('tr').querySelector('input');
@@ -80,14 +89,14 @@
         if (!copied) {
           throw new Error('copy failed');
         }
-        button.textContent = 'Copied';
-        setTimeout(() => button.textContent = 'Copy', 1800);
+        setCopyButtonLabel('Copied', '已复制');
+        setTimeout(() => setCopyButtonLabel('Copy', '复制'), 1800);
       } catch (error) {
         input.focus();
         input.select();
         input.setSelectionRange(0, input.value.length);
-        button.textContent = 'Selected';
-        setTimeout(() => button.textContent = 'Copy', 1800);
+        setCopyButtonLabel('Selected', '已选中');
+        setTimeout(() => setCopyButtonLabel('Copy', '复制'), 1800);
       }
     });
   });
