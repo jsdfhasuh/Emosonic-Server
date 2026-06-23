@@ -6,6 +6,8 @@
 -#}
 {% extends "layout.html" %}
 {% block title %}Recommendations · Emosonic Server{% endblock %}
+{% block document_title_en %}Recommendations · Emosonic Server{% endblock %}
+{% block document_title_zh %}推荐 · Emosonic Server{% endblock %}
 {% block navbar_recommendations %}
 <a class="nav-link active" aria-current="page" href="{{ url_for('frontend.recommendation_index') }}"><span data-i18n-en="Recommendations" data-i18n-zh="推荐">Recommendations</span></a>
 {% endblock %}
@@ -97,47 +99,279 @@
     </div>
   </div>
   <div class="col-xl-4">
-    <div class="card h-100">
-      <div class="card-header"><span data-i18n-en="Recommendation context" data-i18n-zh="推荐上下文">Recommendation context</span></div>
-      <div class="card-body">
-        <ul class="console-info-list">
-          <li>
-            <span data-i18n-en="Owner" data-i18n-zh="所属用户">Owner</span>
-            <strong>{{ request.user.name }}</strong>
-          </li>
-          <li>
-            <span data-i18n-en="Source" data-i18n-zh="来源">Source</span>
-            <strong>
-              {% if summary.source == 'daily' %}
-              <span data-i18n-en="Daily playlist" data-i18n-zh="今日歌单">Daily playlist</span>
-              {% elif summary.source == 'latest' %}
-              <span data-i18n-en="Latest playlist" data-i18n-zh="最近歌单">Latest playlist</span>
-              {% else %}
-              <span data-i18n-en="Library fallback" data-i18n-zh="曲库兜底">Library fallback</span>
-              {% endif %}
-            </strong>
-          </li>
-          <li>
-            <span data-i18n-en="Albums" data-i18n-zh="专辑">Albums</span>
-            <strong>{{ summary.albumCount }}</strong>
-          </li>
-          <li>
-            <span data-i18n-en="Total duration" data-i18n-zh="总时长">Total duration</span>
-            <strong>{{ summary.totalDuration }}</strong>
-          </li>
-          <li>
-            <span data-i18n-en="Playlist" data-i18n-zh="歌单">Playlist</span>
-            <strong>{{ playlist.name if playlist else '-' }}</strong>
-          </li>
-          {% if playlist and playlist.created %}
-          <li>
-            <span data-i18n-en="Created" data-i18n-zh="创建时间">Created</span>
-            <strong>{{ playlist.created.strftime('%Y-%m-%d') }}</strong>
-          </li>
-          {% endif %}
-        </ul>
+    <div class="d-flex flex-column gap-3 h-100">
+      <div class="card">
+        <div class="card-header"><span data-i18n-en="Recommendation context" data-i18n-zh="推荐上下文">Recommendation context</span></div>
+        <div class="card-body">
+          <ul class="console-info-list">
+            <li>
+              <span data-i18n-en="Owner" data-i18n-zh="所属用户">Owner</span>
+              <strong>{{ request.user.name }}</strong>
+            </li>
+            <li>
+              <span data-i18n-en="Source" data-i18n-zh="来源">Source</span>
+              <strong>
+                {% if summary.source == 'daily' %}
+                <span data-i18n-en="Daily playlist" data-i18n-zh="今日歌单">Daily playlist</span>
+                {% elif summary.source == 'latest' %}
+                <span data-i18n-en="Latest playlist" data-i18n-zh="最近歌单">Latest playlist</span>
+                {% else %}
+                <span data-i18n-en="Library fallback" data-i18n-zh="曲库兜底">Library fallback</span>
+                {% endif %}
+              </strong>
+            </li>
+            <li>
+              <span data-i18n-en="Albums" data-i18n-zh="专辑">Albums</span>
+              <strong>{{ summary.albumCount }}</strong>
+            </li>
+            <li>
+              <span data-i18n-en="Total duration" data-i18n-zh="总时长">Total duration</span>
+              <strong>{{ summary.totalDuration }}</strong>
+            </li>
+            <li>
+              <span data-i18n-en="Playlist" data-i18n-zh="歌单">Playlist</span>
+              <strong>{{ playlist.name if playlist else '-' }}</strong>
+            </li>
+            {% if playlist and playlist.created %}
+            <li>
+              <span data-i18n-en="Created" data-i18n-zh="创建时间">Created</span>
+              <strong>{{ playlist.created.strftime('%Y-%m-%d') }}</strong>
+            </li>
+            {% endif %}
+          </ul>
+        </div>
+      </div>
+      <div class="card recommendation-agent-card" data-recommendation-agent data-agent-url="{{ url_for('frontend.recommendation_agent') }}">
+        <div class="card-header d-flex justify-content-between align-items-center gap-3">
+          <span data-i18n-en="Recommendation Agent" data-i18n-zh="推荐 Agent">Recommendation Agent</span>
+          <span class="console-chip" data-agent-status data-i18n-en="Loading" data-i18n-zh="加载中">Loading</span>
+        </div>
+        <div class="card-body">
+          <div class="recommendation-agent-insights">
+            <div>
+              <span class="recommendation-agent-label" data-i18n-en="Played most" data-i18n-zh="常听歌手">Played most</span>
+              <div class="recommendation-agent-chips" data-agent-top-artists></div>
+            </div>
+            <div>
+              <span class="recommendation-agent-label" data-i18n-en="Outside-library artists" data-i18n-zh="曲库外歌手">Outside-library artists</span>
+              <div class="recommendation-agent-chips" data-agent-recommended-artists></div>
+            </div>
+          </div>
+          <div class="recommendation-agent-messages" data-agent-messages aria-live="polite"></div>
+          <div class="recommendation-agent-prompts" data-agent-prompts></div>
+          <form class="recommendation-agent-form" data-agent-form>
+            <input class="form-control" data-agent-input type="text" maxlength="400" autocomplete="off" data-i18n-en="Ask the model for outside-library artists" data-i18n-zh="向大模型询问曲库外歌手" data-i18n-attr="placeholder, aria-label" placeholder="Ask the model for outside-library artists" aria-label="Ask the model for outside-library artists">
+            <button class="btn btn-dark" type="submit" data-i18n-en="Send" data-i18n-zh="发送">Send</button>
+          </form>
+        </div>
       </div>
     </div>
   </div>
 </div>
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+  const agentRoot = document.querySelector('[data-recommendation-agent]');
+  if (!agentRoot) {
+    return;
+  }
+
+  const agentUrl = agentRoot.getAttribute('data-agent-url');
+  const statusNode = agentRoot.querySelector('[data-agent-status]');
+  const messagesNode = agentRoot.querySelector('[data-agent-messages]');
+  const promptNode = agentRoot.querySelector('[data-agent-prompts]');
+  const topArtistsNode = agentRoot.querySelector('[data-agent-top-artists]');
+  const recommendedArtistsNode = agentRoot.querySelector('[data-agent-recommended-artists]');
+  const form = agentRoot.querySelector('[data-agent-form]');
+  const input = agentRoot.querySelector('[data-agent-input]');
+
+  function language() {
+    if (typeof getLanguage === 'function') {
+      return getLanguage();
+    }
+    return document.body.getAttribute('data-language') === 'zh' ? 'zh' : 'en';
+  }
+
+  function text(en, zh) {
+    return language() === 'zh' ? zh : en;
+  }
+
+  function setStatus(en, zh) {
+    statusNode.textContent = text(en, zh);
+  }
+
+  async function readResponsePayload(response) {
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      payload = null;
+    }
+
+    if (!response.ok || !payload || payload.ok === false) {
+      const message = payload && payload.error ? payload.error : `HTTP ${response.status}`;
+      throw new Error(message);
+    }
+
+    return payload;
+  }
+
+  function appendMessage(role, message) {
+    const node = document.createElement('div');
+    node.className = `recommendation-agent-message is-${role}`;
+    node.textContent = message;
+    messagesNode.appendChild(node);
+    messagesNode.scrollTop = messagesNode.scrollHeight;
+  }
+
+  function renderEmptyChip(container, en, zh) {
+    const chip = document.createElement('span');
+    chip.className = 'recommendation-agent-chip is-muted';
+    chip.textContent = text(en, zh);
+    container.appendChild(chip);
+  }
+
+  function renderArtistChips(container, artists, emptyEn, emptyZh) {
+    container.replaceChildren();
+    if (!artists || !artists.length) {
+      renderEmptyChip(container, emptyEn, emptyZh);
+      return;
+    }
+
+    artists.forEach(function (artist) {
+      const chip = document.createElement('span');
+      chip.className = 'recommendation-agent-chip';
+      const name = document.createElement('strong');
+      name.textContent = artist.name || '-';
+      chip.appendChild(name);
+
+      const meta = document.createElement('span');
+      if (artist.playCount) {
+        meta.textContent = text(`${artist.playCount} plays`, `${artist.playCount} 次`);
+      } else if (artist.trackCount) {
+        meta.textContent = text(`${artist.trackCount} tracks`, `${artist.trackCount} 首`);
+      } else if (Array.isArray(artist.genres) && artist.genres.length) {
+        meta.textContent = artist.genres.slice(0, 2).join(' / ');
+      }
+      if (meta.textContent) {
+        chip.appendChild(meta);
+      }
+      container.appendChild(chip);
+    });
+  }
+
+  function renderPrompts(prompts) {
+    promptNode.replaceChildren();
+    (prompts || []).forEach(function (prompt) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'recommendation-agent-prompt';
+      button.textContent = prompt;
+      button.addEventListener('click', function () {
+        sendMessage(prompt);
+      });
+      promptNode.appendChild(button);
+    });
+  }
+
+  function formatArtistReasons(artists) {
+    const artistsWithReasons = (artists || []).filter(function (artist) {
+      return artist && artist.name && artist.reason;
+    });
+    if (!artistsWithReasons.length) {
+      return '';
+    }
+
+    const lines = artistsWithReasons.map(function (artist) {
+      return `- ${artist.name}: ${artist.reason}`;
+    });
+    return text('Reasons:', '推荐理由：') + '\n' + lines.join('\n');
+  }
+
+  function renderPayload(payload, resetMessages) {
+    const history = payload.history || {};
+    renderArtistChips(
+      topArtistsNode,
+      history.topArtists || [],
+      'No play history',
+      '暂无播放记录'
+    );
+    renderArtistChips(
+      recommendedArtistsNode,
+      payload.recommendedArtists || [],
+      'No artist leads',
+      '暂无推荐歌手'
+    );
+    renderPrompts(payload.suggestedPrompts || []);
+    if (resetMessages) {
+      messagesNode.replaceChildren();
+    }
+    const reasonText = formatArtistReasons(payload.recommendedArtists || []);
+    appendMessage('agent', reasonText ? `${payload.reply}\n${reasonText}` : payload.reply);
+  }
+
+  async function loadAgent() {
+    setStatus('Loading', '加载中');
+    try {
+      const response = await fetch(`${agentUrl}?lang=${encodeURIComponent(language())}`, {
+        credentials: 'same-origin'
+      });
+      const payload = await readResponsePayload(response);
+      renderPayload(payload, true);
+      setStatus('Ready', '就绪');
+    } catch (error) {
+      messagesNode.replaceChildren();
+      appendMessage('agent', error.message || text('Recommendation model is unavailable.', '推荐大模型不可用。'));
+      setStatus('Model unavailable', '模型不可用');
+    }
+  }
+
+  async function sendMessage(message) {
+    const trimmed = String(message || '').trim();
+    if (!trimmed) {
+      return;
+    }
+
+    appendMessage('user', trimmed);
+    input.value = '';
+    input.disabled = true;
+    setStatus('Thinking', '思考中');
+
+    try {
+      const response = await fetch(agentUrl, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          language: language(),
+          message: trimmed
+        })
+      });
+      const payload = await readResponsePayload(response);
+      renderPayload(payload, false);
+      setStatus('Ready', '就绪');
+    } catch (error) {
+      appendMessage('agent', error.message || text('Recommendation model is unavailable.', '推荐大模型不可用。'));
+      setStatus('Model unavailable', '模型不可用');
+    } finally {
+      input.disabled = false;
+      input.focus();
+    }
+  }
+
+  form.addEventListener('submit', function (event) {
+    event.preventDefault();
+    sendMessage(input.value);
+  });
+
+  document.querySelectorAll('[data-language-toggle]').forEach(function (button) {
+    button.addEventListener('click', function () {
+      window.setTimeout(loadAgent, 0);
+    });
+  });
+
+  loadAgent();
+});
+</script>
 {% endblock %}

@@ -90,6 +90,16 @@ class DefaultConfig:
     LASTFM = {"api_key": None, "secret": None}
     LISTENBRAINZ = {"api_url": "https://api.listenbrainz.org"}
     SPOTIFY = {"client_id": None, "client_secret": None}
+    RECOMMENDATION_AGENT = {
+        "enabled": False,
+        "api_base_url": "https://api.openai.com/v1",
+        "api_key": "",
+        "model": "",
+        "timeout_seconds": 20,
+        "history_limit": 200,
+        "max_output_tokens": 900,
+        "temperature": 0.7,
+    }
     TRANSCODING = {}
     MIMETYPES = {}
 

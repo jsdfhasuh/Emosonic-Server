@@ -39,6 +39,7 @@ from ..db import (
     EmoPlaybackState,
     EmoSessionQueue,
     Track,
+    User,
     random,
 )
 from ..api.media import _get_cover_path
@@ -55,6 +56,13 @@ from ..recommendation_feedback import (
     HOT_RECOMMENDED_SCOPE,
     filter_disliked_recommended_tracks,
     get_disliked_recommended_song_ids,
+)
+from ..recommendation_agent import (
+    RecommendationAgentError,
+    get_default_agent_message,
+    get_recommendation_agent_language,
+    get_recommendation_agent_prompts,
+    request_recommendation_agent,
 )
 
 logger = logging.getLogger(__name__)
@@ -487,6 +495,45 @@ def recommendation_index():
         _get_recommendation_count(),
     )
     return render_template("recommendations.html", **context)
+
+
+@frontend.route("/recommendations/agent", methods=["GET", "POST"])
+@login_only
+def recommendation_agent():
+    raw_data = {}
+    if request.method == "POST":
+        raw_data = request.get_json(silent=True) or {}
+
+    raw_language = raw_data.get("language") or request.args.get("lang") or "en"
+    language = get_recommendation_agent_language(str(raw_language))
+    message = str(raw_data.get("message") or "").strip()[:400]
+    if not message:
+        message = get_default_agent_message(language)
+
+    context = _build_recommendation_context(
+        request.user,
+        _get_recommendation_count(),
+    )
+    try:
+        payload = request_recommendation_agent(
+            current_app.config.get("RECOMMENDATION_AGENT", {}),
+            request.user,
+            message,
+            language,
+            context["tracks"],
+            context["summary"],
+        )
+    except RecommendationAgentError as exc:
+        return jsonify(
+            {
+                "ok": False,
+                "error": str(exc),
+                "errorCode": exc.error_code,
+            }
+        ), exc.status_code
+
+    payload["suggestedPrompts"] = get_recommendation_agent_prompts(language)
+    return jsonify(payload)
 
 
 @frontend.route("/devices")

@@ -157,6 +157,33 @@ log_rotate = yes
 ; Defaults: https://api.listenbrainz.org/
 ;api_url =
 
+[recommendation_agent]
+; OpenAI-compatible model endpoint for the recommendation page Agent.
+; Disabled unless enabled, api_key, and model are set.
+enabled = off
+
+; Defaults: https://api.openai.com/v1
+api_base_url = https://api.openai.com/v1
+
+; API key for the OpenAI-compatible provider. Do not commit real keys.
+api_key =
+
+; Model name sent to /chat/completions.
+model =
+
+; Request timeout in seconds. Default: 20
+timeout_seconds = 20
+
+; Recent user play records sent to the model. Default: 200
+history_limit = 200
+
+; Maximum model output tokens. Set to 0 to omit max_tokens and let the
+; provider use its model limit. Default: 900
+max_output_tokens = 900
+
+; Model temperature. Default: 0.7
+temperature = 0.7
+
 [transcoding]
 ; Programs used to convert from one format/bitrate to another. Defaults: none
 transcoder_mp3_mp3 = lame --quiet --mp3input -b %outrate %srcpath -
