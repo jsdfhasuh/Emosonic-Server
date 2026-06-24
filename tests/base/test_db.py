@@ -356,6 +356,42 @@ class DbTestCase(unittest.TestCase):
         self.create_track_in(child, root, artist=artist, album=kept_album)
         db.AlbumArtist.create(album_id=orphan_album, artist_id=collaborator)
         db.StarredAlbum.create(user=user, starred=orphan_album)
+        db.Image.create(
+            image_type="album",
+            related_id=kept_album.id,
+            path="/tmp/kept-album-cover.jpg",
+        )
+        db.Image.create(
+            image_type="album",
+            related_id=orphan_album.id,
+            path="/tmp/orphan-album-cover.jpg",
+        )
+        db.Image.create(
+            image_type="artist",
+            related_id=orphan_album.id,
+            path="/tmp/artist-image.jpg",
+        )
+        db.ReviewTask.create(
+            entity_type="album",
+            entity_id=str(kept_album.id),
+            task_type="metadata_review",
+            status="pending",
+            reason="new_album",
+        )
+        db.ReviewTask.create(
+            entity_type="album",
+            entity_id=str(orphan_album.id),
+            task_type="metadata_review",
+            status="pending",
+            reason="new_album",
+        )
+        db.ReviewTask.create(
+            entity_type="album",
+            entity_id=str(orphan_album.id),
+            task_type="metadata_review",
+            status="confirmed",
+            reason="new_album",
+        )
 
         deleted_albums = db.Album.prune()
 
@@ -366,6 +402,43 @@ class DbTestCase(unittest.TestCase):
         )
         self.assertFalse(db.StarredAlbum.select().exists())
         self.assertFalse(db.AlbumArtist.select().exists())
+        self.assertTrue(
+            db.Image.select()
+            .where(db.Image.path == "/tmp/kept-album-cover.jpg")
+            .exists()
+        )
+        self.assertFalse(
+            db.Image.select()
+            .where(db.Image.path == "/tmp/orphan-album-cover.jpg")
+            .exists()
+        )
+        self.assertTrue(
+            db.Image.select().where(db.Image.path == "/tmp/artist-image.jpg").exists()
+        )
+        self.assertTrue(
+            db.ReviewTask.select()
+            .where(
+                db.ReviewTask.entity_id == str(kept_album.id),
+                db.ReviewTask.status == "pending",
+            )
+            .exists()
+        )
+        self.assertFalse(
+            db.ReviewTask.select()
+            .where(
+                db.ReviewTask.entity_id == str(orphan_album.id),
+                db.ReviewTask.status == "pending",
+            )
+            .exists()
+        )
+        self.assertTrue(
+            db.ReviewTask.select()
+            .where(
+                db.ReviewTask.entity_id == str(orphan_album.id),
+                db.ReviewTask.status == "confirmed",
+            )
+            .exists()
+        )
 
     def test_artist_prune_cleans_orphan_annotations(self):
         kept_artist = db.Artist.create(name="Kept Artist")

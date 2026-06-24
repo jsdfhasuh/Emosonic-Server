@@ -68,6 +68,7 @@ def runScanner(scanner: Scanner, logger: logging.Logger) -> None:
         pruneLibrary(scanner)
         logger.info(format_log_event("scanner", "repair_start"))
         scanner.find_lost_information()
+        pruneLibrary(scanner)
         created_review_tasks = createReviewTasks(scanner)
         logger.info(
             format_log_event("scanner", "review_tasks_created", count=created_review_tasks)

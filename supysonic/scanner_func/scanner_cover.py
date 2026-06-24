@@ -139,10 +139,13 @@ def repairAlbumCover(
     logger: Optional[logging.Logger] = None,
 ) -> None:
     trace_logger = logger or module_logger
-    trace_details = []
-    track = Track.select().where(Track.album == album.id).first()
-    scanner.stats().lost_covers_albums[album.name] = os.path.dirname(track.path) if track else ""
-    if track is None:
+    tracks = list(
+        Track.select()
+        .where(Track.album == album.id)
+        .order_by(Track.disc, Track.number, Track.path)
+    )
+    scanner.stats().lost_covers_albums[album.name] = os.path.dirname(tracks[0].path) if tracks else ""
+    if not tracks:
         logTrace(
             trace_logger,
             "ALBUM_COVER_TRACE",
@@ -151,13 +154,37 @@ def repairAlbumCover(
         )
         return
 
+    track = None
+    cover_file = None
+    trace_details = []
+    trace_header = {"album": album.name}
+    for candidate in tracks:
+        track_dir = os.path.dirname(candidate.path)
+        scanner.stats().lost_covers_albums[album.name] = track_dir
+        trace_header = {"album": album.name, "track_path": candidate.path}
+        try:
+            cover_file = find_cover_in_folder(path=track_dir, album_name=album.name)
+        except ValueError:
+            scanner.remove_file(candidate.path)
+            logTrace(
+                trace_logger,
+                "ALBUM_COVER_TRACE",
+                trace_header,
+                [
+                    "folder cover lookup: invalid path",
+                    "stale track path removed",
+                    "cover repair result: invalid track path",
+                ],
+            )
+            continue
+
+        track = candidate
+        break
+
+    if track is None:
+        return
+
     track_dir = os.path.dirname(track.path)
-    trace_header = {"album": album.name, "track_path": track.path}
-    try:
-        cover_file = find_cover_in_folder(path=track_dir, album_name=album.name)
-    except ValueError:
-        cover_file = None
-        trace_details.append("folder cover lookup: miss")
 
     if cover_file:
         image_path = os.path.join(track_dir, cover_file.name)

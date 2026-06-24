@@ -260,11 +260,24 @@ class Album(_Model):
     @classmethod
     def prune(cls):
         from .annotations import delete_orphaned_album_annotations
+        from .review_tasks import ReviewTask
 
-        albums = Track.select(Track.album)
-        delete_orphaned_album_annotations(albums)
-        AlbumArtist.delete().where(AlbumArtist.album_id.not_in(albums)).execute()
-        return cls.delete().where(cls.id.not_in(albums)).execute()
+        album_ids = [
+            album_id for (album_id,) in Track.select(Track.album).distinct().tuples()
+        ]
+        album_id_strings = [str(album_id) for album_id in album_ids]
+        delete_orphaned_album_annotations(album_ids)
+        AlbumArtist.delete().where(AlbumArtist.album_id.not_in(album_ids)).execute()
+        Image.delete().where(
+            Image.image_type == "album",
+            Image.related_id.not_in(album_id_strings),
+        ).execute()
+        ReviewTask.delete().where(
+            ReviewTask.entity_type == "album",
+            ReviewTask.status == "pending",
+            ReviewTask.entity_id.not_in(album_id_strings),
+        ).execute()
+        return cls.delete().where(cls.id.not_in(album_ids)).execute()
 
 
 class AlbumArtist(_Model):

@@ -436,11 +436,27 @@ class ScannerHelpersTestCase(unittest.TestCase):
             scanner_runtime, "createReviewTasks"
         ) as create_review_tasks:
             folder_model.get.return_value = "folder-row"
-            create_review_tasks.return_value = 3
+            prune_library.side_effect = lambda scanner: calls.append(("pruneLibrary", None))
+            create_review_tasks.side_effect = lambda scanner: (
+                calls.append(("createReviewTasks", None)) or 3
+            )
 
             scanner_runtime.runScanner(fake_scanner, fake_logger)
 
-        prune_library.assert_called_once_with(fake_scanner)
+        self.assertEqual(
+            calls,
+            [
+                ("scan_folder", "folder-row"),
+                ("decideAllPositions", None),
+                ("pruneLibrary", None),
+                ("find_lost_information", None),
+                ("pruneLibrary", None),
+                ("createReviewTasks", None),
+                ("handle_done", None),
+            ],
+        )
+        self.assertEqual(prune_library.call_count, 2)
+        prune_library.assert_any_call(fake_scanner)
         create_review_tasks.assert_called_once_with(fake_scanner)
         fake_logger.info.assert_any_call(
             "scanner event=run_start force=false follow_symlinks=false",
