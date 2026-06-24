@@ -246,6 +246,7 @@ class ScannerProcessingQueue(Thread):
                     scanner.prune()
                     logger.info("Beginging cover scan")
                     scanner.find_lost_information()
+                    scanner.prune()
                     createReviewTasks(scanner)
                     logger.info("Cover scan finished")
                     find_lost_information_flag = False
@@ -293,10 +294,13 @@ class ScannerProcessingQueue(Thread):
         if item.operation & OP_MOVE:
             logger.info("Moving: '%s' -> '%s'", item.src_path, item.path)
             scanner.move_file(item.src_path, item.path)
+            scanner.find_cover(os.path.dirname(item.src_path))
+            scanner.find_cover(os.path.dirname(item.path))
 
         if item.operation & OP_SCAN:
             logger.info("Scanning: '%s'", item.path)
             scanner.scan_file(item.path)
+            scanner.find_cover(os.path.dirname(item.path))
 
         if item.operation & OP_REMOVE:
             logger.info("Removing: '%s'", item.path)

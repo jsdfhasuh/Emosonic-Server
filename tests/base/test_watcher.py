@@ -14,7 +14,7 @@ import unittest
 
 from hashlib import sha1
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 from supysonic.db import Album, AlbumReviewTask, init_database, release_database, Track, Artist, Folder, Image
 from supysonic.managers.folder import FolderManager
@@ -24,6 +24,7 @@ from supysonic.watcher import (
     OP_MOVE,
     OP_REMOVE,
     OP_SCAN,
+    ScannerProcessingQueue,
     SupysonicWatcher,
 )
 
@@ -494,6 +495,28 @@ class CoverWatcherTestCase(WatcherTestCase):
         self.assertEqual(Folder.select().first().cover_art, os.path.basename(path))
         self.assertAlbumCoverImageEqual(path)
 
+    def test_add_cover_then_file_in_new_folder_syncs_cover(self):
+        self._stop()
+        dirpath = os.path.join(self._rootdir(), self._tempname())
+        os.makedirs(dirpath)
+        cover_path = os.path.join(dirpath, "cover.jpg")
+        shutil.copyfile("tests/assets/cover.jpg", cover_path)
+
+        self._start()
+        audio_path = os.path.join(dirpath, self._tempname() + ".mp3")
+        shutil.copyfile("tests/assets/folder/silence.mp3", audio_path)
+
+        self.assertTrue(
+            self._wait_until(
+                lambda: Folder.select()
+                .where(Folder.path == dirpath, Folder.cover_art == "cover.jpg")
+                .exists()
+                and Image.select().where(Image.path == cover_path).exists()
+            )
+        )
+        self.assertEqual(Folder.get(Folder.path == dirpath).cover_art, "cover.jpg")
+        self.assertAlbumCoverImageEqual(cover_path)
+
     def test_remove_cover(self):
         self._addfile()
         path = self._addcover()
@@ -567,6 +590,52 @@ class CoverWatcherTestCase(WatcherTestCase):
         self._sleep()
 
 
+class RegularItemCoverRefreshTestCase(unittest.TestCase):
+    @staticmethod
+    def _scanner():
+        return SimpleNamespace(
+            find_cover=Mock(),
+            move_file=Mock(),
+            remove_file=Mock(),
+            scan_file=Mock(),
+        )
+
+    def test_regular_scan_refreshes_parent_cover(self):
+        scanner = self._scanner()
+        item = SimpleNamespace(
+            operation=OP_SCAN,
+            path="/music/Album/track.flac",
+            src_path=None,
+        )
+
+        ScannerProcessingQueue(0)._ScannerProcessingQueue__process_regular_item(
+            scanner, item
+        )
+
+        scanner.scan_file.assert_called_once_with("/music/Album/track.flac")
+        scanner.find_cover.assert_called_once_with("/music/Album")
+
+    def test_regular_move_refreshes_source_and_destination_parent_covers(self):
+        scanner = self._scanner()
+        item = SimpleNamespace(
+            operation=OP_MOVE,
+            path="/music/New Album/track.flac",
+            src_path="/music/Old Album/track.flac",
+        )
+
+        ScannerProcessingQueue(0)._ScannerProcessingQueue__process_regular_item(
+            scanner, item
+        )
+
+        scanner.move_file.assert_called_once_with(
+            "/music/Old Album/track.flac",
+            "/music/New Album/track.flac",
+        )
+        scanner.find_cover.assert_has_calls(
+            [call("/music/Old Album"), call("/music/New Album")]
+        )
+
+
 class DummyObserver:
     def __init__(self):
         self._alive = False
@@ -605,11 +674,13 @@ class ReviewTaskWatcherTestCase(WatcherTestBase):
     def test_regular_scan_batch_creates_pending_review_task(self):
         artist = Artist.create(name="Review Artist")
         album = Album.create(name="Review Album", artist=artist, year="2024")
+        prune = Mock()
         fake_scanner = SimpleNamespace(
             review_task_album_ids={album.id},
             scan_file=lambda path: None,
+            find_cover=lambda path: None,
             find_lost_information=lambda: None,
-            prune=lambda: None,
+            prune=prune,
             stats=lambda: SimpleNamespace(
                 lost_covers=SimpleNamespace(artists=0, albums=0),
                 lost_covers_albums={},
@@ -630,6 +701,7 @@ class ReviewTaskWatcherTestCase(WatcherTestBase):
         task = AlbumReviewTask.get()
         self.assertEqual(task.status, "pending")
         self.assertEqual(task.album_id, album.id)
+        self.assertEqual(prune.call_count, 3)
 
 
 if __name__ == "__main__":
