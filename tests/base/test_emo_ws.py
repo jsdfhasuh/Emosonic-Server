@@ -46,6 +46,39 @@ class EmoWebSocketTestCase(unittest.TestCase):
     os.close(self.__db[0])
     os.remove(self.__db[1])
 
+  def connect_authenticated_client(self, user_name, password, request_id="auth-1"):
+    client = socketio.test_client(self.app, namespace="/emo", flask_test_client=self.http_client)
+    self.clients.append(client)
+
+    client.emit(
+      "message",
+      {
+        "type": "auth",
+        "action": "auth.login",
+        "requestId": request_id,
+        "payload": {"u": user_name, "p": password},
+      },
+      namespace="/emo",
+    )
+    auth_messages = self.get_messages(client)
+    self.assertTrue(
+      any(message["action"] == "system.ack" and message["requestId"] == request_id for message in auth_messages)
+    )
+    return client
+
+  def register_device(self, client, request_id, payload):
+    client.emit(
+      "message",
+      {
+        "type": "device",
+        "action": "device.register",
+        "requestId": request_id,
+        "payload": payload,
+      },
+      namespace="/emo",
+    )
+    return self.get_messages(client)
+
   def connect_device(self, user_name, password, client_id, session_id, roles):
     client = socketio.test_client(self.app, namespace="/emo", flask_test_client=self.http_client)
     self.clients.append(client)
@@ -106,6 +139,80 @@ class EmoWebSocketTestCase(unittest.TestCase):
       },
       namespace="/emo",
     )
+
+  def test_device_register_keeps_alias_in_device_list(self):
+    client = self.connect_authenticated_client("alice", "Alic3", "auth-player-1")
+    alias = "\u5ba2\u5385\u64ad\u653e\u5668"
+
+    messages = self.register_device(
+      client,
+      "register-player-1",
+      {
+        "clientId": "player-1",
+        "deviceName": "Windows Player",
+        "alias": alias,
+        "roles": ["player"],
+        "sessionId": "sess-main",
+      },
+    )
+
+    ack = next(message for message in messages if message["action"] == "system.ack")
+    self.assertEqual(ack["payload"]["client"]["alias"], alias)
+
+    device_list = next(message for message in messages if message["action"] == "device.list")
+    device = next(device for device in device_list["payload"]["devices"] if device["clientId"] == "player-1")
+    self.assertEqual(device["alias"], alias)
+
+  def test_device_register_alias_falls_back_to_device_name(self):
+    client = self.connect_authenticated_client("alice", "Alic3", "auth-player-1")
+
+    messages = self.register_device(
+      client,
+      "register-player-1",
+      {
+        "clientId": "player-1",
+        "deviceName": "Living Room Player",
+        "roles": ["player"],
+        "sessionId": "sess-main",
+      },
+    )
+
+    ack = next(message for message in messages if message["action"] == "system.ack")
+    self.assertEqual(ack["payload"]["client"]["alias"], "Living Room Player")
+
+  def test_device_register_alias_falls_back_to_client_id(self):
+    client = self.connect_authenticated_client("alice", "Alic3", "auth-player-1")
+
+    messages = self.register_device(
+      client,
+      "register-player-1",
+      {
+        "clientId": "player-1",
+        "roles": ["player"],
+        "sessionId": "sess-main",
+      },
+    )
+
+    ack = next(message for message in messages if message["action"] == "system.ack")
+    self.assertEqual(ack["payload"]["client"]["alias"], "player-1")
+
+  def test_device_register_rejects_non_string_alias(self):
+    client = self.connect_authenticated_client("alice", "Alic3", "auth-player-1")
+
+    messages = self.register_device(
+      client,
+      "register-player-1",
+      {
+        "clientId": "player-1",
+        "alias": 123,
+        "roles": ["player"],
+        "sessionId": "sess-main",
+      },
+    )
+
+    error = next(message for message in messages if message["action"] == "system.error")
+    self.assertEqual(error["requestId"], "register-player-1")
+    self.assertEqual(error["payload"]["code"], "bad_request")
 
   def test_system_ping_refreshes_registered_client_last_seen(self):
     client = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"])

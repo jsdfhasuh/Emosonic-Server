@@ -348,12 +348,26 @@ def _register_device(sid, user_name, payload):
     if not isinstance(roles, list):
         raise ValueError("roles must be a list")
 
+    device_name = payload.get("deviceName") or client_id
+
+    alias = payload.get("alias")
+    if alias is None:
+        alias = payload.get("deviceAlias")
+    if alias is None:
+        alias = device_name
+
+    if not isinstance(alias, str):
+        raise ValueError("alias must be a string")
+
+    alias = alias.strip() or device_name
+
     return state.register_client(
         sid,
         client_id,
         {
             "userName": user_name,
-            "deviceName": payload.get("deviceName") or client_id,
+            "deviceName": device_name,
+            "alias": alias,
             "roles": roles,
             "sessionId": payload.get("sessionId") or client_id,
             "capabilities": payload.get("capabilities") or {},
