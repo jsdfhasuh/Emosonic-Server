@@ -861,22 +861,137 @@ body[data-bs-theme="dark"] code {
   font-size: 0.96rem;
 }
 
+.recommendation-workspace {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.recommendation-workspace .card,
+.recommendation-summary-item {
+  border: 1px solid var(--console-border);
+  border-radius: 8px;
+  background: var(--console-surface-strong);
+  box-shadow: none;
+}
+
+.recommendation-summary-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.recommendation-summary-item {
+  min-width: 0;
+  padding: 0.75rem 0.85rem;
+}
+
+.recommendation-summary-item strong,
+.recommendation-summary-item span {
+  display: block;
+}
+
+.recommendation-summary-item strong {
+  margin: 0.18rem 0;
+  font-size: 1.1rem;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+.recommendation-summary-label,
+.recommendation-summary-item > span:last-child {
+  color: var(--console-muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.recommendation-tabs {
+  border-bottom: 1px solid var(--console-border);
+  gap: 0.25rem;
+}
+
+.recommendation-tabs .nav-link {
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  color: var(--console-muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  padding: 0.75rem 1rem;
+  text-transform: uppercase;
+}
+
+.recommendation-tabs .nav-link:hover,
+.recommendation-tabs .nav-link:focus {
+  border-bottom-color: var(--console-border-strong);
+  color: var(--console-text);
+}
+
+.recommendation-tabs .nav-link.active {
+  border-bottom-color: var(--console-brand);
+  color: var(--console-brand);
+  background: transparent;
+}
+
+.recommendation-tab-content {
+  min-height: 560px;
+}
+
+.recommendation-agent-workspace {
+  min-height: 680px;
+}
+
 .recommendation-agent-card .card-body {
   display: flex;
   flex-direction: column;
   gap: 1rem;
 }
 
-.recommendation-agent-insights {
-  display: grid;
-  gap: 0.85rem;
+.recommendation-agent-header,
+.recommendation-track-header,
+.recommendation-agent-actions,
+.recommendation-pagination {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
 }
 
-.recommendation-agent-label {
+.recommendation-agent-header,
+.recommendation-track-header {
+  justify-content: space-between;
+}
+
+.recommendation-agent-header small,
+.recommendation-track-header small {
   display: block;
-  margin-bottom: 0.4rem;
+  margin-top: 0.2rem;
   color: var(--console-muted);
   font-size: 0.78rem;
+  font-weight: 500;
+}
+
+.recommendation-agent-insights {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.recommendation-agent-insight {
+  min-width: 0;
+  border: 1px solid var(--console-border);
+  border-radius: 8px;
+  padding: 0.75rem;
+}
+
+.recommendation-agent-label,
+.recommendation-agent-section-head {
+  display: block;
+  margin-bottom: 0.45rem;
+  color: var(--console-muted);
+  font-size: 0.76rem;
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -937,20 +1052,28 @@ body[data-bs-theme="dark"] code {
   display: flex;
   flex-direction: column;
   gap: 0.65rem;
-  max-height: 300px;
+  max-height: min(58vh, 620px);
   overflow: auto;
   padding: 0.15rem 0.25rem 0.15rem 0;
 }
 
 .recommendation-agent-message {
-  max-width: 92%;
+  max-width: 86%;
   padding: 0.72rem 0.85rem;
   border: 1px solid var(--console-border);
-  border-radius: 16px;
+  border-radius: 8px;
   font-size: 0.9rem;
   line-height: 1.45;
   overflow-wrap: anywhere;
+}
+
+.recommendation-agent-message-text {
   white-space: pre-line;
+}
+
+.recommendation-agent-message.has-artist-cards {
+  max-width: 100%;
+  width: 100%;
 }
 
 .recommendation-agent-message.is-agent {
@@ -964,21 +1087,116 @@ body[data-bs-theme="dark"] code {
   border-color: var(--console-border-strong);
 }
 
+.recommendation-agent-artist-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.75rem;
+}
+
+.recommendation-agent-artist-grid.is-inline {
+  margin-top: 0.8rem;
+}
+
+.recommendation-agent-artist-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  min-height: 178px;
+  border: 1px solid var(--console-border);
+  border-radius: 8px;
+  padding: 0.85rem;
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.recommendation-agent-message.has-artist-cards .recommendation-agent-artist-card {
+  background: rgba(255, 255, 255, 0.36);
+}
+
+.recommendation-agent-artist-head {
+  display: grid;
+  gap: 0.18rem;
+}
+
+.recommendation-agent-artist-head h3 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 700;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+.recommendation-agent-artist-head span,
+.recommendation-agent-artist-label {
+  color: var(--console-muted);
+  font-size: 0.74rem;
+}
+
+.recommendation-agent-artist-reason,
+.recommendation-agent-artist-starters {
+  margin: 0;
+  font-size: 0.84rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.recommendation-agent-artist-reason {
+  flex: 1;
+  border-left: 2px solid var(--console-brand);
+  padding-left: 0.65rem;
+}
+
+.recommendation-agent-artist-label {
+  margin-top: auto;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.recommendation-agent-artist-starters {
+  color: var(--console-brand);
+  font-family: "Consolas", "SFMono-Regular", monospace;
+  font-size: 0.78rem;
+}
+
+.recommendation-agent-empty {
+  grid-column: 1 / -1;
+  border: 1px dashed var(--console-border-strong);
+  border-radius: 8px;
+  color: var(--console-muted);
+  padding: 1rem;
+  text-align: center;
+}
+
 .recommendation-agent-form {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 0.55rem;
 }
 
+.recommendation-track-table > :not(caption) > * > * {
+  padding: 0.68rem 0.75rem;
+}
+
+.recommendation-track-table .console-chip {
+  min-width: 2.1rem;
+  justify-content: center;
+}
+
 body[data-bs-theme="dark"] .recommendation-agent-chip,
 body[data-bs-theme="dark"] .recommendation-agent-prompt,
-body[data-bs-theme="dark"] .recommendation-agent-message.is-user {
+body[data-bs-theme="dark"] .recommendation-agent-message.is-user,
+body[data-bs-theme="dark"] .recommendation-agent-artist-card {
   background: rgba(255, 255, 255, 0.06);
 }
 
 @media (max-width: 991.98px) {
   body {
     padding-top: 78px;
+  }
+
+  .recommendation-summary-strip,
+  .recommendation-agent-insights {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .console-toolbar {
@@ -1006,6 +1224,28 @@ body[data-bs-theme="dark"] .recommendation-agent-message.is-user {
 @media (max-width: 767.98px) {
   .console-hero {
     padding-bottom: 1.25rem;
+  }
+
+  .recommendation-summary-strip,
+  .recommendation-agent-insights,
+  .recommendation-agent-artist-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .recommendation-agent-header,
+  .recommendation-track-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .recommendation-agent-actions,
+  .recommendation-pagination {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .recommendation-agent-message {
+    max-width: 100%;
   }
 
   .console-title {

@@ -16,12 +16,15 @@ from flask import (
     abort,
     current_app,
     flash,
+    g,
     jsonify,
     redirect,
     request,
+    Response,
     render_template,
     send_file,
     session,
+    stream_with_context,
     url_for,
 )
 from PIL import Image
@@ -63,6 +66,7 @@ from ..recommendation_agent import (
     get_recommendation_agent_language,
     get_recommendation_agent_prompts,
     request_recommendation_agent,
+    stream_recommendation_agent,
 )
 
 logger = logging.getLogger(__name__)
@@ -500,15 +504,8 @@ def recommendation_index():
 @frontend.route("/recommendations/agent", methods=["GET", "POST"])
 @login_only
 def recommendation_agent():
-    raw_data = {}
-    if request.method == "POST":
-        raw_data = request.get_json(silent=True) or {}
-
-    raw_language = raw_data.get("language") or request.args.get("lang") or "en"
-    language = get_recommendation_agent_language(str(raw_language))
-    message = str(raw_data.get("message") or "").strip()[:400]
-    if not message:
-        message = get_default_agent_message(language)
+    request_id = getattr(g, "supysonic_request_id", None)
+    language, message, previous_recommended_artists = _recommendation_agent_request_values()
 
     context = _build_recommendation_context(
         request.user,
@@ -522,18 +519,156 @@ def recommendation_agent():
             language,
             context["tracks"],
             context["summary"],
+            previous_recommended_artists,
         )
     except RecommendationAgentError as exc:
+        error_payload = {
+            "ok": False,
+            "error": str(exc),
+            "errorCode": exc.error_code,
+            "requestId": request_id,
+        }
+        if getattr(exc, "details", None):
+            error_payload["details"] = exc.details
+        logger.warning(
+            "recommendation_agent_error request_id=%s method=%s user=%s error_code=%s details=%s",
+            request_id,
+            request.method,
+            getattr(request.user, "name", "-"),
+            exc.error_code,
+            getattr(exc, "details", {}),
+        )
         return jsonify(
-            {
-                "ok": False,
-                "error": str(exc),
-                "errorCode": exc.error_code,
-            }
+            error_payload
         ), exc.status_code
 
+    payload["requestId"] = request_id
     payload["suggestedPrompts"] = get_recommendation_agent_prompts(language)
     return jsonify(payload)
+
+
+def _recommendation_agent_error_payload(exc, request_id):
+    error_payload = {
+        "ok": False,
+        "error": str(exc),
+        "errorCode": exc.error_code,
+        "requestId": request_id,
+    }
+    if getattr(exc, "details", None):
+        error_payload["details"] = exc.details
+    return error_payload
+
+
+def _recommendation_agent_request_values():
+    raw_data = {}
+    if request.method == "POST":
+        raw_data = request.get_json(silent=True) or {}
+
+    raw_language = raw_data.get("language") or request.args.get("lang") or "en"
+    language = get_recommendation_agent_language(str(raw_language))
+    message = str(raw_data.get("message") or "").strip()[:400]
+    if not message:
+        message = get_default_agent_message(language)
+    return language, message, _request_recommended_artists(raw_data)
+
+
+def _request_recommended_artists(raw_data):
+    artists = raw_data.get("previousRecommendedArtists")
+    if not isinstance(artists, list):
+        return []
+
+    sanitized = []
+    for artist in artists[:8]:
+        if not isinstance(artist, dict):
+            continue
+        name = str(artist.get("name") or "").strip()
+        if not name:
+            continue
+        genres = artist.get("genres")
+        if not isinstance(genres, list):
+            genres = []
+        starter_tracks = artist.get("starterTracks")
+        if not isinstance(starter_tracks, list):
+            starter_tracks = []
+        sanitized.append(
+            {
+                "name": name[:120],
+                "reason": str(artist.get("reason") or "").strip()[:500],
+                "genres": [
+                    str(genre).strip()[:80]
+                    for genre in genres
+                    if str(genre).strip()
+                ][:6],
+                "starterTracks": [
+                    str(track).strip()[:120]
+                    for track in starter_tracks
+                    if str(track).strip()
+                ][:8],
+            }
+        )
+    return sanitized
+
+
+def _sse_event(event_name, payload):
+    return (
+        f"event: {event_name}\n"
+        f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    )
+
+
+def _sse_prelude():
+    return ": " + (" " * 4096) + "\n\n"
+
+
+@frontend.route("/recommendations/agent/stream", methods=["GET", "POST"])
+@login_only
+def recommendation_agent_stream():
+    request_id = getattr(g, "supysonic_request_id", None)
+    language, message, previous_recommended_artists = _recommendation_agent_request_values()
+    context = _build_recommendation_context(
+        request.user,
+        _get_recommendation_count(),
+    )
+
+    @stream_with_context
+    def generate():
+        yield _sse_prelude()
+        yield _sse_event("status", {"status": "thinking"})
+        try:
+            for event_name, payload in stream_recommendation_agent(
+                current_app.config.get("RECOMMENDATION_AGENT", {}),
+                request.user,
+                message,
+                language,
+                context["tracks"],
+                context["summary"],
+                previous_recommended_artists,
+            ):
+                payload = dict(payload)
+                if event_name == "final":
+                    payload["requestId"] = request_id
+                    payload["suggestedPrompts"] = get_recommendation_agent_prompts(language)
+                yield _sse_event(event_name, payload)
+        except RecommendationAgentError as exc:
+            error_payload = _recommendation_agent_error_payload(exc, request_id)
+            logger.warning(
+                "recommendation_agent_stream_error request_id=%s method=%s user=%s error_code=%s details=%s",
+                request_id,
+                request.method,
+                getattr(request.user, "name", "-"),
+                exc.error_code,
+                getattr(exc, "details", {}),
+            )
+            yield _sse_event("error", error_payload)
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @frontend.route("/devices")
