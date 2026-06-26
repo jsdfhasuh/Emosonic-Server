@@ -1,13 +1,28 @@
 import json
 import logging
 import re
+import time
 import unicodedata
+import uuid
 from typing import Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import requests
 from peewee import OperationalError
 
-from .db import Artist, Track, User, User_Play_Activity
+from .db import Artist, Track, User, User_Play_Activity, now
+from .recommendation_agent_cache import (
+    DEFAULT_AGENT_CACHE_TTL_SECONDS,
+    build_recommendation_agent_context_hash,
+    get_cached_recommendation_agent_payload,
+    save_recommendation_agent_cache_payload,
+)
+from .recommendation_agent_session import (
+    DEFAULT_AGENT_SESSION_LIMIT,
+    latest_recommended_artists_from_sessions,
+    list_recommendation_agent_sessions,
+    save_recommendation_agent_session,
+)
+from .recommendation_feedback import get_recommendation_feedback_preferences
 
 
 logger = logging.getLogger(__name__)
@@ -21,6 +36,99 @@ DEFAULT_TIMEOUT_SECONDS = 20
 DEFAULT_MAX_OUTPUT_TOKENS = 900
 DEFAULT_TEMPERATURE = 0.7
 RECOMMENDED_ARTIST_LIMIT = 8
+NEXT_ACTION_LIMIT = 4
+AGENT_HIDDEN_ARTIST_LIMIT = 24
+AGENT_SESSION_TRACK_LIMIT = 8
+AGENT_CACHE_TRACK_LIMIT = 50
+AGENT_CACHE_PLAY_HISTORY_LIMIT = 50
+AGENT_METRIC_DEFAULTS = {
+    "agent_request_count": 0,
+    "agent_success_count": 0,
+    "agent_error_count": 0,
+    "agent_timeout_count": 0,
+    "agent_cache_hit_count": 0,
+    "agent_latency_ms": 0,
+    "agent_average_latency_ms": 0,
+    "agent_payload_size_bytes": 0,
+    "agent_filtered_local_artist_count": 0,
+    "agent_last_filtered_local_artist_count": 0,
+    "agent_filtered_feedback_artist_count": 0,
+    "agent_last_filtered_feedback_artist_count": 0,
+    "agent_empty_result_count": 0,
+}
+
+
+def _default_agent_health_state() -> Dict[str, object]:
+    metrics = dict(AGENT_METRIC_DEFAULTS)
+    metrics["agent_total_latency_ms"] = 0
+    return {
+        "last_success_at": None,
+        "last_error": None,
+        "metrics": metrics,
+    }
+
+
+AGENT_HEALTH_STATE = _default_agent_health_state()
+FOLLOW_UP_WORD_MARKERS = (
+    "these",
+    "those",
+    "them",
+    "previous",
+    "earlier",
+    "starter",
+    "why",
+)
+FOLLOW_UP_PHRASE_MARKERS = (
+    "different style",
+    "another style",
+    "change style",
+    "change the style",
+    "switch style",
+    "switch styles",
+    "more obscure",
+    "obscure artist",
+    "less mainstream",
+    "deeper cut",
+    "deeper cuts",
+    "more underground",
+    "more like this",
+    "more like these",
+    "last recommendation",
+    "last recommendations",
+    "last artist",
+    "last artists",
+    "last answer",
+    "last response",
+    "last session",
+    "这些",
+    "那些",
+    "他们",
+    "它们",
+    "上次",
+    "上一个",
+    "上一轮",
+    "上一批",
+    "上轮推荐",
+    "刚才",
+    "刚刚",
+    "之前",
+    "为什么",
+    "原因",
+    "入门",
+    "换一种风格",
+    "换个风格",
+    "换风格",
+    "另一种风格",
+    "别的风格",
+    "不同风格",
+    "不同的风格",
+    "更冷门",
+    "冷门一点",
+    "再冷门",
+    "更多类似",
+    "多来点类似",
+)
+FOLLOW_UP_MARKERS = FOLLOW_UP_WORD_MARKERS + FOLLOW_UP_PHRASE_MARKERS
 
 
 class RecommendationAgentError(Exception):
@@ -71,16 +179,202 @@ def get_recommendation_agent_prompts(language: str) -> List[str]:
             "根据我的播放记录推荐曲库外歌手",
             "为什么推荐这些歌手？",
             "给我一些可以入门的歌曲",
+            "换一种风格",
+            "推荐更冷门的",
         ]
     return [
         "Recommend artists outside my library",
         "Why these artists?",
         "Give me starter tracks",
+        "Try a different style",
+        "Recommend more obscure artists",
     ]
 
 
 def get_default_agent_message(language: str) -> str:
     return DEFAULT_AGENT_MESSAGE.get(language, DEFAULT_AGENT_MESSAGE["en"])
+
+
+def reset_recommendation_agent_health_state() -> None:
+    AGENT_HEALTH_STATE.clear()
+    AGENT_HEALTH_STATE.update(_default_agent_health_state())
+
+
+def _agent_metrics() -> Dict[str, object]:
+    metrics = AGENT_HEALTH_STATE.setdefault("metrics", {})
+    if not isinstance(metrics, dict):
+        metrics = {}
+        AGENT_HEALTH_STATE["metrics"] = metrics
+
+    for key, value in AGENT_METRIC_DEFAULTS.items():
+        metrics.setdefault(key, value)
+    metrics.setdefault("agent_total_latency_ms", 0)
+    return metrics
+
+
+def _public_agent_metrics() -> Dict[str, object]:
+    metrics = _agent_metrics()
+    return {
+        key: metrics.get(key, value)
+        for key, value in AGENT_METRIC_DEFAULTS.items()
+    }
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return max(0, int(round((time.monotonic() - started_at) * 1000)))
+
+
+def _increment_metric(metrics: Dict[str, object], key: str, amount: int = 1) -> None:
+    metrics[key] = int(metrics.get(key, 0) or 0) + amount
+
+
+def _record_recommendation_agent_request() -> None:
+    metrics = _agent_metrics()
+    _increment_metric(metrics, "agent_request_count")
+
+
+def _update_completion_metrics(
+    latency_ms: int,
+    context_stats: Optional[Mapping[str, object]] = None,
+    filtered_local_artist_count: int = 0,
+    filtered_feedback_artist_count: int = 0,
+    empty_result: bool = False,
+    cache_hit: bool = False,
+) -> Dict[str, object]:
+    metrics = _agent_metrics()
+    metrics["agent_latency_ms"] = latency_ms
+    metrics["agent_total_latency_ms"] = (
+        int(metrics.get("agent_total_latency_ms", 0) or 0) + latency_ms
+    )
+    completed_count = int(metrics.get("agent_success_count", 0) or 0) + int(
+        metrics.get("agent_error_count", 0) or 0
+    )
+    metrics["agent_average_latency_ms"] = (
+        int(round(int(metrics["agent_total_latency_ms"]) / completed_count))
+        if completed_count
+        else 0
+    )
+
+    payload_size_bytes = 0
+    if context_stats:
+        payload_size_bytes = int(context_stats.get("requestPayloadBytes", 0) or 0)
+    metrics["agent_payload_size_bytes"] = payload_size_bytes
+    metrics["agent_last_filtered_local_artist_count"] = filtered_local_artist_count
+    _increment_metric(
+        metrics,
+        "agent_filtered_local_artist_count",
+        filtered_local_artist_count,
+    )
+    metrics["agent_last_filtered_feedback_artist_count"] = (
+        filtered_feedback_artist_count
+    )
+    _increment_metric(
+        metrics,
+        "agent_filtered_feedback_artist_count",
+        filtered_feedback_artist_count,
+    )
+    if empty_result:
+        _increment_metric(metrics, "agent_empty_result_count")
+    if cache_hit:
+        _increment_metric(metrics, "agent_cache_hit_count")
+    return metrics
+
+
+def _log_recommendation_agent_metrics(
+    status: str,
+    metrics: Mapping[str, object],
+    cache_hit: bool = False,
+) -> None:
+    logger.info(
+        "recommendation_agent_metrics status=%s cache_hit=%s "
+        "agent_request_count=%s agent_success_count=%s agent_error_count=%s "
+        "agent_timeout_count=%s agent_cache_hit_count=%s agent_latency_ms=%s "
+        "agent_average_latency_ms=%s agent_payload_size_bytes=%s "
+        "agent_filtered_local_artist_count=%s "
+        "agent_last_filtered_local_artist_count=%s "
+        "agent_filtered_feedback_artist_count=%s "
+        "agent_last_filtered_feedback_artist_count=%s "
+        "agent_empty_result_count=%s",
+        status,
+        cache_hit,
+        metrics.get("agent_request_count"),
+        metrics.get("agent_success_count"),
+        metrics.get("agent_error_count"),
+        metrics.get("agent_timeout_count"),
+        metrics.get("agent_cache_hit_count"),
+        metrics.get("agent_latency_ms"),
+        metrics.get("agent_average_latency_ms"),
+        metrics.get("agent_payload_size_bytes"),
+        metrics.get("agent_filtered_local_artist_count"),
+        metrics.get("agent_last_filtered_local_artist_count"),
+        metrics.get("agent_filtered_feedback_artist_count"),
+        metrics.get("agent_last_filtered_feedback_artist_count"),
+        metrics.get("agent_empty_result_count"),
+    )
+
+
+def _agent_config_status(config: Mapping[str, object]) -> Dict[str, object]:
+    api_base_url = str(config.get("api_base_url") or "").strip()
+    api_key = str(config.get("api_key") or "").strip()
+    model = str(config.get("model") or "").strip()
+    enabled = _enabled(config.get("enabled"))
+    return {
+        "enabled": enabled,
+        "model": model,
+        "apiBaseUrl": api_base_url,
+        "configured": bool(enabled and api_base_url and api_key and model),
+    }
+
+
+def get_recommendation_agent_health(config: Mapping[str, object]) -> Dict[str, object]:
+    health = _agent_config_status(config)
+    last_success_at = AGENT_HEALTH_STATE.get("last_success_at")
+    last_error = AGENT_HEALTH_STATE.get("last_error")
+    health["lastSuccessAt"] = _serialize_datetime(last_success_at)
+    health["lastError"] = dict(last_error) if isinstance(last_error, dict) else None
+    health["metrics"] = _public_agent_metrics()
+    return health
+
+
+def _record_recommendation_agent_success(
+    latency_ms: int,
+    context_stats: Optional[Mapping[str, object]] = None,
+    result_metrics: Optional[Mapping[str, object]] = None,
+    cache_hit: bool = False,
+) -> None:
+    AGENT_HEALTH_STATE["last_success_at"] = now()
+    AGENT_HEALTH_STATE["last_error"] = None
+    metrics = _agent_metrics()
+    _increment_metric(metrics, "agent_success_count")
+    result_metrics = result_metrics or {}
+    metrics = _update_completion_metrics(
+        latency_ms,
+        context_stats,
+        int(result_metrics.get("filteredLocalArtistCount", 0) or 0),
+        int(result_metrics.get("filteredFeedbackArtistCount", 0) or 0),
+        bool(result_metrics.get("emptyResult")),
+        cache_hit,
+    )
+    _log_recommendation_agent_metrics("success", metrics, cache_hit)
+
+
+def _record_recommendation_agent_error(
+    exc: RecommendationAgentError,
+    latency_ms: int = 0,
+    context_stats: Optional[Mapping[str, object]] = None,
+) -> None:
+    AGENT_HEALTH_STATE["last_error"] = {
+        "errorCode": exc.error_code,
+        "message": str(exc),
+        "details": dict(exc.details or {}),
+        "at": _serialize_datetime(now()),
+    }
+    metrics = _agent_metrics()
+    _increment_metric(metrics, "agent_error_count")
+    if isinstance(exc, RecommendationAgentTimeoutError):
+        _increment_metric(metrics, "agent_timeout_count")
+    metrics = _update_completion_metrics(latency_ms, context_stats)
+    _log_recommendation_agent_metrics("error", metrics)
 
 
 def _enabled(value: object) -> bool:
@@ -196,6 +490,36 @@ def _collect_library_artist_names() -> List[str]:
     return sorted((name for name in names if name), key=str.casefold)
 
 
+def _hidden_feedback_artist_names(preferences: Mapping[str, object]) -> List[str]:
+    hidden_names = []
+    local_artist_ids = []
+    seen = set()
+
+    for target in preferences.get("hidden_artist_ids", set()) or set():
+        target = str(target or "").strip()
+        if not target:
+            continue
+        try:
+            uuid.UUID(target)
+        except ValueError:
+            key = target.casefold()
+            if key not in seen:
+                seen.add(key)
+                hidden_names.append(target)
+            continue
+        local_artist_ids.append(target)
+
+    if local_artist_ids:
+        for artist in Artist.select().where(Artist.id.in_(local_artist_ids)):
+            name = (artist.get_artist_name() or artist.name or "").strip()
+            key = name.casefold()
+            if name and key not in seen:
+                seen.add(key)
+                hidden_names.append(name)
+
+    return sorted(hidden_names, key=str.casefold)[:AGENT_HIDDEN_ARTIST_LIMIT]
+
+
 def _summarize_play_history(play_history: Sequence[Dict[str, object]]) -> Dict[str, object]:
     artist_counts: Dict[str, int] = {}
     genre_counts: Dict[str, int] = {}
@@ -257,9 +581,12 @@ def build_recommendation_agent_context(
     recommendation_tracks: Sequence[Track],
     recommendation_summary: Mapping[str, object],
     history_limit: int,
+    recent_agent_sessions: Optional[Sequence[Mapping[str, object]]] = None,
 ) -> Dict[str, object]:
     play_history = _collect_play_history(user, history_limit)
     history_summary = _summarize_play_history(play_history)
+    feedback_preferences = get_recommendation_feedback_preferences(user)
+    hidden_artist_names = _hidden_feedback_artist_names(feedback_preferences)
 
     return {
         "user": user.name,
@@ -273,6 +600,10 @@ def build_recommendation_agent_context(
         ],
         "recommendationSummary": dict(recommendation_summary),
         "libraryArtists": _collect_library_artist_names(),
+        "recommendationFeedback": {
+            "hiddenArtistNames": hidden_artist_names,
+        },
+        "recentAgentSessions": list(recent_agent_sessions or []),
     }
 
 
@@ -308,6 +639,10 @@ def _validate_config(config: Mapping[str, object]) -> Dict[str, object]:
             config.get("temperature"),
             DEFAULT_TEMPERATURE,
         ),
+        "cache_ttl_seconds": _non_negative_int(
+            config.get("cache_ttl_seconds"),
+            DEFAULT_AGENT_CACHE_TTL_SECONDS,
+        ),
     }
 
 
@@ -318,7 +653,9 @@ def _build_system_prompt(language: str) -> str:
         "artists outside the user's local music library from their listening "
         "history and the current recommendation context. Do not recommend any "
         "artist whose name appears in context.libraryArtists, including spelling "
-        "or capitalization variants. Use the user's full playHistory as the main "
+        "or capitalization variants. Do not recommend artists listed in "
+        "context.recommendationFeedback.hiddenArtistNames; those artists were "
+        "hidden by the user. Use the user's full playHistory as the main "
         "signal, then topArtists, favoriteGenres, and currentRecommendationTracks. "
         "If context.previousRecommendedArtists is present and the user asks a "
         "follow-up such as starter songs, starter tracks, reasons, comparisons, "
@@ -326,12 +663,46 @@ def _build_system_prompt(language: str) -> str:
         "artists and keep them in recommendedArtists unless the user explicitly "
         "asks for different or new artists. For starter-track follow-ups, improve "
         "or expand starterTracks for the previous artists instead of discovering "
-        "a fresh set. "
+        "a fresh set. If context.recentAgentSessions is present, use it as durable "
+        "conversation memory across page refreshes; when the user says these, them, "
+        "previous, earlier, or prompt-button follow-up wording such as changing "
+        "style, asking for more obscure artists, or asking for more like this, "
+        "resolve that reference against the most recent relevant session. "
         f"Reply in {response_language}. Return only a JSON object with this exact "
         "shape: {\"reply\": string, \"recommendedArtists\": [{\"name\": string, "
-        "\"reason\": string, \"genres\": [string], \"starterTracks\": [string]}]}. "
+        "\"reason\": string, \"genres\": [string], \"starterTracks\": [string], "
+        "\"similarTo\": [string], \"confidence\": number, \"mood\": [string]}], "
+        "\"nextActions\": [string]}. confidence must be between 0 and 1. "
+        "nextActions should contain short follow-up actions such as generating "
+        "starter tracks, changing style, or recommending more obscure artists. "
         "recommendedArtists must contain only outside-library artists."
     )
+
+
+def _sanitize_string_list(
+    value: object,
+    limit: int,
+    item_limit: int,
+) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    return [
+        str(item).strip()[:item_limit]
+        for item in value
+        if str(item).strip()
+    ][:limit]
+
+
+def _sanitize_confidence(value: object) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return min(1.0, max(0.0, confidence))
+
+
+def _sanitize_next_actions(value: object) -> List[str]:
+    return _sanitize_string_list(value, NEXT_ACTION_LIMIT, 80)
 
 
 def _sanitize_recommended_artists(
@@ -354,27 +725,50 @@ def _sanitize_recommended_artists(
             {
                 "name": name[:120],
                 "reason": str(artist.get("reason") or "").strip()[:500],
-                "genres": [
-                    str(genre).strip()[:80]
-                    for genre in genres
-                    if str(genre).strip()
-                ][:6],
-                "starterTracks": [
-                    str(track).strip()[:120]
-                    for track in starter_tracks
-                    if str(track).strip()
-                ][:8],
+                "genres": _sanitize_string_list(genres, 6, 80),
+                "starterTracks": _sanitize_string_list(starter_tracks, 8, 120),
+                "similarTo": _sanitize_string_list(artist.get("similarTo"), 6, 120),
+                "confidence": _sanitize_confidence(artist.get("confidence")),
+                "mood": _sanitize_string_list(artist.get("mood"), 6, 80),
             }
         )
     return sanitized
 
 
+def _message_looks_like_followup(message: str) -> bool:
+    normalized = str(message or "").casefold()
+    if any(marker in normalized for marker in FOLLOW_UP_PHRASE_MARKERS):
+        return True
+    words = set(re.findall(r"[a-z0-9']+", normalized))
+    return any(marker in words for marker in FOLLOW_UP_WORD_MARKERS)
+
+
+def _effective_previous_recommended_artists(
+    message: str,
+    context: Mapping[str, object],
+    previous_recommended_artists: Optional[Sequence[Mapping[str, object]]] = None,
+) -> List[Dict[str, object]]:
+    previous_artists = _sanitize_recommended_artists(previous_recommended_artists)
+    if not previous_artists and _message_looks_like_followup(message):
+        recent_sessions = context.get("recentAgentSessions")
+        if isinstance(recent_sessions, list):
+            previous_artists = _sanitize_recommended_artists(
+                latest_recommended_artists_from_sessions(recent_sessions)
+            )
+    return previous_artists
+
+
 def _build_agent_prompt_context(
+    message: str,
     context: Mapping[str, object],
     previous_recommended_artists: Optional[Sequence[Mapping[str, object]]] = None,
 ) -> Dict[str, object]:
     prompt_context = dict(context)
-    previous_artists = _sanitize_recommended_artists(previous_recommended_artists)
+    previous_artists = _effective_previous_recommended_artists(
+        message,
+        context,
+        previous_recommended_artists,
+    )
     if previous_artists:
         prompt_context["previousRecommendedArtists"] = previous_artists
     return prompt_context
@@ -387,7 +781,11 @@ def _build_user_prompt(
 ) -> str:
     payload = {
         "userMessage": message,
-        "context": _build_agent_prompt_context(context, previous_recommended_artists),
+        "context": _build_agent_prompt_context(
+            message,
+            context,
+            previous_recommended_artists,
+        ),
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
@@ -400,12 +798,17 @@ def _build_repair_user_prompt(
 ) -> str:
     payload = {
         "userMessage": message,
-        "context": _build_agent_prompt_context(context, previous_recommended_artists),
+        "context": _build_agent_prompt_context(
+            message,
+            context,
+            previous_recommended_artists,
+        ),
         "previousError": str(previous_error),
         "repairInstruction": (
             "The previous model response could not be parsed by the server. "
             "Generate a fresh response for the same user request and context. "
-            "Return only one valid JSON object with reply and recommendedArtists."
+            "Return only one valid JSON object with reply, recommendedArtists, "
+            "and nextActions."
         ),
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -480,24 +883,24 @@ def _parse_model_content(content: object) -> Dict[str, object]:
             )
         valid_artists.append(
             {
-                "name": artist["name"].strip(),
-                "reason": artist["reason"].strip(),
-                "genres": [
-                    str(genre).strip()
-                    for genre in artist["genres"]
-                    if str(genre).strip()
-                ],
-                "starterTracks": [
-                    str(track).strip()
-                    for track in artist["starterTracks"]
-                    if str(track).strip()
-                ],
+                "name": artist["name"].strip()[:120],
+                "reason": artist["reason"].strip()[:500],
+                "genres": _sanitize_string_list(artist["genres"], 6, 80),
+                "starterTracks": _sanitize_string_list(
+                    artist["starterTracks"],
+                    8,
+                    120,
+                ),
+                "similarTo": _sanitize_string_list(artist.get("similarTo"), 6, 120),
+                "confidence": _sanitize_confidence(artist.get("confidence")),
+                "mood": _sanitize_string_list(artist.get("mood"), 6, 80),
             }
         )
 
     parsed["recommendedArtists"] = [
         artist for artist in valid_artists if artist["name"]
     ]
+    parsed["nextActions"] = _sanitize_next_actions(parsed.get("nextActions"))
     return parsed
 
 
@@ -520,20 +923,41 @@ def _filter_library_artists(
     return model_payload
 
 
+def _filter_hidden_feedback_artists(
+    model_payload: Dict[str, object],
+    hidden_artist_names: Sequence[str],
+) -> Dict[str, object]:
+    hidden_names = set()
+    for name in hidden_artist_names:
+        hidden_names.update(_artist_name_variants(name))
+
+    filtered_artists = []
+    for artist in model_payload["recommendedArtists"]:
+        if hidden_names.intersection(_artist_name_variants(artist["name"])):
+            continue
+        filtered_artists.append(artist)
+
+    model_payload = dict(model_payload)
+    model_payload["recommendedArtists"] = filtered_artists
+    return model_payload
+
+
 def _filter_notice_reply(language: str, filtered_artists: Sequence[object]) -> str:
     if language == "zh":
         if filtered_artists:
-            return "模型返回的部分歌手已经在曲库中，我已过滤，只保留下列曲库外歌手。"
-        return "模型返回的歌手都已经在曲库中，因此没有可展示的曲库外歌手。请换一个方向继续问我。"
+            return "模型返回的部分歌手已经在曲库中或被你标记为不感兴趣，我已过滤，只保留下列可展示歌手。"
+        return "模型返回的歌手都已经在曲库中或被你标记为不感兴趣，因此没有可展示的曲库外歌手。请换一个方向继续问我。"
 
     if filtered_artists:
         return (
-            "Some artists from the model response were already in your library, "
-            "so I filtered them out and kept only outside-library artists below."
+            "Some artists from the model response were already in your library "
+            "or hidden by your feedback, so I filtered them out and kept only "
+            "eligible outside-library artists below."
         )
     return (
-        "Every artist from the model response was already in your library, "
-        "so there are no outside-library artists to show. Try a different angle."
+        "Every artist from the model response was already in your library or "
+        "hidden by your feedback, so there are no outside-library artists to "
+        "show. Try a different angle."
     )
 
 
@@ -576,6 +1000,33 @@ def _build_stream_chat_completion_payload(
 def _safe_text(value: object, limit: int = 240) -> str:
     text = " ".join(str(value or "").split())
     return text[:limit]
+
+
+def _safe_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _compact_agent_track_summary(track: Mapping[str, object]) -> Dict[str, object]:
+    return {
+        "id": _safe_text(track.get("id"), 64),
+        "title": _safe_text(track.get("title"), 160),
+        "artist": _safe_text(track.get("artist"), 160),
+        "album": _safe_text(track.get("album"), 160),
+        "genre": _safe_text(track.get("genre"), 80),
+        "playCount": _safe_int(track.get("playCount")),
+    }
+
+
+def _compact_agent_play_history_summary(
+    track: Mapping[str, object],
+) -> Dict[str, object]:
+    summary = _compact_agent_track_summary(track)
+    summary["duration"] = _safe_int(track.get("duration"))
+    summary["playedAt"] = _safe_text(track.get("playedAt"), 64)
+    return summary
 
 
 def _extract_upstream_error(response: object) -> Dict[str, object]:
@@ -877,12 +1328,20 @@ def _build_context_stats(
 ) -> Dict[str, object]:
     play_history = agent_context.get("playHistory") or []
     library_artists = agent_context.get("libraryArtists") or []
+    recommendation_feedback = agent_context.get("recommendationFeedback") or {}
+    hidden_artist_names = []
+    if isinstance(recommendation_feedback, Mapping):
+        hidden_artist_names = recommendation_feedback.get("hiddenArtistNames") or []
     return {
         "playHistoryCount": len(play_history) if isinstance(play_history, list) else 0,
         "libraryArtistCount": (
             len(library_artists) if isinstance(library_artists, list) else 0
         ),
+        "hiddenAgentArtistCount": (
+            len(hidden_artist_names) if isinstance(hidden_artist_names, list) else 0
+        ),
         "recommendationTrackCount": len(recommendation_tracks),
+        "agentSessionCount": len(agent_context.get("recentAgentSessions") or []),
         "requestPayloadBytes": _payload_size_bytes(request_payload),
     }
 
@@ -904,11 +1363,16 @@ def _prepare_recommendation_agent_request(
     previous_recommended_artists: Optional[Sequence[Mapping[str, object]]] = None,
 ) -> Dict[str, object]:
     llm_config = _validate_config(config)
+    recent_agent_sessions = list_recommendation_agent_sessions(
+        user,
+        DEFAULT_AGENT_SESSION_LIMIT,
+    )
     agent_context = build_recommendation_agent_context(
         user,
         recommendation_tracks,
         recommendation_summary,
         int(llm_config["history_limit"]),
+        recent_agent_sessions,
     )
     messages = [
         {"role": "system", "content": _build_system_prompt(language)},
@@ -940,25 +1404,108 @@ def _prepare_recommendation_agent_request(
     }
 
 
+def _build_agent_session_context_summary(
+    agent_context: Mapping[str, object],
+) -> Dict[str, object]:
+    recommendation_tracks = agent_context.get("currentRecommendationTracks") or []
+    if not isinstance(recommendation_tracks, list):
+        recommendation_tracks = []
+    return {
+        "history": dict(agent_context.get("history") or {}),
+        "recommendationSummary": dict(
+            agent_context.get("recommendationSummary") or {}
+        ),
+        "currentRecommendationTracks": [
+            _compact_agent_track_summary(track)
+            for track in recommendation_tracks[:AGENT_SESSION_TRACK_LIMIT]
+            if isinstance(track, Mapping) and str(track.get("id") or "")
+        ],
+    }
+
+
+def _build_agent_cache_context_hash(
+    user: User,
+    message: str,
+    language: str,
+    model: str,
+    agent_context: Mapping[str, object],
+    previous_recommended_artists: Optional[Sequence[Mapping[str, object]]] = None,
+) -> str:
+    previous_artists = _effective_previous_recommended_artists(
+        message,
+        agent_context,
+        previous_recommended_artists,
+    )
+    recommendation_tracks = agent_context.get("currentRecommendationTracks") or []
+    if not isinstance(recommendation_tracks, list):
+        recommendation_tracks = []
+    play_history = agent_context.get("playHistory") or []
+    if not isinstance(play_history, list):
+        play_history = []
+    return build_recommendation_agent_context_hash(
+        {
+            "userId": str(user.id),
+            "message": " ".join(str(message or "").split()),
+            "language": language,
+            "model": model,
+            "history": agent_context.get("history") or {},
+            "playHistory": [
+                _compact_agent_play_history_summary(track)
+                for track in play_history[:AGENT_CACHE_PLAY_HISTORY_LIMIT]
+                if isinstance(track, Mapping) and track.get("id")
+            ],
+            "recommendationFeedback": agent_context.get("recommendationFeedback") or {},
+            "recommendationSummary": agent_context.get("recommendationSummary") or {},
+            "recommendationTracks": sorted(
+                (
+                    _compact_agent_track_summary(track)
+                    for track in recommendation_tracks[:AGENT_CACHE_TRACK_LIMIT]
+                    if isinstance(track, Mapping) and track.get("id")
+                ),
+                key=lambda track: str(track["id"]),
+            ),
+            "previousRecommendedArtists": previous_artists,
+        }
+    )
+
+
 def _finalize_recommendation_agent_payload(
     llm_config: Mapping[str, object],
     agent_context: Mapping[str, object],
     model_payload: Dict[str, object],
     language: str,
-) -> Dict[str, object]:
+) -> Tuple[Dict[str, object], Dict[str, object]]:
     original_artist_count = len(model_payload["recommendedArtists"])
     original_reply = model_payload["reply"]
     model_payload = _filter_library_artists(
         model_payload,
         agent_context["libraryArtists"],
     )
-    if len(model_payload["recommendedArtists"]) != original_artist_count:
+    filtered_local_artist_count = (
+        original_artist_count - len(model_payload["recommendedArtists"])
+    )
+    recommendation_feedback = agent_context.get("recommendationFeedback") or {}
+    hidden_artist_names = []
+    if isinstance(recommendation_feedback, Mapping):
+        hidden_artist_names = recommendation_feedback.get("hiddenArtistNames") or []
+    visible_artist_count = len(model_payload["recommendedArtists"])
+    model_payload = _filter_hidden_feedback_artists(
+        model_payload,
+        hidden_artist_names if isinstance(hidden_artist_names, list) else [],
+    )
+    filtered_feedback_artist_count = (
+        visible_artist_count - len(model_payload["recommendedArtists"])
+    )
+    if (
+        filtered_local_artist_count > 0
+        or filtered_feedback_artist_count > 0
+    ):
         model_payload["reply"] = _reply_with_filter_notice(
             language,
             original_reply,
             model_payload["recommendedArtists"],
         )
-    return {
+    payload = {
         "ok": True,
         "agent": {
             "name": "Recommendation Agent",
@@ -967,9 +1514,40 @@ def _finalize_recommendation_agent_payload(
         },
         "reply": model_payload["reply"],
         "recommendedArtists": model_payload["recommendedArtists"],
+        "nextActions": _sanitize_next_actions(model_payload.get("nextActions")),
         "history": agent_context["history"],
         "recommendationSummary": agent_context["recommendationSummary"],
     }
+    return payload, {
+        "filteredLocalArtistCount": filtered_local_artist_count,
+        "filteredFeedbackArtistCount": filtered_feedback_artist_count,
+        "emptyResult": not bool(payload["recommendedArtists"]),
+    }
+
+
+def _attach_agent_session(
+    payload: Dict[str, object],
+    user: User,
+    message: str,
+    language: str,
+    model: str,
+    agent_context: Mapping[str, object],
+) -> Dict[str, object]:
+    session = save_recommendation_agent_session(
+        user,
+        message,
+        str(payload.get("reply") or ""),
+        payload.get("recommendedArtists") or [],
+        _build_agent_session_context_summary(agent_context),
+        model,
+        language,
+    )
+    payload["agentSession"] = session
+    payload["agentSessions"] = list_recommendation_agent_sessions(
+        user,
+        DEFAULT_AGENT_SESSION_LIMIT,
+    )
+    return payload
 
 
 def request_recommendation_agent(
@@ -980,22 +1558,63 @@ def request_recommendation_agent(
     recommendation_tracks: Sequence[Track],
     recommendation_summary: Mapping[str, object],
     previous_recommended_artists: Optional[Sequence[Mapping[str, object]]] = None,
+    force_refresh: bool = False,
 ) -> Dict[str, object]:
-    prepared = _prepare_recommendation_agent_request(
-        config,
-        user,
-        message,
-        language,
-        recommendation_tracks,
-        recommendation_summary,
-        previous_recommended_artists,
-    )
+    started_at = time.monotonic()
+    _record_recommendation_agent_request()
+    try:
+        prepared = _prepare_recommendation_agent_request(
+            config,
+            user,
+            message,
+            language,
+            recommendation_tracks,
+            recommendation_summary,
+            previous_recommended_artists,
+        )
+    except RecommendationAgentError as exc:
+        _record_recommendation_agent_error(exc, _elapsed_ms(started_at))
+        raise
     llm_config = prepared["llm_config"]
     agent_context = prepared["agent_context"]
     request_payload = prepared["request_payload"]
     endpoint = prepared["endpoint"]
     context_stats = prepared["context_stats"]
     previous_recommended_artists = prepared["previous_recommended_artists"]
+    cache_ttl_seconds = int(llm_config["cache_ttl_seconds"])
+    cache_context_hash = _build_agent_cache_context_hash(
+        user,
+        message,
+        language,
+        str(llm_config["model"]),
+        agent_context,
+        previous_recommended_artists,
+    )
+    if cache_ttl_seconds > 0 and not force_refresh:
+        cached_payload = get_cached_recommendation_agent_payload(
+            user,
+            cache_context_hash,
+        )
+        if cached_payload is not None:
+            payload = dict(cached_payload)
+            payload["agent"] = dict(payload.get("agent") or {})
+            payload["agent"]["cached"] = True
+            payload["cache"] = {"hit": True, "contextHash": cache_context_hash}
+            _record_recommendation_agent_success(
+                _elapsed_ms(started_at),
+                context_stats,
+                {"emptyResult": not bool(payload.get("recommendedArtists"))},
+                cache_hit=True,
+            )
+            return _attach_agent_session(
+                payload,
+                user,
+                message,
+                language,
+                str(llm_config["model"]),
+                agent_context,
+            )
+
     try:
         try:
             response_json = _post_chat_completion(endpoint, llm_config, request_payload)
@@ -1025,6 +1644,11 @@ def request_recommendation_agent(
                 raise second_error from first_error
     except RecommendationAgentError as exc:
         _attach_context_stats(exc, context_stats)
+        _record_recommendation_agent_error(
+            exc,
+            _elapsed_ms(started_at),
+            context_stats,
+        )
         logger.warning(
             "recommendation_agent_failed user=%s error_code=%s upstream_status=%s context_stats=%s",
             user.name,
@@ -1034,11 +1658,34 @@ def request_recommendation_agent(
         )
         raise
 
-    return _finalize_recommendation_agent_payload(
+    payload, result_metrics = _finalize_recommendation_agent_payload(
         llm_config,
         agent_context,
         model_payload,
         language,
+    )
+    _record_recommendation_agent_success(
+        _elapsed_ms(started_at),
+        context_stats,
+        result_metrics,
+    )
+    payload["cache"] = {"hit": False, "contextHash": cache_context_hash}
+    save_recommendation_agent_cache_payload(
+        user,
+        cache_context_hash,
+        message,
+        language,
+        str(llm_config["model"]),
+        payload,
+        cache_ttl_seconds,
+    )
+    return _attach_agent_session(
+        payload,
+        user,
+        message,
+        language,
+        str(llm_config["model"]),
+        agent_context,
     )
 
 
@@ -1050,16 +1697,23 @@ def stream_recommendation_agent(
     recommendation_tracks: Sequence[Track],
     recommendation_summary: Mapping[str, object],
     previous_recommended_artists: Optional[Sequence[Mapping[str, object]]] = None,
+    force_refresh: bool = False,
 ) -> Iterator[Tuple[str, Dict[str, object]]]:
-    prepared = _prepare_recommendation_agent_request(
-        config,
-        user,
-        message,
-        language,
-        recommendation_tracks,
-        recommendation_summary,
-        previous_recommended_artists,
-    )
+    started_at = time.monotonic()
+    _record_recommendation_agent_request()
+    try:
+        prepared = _prepare_recommendation_agent_request(
+            config,
+            user,
+            message,
+            language,
+            recommendation_tracks,
+            recommendation_summary,
+            previous_recommended_artists,
+        )
+    except RecommendationAgentError as exc:
+        _record_recommendation_agent_error(exc, _elapsed_ms(started_at))
+        raise
     llm_config = prepared["llm_config"]
     agent_context = prepared["agent_context"]
     endpoint = prepared["endpoint"]
@@ -1067,11 +1721,51 @@ def stream_recommendation_agent(
         prepared["request_payload"],
     )
     previous_recommended_artists = prepared["previous_recommended_artists"]
+    cache_ttl_seconds = int(llm_config["cache_ttl_seconds"])
+    cache_context_hash = _build_agent_cache_context_hash(
+        user,
+        message,
+        language,
+        str(llm_config["model"]),
+        agent_context,
+        previous_recommended_artists,
+    )
     context_stats = _build_context_stats(
         agent_context,
         recommendation_tracks,
         request_payload,
     )
+
+    if cache_ttl_seconds > 0 and not force_refresh:
+        cached_payload = get_cached_recommendation_agent_payload(
+            user,
+            cache_context_hash,
+        )
+        if cached_payload is not None:
+            yield ("status", {"status": "cached"})
+            payload = dict(cached_payload)
+            payload["agent"] = dict(payload.get("agent") or {})
+            payload["agent"]["cached"] = True
+            payload["cache"] = {"hit": True, "contextHash": cache_context_hash}
+            _record_recommendation_agent_success(
+                _elapsed_ms(started_at),
+                context_stats,
+                {"emptyResult": not bool(payload.get("recommendedArtists"))},
+                cache_hit=True,
+            )
+            yield (
+                "final",
+                _attach_agent_session(
+                    payload,
+                    user,
+                    message,
+                    language,
+                    str(llm_config["model"]),
+                    agent_context,
+                ),
+            )
+            yield ("status", {"status": "ready"})
+            return
 
     try:
         yield ("status", {"status": "thinking"})
@@ -1123,6 +1817,11 @@ def stream_recommendation_agent(
                 raise second_error from first_error
     except RecommendationAgentError as exc:
         _attach_context_stats(exc, context_stats)
+        _record_recommendation_agent_error(
+            exc,
+            _elapsed_ms(started_at),
+            context_stats,
+        )
         logger.warning(
             "recommendation_agent_failed user=%s error_code=%s upstream_status=%s context_stats=%s",
             user.name,
@@ -1132,11 +1831,34 @@ def stream_recommendation_agent(
         )
         raise
 
-    payload = _finalize_recommendation_agent_payload(
+    payload, result_metrics = _finalize_recommendation_agent_payload(
         llm_config,
         agent_context,
         model_payload,
         language,
+    )
+    _record_recommendation_agent_success(
+        _elapsed_ms(started_at),
+        context_stats,
+        result_metrics,
+    )
+    payload["cache"] = {"hit": False, "contextHash": cache_context_hash}
+    save_recommendation_agent_cache_payload(
+        user,
+        cache_context_hash,
+        message,
+        language,
+        str(llm_config["model"]),
+        payload,
+        cache_ttl_seconds,
+    )
+    payload = _attach_agent_session(
+        payload,
+        user,
+        message,
+        language,
+        str(llm_config["model"]),
+        agent_context,
     )
     yield ("final", payload)
     yield ("status", {"status": "ready"})

@@ -11,6 +11,6 @@ CREATE TABLE IF NOT EXISTS music_request (
     updated_at DATETIME NOT NULL,
     resolved_at DATETIME
 ) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE INDEX IF NOT EXISTS index_music_request_status_created_at ON music_request(status, created_at);
-CREATE INDEX IF NOT EXISTS index_music_request_user_created_at ON music_request(user_id, created_at);
-CREATE INDEX IF NOT EXISTS index_music_request_artist_album_status ON music_request(artist_name, album_name, status);
+CREATE INDEX index_music_request_status_created_at ON music_request(status, created_at);
+CREATE INDEX index_music_request_user_created_at ON music_request(user_id, created_at);
+CREATE INDEX index_music_request_artist_album_status ON music_request(artist_name, album_name, status);

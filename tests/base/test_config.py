@@ -80,6 +80,7 @@ class ConfigTestCase(unittest.TestCase):
             self.assertEqual(DefaultConfig.RECOMMENDATION_AGENT["api_key"], "")
             self.assertEqual(DefaultConfig.RECOMMENDATION_AGENT["model"], "")
             self.assertEqual(DefaultConfig.RECOMMENDATION_AGENT["max_output_tokens"], 900)
+            self.assertEqual(DefaultConfig.RECOMMENDATION_AGENT["cache_ttl_seconds"], 900)
 
             with NamedTemporaryFile("w", delete=False) as config_file:
                 config_file.write(
@@ -92,6 +93,7 @@ class ConfigTestCase(unittest.TestCase):
                     "history_limit = 33\n"
                     "max_output_tokens = 0\n"
                     "temperature = 0.2\n"
+                    "cache_ttl_seconds = 42\n"
                 )
                 config_file.flush()
                 config_file_path = config_file.name
@@ -109,6 +111,7 @@ class ConfigTestCase(unittest.TestCase):
             self.assertEqual(conf.RECOMMENDATION_AGENT["history_limit"], 33)
             self.assertEqual(conf.RECOMMENDATION_AGENT["max_output_tokens"], 0)
             self.assertEqual(conf.RECOMMENDATION_AGENT["temperature"], 0.2)
+            self.assertEqual(conf.RECOMMENDATION_AGENT["cache_ttl_seconds"], 42)
             self.assertEqual(DefaultConfig.RECOMMENDATION_AGENT, original_agent)
         finally:
             if config_file_path:

@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional, Sequence
 
 from flask import (
     abort,
@@ -41,8 +41,11 @@ from ..db import (
     EmoLocalQueue,
     EmoPlaybackState,
     EmoSessionQueue,
+    MusicRequest,
+    Playlist,
     Track,
     User,
+    User_Play_Activity,
     random,
 )
 from ..api.media import _get_cover_path
@@ -52,21 +55,29 @@ from ..api.media import __new_get_cover_path
 from ..cache import CacheMiss
 from ..client_releases import get_latest_release
 from ..recommend import (
+    buildRecommendationReasonMap,
     getLatestRecommendedPlaylist,
     getRecommendedPlaylistForDay,
 )
 from ..recommendation_feedback import (
     HOT_RECOMMENDED_SCOPE,
-    filter_disliked_recommended_tracks,
-    get_disliked_recommended_song_ids,
+    get_recommendation_feedback_preferences,
+    set_recommendation_feedback,
+    track_matches_negative_recommendation_feedback,
 )
 from ..recommendation_agent import (
     RecommendationAgentError,
     get_default_agent_message,
+    get_recommendation_agent_health,
     get_recommendation_agent_language,
     get_recommendation_agent_prompts,
     request_recommendation_agent,
     stream_recommendation_agent,
+)
+from ..recommendation_agent_cache import clear_recommendation_agent_cache
+from ..recommendation_agent_session import (
+    clear_recommendation_agent_sessions,
+    list_recommendation_agent_sessions,
 )
 
 logger = logging.getLogger(__name__)
@@ -76,6 +87,11 @@ state = get_state()
 DEFAULT_DEVICE_TIMEOUT_SECONDS = DEFAULT_CLIENT_STALE_SECONDS
 DEFAULT_RECOMMENDATION_COUNT = 30
 MAX_RECOMMENDATION_COUNT = 100
+AGENT_STARTER_TRACK_LIMIT = 12
+AGENT_STARTER_PLAYLIST_COMMENT = "Recommendation Agent starter playlist"
+AGENT_STARTER_MUSIC_REQUEST_NOTE = (
+    "Created from Recommendation Agent starter playlist action."
+)
 ANONYMOUS_FRONTEND_ENDPOINTS = {
     "frontend.login",
     "frontend.register",
@@ -430,7 +446,7 @@ def _collect_random_recommendation_tracks(user, count: int) -> List[Track]:
     if count <= 0:
         return []
 
-    disliked_song_ids = get_disliked_recommended_song_ids(
+    preferences = get_recommendation_feedback_preferences(
         user,
         scope=HOT_RECOMMENDED_SCOPE,
     )
@@ -439,13 +455,148 @@ def _collect_random_recommendation_tracks(user, count: int) -> List[Track]:
     query_limit = max(count * 3, 50)
     for track in Track.select().order_by(random()).limit(query_limit):
         track_id = str(track.id)
-        if track_id in disliked_song_ids or track_id in seen_track_ids:
+        if (
+            track_id in seen_track_ids
+            or track_matches_negative_recommendation_feedback(track, preferences)
+        ):
             continue
         tracks.append(track)
         seen_track_ids.add(track_id)
         if len(tracks) >= count:
             break
 
+    return tracks
+
+
+def _add_unique_recommendation_tracks(
+    tracks: List[Track],
+    candidates,
+    count: int,
+    preferences: Dict[str, set],
+    seen_track_ids: set,
+) -> None:
+    if len(tracks) >= count:
+        return
+    for track in candidates:
+        track_id = str(track.id)
+        if (
+            track_id in seen_track_ids
+            or track_matches_negative_recommendation_feedback(track, preferences)
+        ):
+            continue
+        tracks.append(track)
+        seen_track_ids.add(track_id)
+        if len(tracks) >= count:
+            break
+
+
+def _get_user_listened_track_ids(user) -> set:
+    return {
+        activity.track_id
+        for activity in User_Play_Activity.select(User_Play_Activity.track_id).where(
+            User_Play_Activity.user == user
+        )
+    }
+
+
+def _backfill_recommendation_tracks(
+    user,
+    tracks: List[Track],
+    seed_tracks: List[Track],
+    count: int,
+    preferences: Dict[str, set],
+    seen_track_ids: set,
+) -> None:
+    if len(tracks) >= count:
+        return
+
+    seed_tracks = list(seed_tracks)
+    liked_more_song_ids = preferences.get("liked_more_song_ids", set())
+    if liked_more_song_ids:
+        seed_tracks.extend(
+            Track.select().where(Track.id.in_(list(liked_more_song_ids)))
+        )
+
+    genres = []
+    artist_ids = []
+    for track in seed_tracks:
+        if track.genre and track.genre not in genres:
+            genres.append(track.genre)
+        if track.artist_id and track.artist_id not in artist_ids:
+            artist_ids.append(track.artist_id)
+
+    query_limit = max((count - len(tracks)) * 5, 50)
+    for genre in genres:
+        _add_unique_recommendation_tracks(
+            tracks,
+            Track.select()
+            .where(Track.genre == genre)
+            .order_by(Track.play_count.desc(), Track.id)
+            .limit(query_limit),
+            count,
+            preferences,
+            seen_track_ids,
+        )
+
+    for artist_id in artist_ids:
+        _add_unique_recommendation_tracks(
+            tracks,
+            Track.select()
+            .where(Track.artist == artist_id)
+            .order_by(Track.play_count.desc(), Track.id)
+            .limit(query_limit),
+            count,
+            preferences,
+            seen_track_ids,
+        )
+
+    listened_track_ids = _get_user_listened_track_ids(user)
+    popular_query = Track.select()
+    if listened_track_ids:
+        popular_query = popular_query.where(Track.id.not_in(list(listened_track_ids)))
+    _add_unique_recommendation_tracks(
+        tracks,
+        popular_query.order_by(Track.play_count.desc(), Track.id).limit(query_limit),
+        count,
+        preferences,
+        seen_track_ids,
+    )
+
+    _add_unique_recommendation_tracks(
+        tracks,
+        Track.select().order_by(random()).limit(query_limit),
+        count,
+        preferences,
+        seen_track_ids,
+    )
+
+
+def _filter_and_backfill_recommendation_tracks(
+    user,
+    playlist_tracks: List[Track],
+    count: int,
+) -> List[Track]:
+    preferences = get_recommendation_feedback_preferences(
+        user,
+        scope=HOT_RECOMMENDED_SCOPE,
+    )
+    tracks: List[Track] = []
+    seen_track_ids = set()
+    _add_unique_recommendation_tracks(
+        tracks,
+        playlist_tracks,
+        count,
+        preferences,
+        seen_track_ids,
+    )
+    _backfill_recommendation_tracks(
+        user,
+        tracks,
+        playlist_tracks,
+        count,
+        preferences,
+        seen_track_ids,
+    )
     return tracks
 
 
@@ -457,11 +608,11 @@ def _build_recommendation_context(user, count: int) -> Dict[str, object]:
         source = "latest" if playlist is not None else "random"
 
     if playlist is not None:
-        tracks = filter_disliked_recommended_tracks(
+        tracks = _filter_and_backfill_recommendation_tracks(
             user,
             playlist.get_tracks(),
-            scope=HOT_RECOMMENDED_SCOPE,
-        )[:count]
+            count,
+        )
     else:
         tracks = _collect_random_recommendation_tracks(user, count)
 
@@ -476,10 +627,12 @@ def _build_recommendation_context(user, count: int) -> Dict[str, object]:
         if getattr(track, "album_id", None) is not None
     }
     total_duration = sum(track.duration or 0 for track in tracks)
+    track_reasons = buildRecommendationReasonMap(user, tracks)
 
     return {
         "playlist": playlist,
         "tracks": tracks,
+        "trackReasons": track_reasons,
         "summary": {
             "source": source,
             "trackCount": len(tracks),
@@ -498,14 +651,261 @@ def recommendation_index():
         request.user,
         _get_recommendation_count(),
     )
+    context["agentSessions"] = list_recommendation_agent_sessions(request.user)
     return render_template("recommendations.html", **context)
+
+
+@frontend.route("/recommendations/feedback", methods=["POST"])
+@login_only
+def recommendation_feedback():
+    raw_data = request.get_json(silent=True) or {}
+    target_id = str(
+        raw_data.get("id")
+        or raw_data.get("targetId")
+        or raw_data.get("target_id")
+        or ""
+    ).strip()
+    action = str(raw_data.get("action") or "").strip()
+    target_type = (
+        raw_data.get("targetType")
+        or raw_data.get("target_type")
+    )
+    scope = str(raw_data.get("scope") or HOT_RECOMMENDED_SCOPE).strip()
+    reason = str(raw_data.get("reason") or "web_feedback").strip()
+    source = str(raw_data.get("source") or "web").strip()
+
+    if not target_id:
+        return jsonify({"ok": False, "error": "feedback target id is required"}), 400
+    if not action:
+        return jsonify({"ok": False, "error": "feedback action is required"}), 400
+
+    try:
+        feedback = set_recommendation_feedback(
+            request.user,
+            target_id,
+            action,
+            scope=scope,
+            reason=reason,
+            source=source,
+            target_type=target_type,
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    return jsonify(
+        {
+            "ok": True,
+            "feedback": {
+                "id": feedback.target_id,
+                "targetType": feedback.target_type,
+                "targetId": feedback.target_id,
+                "target_id": feedback.target_id,
+                "action": feedback.action,
+                "scope": feedback.scope,
+            },
+        }
+    )
+
+
+def _clean_agent_text(value: object, limit: int = 256) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _normalize_agent_text(value: object) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def _clean_agent_starter_tracks(value: object) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    tracks = []
+    seen = set()
+    for item in value:
+        title = _clean_agent_text(item, 256)
+        key = _normalize_agent_text(title)
+        if not title or key in seen:
+            continue
+        seen.add(key)
+        tracks.append(title)
+        if len(tracks) >= AGENT_STARTER_TRACK_LIMIT:
+            break
+    return tracks
+
+
+def _match_local_agent_starter_tracks(
+    artist_name: str,
+    starter_tracks: Sequence[str],
+) -> List[Track]:
+    artist_key = _normalize_agent_text(artist_name)
+    title_order = {
+        _normalize_agent_text(title): index
+        for index, title in enumerate(starter_tracks)
+    }
+    matched = []
+    matched_ids = set()
+    if not artist_key or not title_order:
+        return matched
+
+    for track in Track.select(Track, Artist).join(Artist):
+        title_key = _normalize_agent_text(track.title)
+        if title_key not in title_order or track.id in matched_ids:
+            continue
+        track_artist = track.artist.get_artist_name() if track.artist else ""
+        if _normalize_agent_text(track_artist) != artist_key:
+            continue
+        matched.append(track)
+        matched_ids.add(track.id)
+
+    return sorted(
+        matched,
+        key=lambda track: title_order.get(_normalize_agent_text(track.title), 0),
+    )
+
+
+def _agent_track_id_sequence(tracks: Sequence[Track]) -> List[str]:
+    return [str(track.id) for track in tracks]
+
+
+def _find_existing_agent_starter_playlist(
+    user: User,
+    playlist_name: str,
+    tracks: Sequence[Track],
+) -> Optional[Playlist]:
+    target_track_ids = _agent_track_id_sequence(tracks)
+    if not target_track_ids:
+        return None
+
+    query = Playlist.select().where(
+        Playlist.user == user,
+        Playlist.name == playlist_name,
+        Playlist.comment == AGENT_STARTER_PLAYLIST_COMMENT,
+    )
+    for playlist in query:
+        if _agent_track_id_sequence(playlist.get_tracks()) == target_track_ids:
+            return playlist
+    return None
+
+
+def _find_existing_agent_starter_music_request(
+    user: User,
+    artist_name: str,
+    starter_tracks: Sequence[str],
+) -> Optional[MusicRequest]:
+    target_artist = _normalize_agent_text(artist_name)
+    target_tracks = [_normalize_agent_text(track) for track in starter_tracks]
+    if not target_artist or not target_tracks:
+        return None
+
+    query = MusicRequest.select().where(
+        MusicRequest.user == user,
+        MusicRequest.status == MusicRequest.STATUS_PENDING,
+        MusicRequest.album_name.is_null(True),
+        MusicRequest.note == AGENT_STARTER_MUSIC_REQUEST_NOTE,
+    )
+    for music_request in query:
+        if _normalize_agent_text(music_request.artist_name) != target_artist:
+            continue
+        if [
+            _normalize_agent_text(track)
+            for track in music_request.get_track_titles()
+        ] == target_tracks:
+            return music_request
+    return None
+
+
+@frontend.route("/recommendations/agent/starter-playlist", methods=["POST"])
+@login_only
+def recommendation_agent_starter_playlist() -> Response:
+    raw_data = request.get_json(silent=True) or {}
+    artist_name = _clean_agent_text(
+        raw_data.get("artistName") or raw_data.get("artist") or "",
+        256,
+    )
+    starter_tracks = _clean_agent_starter_tracks(raw_data.get("starterTracks"))
+
+    if not artist_name:
+        return jsonify({"ok": False, "error": "artist name is required"}), 400
+    if not starter_tracks:
+        return jsonify({"ok": False, "error": "starter tracks are required"}), 400
+
+    matched_tracks = _match_local_agent_starter_tracks(artist_name, starter_tracks)
+    if matched_tracks:
+        playlist_name = _clean_agent_text(
+            f"{artist_name} starter playlist",
+            240,
+        )
+        playlist = _find_existing_agent_starter_playlist(
+            request.user,
+            playlist_name,
+            matched_tracks,
+        )
+        reused = playlist is not None
+        if playlist is None:
+            playlist = Playlist.create(
+                user=request.user,
+                name=playlist_name,
+                comment=AGENT_STARTER_PLAYLIST_COMMENT,
+            )
+            for track in matched_tracks:
+                playlist.add(track)
+            playlist.save()
+        return jsonify(
+            {
+                "ok": True,
+                "mode": "playlist",
+                "reused": reused,
+                "playlist": {
+                    "id": str(playlist.id),
+                    "name": playlist.name,
+                    "trackCount": len(playlist.get_tracks()),
+                    "url": url_for(
+                        "frontend.playlist_details",
+                        uid=str(playlist.id),
+                    ),
+                },
+            }
+        )
+
+    music_request = _find_existing_agent_starter_music_request(
+        request.user,
+        artist_name,
+        starter_tracks,
+    )
+    reused = music_request is not None
+    if music_request is None:
+        music_request = MusicRequest.create(
+            user=request.user,
+            artist_name=artist_name,
+            album_name=None,
+            note=AGENT_STARTER_MUSIC_REQUEST_NOTE,
+        )
+        music_request.set_track_titles(starter_tracks)
+        music_request.save()
+    return jsonify(
+        {
+            "ok": True,
+            "mode": "music_request",
+            "reused": reused,
+            "musicRequest": {
+                "id": str(music_request.id),
+                "artistName": music_request.artist_name,
+                "trackCount": len(music_request.get_track_titles()),
+                "url": url_for("frontend.music_request_index"),
+            },
+        }
+    )
 
 
 @frontend.route("/recommendations/agent", methods=["GET", "POST"])
 @login_only
 def recommendation_agent():
     request_id = getattr(g, "supysonic_request_id", None)
-    language, message, previous_recommended_artists = _recommendation_agent_request_values()
+    (
+        language,
+        message,
+        previous_recommended_artists,
+        force_refresh,
+    ) = _recommendation_agent_request_values()
 
     context = _build_recommendation_context(
         request.user,
@@ -520,6 +920,7 @@ def recommendation_agent():
             context["tracks"],
             context["summary"],
             previous_recommended_artists,
+            force_refresh=force_refresh,
         )
     except RecommendationAgentError as exc:
         error_payload = {
@@ -547,6 +948,31 @@ def recommendation_agent():
     return jsonify(payload)
 
 
+@frontend.route("/recommendations/agent/health")
+@login_only
+def recommendation_agent_health():
+    return jsonify(
+        get_recommendation_agent_health(
+            current_app.config.get("RECOMMENDATION_AGENT", {})
+        )
+    )
+
+
+@frontend.route("/recommendations/agent/session/clear", methods=["POST"])
+@login_only
+def recommendation_agent_session_clear():
+    deleted_count = clear_recommendation_agent_sessions(request.user)
+    deleted_cache_count = clear_recommendation_agent_cache(request.user)
+    return jsonify(
+        {
+            "ok": True,
+            "deleted": deleted_count,
+            "deletedCache": deleted_cache_count,
+            "agentSessions": [],
+        }
+    )
+
+
 def _recommendation_agent_error_payload(exc, request_id):
     error_payload = {
         "ok": False,
@@ -569,7 +995,19 @@ def _recommendation_agent_request_values():
     message = str(raw_data.get("message") or "").strip()[:400]
     if not message:
         message = get_default_agent_message(language)
-    return language, message, _request_recommended_artists(raw_data)
+    force_refresh = _truthy_request_value(
+        raw_data.get("forceRefresh")
+        or raw_data.get("force_refresh")
+        or request.args.get("forceRefresh")
+        or request.args.get("force_refresh")
+    )
+    return language, message, _request_recommended_artists(raw_data), force_refresh
+
+
+def _truthy_request_value(value):
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in ("1", "yes", "true", "on")
 
 
 def _request_recommended_artists(raw_data):
@@ -590,6 +1028,16 @@ def _request_recommended_artists(raw_data):
         starter_tracks = artist.get("starterTracks")
         if not isinstance(starter_tracks, list):
             starter_tracks = []
+        similar_to = artist.get("similarTo")
+        if not isinstance(similar_to, list):
+            similar_to = []
+        mood = artist.get("mood")
+        if not isinstance(mood, list):
+            mood = []
+        try:
+            confidence = float(artist.get("confidence") or 0)
+        except (TypeError, ValueError):
+            confidence = 0.0
         sanitized.append(
             {
                 "name": name[:120],
@@ -604,6 +1052,17 @@ def _request_recommended_artists(raw_data):
                     for track in starter_tracks
                     if str(track).strip()
                 ][:8],
+                "similarTo": [
+                    str(similar).strip()[:120]
+                    for similar in similar_to
+                    if str(similar).strip()
+                ][:6],
+                "confidence": min(1.0, max(0.0, confidence)),
+                "mood": [
+                    str(value).strip()[:80]
+                    for value in mood
+                    if str(value).strip()
+                ][:6],
             }
         )
     return sanitized
@@ -624,7 +1083,12 @@ def _sse_prelude():
 @login_only
 def recommendation_agent_stream():
     request_id = getattr(g, "supysonic_request_id", None)
-    language, message, previous_recommended_artists = _recommendation_agent_request_values()
+    (
+        language,
+        message,
+        previous_recommended_artists,
+        force_refresh,
+    ) = _recommendation_agent_request_values()
     context = _build_recommendation_context(
         request.user,
         _get_recommendation_count(),
@@ -643,6 +1107,7 @@ def recommendation_agent_stream():
                 context["tracks"],
                 context["summary"],
                 previous_recommended_artists,
+                force_refresh=force_refresh,
             ):
                 payload = dict(payload)
                 if event_name == "final":

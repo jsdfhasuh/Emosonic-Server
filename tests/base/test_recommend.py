@@ -1,11 +1,17 @@
 import json
 import os
+import uuid
 import unittest
 
+from datetime import datetime
 from unittest.mock import patch
 
 from supysonic.db import Album, Artist, Folder, Playlist, Track, User, User_Play_Activity, db
-from supysonic.recommend import RECOMMENDED_PLAYLIST_COMMENT, create_recommend_playlist
+from supysonic.recommend import (
+    RECOMMENDED_PLAYLIST_COMMENT,
+    _buildRecommendedTracks,
+    create_recommend_playlist,
+)
 from supysonic.recommendation_feedback import set_recommendation_feedback
 
 from ..testbase import TestBase
@@ -38,22 +44,37 @@ class RecommendTestCase(TestBase):
             self._create_track("Candidate Other", 5, genre="jazz"),
         ]
 
-    def _create_track(self, title, number, genre=None):
-        return Track.create(
-            disc=1,
-            number=number,
-            title=title,
-            duration=180,
-            has_art=False,
-            album=self.album,
-            artist=self.artist,
-            genre=genre,
-            bitrate=320,
-            path=os.path.join("/music", f"{number}.flac"),
-            last_modification=1,
-            root_folder=self.root,
-            folder=self.root,
-        )
+    def _create_track(
+        self,
+        title,
+        number,
+        genre=None,
+        artist=None,
+        album=None,
+        play_count=0,
+        track_id=None,
+    ):
+        artist = artist or self.artist
+        album = album or self.album
+        values = {
+            "disc": 1,
+            "number": number,
+            "title": title,
+            "duration": 180,
+            "has_art": False,
+            "album": album,
+            "artist": artist,
+            "genre": genre,
+            "bitrate": 320,
+            "play_count": play_count,
+            "path": os.path.join("/music", f"{number}.flac"),
+            "last_modification": 1,
+            "root_folder": self.root,
+            "folder": self.root,
+        }
+        if track_id is not None:
+            values["id"] = track_id
+        return Track.create(**values)
 
     def _record_play(self, track, count):
         for _ in range(count):
@@ -109,6 +130,310 @@ class RecommendTestCase(TestBase):
         recommended_ids = {track.id for track in playlist.get_tracks()}
         self.assertNotIn(disliked_track.id, recommended_ids)
 
+    def test_create_recommend_playlist_excludes_hidden_artist_tracks(self):
+        self._record_play(self.listened_tracks[0], 2)
+        hidden_artist = Artist.create(name="Hidden Artist")
+        hidden_album = Album.create(name="Hidden Album", artist=hidden_artist)
+        visible_artist = Artist.create(name="Visible Artist")
+        visible_album = Album.create(name="Visible Album", artist=visible_artist)
+        hidden_track = self._create_track(
+            "Hidden Artist Candidate",
+            6,
+            genre="rock",
+            artist=hidden_artist,
+            album=hidden_album,
+        )
+        visible_track = self._create_track(
+            "Visible Artist Candidate",
+            7,
+            genre="rock",
+            artist=visible_artist,
+            album=visible_album,
+        )
+
+        set_recommendation_feedback(
+            self.user,
+            str(self.artist.id),
+            "hide_artist",
+        )
+        set_recommendation_feedback(
+            self.user,
+            "hidden artist",
+            "hide_artist",
+        )
+        create_recommend_playlist(num_songs=2, user=self.user, day="2026-05-02")
+
+        playlist = Playlist.get(Playlist.user == self.user)
+        recommended_ids = {track.id for track in playlist.get_tracks()}
+        self.assertNotIn(hidden_track.id, recommended_ids)
+        self.assertIn(visible_track.id, recommended_ids)
+
+    def test_create_recommend_playlist_excludes_hidden_album_and_style_tracks(self):
+        self._record_play(self.listened_tracks[0], 2)
+        hidden_album_artist = Artist.create(name="Hidden Album Artist")
+        hidden_album = Album.create(
+            name="Hidden Album",
+            artist=hidden_album_artist,
+        )
+        hidden_style_artist = Artist.create(name="Hidden Style Artist")
+        hidden_style_album = Album.create(
+            name="Hidden Style Album",
+            artist=hidden_style_artist,
+        )
+        visible_artist = Artist.create(name="Visible Album Style Artist")
+        visible_album = Album.create(
+            name="Visible Album Style Album",
+            artist=visible_artist,
+        )
+        hidden_album_track = self._create_track(
+            "Hidden Album Candidate",
+            8,
+            genre="rock",
+            artist=hidden_album_artist,
+            album=hidden_album,
+            play_count=100,
+        )
+        hidden_style_track = self._create_track(
+            "Hidden Style Candidate",
+            9,
+            genre="Blocked",
+            artist=hidden_style_artist,
+            album=hidden_style_album,
+            play_count=90,
+        )
+        visible_track = self._create_track(
+            "Visible Album Style Candidate",
+            10,
+            genre="rock",
+            artist=visible_artist,
+            album=visible_album,
+            play_count=1,
+        )
+
+        set_recommendation_feedback(
+            self.user,
+            str(hidden_album.id),
+            "hide_album",
+        )
+        set_recommendation_feedback(
+            self.user,
+            "blocked",
+            "not_this_style",
+        )
+        create_recommend_playlist(num_songs=6, user=self.user, day="2026-05-02")
+
+        playlist = Playlist.get(Playlist.user == self.user)
+        recommended_ids = {track.id for track in playlist.get_tracks()}
+        self.assertNotIn(hidden_album_track.id, recommended_ids)
+        self.assertNotIn(hidden_style_track.id, recommended_ids)
+        self.assertIn(visible_track.id, recommended_ids)
+
+    def test_create_recommend_playlist_scores_genre_affinity_above_popularity(self):
+        self._record_play(self.listened_tracks[0], 3)
+        set_recommendation_feedback(
+            self.user,
+            str(self.artist.id),
+            "hide_artist",
+        )
+        rock_artist = Artist.create(name="Rock Candidate Artist")
+        rock_album = Album.create(name="Rock Candidate Album", artist=rock_artist)
+        jazz_artist = Artist.create(name="Popular Jazz Artist")
+        jazz_album = Album.create(name="Popular Jazz Album", artist=jazz_artist)
+        rock_candidate = self._create_track(
+            "Low Play Rock Candidate",
+            8,
+            genre="rock",
+            artist=rock_artist,
+            album=rock_album,
+            play_count=0,
+        )
+        jazz_candidate = self._create_track(
+            "Popular Jazz Candidate",
+            9,
+            genre="jazz",
+            artist=jazz_artist,
+            album=jazz_album,
+            play_count=100,
+        )
+
+        create_recommend_playlist(num_songs=1, user=self.user, day="2026-05-02")
+
+        playlist = Playlist.get(Playlist.user == self.user)
+        recommended_ids = [track.id for track in playlist.get_tracks()]
+        self.assertEqual(recommended_ids, [rock_candidate.id])
+        self.assertNotIn(jazz_candidate.id, recommended_ids)
+
+    def test_create_recommend_playlist_scores_album_affinity_for_equal_candidates(self):
+        self._record_play(self.listened_tracks[0], 3)
+        set_recommendation_feedback(
+            self.user,
+            str(self.artist.id),
+            "hide_artist",
+        )
+        affinity_artist = Artist.create(name="Album Affinity Artist")
+        affinity_candidate = self._create_track(
+            "Same Album Candidate",
+            10,
+            genre="ambient",
+            artist=affinity_artist,
+            album=self.album,
+            play_count=7,
+        )
+        other_artist = Artist.create(name="Different Album Artist")
+        other_album = Album.create(
+            name="Different Album",
+            artist=other_artist,
+        )
+        other_candidate = self._create_track(
+            "Different Album Candidate",
+            11,
+            genre="ambient",
+            artist=other_artist,
+            album=other_album,
+            play_count=7,
+        )
+
+        create_recommend_playlist(num_songs=1, user=self.user, day="2026-05-02")
+
+        playlist = Playlist.get(Playlist.user == self.user)
+        recommended_ids = [track.id for track in playlist.get_tracks()]
+        self.assertEqual(recommended_ids, [affinity_candidate.id])
+        self.assertNotIn(other_candidate.id, recommended_ids)
+
+    def test_create_recommend_playlist_scores_freshness_for_equal_candidates(self):
+        self._record_play(self.listened_tracks[0], 3)
+        set_recommendation_feedback(
+            self.user,
+            str(self.artist.id),
+            "hide_artist",
+        )
+        fresh_artist = Artist.create(name="Fresh Candidate Artist")
+        fresh_album = Album.create(name="Fresh Candidate Album", artist=fresh_artist)
+        stale_artist = Artist.create(name="Stale Candidate Artist")
+        stale_album = Album.create(name="Stale Candidate Album", artist=stale_artist)
+        fresh_candidate = self._create_track(
+            "Fresh Candidate",
+            12,
+            genre="ambient",
+            artist=fresh_artist,
+            album=fresh_album,
+            play_count=7,
+        )
+        stale_candidate = self._create_track(
+            "Stale Candidate",
+            13,
+            genre="ambient",
+            artist=stale_artist,
+            album=stale_album,
+            play_count=7,
+        )
+        stale_candidate.last_play = datetime(2026, 5, 1, 12, 0, 0)
+        stale_candidate.save()
+
+        create_recommend_playlist(num_songs=1, user=self.user, day="2026-05-02")
+
+        playlist = Playlist.get(Playlist.user == self.user)
+        recommended_ids = [track.id for track in playlist.get_tracks()]
+        self.assertEqual(recommended_ids, [fresh_candidate.id])
+        self.assertNotIn(stale_candidate.id, recommended_ids)
+
+    def test_build_recommended_tracks_scores_like_more_feedback(self):
+        seed_artist = Artist.create(name="Seed Artist")
+        seed_album = Album.create(name="Seed Album", artist=seed_artist)
+        other_artist = Artist.create(name="Other Artist")
+        other_album = Album.create(name="Other Album", artist=other_artist)
+        seed_track = self._create_track(
+            "Liked Seed",
+            10,
+            genre="ambient",
+            artist=seed_artist,
+            album=seed_album,
+        )
+        similar_track = self._create_track(
+            "Similar Candidate",
+            11,
+            genre="ambient",
+            artist=seed_artist,
+            album=seed_album,
+        )
+        other_track = self._create_track(
+            "Other Candidate",
+            12,
+            genre="ambient",
+            artist=other_artist,
+            album=other_album,
+        )
+
+        tracks = _buildRecommendedTracks(
+            {self.listened_tracks[0].id: 1, self.listened_tracks[1].id: 1},
+            1,
+            excludedTrackIds={seed_track.id, *[track.id for track in self.candidate_tracks]},
+            preferences={
+                "disliked_song_ids": set(),
+                "hidden_artist_ids": set(),
+                "hidden_album_ids": set(),
+                "hidden_genres": set(),
+                "liked_more_song_ids": {str(seed_track.id)},
+            },
+        )
+
+        self.assertEqual([track.id for track in tracks], [similar_track.id])
+        self.assertNotEqual(tracks[0].id, other_track.id)
+
+    def test_build_recommended_tracks_rotates_equal_candidates_by_day(self):
+        existing_ids = {
+            track.id
+            for track in self.listened_tracks + self.candidate_tracks
+        }
+        tied_tracks = [
+            self._create_track(
+                f"Tied Candidate {index}",
+                20 + index,
+                genre="ambient",
+                play_count=0,
+                track_id=uuid.UUID(
+                    f"00000000-0000-0000-0000-00000000000{index}"
+                ),
+            )
+            for index in range(1, 7)
+        ]
+
+        first_day = _buildRecommendedTracks(
+            {},
+            3,
+            excludedTrackIds=existing_ids,
+            recommendationDay="2026-05-02",
+        )
+        first_day_repeat = _buildRecommendedTracks(
+            {},
+            3,
+            excludedTrackIds=existing_ids,
+            recommendationDay="2026-05-02",
+        )
+        second_day = _buildRecommendedTracks(
+            {},
+            3,
+            excludedTrackIds=existing_ids,
+            recommendationDay="2026-05-03",
+        )
+
+        self.assertEqual(
+            [track.id for track in first_day],
+            [track.id for track in first_day_repeat],
+        )
+        self.assertNotEqual(
+            [track.id for track in first_day],
+            [track.id for track in second_day],
+        )
+        self.assertEqual(
+            [track.id for track in first_day],
+            [tied_tracks[4].id, tied_tracks[1].id, tied_tracks[5].id],
+        )
+        self.assertEqual(
+            [track.id for track in second_day],
+            [tied_tracks[2].id, tied_tracks[3].id, tied_tracks[5].id],
+        )
+
     def test_create_recommend_playlist_is_idempotent_for_same_user_and_day(self):
         self._record_play(self.listened_tracks[0], 2)
         self._record_play(self.listened_tracks[1], 1)
@@ -150,6 +475,7 @@ class RecommendTestCase(TestBase):
         self.assertEqual(payload["recommendation_day"], "2026-05-01")
         self.assertEqual(payload["track_ids"], [str(self.candidate_tracks[0].id)])
         self.assertEqual(payload["tracks"][0]["title"], self.candidate_tracks[0].title)
+        self.assertIn("rock", payload["tracks"][0]["recommend_reason"])
 
     def test_create_recommend_playlist_sanitizes_archive_user_directory(self):
         self._record_play(self.listened_tracks[0], 2)

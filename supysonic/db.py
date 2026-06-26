@@ -38,6 +38,8 @@ from .db_layer.runtime import (
 from .db_layer.schema import SCHEMA_VERSION, execute_sql_resource_script
 from .db_layer.users import (
     ClientPrefs,
+    RecommendationAgentCache,
+    RecommendationAgentSession,
     User,
     User_Play_Activity,
     UserRecommendationFeedback,

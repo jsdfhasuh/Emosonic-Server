@@ -50,6 +50,8 @@ class DbLayerContractTestCase(unittest.TestCase):
             "User",
             "User_Play_Activity",
             "UserRecommendationFeedback",
+            "RecommendationAgentSession",
+            "RecommendationAgentCache",
             "ClientPrefs",
             "MusicRequest",
             "EmoSessionQueue",
@@ -199,6 +201,8 @@ class DbLayerContractTestCase(unittest.TestCase):
             "User",
             "User_Play_Activity",
             "UserRecommendationFeedback",
+            "RecommendationAgentSession",
+            "RecommendationAgentCache",
             "ClientPrefs",
         ):
             with self.subTest(name=name):
@@ -223,6 +227,18 @@ class DbLayerContractTestCase(unittest.TestCase):
         self.assertIs(db_module.SharedTrackLink, playlists.SharedTrackLink)
         self.assertIs(db_module.ChatMessage, misc.ChatMessage)
         self.assertIs(db_module.RadioStation, misc.RadioStation)
+
+    def test_mysql_migrations_avoid_unsupported_create_index_if_not_exists(self):
+        package_dir = (
+            Path(importlib.import_module("supysonic").__file__).resolve().parent
+        )
+        migration_dir = package_dir / "schema" / "migration" / "mysql"
+
+        for path in sorted(migration_dir.glob("*.sql")):
+            sql = path.read_text(encoding="utf-8").upper()
+            with self.subTest(path=path.name):
+                self.assertNotIn("CREATE INDEX IF NOT EXISTS", sql)
+                self.assertNotIn("CREATE UNIQUE INDEX IF NOT EXISTS", sql)
 
 
 if __name__ == "__main__":

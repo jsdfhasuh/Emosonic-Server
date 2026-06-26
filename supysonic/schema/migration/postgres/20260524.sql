@@ -1,7 +1,7 @@
 CREATE TABLE IF NOT EXISTS user_recommendation_feedback (
     id UUID PRIMARY KEY,
     user_id UUID NOT NULL REFERENCES "user",
-    song_id VARCHAR(96) NOT NULL,
+    song_id VARCHAR(128) NOT NULL,
     action VARCHAR(32) NOT NULL,
     scope VARCHAR(64) NOT NULL,
     source VARCHAR(64) NOT NULL,

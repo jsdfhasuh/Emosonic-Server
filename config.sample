@@ -184,6 +184,10 @@ max_output_tokens = 900
 ; Model temperature. Default: 0.7
 temperature = 0.7
 
+; Seconds to reuse identical Agent results for the same user/context.
+; Set to 0 to disable Agent result caching. Default: 900
+cache_ttl_seconds = 900
+
 [transcoding]
 ; Programs used to convert from one format/bitrate to another. Defaults: none
 transcoder_mp3_mp3 = lame --quiet --mp3input -b %outrate %srcpath -

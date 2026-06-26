@@ -6,6 +6,7 @@ from peewee import (
     FixedCharField,
     ForeignKeyField,
     IntegerField,
+    TextField,
 )
 
 from .core import PrimaryKeyField, _Model, now
@@ -55,7 +56,9 @@ class User_Play_Activity(_Model):
 class UserRecommendationFeedback(_Model):
     id = PrimaryKeyField()
     user = ForeignKeyField(User, backref="recommendation_feedback")
-    song_id = CharField(max_length=96)
+    song_id = CharField(max_length=128)
+    target_type = CharField(max_length=32, default="song")
+    target_id = CharField(max_length=128)
     action = CharField(max_length=32)
     scope = CharField(max_length=64)
     source = CharField(max_length=64)
@@ -67,8 +70,46 @@ class UserRecommendationFeedback(_Model):
     class Meta:
         table_name = "user_recommendation_feedback"
         indexes = (
-            (("user", "song_id", "scope"), True),
+            (("user", "target_type", "target_id", "scope"), True),
             (("user", "scope", "deleted_at"), False),
+        )
+
+
+class RecommendationAgentSession(_Model):
+    id = PrimaryKeyField()
+    user = ForeignKeyField(User, backref="recommendation_agent_sessions")
+    message = TextField()
+    reply = TextField()
+    recommended_artists_json = TextField()
+    context_summary_json = TextField()
+    model = CharField(max_length=128)
+    language = CharField(max_length=8)
+    created_at = DateTimeField(default=now)
+
+    class Meta:
+        table_name = "recommendation_agent_session"
+        indexes = (
+            (("user", "created_at"), False),
+        )
+
+
+class RecommendationAgentCache(_Model):
+    id = PrimaryKeyField()
+    user = ForeignKeyField(User, backref="recommendation_agent_cache_entries")
+    context_hash = CharField(max_length=64)
+    message = TextField()
+    language = CharField(max_length=8)
+    model = CharField(max_length=128)
+    payload_json = TextField()
+    created_at = DateTimeField(default=now)
+    updated_at = DateTimeField(default=now)
+    expires_at = DateTimeField()
+
+    class Meta:
+        table_name = "recommendation_agent_cache"
+        indexes = (
+            (("user", "context_hash"), True),
+            (("user", "expires_at"), False),
         )
 
 

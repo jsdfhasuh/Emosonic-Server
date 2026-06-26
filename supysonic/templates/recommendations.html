@@ -61,7 +61,7 @@
 
   <div class="tab-content recommendation-tab-content" id="recommendation-workspace-tab-content">
     <section class="tab-pane fade show active" id="recommendation-agent-panel" role="tabpanel" aria-labelledby="recommendation-agent-tab" tabindex="0">
-      <div class="card recommendation-agent-card recommendation-agent-workspace" data-recommendation-agent data-agent-url="{{ url_for('frontend.recommendation_agent') }}" data-agent-stream-url="{{ url_for('frontend.recommendation_agent_stream') }}">
+      <div class="card recommendation-agent-card recommendation-agent-workspace" data-recommendation-agent data-agent-url="{{ url_for('frontend.recommendation_agent') }}" data-agent-stream-url="{{ url_for('frontend.recommendation_agent_stream') }}" data-agent-health-url="{{ url_for('frontend.recommendation_agent_health') }}" data-agent-feedback-url="{{ url_for('frontend.recommendation_feedback') }}" data-agent-starter-url="{{ url_for('frontend.recommendation_agent_starter_playlist') }}" data-agent-session-clear-url="{{ url_for('frontend.recommendation_agent_session_clear') }}">
         <div class="card-header recommendation-agent-header">
           <div>
             <span data-i18n-en="Recommendation Agent" data-i18n-zh="推荐 Agent">Recommendation Agent</span>
@@ -70,6 +70,7 @@
           <div class="recommendation-agent-actions">
             <span class="console-chip" data-agent-status data-i18n-en="Loading" data-i18n-zh="加载中">Loading</span>
             <button class="btn btn-sm btn-outline-secondary" type="button" data-agent-retry data-i18n-en="Retry" data-i18n-zh="重试">Retry</button>
+            <button class="btn btn-sm btn-outline-secondary" type="button" data-agent-clear data-i18n-en="Clear" data-i18n-zh="清空">Clear</button>
           </div>
         </div>
         <div class="card-body">
@@ -83,8 +84,17 @@
               <div class="recommendation-agent-chips" data-agent-recommended-artists></div>
             </section>
           </div>
+          <section class="recommendation-agent-health" data-agent-health>
+            <div>
+              <span class="recommendation-agent-label" data-i18n-en="Agent health" data-i18n-zh="Agent 状态">Agent health</span>
+              <div class="recommendation-agent-health-summary" data-agent-health-summary data-i18n-en="Checking configuration" data-i18n-zh="正在检查配置">Checking configuration</div>
+            </div>
+            <div class="recommendation-agent-health-metrics" data-agent-health-metrics></div>
+          </section>
+          <script type="application/json" data-agent-initial-sessions>{{ agentSessions|default([])|tojson }}</script>
           <div class="recommendation-agent-messages" data-agent-messages aria-live="polite"></div>
           <div class="recommendation-agent-prompts" data-agent-prompts></div>
+          <div class="recommendation-agent-feedback-status" data-agent-feedback-status hidden></div>
           <form class="recommendation-agent-form" data-agent-form>
             <input class="form-control" data-agent-input type="text" maxlength="400" autocomplete="off" data-i18n-en="Ask the model for outside-library artists" data-i18n-zh="向大模型询问曲库外歌手" data-i18n-attr="placeholder, aria-label" placeholder="Ask the model for outside-library artists" aria-label="Ask the model for outside-library artists">
             <button class="btn btn-dark" type="submit" data-i18n-en="Send" data-i18n-zh="发送">Send</button>
@@ -154,7 +164,8 @@
             <div class="card-body p-0">
               {% if tracks %}
               <div class="table-responsive">
-                <table class="table table-hover align-middle mb-0 recommendation-track-table">
+                <div class="recommendation-feedback-status" data-recommendation-feedback-status hidden></div>
+                <table class="table table-hover align-middle mb-0 recommendation-track-table" data-recommendation-feedback-url="{{ url_for('frontend.recommendation_feedback') }}">
                   <thead>
                     <tr>
                       <th>#</th>
@@ -162,13 +173,15 @@
                       <th data-i18n-en="Artist" data-i18n-zh="艺人">Artist</th>
                       <th data-i18n-en="Album" data-i18n-zh="专辑">Album</th>
                       <th data-i18n-en="Genre" data-i18n-zh="流派">Genre</th>
+                      <th data-i18n-en="Reason" data-i18n-zh="推荐原因">Reason</th>
                       <th data-i18n-en="Duration" data-i18n-zh="时长">Duration</th>
                       <th data-i18n-en="Plays" data-i18n-zh="播放">Plays</th>
+                      <th data-i18n-en="Actions" data-i18n-zh="操作">Actions</th>
                     </tr>
                   </thead>
                   <tbody>
                     {% for track in tracks %}
-                    <tr data-recommendation-row>
+                    <tr data-recommendation-row data-track-id="{{ track.id }}" data-artist-id="{{ track.artist.id if track.artist else '' }}" data-album-id="{{ track.album.id if track.album else '' }}" data-genre="{{ track.genre or '' }}">
                       <td><span class="console-chip">{{ loop.index }}</span></td>
                       <td>
                         <div class="console-table-title">{{ track.title }}</div>
@@ -177,8 +190,25 @@
                       <td>{{ track.artist.get_artist_name() if track.artist else '-' }}</td>
                       <td>{{ track.album.name if track.album else '-' }}</td>
                       <td>{{ track.genre or '-' }}</td>
+                      <td class="recommendation-reason-cell">{{ trackReasons.get(track.id|string, '-') }}</td>
                       <td>{{ track.duration_str() }}</td>
                       <td>{{ track.play_count }}</td>
+                      <td>
+                        <div class="recommendation-row-actions">
+                          <button class="btn btn-sm btn-outline-secondary" type="button" data-recommendation-why data-i18n-en="Why?" data-i18n-zh="为什么？">Why?</button>
+                          <button class="btn btn-sm btn-outline-secondary" type="button" data-recommendation-feedback-action="dislike_song" data-feedback-target-type="song" data-feedback-target-id="{{ track.id }}" data-feedback-restore-action="restore_song" data-feedback-hide="row" data-i18n-en="Hide" data-i18n-zh="不再推荐">Hide</button>
+                          <button class="btn btn-sm btn-outline-secondary" type="button" data-recommendation-feedback-action="like_more" data-feedback-target-type="song" data-feedback-target-id="{{ track.id }}" data-feedback-restore-action="restore_song" data-i18n-en="More Like This" data-i18n-zh="多推荐类似">More Like This</button>
+                          {% if track.artist %}
+                          <button class="btn btn-sm btn-outline-secondary" type="button" data-recommendation-feedback-action="hide_artist" data-feedback-target-type="artist" data-feedback-target-id="{{ track.artist.id }}" data-feedback-restore-action="restore_artist" data-feedback-hide="artist" data-i18n-en="Less Artist" data-i18n-zh="少推荐该艺人">Less Artist</button>
+                          {% endif %}
+                          {% if track.album %}
+                          <button class="btn btn-sm btn-outline-secondary" type="button" data-recommendation-feedback-action="hide_album" data-feedback-target-type="album" data-feedback-target-id="{{ track.album.id }}" data-feedback-restore-action="restore_album" data-feedback-hide="album" data-i18n-en="Less Album" data-i18n-zh="少推荐该专辑">Less Album</button>
+                          {% endif %}
+                          {% if track.genre %}
+                          <button class="btn btn-sm btn-outline-secondary" type="button" data-recommendation-feedback-action="not_this_style" data-feedback-target-type="genre" data-feedback-target-id="{{ track.genre }}" data-feedback-restore-action="restore_style" data-feedback-hide="genre" data-i18n-en="Less Style" data-i18n-zh="少推荐该风格">Less Style</button>
+                          {% endif %}
+                        </div>
+                      </td>
                     </tr>
                     {% endfor %}
                   </tbody>
@@ -235,23 +265,36 @@ document.addEventListener('DOMContentLoaded', function () {
   initRecommendationTabs();
 
   const recommendationRows = Array.from(document.querySelectorAll('[data-recommendation-row]'));
+  const recommendationTable = document.querySelector('[data-recommendation-feedback-url]');
+  const recommendationFeedbackUrl = recommendationTable ? recommendationTable.getAttribute('data-recommendation-feedback-url') : '';
+  const feedbackStatusNode = document.querySelector('[data-recommendation-feedback-status]');
   const prevPageButton = document.querySelector('[data-recommendation-prev]');
   const nextPageButton = document.querySelector('[data-recommendation-next]');
   const pageIndicator = document.querySelector('[data-recommendation-page]');
   const recommendationPageSize = 10;
   let recommendationPage = 0;
 
+  function visibleRecommendationRows() {
+    return recommendationRows.filter(function (row) {
+      return row.getAttribute('data-recommendation-hidden') !== 'true';
+    });
+  }
+
   function renderRecommendationPage() {
     if (!prevPageButton || !nextPageButton || !pageIndicator) {
       return;
     }
 
-    const totalPages = Math.max(1, Math.ceil(recommendationRows.length / recommendationPageSize));
+    const visibleRows = visibleRecommendationRows();
+    const totalPages = Math.max(1, Math.ceil(visibleRows.length / recommendationPageSize));
     recommendationPage = Math.min(recommendationPage, totalPages - 1);
     const start = recommendationPage * recommendationPageSize;
     const end = start + recommendationPageSize;
 
-    recommendationRows.forEach(function (row, index) {
+    recommendationRows.forEach(function (row) {
+      row.hidden = true;
+    });
+    visibleRows.forEach(function (row, index) {
       row.hidden = index < start || index >= end;
     });
 
@@ -281,6 +324,166 @@ document.addEventListener('DOMContentLoaded', function () {
     renderRecommendationPage();
   }
 
+  function feedbackRows(targetType, targetId, hideMode) {
+    function normalizedFeedbackTarget(value) {
+      return String(value || '').trim().toLocaleLowerCase();
+    }
+    if (hideMode === 'artist') {
+      return recommendationRows.filter(function (row) {
+        return row.getAttribute('data-artist-id') === targetId;
+      });
+    }
+    if (hideMode === 'album') {
+      return recommendationRows.filter(function (row) {
+        return row.getAttribute('data-album-id') === targetId;
+      });
+    }
+    if (hideMode === 'genre') {
+      const normalizedTargetId = normalizedFeedbackTarget(targetId);
+      return recommendationRows.filter(function (row) {
+        return normalizedFeedbackTarget(row.getAttribute('data-genre')) === normalizedTargetId;
+      });
+    }
+    if (targetType === 'song') {
+      return recommendationRows.filter(function (row) {
+        return row.getAttribute('data-track-id') === targetId;
+      });
+    }
+    return [];
+  }
+
+  function setFeedbackStatus(message, undoConfig) {
+    if (!feedbackStatusNode) {
+      return;
+    }
+    feedbackStatusNode.replaceChildren();
+    const label = document.createElement('span');
+    label.textContent = message;
+    feedbackStatusNode.appendChild(label);
+    if (undoConfig) {
+      const undo = document.createElement('button');
+      undo.type = 'button';
+      undo.className = 'btn btn-sm btn-outline-secondary';
+      undo.textContent = text('Undo', '撤销');
+      undo.addEventListener('click', function () {
+        sendRecommendationFeedback(undoConfig, true);
+      });
+      feedbackStatusNode.appendChild(undo);
+    }
+    feedbackStatusNode.hidden = false;
+  }
+
+  async function postRecommendationFeedback(config) {
+    const feedbackUrl = config.url || recommendationFeedbackUrl;
+    if (!feedbackUrl) {
+      throw new Error('feedback endpoint unavailable');
+    }
+    const response = await fetch(feedbackUrl, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        id: config.targetId,
+        targetType: config.targetType,
+        action: config.action,
+        scope: 'hot_recommended',
+        reason: config.reason || 'web_feedback',
+        source: config.source || 'web'
+      })
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload && payload.error ? payload.error : `HTTP ${response.status}`);
+    }
+    return payload;
+  }
+
+  function applyFeedbackState(config, isUndo) {
+    const rows = feedbackRows(config.targetType, config.targetId, config.hideMode);
+    if (isUndo) {
+      rows.forEach(function (row) {
+        row.removeAttribute('data-recommendation-hidden');
+        row.classList.remove('is-feedback-hidden', 'is-feedback-positive');
+      });
+      renderRecommendationPage();
+      setFeedbackStatus(text('Feedback restored.', '反馈已撤销。'));
+      return;
+    }
+
+    if (config.hideMode) {
+      rows.forEach(function (row) {
+        row.setAttribute('data-recommendation-hidden', 'true');
+        row.classList.add('is-feedback-hidden');
+      });
+      renderRecommendationPage();
+    } else {
+      rows.forEach(function (row) {
+        row.classList.add('is-feedback-positive');
+      });
+    }
+
+    const undoConfig = {
+      action: config.restoreAction,
+      restoreAction: config.action,
+      targetType: config.targetType,
+      targetId: config.targetId,
+      hideMode: config.hideMode
+    };
+    setFeedbackStatus(config.successText, undoConfig);
+  }
+
+  async function sendRecommendationFeedback(config, isUndo) {
+    if (!recommendationFeedbackUrl) {
+      return;
+    }
+    try {
+      await postRecommendationFeedback(config);
+      applyFeedbackState(config, isUndo);
+    } catch (error) {
+      setFeedbackStatus(text(
+        `Feedback failed: ${error.message}`,
+        `反馈失败：${error.message}`
+      ));
+    }
+  }
+
+  function showRecommendationReason(button) {
+    const row = button.closest('[data-recommendation-row]');
+    const reasonNode = row ? row.querySelector('.recommendation-reason-cell') : null;
+    const reason = reasonNode ? reasonNode.textContent.trim() : '';
+    setFeedbackStatus(
+      reason && reason !== '-'
+        ? text('Reason: ', '推荐原因：') + reason
+        : text('No recommendation reason available.', '暂无推荐原因。')
+    );
+  }
+
+  document.querySelectorAll('[data-recommendation-why]').forEach(function (button) {
+    button.addEventListener('click', function () {
+      showRecommendationReason(button);
+    });
+  });
+
+  document.querySelectorAll('[data-recommendation-feedback-action]').forEach(function (button) {
+    button.addEventListener('click', function () {
+      const action = button.getAttribute('data-recommendation-feedback-action');
+      const targetType = button.getAttribute('data-feedback-target-type');
+      const targetId = button.getAttribute('data-feedback-target-id');
+      const hideMode = button.getAttribute('data-feedback-hide') || '';
+      const restoreAction = button.getAttribute('data-feedback-restore-action');
+      if (!action || !targetType || !targetId || !restoreAction) {
+        return;
+      }
+      sendRecommendationFeedback({
+        action,
+        restoreAction,
+        targetType,
+        targetId,
+        hideMode,
+        successText: text('Feedback saved.', '反馈已保存。')
+      });
+    });
+  });
+
   const agentRoot = document.querySelector('[data-recommendation-agent]');
   if (!agentRoot) {
     return;
@@ -288,8 +491,16 @@ document.addEventListener('DOMContentLoaded', function () {
 
   const agentUrl = agentRoot.getAttribute('data-agent-url');
   const agentStreamUrl = agentRoot.getAttribute('data-agent-stream-url');
+  const agentHealthUrl = agentRoot.getAttribute('data-agent-health-url');
+  const agentFeedbackUrl = agentRoot.getAttribute('data-agent-feedback-url') || recommendationFeedbackUrl;
+  const agentStarterUrl = agentRoot.getAttribute('data-agent-starter-url');
+  const agentSessionClearUrl = agentRoot.getAttribute('data-agent-session-clear-url');
   const statusNode = agentRoot.querySelector('[data-agent-status]');
   const modelNode = agentRoot.querySelector('[data-agent-model]');
+  const healthSummaryNode = agentRoot.querySelector('[data-agent-health-summary]');
+  const healthMetricsNode = agentRoot.querySelector('[data-agent-health-metrics]');
+  const agentFeedbackStatusNode = agentRoot.querySelector('[data-agent-feedback-status]');
+  const initialSessionsNode = agentRoot.querySelector('[data-agent-initial-sessions]');
   const messagesNode = agentRoot.querySelector('[data-agent-messages]');
   const promptNode = agentRoot.querySelector('[data-agent-prompts]');
   const topArtistsNode = agentRoot.querySelector('[data-agent-top-artists]');
@@ -297,9 +508,20 @@ document.addEventListener('DOMContentLoaded', function () {
   const form = agentRoot.querySelector('[data-agent-form]');
   const input = agentRoot.querySelector('[data-agent-input]');
   const retryButton = agentRoot.querySelector('[data-agent-retry]');
+  const clearButton = agentRoot.querySelector('[data-agent-clear]');
   let loadController = null;
   let loadSequence = 0;
   let latestRecommendedArtists = [];
+  let knownAgentSessions = [];
+
+  if (initialSessionsNode) {
+    try {
+      const parsedSessions = JSON.parse(initialSessionsNode.textContent || '[]');
+      knownAgentSessions = Array.isArray(parsedSessions) ? parsedSessions : [];
+    } catch (error) {
+      knownAgentSessions = [];
+    }
+  }
 
   function setStatus(en, zh) {
     statusNode.textContent = text(en, zh);
@@ -312,6 +534,90 @@ document.addEventListener('DOMContentLoaded', function () {
     const agent = payload && payload.agent ? payload.agent : {};
     const model = agent.model || text('Model unavailable', '模型不可用');
     modelNode.textContent = text(`Model: ${model}`, `模型：${model}`);
+  }
+
+  function setHealthSummary(en, zh, state) {
+    if (!healthSummaryNode) {
+      return;
+    }
+    healthSummaryNode.textContent = text(en, zh);
+    healthSummaryNode.classList.remove('is-ok', 'is-warning', 'is-error');
+    if (state) {
+      healthSummaryNode.classList.add(`is-${state}`);
+    }
+  }
+
+  function renderHealthMetric(labelEn, labelZh, value, suffixEn, suffixZh) {
+    if (!healthMetricsNode) {
+      return;
+    }
+    const chip = document.createElement('span');
+    chip.className = 'recommendation-agent-chip';
+    const label = document.createElement('strong');
+    label.textContent = text(labelEn, labelZh);
+    const meta = document.createElement('span');
+    meta.textContent = `${value || 0}${text(suffixEn || '', suffixZh || '')}`;
+    chip.appendChild(label);
+    chip.appendChild(meta);
+    healthMetricsNode.appendChild(chip);
+  }
+
+  function renderAgentHealth(payload) {
+    const health = payload || {};
+    const metrics = health.metrics || {};
+    const model = health.model || text('not configured', '未配置');
+    const lastError = health.lastError || null;
+
+    if (!health.enabled) {
+      setHealthSummary('Disabled', '未启用', 'warning');
+    } else if (!health.configured) {
+      setHealthSummary('Not configured', '未配置', 'warning');
+    } else if (lastError) {
+      setHealthSummary(
+        `Last error: ${lastError.errorCode || lastError.message || 'unknown'}`,
+        `最近错误：${lastError.errorCode || lastError.message || '未知'}`,
+        'error'
+      );
+    } else if (health.lastSuccessAt) {
+      setHealthSummary(`Healthy · ${model}`, `健康 · ${model}`, 'ok');
+    } else {
+      setHealthSummary(`Configured · ${model}`, `已配置 · ${model}`, 'ok');
+    }
+
+    if (modelNode && !health.configured) {
+      modelNode.textContent = text('Model unavailable', '模型不可用');
+    } else if (modelNode && health.configured) {
+      modelNode.textContent = text(`Model: ${model}`, `模型：${model}`);
+    }
+
+    if (!healthMetricsNode) {
+      return;
+    }
+    healthMetricsNode.replaceChildren();
+    renderHealthMetric('Requests', '请求', metrics.agent_request_count);
+    renderHealthMetric('Success', '成功', metrics.agent_success_count);
+    renderHealthMetric('Errors', '错误', metrics.agent_error_count);
+    renderHealthMetric('Cache', '缓存', metrics.agent_cache_hit_count);
+    renderHealthMetric('Local filter', '本地过滤', metrics.agent_filtered_local_artist_count);
+    renderHealthMetric('Feedback filter', '反馈过滤', metrics.agent_filtered_feedback_artist_count);
+    renderHealthMetric('Avg', '平均', metrics.agent_average_latency_ms, ' ms', ' ms');
+  }
+
+  async function loadAgentHealth() {
+    if (!agentHealthUrl || !healthSummaryNode) {
+      return;
+    }
+    try {
+      const response = await fetch(agentHealthUrl, {
+        credentials: 'same-origin'
+      });
+      renderAgentHealth(await readResponsePayload(response));
+    } catch (error) {
+      setHealthSummary('Health unavailable', '状态不可用', 'error');
+      if (healthMetricsNode) {
+        healthMetricsNode.replaceChildren();
+      }
+    }
   }
 
   async function readResponsePayload(response) {
@@ -441,6 +747,214 @@ document.addEventListener('DOMContentLoaded', function () {
     });
   }
 
+  function normalizeArtistName(name) {
+    return String(name || '').trim().toLocaleLowerCase();
+  }
+
+  function setAgentFeedbackStatus(message, undoConfig, linkConfig) {
+    if (!agentFeedbackStatusNode) {
+      return;
+    }
+    agentFeedbackStatusNode.replaceChildren();
+    const label = document.createElement('span');
+    label.textContent = message;
+    agentFeedbackStatusNode.appendChild(label);
+    if (undoConfig) {
+      const undo = document.createElement('button');
+      undo.type = 'button';
+      undo.className = 'btn btn-sm btn-outline-secondary';
+      undo.textContent = text('Undo', '撤销');
+      undo.addEventListener('click', function () {
+        sendAgentArtistFeedback(undoConfig, true);
+      });
+      agentFeedbackStatusNode.appendChild(undo);
+    }
+    if (linkConfig && linkConfig.url) {
+      const link = document.createElement('a');
+      link.className = 'btn btn-sm btn-outline-secondary';
+      link.href = linkConfig.url;
+      link.textContent = linkConfig.label || text('Open', '打开');
+      agentFeedbackStatusNode.appendChild(link);
+    }
+    agentFeedbackStatusNode.hidden = false;
+  }
+
+  function renderLatestRecommendedArtistChips() {
+    renderArtistChips(
+      recommendedArtistsNode,
+      latestRecommendedArtists,
+      'No artist leads',
+      '暂无推荐歌手'
+    );
+  }
+
+  function saveAgentArtist(artist, button) {
+    const savedArtist = {
+      name: artist.name || '',
+      genres: Array.isArray(artist.genres) ? artist.genres.slice(0, 6) : [],
+      starterTracks: Array.isArray(artist.starterTracks) ? artist.starterTracks.slice(0, 8) : [],
+      savedAt: new Date().toISOString()
+    };
+    if (!savedArtist.name) {
+      return;
+    }
+    try {
+      const key = 'emosonic.recommendationAgent.listenLater';
+      const current = JSON.parse(window.localStorage.getItem(key) || '[]');
+      const filtered = Array.isArray(current)
+        ? current.filter(function (item) {
+          return normalizeArtistName(item && item.name) !== normalizeArtistName(savedArtist.name);
+        })
+        : [];
+      filtered.unshift(savedArtist);
+      window.localStorage.setItem(key, JSON.stringify(filtered.slice(0, 40)));
+      if (button) {
+        button.disabled = true;
+        button.textContent = text('Saved', '已加入');
+      }
+      setAgentFeedbackStatus(text('Saved to listen later.', '已加入待听。'));
+    } catch (error) {
+      setAgentFeedbackStatus(text('Could not save this artist.', '无法保存该歌手。'));
+    }
+  }
+
+  async function createAgentStarterPlaylist(artist, button) {
+    if (!agentStarterUrl || !artist || !artist.name) {
+      return;
+    }
+    const starterTracks = Array.isArray(artist.starterTracks)
+      ? artist.starterTracks.slice(0, 12)
+      : [];
+    if (!starterTracks.length) {
+      setAgentFeedbackStatus(text(
+        'No starter tracks available for this artist.',
+        '该歌手暂无入门歌曲。'
+      ));
+      return;
+    }
+
+    if (button) {
+      button.disabled = true;
+    }
+    try {
+      const response = await fetch(agentStarterUrl, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          artistName: artist.name,
+          starterTracks,
+          genres: Array.isArray(artist.genres) ? artist.genres.slice(0, 6) : []
+        })
+      });
+      const payload = await readResponsePayload(response);
+      if (payload.mode === 'playlist') {
+        if (button) {
+          button.textContent = payload.reused
+            ? text('Playlist exists', '歌单已存在')
+            : text('Playlist created', '歌单已生成');
+        }
+        setAgentFeedbackStatus(
+          payload.reused
+            ? text(
+              `Starter playlist already exists with ${payload.playlist.trackCount || 0} local tracks.`,
+              `入门歌单已存在，包含 ${payload.playlist.trackCount || 0} 首本地歌曲。`
+            )
+            : text(
+              `Starter playlist created with ${payload.playlist.trackCount || 0} local tracks.`,
+              `已用 ${payload.playlist.trackCount || 0} 首本地歌曲生成入门歌单。`
+            ),
+          null,
+          {
+            url: payload.playlist.url,
+            label: text('Open playlist', '打开歌单')
+          }
+        );
+      } else {
+        if (button) {
+          button.textContent = payload.reused
+            ? text('Request exists', '请求已存在')
+            : text('Request saved', '已登记');
+        }
+        setAgentFeedbackStatus(
+          payload.reused
+            ? text(
+              'Starter request already exists on the request board.',
+              '入门歌单请求已在登记板中。'
+            )
+            : text(
+              'Starter request saved to the request board.',
+              '入门歌单已登记到请求板。'
+            ),
+          null,
+          {
+            url: payload.musicRequest && payload.musicRequest.url,
+            label: text('Open requests', '打开请求板')
+          }
+        );
+      }
+    } catch (error) {
+      if (button) {
+        button.disabled = false;
+      }
+      setAgentFeedbackStatus(text(
+        `Starter playlist failed: ${error.message}`,
+        `生成入门歌单失败：${error.message}`
+      ));
+    }
+  }
+
+  async function sendAgentArtistFeedback(config, isUndo) {
+    if (!agentFeedbackUrl || !config.targetId) {
+      return;
+    }
+    try {
+      await postRecommendationFeedback({
+        url: agentFeedbackUrl,
+        action: config.action,
+        targetType: 'artist',
+        targetId: config.targetId,
+        reason: 'agent_artist_feedback',
+        source: 'web_agent'
+      });
+      if (isUndo) {
+        if (config.card) {
+          config.card.hidden = false;
+        }
+        if (config.artist && !latestRecommendedArtists.some(function (artist) {
+          return normalizeArtistName(artist.name) === normalizeArtistName(config.targetId);
+        })) {
+          latestRecommendedArtists.push(config.artist);
+          renderLatestRecommendedArtistChips();
+        }
+        setAgentFeedbackStatus(text('Feedback restored.', '反馈已撤销。'));
+        return;
+      }
+
+      if (config.card) {
+        config.card.hidden = true;
+      }
+      latestRecommendedArtists = latestRecommendedArtists.filter(function (artist) {
+        return normalizeArtistName(artist.name) !== normalizeArtistName(config.targetId);
+      });
+      renderLatestRecommendedArtistChips();
+      setAgentFeedbackStatus(
+        text('Artist hidden from future Agent suggestions.', '后续 Agent 推荐将避开该歌手。'),
+        {
+          action: 'restore_artist',
+          targetId: config.targetId,
+          card: config.card,
+          artist: config.artist
+        }
+      );
+    } catch (error) {
+      setAgentFeedbackStatus(text(
+        `Feedback failed: ${error.message}`,
+        `反馈失败：${error.message}`
+      ));
+    }
+  }
+
   function clearMessageArtistCards(messageNode) {
     if (!messageNode) {
       return;
@@ -465,6 +979,8 @@ document.addEventListener('DOMContentLoaded', function () {
     artists.forEach(function (artist) {
       const card = document.createElement('article');
       card.className = 'recommendation-agent-artist-card';
+      card.setAttribute('data-agent-artist-card', '');
+      card.setAttribute('data-agent-artist-name', artist.name || '');
 
       const header = document.createElement('div');
       header.className = 'recommendation-agent-artist-head';
@@ -481,6 +997,27 @@ document.addEventListener('DOMContentLoaded', function () {
       reason.className = 'recommendation-agent-artist-reason';
       reason.textContent = artist.reason || text('No reason provided.', '暂无推荐理由。');
 
+      const metaItems = [];
+      if (typeof artist.confidence === 'number' && artist.confidence > 0) {
+        metaItems.push(`${Math.round(artist.confidence * 100)}%`);
+      }
+      if (Array.isArray(artist.similarTo) && artist.similarTo.length) {
+        metaItems.push(text('Similar to ', '相近：') + artist.similarTo.slice(0, 3).join(', '));
+      }
+      if (Array.isArray(artist.mood) && artist.mood.length) {
+        metaItems.push(artist.mood.slice(0, 3).join(' / '));
+      }
+      let meta = null;
+      if (metaItems.length) {
+        meta = document.createElement('div');
+        meta.className = 'recommendation-agent-artist-meta';
+        metaItems.forEach(function (item) {
+          const chip = document.createElement('span');
+          chip.textContent = item;
+          meta.appendChild(chip);
+        });
+      }
+
       const starterLabel = document.createElement('span');
       starterLabel.className = 'recommendation-agent-artist-label';
       starterLabel.textContent = text('Starter tracks', '入门歌曲');
@@ -490,10 +1027,49 @@ document.addEventListener('DOMContentLoaded', function () {
         ? artist.starterTracks.slice(0, 4).join(', ')
         : '-';
 
+      const actions = document.createElement('div');
+      actions.className = 'recommendation-agent-artist-actions';
+
+      function addArtistAction(action, en, zh, handler) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'btn btn-sm btn-outline-secondary';
+        button.setAttribute('data-agent-artist-action', action);
+        button.textContent = text(en, zh);
+        button.addEventListener('click', handler);
+        actions.appendChild(button);
+        return button;
+      }
+
+      addArtistAction('save', 'Save', '加入待听', function (event) {
+        saveAgentArtist(artist, event.currentTarget);
+      });
+      addArtistAction('details', 'More details', '查看更多', function () {
+        sendMessage(text(
+          `Tell me more about ${artist.name || 'this artist'} and why they fit my library.`,
+          `详细介绍 ${artist.name || '这个歌手'}，并说明为什么适合我的曲库。`
+        ));
+      });
+      addArtistAction('generate_starters', 'Starter playlist', '生成入门歌单', function (event) {
+        createAgentStarterPlaylist(artist, event.currentTarget);
+      });
+      addArtistAction('not_interested', 'Not interested', '不感兴趣', function () {
+        sendAgentArtistFeedback({
+          action: 'hide_artist',
+          targetId: artist.name || '',
+          card,
+          artist
+        }, false);
+      });
+
       card.appendChild(header);
       card.appendChild(reason);
+      if (meta) {
+        card.appendChild(meta);
+      }
       card.appendChild(starterLabel);
       card.appendChild(starters);
+      card.appendChild(actions);
       grid.appendChild(card);
     });
 
@@ -507,18 +1083,35 @@ document.addEventListener('DOMContentLoaded', function () {
         name: artist.name || '',
         reason: artist.reason || '',
         genres: Array.isArray(artist.genres) ? artist.genres.slice(0, 6) : [],
-        starterTracks: Array.isArray(artist.starterTracks) ? artist.starterTracks.slice(0, 8) : []
+        starterTracks: Array.isArray(artist.starterTracks) ? artist.starterTracks.slice(0, 8) : [],
+        similarTo: Array.isArray(artist.similarTo) ? artist.similarTo.slice(0, 6) : [],
+        confidence: typeof artist.confidence === 'number' ? artist.confidence : 0,
+        mood: Array.isArray(artist.mood) ? artist.mood.slice(0, 6) : []
       };
     }).filter(function (artist) {
       return artist.name;
     });
   }
 
-  function agentRequestBody(message) {
+  function latestSessionRecommendedArtists(sessions) {
+    for (let index = (sessions || []).length - 1; index >= 0; index -= 1) {
+      const session = sessions[index] || {};
+      const artists = cloneArtistsForRequest(session.recommendedArtists || []);
+      if (artists.length) {
+        return artists;
+      }
+    }
+    return [];
+  }
+
+  function agentRequestBody(message, forceRefresh) {
     const body = {
       language: language(),
       message
     };
+    if (forceRefresh) {
+      body.forceRefresh = true;
+    }
     const previousRecommendedArtists = cloneArtistsForRequest(latestRecommendedArtists);
     if (previousRecommendedArtists.length) {
       body.previousRecommendedArtists = previousRecommendedArtists;
@@ -526,9 +1119,24 @@ document.addEventListener('DOMContentLoaded', function () {
     return JSON.stringify(body);
   }
 
+  function agentRequestUrl(baseUrl, forceRefresh) {
+    const params = new URLSearchParams();
+    params.set('lang', language());
+    if (forceRefresh) {
+      params.set('forceRefresh', '1');
+    }
+    return `${baseUrl}?${params.toString()}`;
+  }
+
   function renderPrompts(prompts) {
     promptNode.replaceChildren();
+    const seen = new Set();
     (prompts || []).forEach(function (prompt) {
+      prompt = String(prompt || '').trim();
+      if (!prompt || seen.has(prompt)) {
+        return;
+      }
+      seen.add(prompt);
       const button = document.createElement('button');
       button.type = 'button';
       button.className = 'recommendation-agent-prompt';
@@ -540,9 +1148,28 @@ document.addEventListener('DOMContentLoaded', function () {
     });
   }
 
+  function renderSessionHistory(sessions, currentSessionId) {
+    (sessions || []).forEach(function (session) {
+      if (!session || session.id === currentSessionId) {
+        return;
+      }
+      if (session.message) {
+        appendMessage('user', session.message);
+      }
+      const agentMessage = appendMessage(
+        'agent',
+        session.reply || text('The model returned an empty reply.', '模型返回了空回复。')
+      );
+      renderArtistCards(agentMessage, session.recommendedArtists || []);
+    });
+  }
+
   function renderPayload(payload, resetMessages, messageNode) {
     const history = payload.history || {};
     const recommendedArtists = payload.recommendedArtists || [];
+    if (Array.isArray(payload.agentSessions)) {
+      knownAgentSessions = payload.agentSessions;
+    }
     latestRecommendedArtists = cloneArtistsForRequest(recommendedArtists);
     renderArtistChips(
       topArtistsNode,
@@ -556,10 +1183,14 @@ document.addEventListener('DOMContentLoaded', function () {
       'No artist leads',
       '暂无推荐歌手'
     );
-    renderPrompts(payload.suggestedPrompts || []);
+    renderPrompts([].concat(payload.nextActions || [], payload.suggestedPrompts || []));
     setModelLabel(payload);
     if (resetMessages) {
       messagesNode.replaceChildren();
+      renderSessionHistory(
+        payload.agentSessions || [],
+        payload.agentSession && payload.agentSession.id
+      );
     }
     const reply = payload.reply || text('The model returned an empty reply.', '模型返回了空回复。');
     let agentMessage = messageNode;
@@ -584,6 +1215,9 @@ document.addEventListener('DOMContentLoaded', function () {
     if (status === 'repairing') {
       return text('Repairing model JSON', '正在修复模型格式');
     }
+    if (status === 'cached') {
+      return text('Using cached answer', '正在使用缓存回答');
+    }
     return text('Thinking', '思考中');
   }
 
@@ -594,6 +1228,8 @@ document.addEventListener('DOMContentLoaded', function () {
       setStatus('Filtering', '过滤中');
     } else if (status === 'receiving') {
       setStatus('Receiving', '接收中');
+    } else if (status === 'cached') {
+      setStatus('Cached', '缓存');
     } else {
       setStatus('Thinking', '思考中');
     }
@@ -656,13 +1292,13 @@ document.addEventListener('DOMContentLoaded', function () {
     const resetMessages = options.resetMessages;
     const sequence = options.sequence;
     const response = await fetch(method === 'GET'
-      ? `${agentUrl}?lang=${encodeURIComponent(language())}`
+      ? agentRequestUrl(agentUrl, options.forceRefresh)
       : agentUrl, {
       method,
       credentials: 'same-origin',
       headers: method === 'POST' ? { 'Content-Type': 'application/json' } : undefined,
       body: method === 'POST'
-        ? agentRequestBody(message)
+        ? agentRequestBody(message, options.forceRefresh)
         : undefined,
       signal: loadController ? loadController.signal : undefined
     });
@@ -690,13 +1326,13 @@ document.addEventListener('DOMContentLoaded', function () {
     }
     let streamMessage = appendMessage('agent', streamStatusText('thinking'));
     const response = await fetch(method === 'GET'
-      ? `${agentStreamUrl}?lang=${encodeURIComponent(language())}`
+      ? agentRequestUrl(agentStreamUrl, options.forceRefresh)
       : agentStreamUrl, {
       method,
       credentials: 'same-origin',
       headers: method === 'POST' ? { 'Content-Type': 'application/json' } : undefined,
       body: method === 'POST'
-        ? agentRequestBody(message)
+        ? agentRequestBody(message, options.forceRefresh)
         : undefined,
       signal: loadController ? loadController.signal : undefined
     });
@@ -707,6 +1343,7 @@ document.addEventListener('DOMContentLoaded', function () {
     let replyTimer = null;
     let pendingFinalPayload = null;
     let resolveFinalRender = null;
+    let sessionHistoryRendered = false;
     const finalRenderPromise = new Promise(function (resolve) {
       resolveFinalRender = resolve;
     });
@@ -743,6 +1380,13 @@ document.addEventListener('DOMContentLoaded', function () {
       }
       if (!pendingFinalPayload || queuedReply || replyTimer) {
         return;
+      }
+      if (resetMessages && !sessionHistoryRendered) {
+        const currentSessionId = pendingFinalPayload.agentSession && pendingFinalPayload.agentSession.id;
+        messagesNode.replaceChildren();
+        renderSessionHistory(pendingFinalPayload.agentSessions || [], currentSessionId);
+        streamMessage = appendMessage('agent', streamedReply || streamStatusText('thinking'));
+        sessionHistoryRendered = true;
       }
       renderPayload(pendingFinalPayload, false, streamMessage);
       setStatus('Ready', '就绪');
@@ -828,7 +1472,7 @@ document.addEventListener('DOMContentLoaded', function () {
     }
   }
 
-  async function loadAgent() {
+  async function loadAgent(forceRefresh) {
     const sequence = loadSequence + 1;
     loadSequence = sequence;
     if (loadController) {
@@ -843,6 +1487,7 @@ document.addEventListener('DOMContentLoaded', function () {
     try {
       await requestAgent({
         method: 'GET',
+        forceRefresh: Boolean(forceRefresh),
         resetMessages: true,
         sequence
       });
@@ -854,7 +1499,8 @@ document.addEventListener('DOMContentLoaded', function () {
         return;
       }
       messagesNode.replaceChildren();
-      latestRecommendedArtists = [];
+      renderSessionHistory(knownAgentSessions || []);
+      latestRecommendedArtists = latestSessionRecommendedArtists(knownAgentSessions);
       appendMessage('agent', formatErrorMessage(error));
       setModelLabel(null);
       setStatus('Model unavailable', '模型不可用');
@@ -865,6 +1511,7 @@ document.addEventListener('DOMContentLoaded', function () {
         retryButton.disabled = false;
       }
     }
+    loadAgentHealth();
   }
 
   async function sendMessage(message) {
@@ -910,9 +1557,54 @@ document.addEventListener('DOMContentLoaded', function () {
         input.focus();
       }
     }
+    loadAgentHealth();
   }
 
-  retryButton.addEventListener('click', loadAgent);
+  async function clearAgentSessions() {
+    if (!agentSessionClearUrl || !clearButton) {
+      return;
+    }
+    if (loadController) {
+      loadController.abort();
+      loadController = null;
+    }
+    loadSequence += 1;
+    clearButton.disabled = true;
+    try {
+      const response = await fetch(agentSessionClearUrl, {
+        method: 'POST',
+        credentials: 'same-origin'
+      });
+      const payload = await readResponsePayload(response);
+      knownAgentSessions = [];
+      messagesNode.replaceChildren();
+      latestRecommendedArtists = [];
+      renderArtistChips(
+        recommendedArtistsNode,
+        [],
+        'No artist leads',
+        '暂无推荐歌手'
+      );
+      renderPrompts([]);
+      setStatus('Ready', '就绪');
+      if (payload.deleted) {
+        appendMessage('agent', text('Conversation cleared.', '会话已清空。'));
+      }
+    } catch (error) {
+      appendMessage('agent', formatErrorMessage(error));
+    } finally {
+      clearButton.disabled = false;
+      retryButton.disabled = false;
+      input.disabled = false;
+    }
+  }
+
+  retryButton.addEventListener('click', function () {
+    loadAgent(true);
+  });
+  if (clearButton) {
+    clearButton.addEventListener('click', clearAgentSessions);
+  }
 
   form.addEventListener('submit', function (event) {
     event.preventDefault();
@@ -921,11 +1613,16 @@ document.addEventListener('DOMContentLoaded', function () {
 
   document.querySelectorAll('[data-language-toggle]').forEach(function (button) {
     button.addEventListener('click', function () {
-      window.setTimeout(loadAgent, 0);
+      window.setTimeout(function () {
+        loadAgent(false);
+      }, 0);
     });
   });
 
-  loadAgent();
+  loadAgentHealth();
+  renderSessionHistory(knownAgentSessions || []);
+  latestRecommendedArtists = latestSessionRecommendedArtists(knownAgentSessions);
+  loadAgent(false);
 });
 </script>
 {% endblock %}

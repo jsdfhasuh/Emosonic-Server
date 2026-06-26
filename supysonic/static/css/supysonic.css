@@ -986,6 +986,48 @@ body[data-bs-theme="dark"] code {
   padding: 0.75rem;
 }
 
+.recommendation-agent-health {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.75rem;
+  border: 1px solid var(--console-border);
+  border-radius: 8px;
+  padding: 0.75rem;
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.recommendation-agent-health .recommendation-agent-label {
+  margin-bottom: 0.28rem;
+}
+
+.recommendation-agent-health-summary {
+  color: var(--console-muted);
+  font-size: 0.9rem;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.recommendation-agent-health-summary.is-ok {
+  color: var(--bs-success);
+}
+
+.recommendation-agent-health-summary.is-warning {
+  color: var(--bs-warning-text-emphasis);
+}
+
+.recommendation-agent-health-summary.is-error {
+  color: var(--bs-danger);
+}
+
+.recommendation-agent-health-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
 .recommendation-agent-label,
 .recommendation-agent-section-head {
   display: block;
@@ -1145,6 +1187,21 @@ body[data-bs-theme="dark"] code {
   padding-left: 0.65rem;
 }
 
+.recommendation-agent-artist-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.recommendation-agent-artist-meta span {
+  border: 1px solid var(--bs-border-color);
+  border-radius: 999px;
+  color: var(--console-muted);
+  font-size: 0.75rem;
+  line-height: 1.2;
+  padding: 0.18rem 0.45rem;
+}
+
 .recommendation-agent-artist-label {
   margin-top: auto;
   font-weight: 700;
@@ -1156,6 +1213,12 @@ body[data-bs-theme="dark"] code {
   color: var(--console-brand);
   font-family: "Consolas", "SFMono-Regular", monospace;
   font-size: 0.78rem;
+}
+
+.recommendation-agent-artist-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
 }
 
 .recommendation-agent-empty {
@@ -1182,10 +1245,51 @@ body[data-bs-theme="dark"] code {
   justify-content: center;
 }
 
+.recommendation-feedback-status {
+  align-items: center;
+  background: var(--bs-tertiary-bg);
+  border-bottom: 1px solid var(--bs-border-color);
+  display: flex;
+  gap: 0.5rem;
+  justify-content: space-between;
+  padding: 0.55rem 0.75rem;
+}
+
+.recommendation-agent-feedback-status {
+  align-items: center;
+  background: var(--bs-tertiary-bg);
+  border: 1px solid var(--bs-border-color);
+  border-radius: 8px;
+  display: flex;
+  gap: 0.5rem;
+  justify-content: space-between;
+  padding: 0.55rem 0.75rem;
+}
+
+.recommendation-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  min-width: 14rem;
+}
+
+.recommendation-track-table tr.is-feedback-positive > * {
+  background: rgba(25, 135, 84, 0.08);
+}
+
+.recommendation-reason-cell {
+  min-width: 15rem;
+  max-width: 24rem;
+  color: var(--bs-secondary-color);
+  font-size: 0.875rem;
+  white-space: normal;
+}
+
 body[data-bs-theme="dark"] .recommendation-agent-chip,
 body[data-bs-theme="dark"] .recommendation-agent-prompt,
 body[data-bs-theme="dark"] .recommendation-agent-message.is-user,
-body[data-bs-theme="dark"] .recommendation-agent-artist-card {
+body[data-bs-theme="dark"] .recommendation-agent-artist-card,
+body[data-bs-theme="dark"] .recommendation-agent-health {
   background: rgba(255, 255, 255, 0.06);
 }
 
@@ -1246,6 +1350,14 @@ body[data-bs-theme="dark"] .recommendation-agent-artist-card {
 
   .recommendation-agent-message {
     max-width: 100%;
+  }
+
+  .recommendation-agent-health {
+    grid-template-columns: 1fr;
+  }
+
+  .recommendation-agent-health-metrics {
+    justify-content: flex-start;
   }
 
   .console-title {

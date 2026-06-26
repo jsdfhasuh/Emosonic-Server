@@ -99,6 +99,7 @@ class DefaultConfig:
         "history_limit": 200,
         "max_output_tokens": 900,
         "temperature": 0.7,
+        "cache_ttl_seconds": 900,
     }
     TRANSCODING = {}
     MIMETYPES = {}
