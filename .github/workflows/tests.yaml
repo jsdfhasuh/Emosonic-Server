@@ -1,21 +1,8 @@
 # Inspired by python-package
 
 name: CI
+
 on:
-  push:
-    paths:
-      - supysonic/**
-      - tests/**
-      - script/**
-      - requirements.txt
-      - ci-requirements.txt
-      - pyproject.toml
-      - setup.cfg
-      - setup.py
-      - Dockerfile
-      - setup.sh
-      - config.sample
-      - .github/workflows/**
   pull_request:
     paths:
       - supysonic/**
@@ -30,6 +17,7 @@ on:
       - setup.sh
       - config.sample
       - .github/workflows/**
+  workflow_dispatch:
 
 jobs:
   test:
