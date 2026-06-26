@@ -27,6 +27,7 @@ class DefaultConfig:
         "database_uri": "sqlite:///" + os.path.join(tempdir, "supysonic.db"),
         "scanner_extensions": None,
         "follow_symlinks": False,
+        "tempdatafolder": tempdir,
     }
     WEBAPP = {
         "cache_dir": tempdir,
