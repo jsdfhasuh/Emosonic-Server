@@ -41,17 +41,21 @@ def authenticate(sio, args):
 
 
 def register_device(sio, args):
+    payload = {
+        "clientId": args.client_id,
+        "deviceName": args.device_name,
+        "roles": args.roles,
+        "sessionId": args.session_id,
+    }
+    if args.alias:
+        payload["alias"] = args.alias
+
     send_message(
         sio,
         build_message(
             "device",
             "device.register",
-            {
-                "clientId": args.client_id,
-                "deviceName": args.device_name,
-                "roles": args.roles,
-                "sessionId": args.session_id,
-            },
+            payload,
             request_id="register-1",
         ),
     )
@@ -284,6 +288,7 @@ def parse_args(argv):
     parser.add_argument("--password", required=True)
     parser.add_argument("--client-id", required=True)
     parser.add_argument("--device-name", required=True)
+    parser.add_argument("--alias")
     parser.add_argument("--session-id", default="sess-main")
     parser.add_argument("--roles", nargs="+", default=["controller"])
     parser.add_argument("--track-id", default="demo-track")

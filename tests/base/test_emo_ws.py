@@ -163,6 +163,60 @@ class EmoWebSocketTestCase(unittest.TestCase):
     device = next(device for device in device_list["payload"]["devices"] if device["clientId"] == "player-1")
     self.assertEqual(device["alias"], alias)
 
+  def test_device_register_alias_strips_whitespace(self):
+    client = self.connect_authenticated_client("alice", "Alic3", "auth-player-1")
+
+    messages = self.register_device(
+      client,
+      "register-player-1",
+      {
+        "clientId": "player-1",
+        "deviceName": "Windows Player",
+        "alias": "  \u5ba2\u5385\u64ad\u653e\u5668  ",
+        "roles": ["player"],
+        "sessionId": "sess-main",
+      },
+    )
+
+    ack = next(message for message in messages if message["action"] == "system.ack")
+    self.assertEqual(ack["payload"]["client"]["alias"], "\u5ba2\u5385\u64ad\u653e\u5668")
+
+  def test_device_register_blank_alias_falls_back_to_device_name(self):
+    client = self.connect_authenticated_client("alice", "Alic3", "auth-player-1")
+
+    messages = self.register_device(
+      client,
+      "register-player-1",
+      {
+        "clientId": "player-1",
+        "deviceName": "Windows Player",
+        "alias": "   ",
+        "roles": ["player"],
+        "sessionId": "sess-main",
+      },
+    )
+
+    ack = next(message for message in messages if message["action"] == "system.ack")
+    self.assertEqual(ack["payload"]["client"]["alias"], "Windows Player")
+
+  def test_device_register_blank_device_name_falls_back_to_client_id(self):
+    client = self.connect_authenticated_client("alice", "Alic3", "auth-player-1")
+
+    messages = self.register_device(
+      client,
+      "register-player-1",
+      {
+        "clientId": "player-1",
+        "deviceName": "   ",
+        "roles": ["player"],
+        "sessionId": "sess-main",
+      },
+    )
+
+    ack = next(message for message in messages if message["action"] == "system.ack")
+    self.assertEqual(ack["payload"]["client"]["deviceName"], "player-1")
+    self.assertEqual(ack["payload"]["client"]["alias"], "player-1")
+
   def test_device_register_alias_falls_back_to_device_name(self):
     client = self.connect_authenticated_client("alice", "Alic3", "auth-player-1")
 
@@ -213,6 +267,42 @@ class EmoWebSocketTestCase(unittest.TestCase):
     error = next(message for message in messages if message["action"] == "system.error")
     self.assertEqual(error["requestId"], "register-player-1")
     self.assertEqual(error["payload"]["code"], "bad_request")
+
+  def test_device_register_rejects_non_string_device_name(self):
+    client = self.connect_authenticated_client("alice", "Alic3", "auth-player-1")
+
+    messages = self.register_device(
+      client,
+      "register-player-1",
+      {
+        "clientId": "player-1",
+        "deviceName": 123,
+        "roles": ["player"],
+        "sessionId": "sess-main",
+      },
+    )
+
+    error = next(message for message in messages if message["action"] == "system.error")
+    self.assertEqual(error["requestId"], "register-player-1")
+    self.assertEqual(error["payload"]["code"], "bad_request")
+
+  def test_device_register_accepts_device_alias(self):
+    client = self.connect_authenticated_client("alice", "Alic3", "auth-player-1")
+
+    messages = self.register_device(
+      client,
+      "register-player-1",
+      {
+        "clientId": "player-1",
+        "deviceName": "Windows Player",
+        "deviceAlias": "\u7535\u8111\u64ad\u653e\u5668",
+        "roles": ["player"],
+        "sessionId": "sess-main",
+      },
+    )
+
+    ack = next(message for message in messages if message["action"] == "system.ack")
+    self.assertEqual(ack["payload"]["client"]["alias"], "\u7535\u8111\u64ad\u653e\u5668")
 
   def test_system_ping_refreshes_registered_client_last_seen(self):
     client = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"])

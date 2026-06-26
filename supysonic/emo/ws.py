@@ -344,11 +344,18 @@ def _register_device(sid, user_name, payload):
     if not client_id:
         raise ValueError("Missing clientId")
 
-    roles = payload.get("roles") or []
+    roles = payload.get("roles")
+    if roles is None:
+        roles = []
     if not isinstance(roles, list):
         raise ValueError("roles must be a list")
 
-    device_name = payload.get("deviceName") or client_id
+    device_name = payload.get("deviceName")
+    if device_name is None:
+        device_name = client_id
+    if not isinstance(device_name, str):
+        raise ValueError("deviceName must be a string")
+    device_name = device_name.strip() or client_id
 
     alias = payload.get("alias")
     if alias is None:
