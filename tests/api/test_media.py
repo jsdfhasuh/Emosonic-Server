@@ -70,6 +70,19 @@ class MediaTestCase(ApiTestBase):
             self.format_trackids[format_name] = track_embeded_art.id
             self.formats[i] = track_embeded_art.id
 
+    def test_lyrics_ignores_malformed_external_response(self):
+        self.config.WEBAPP["online_lyrics"] = True
+        response = Mock(content=b"<SearchLyricResult></Lyric>")
+
+        with patch("supysonic.api.media.requests.get", return_value=response):
+            rv, child = self._make_request(
+                "getLyrics",
+                {"artist": "Nobody", "title": "Nowhere"},
+                tag="lyrics",
+            )
+
+        self.assertIsNone(child.text)
+
     def test_stream(self):
         self._make_request("stream", error=10)
         self._make_request("stream", {"id": "string"}, error=0)

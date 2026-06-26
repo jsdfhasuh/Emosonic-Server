@@ -5,10 +5,12 @@
 #
 # Distributed under terms of the GNU AGPLv3 license.
 
-import flask.json
 import os.path
-import requests
 import unittest
+from xml.etree import ElementTree
+
+import flask.json
+import requests
 
 from supysonic.db import Folder, Artist, Album, Track
 
@@ -57,16 +59,42 @@ class LyricsTestCase(ApiTestBase):
             last_modification=0,
         )
 
+    def _skip_if_chartlyrics_unavailable(self):
+        try:
+            r = requests.get(
+                "http://api.chartlyrics.com/apiv1.asmx/SearchLyricDirect",
+                params={"artist": "The Clash", "song": "London Calling"},
+                timeout=5,
+            )
+            root = ElementTree.fromstring(r.content)
+        except (requests.exceptions.RequestException, ElementTree.ParseError) as e:
+            self.skipTest("ChartLyrics down: " + e.__class__.__name__)
+
+        ns = {"cl": "http://api.chartlyrics.com/"}
+        lyric = root.find("cl:Lyric", namespaces=ns)
+        if lyric is None or lyric.text is None or "live by the river" not in lyric.text:
+            self.skipTest("ChartLyrics did not return expected lyrics")
+
     def test_get_lyrics(self):
         self._make_request("getLyrics", error=10)
         self._make_request("getLyrics", {"artist": "artist"}, error=10)
         self._make_request("getLyrics", {"title": "title"}, error=10)
 
+        # Local file
+        rv, child = self._make_request(
+            "getLyrics", {"artist": "artist", "title": "nope"}, tag="lyrics"
+        )
+        self.assertIn("text file", child.text)
+
+        # Metadata
+        rv, child = self._make_request(
+            "getLyrics", {"artist": "artist", "title": "yay"}, tag="lyrics"
+        )
+        self.assertIn("Some words", child.text)
+
+    def test_get_online_lyrics(self):
         # Potentially skip the tests if ChartLyrics is down (which happens quite often)
-        try:
-            requests.get("http://api.chartlyrics.com/", timeout=5)
-        except requests.exceptions.Timeout:
-            self.skipTest("ChartLyrics down")
+        self._skip_if_chartlyrics_unavailable()
 
         rv, child = self._make_request(
             "getLyrics",
@@ -98,18 +126,6 @@ class LyricsTestCase(ApiTestBase):
         json = flask.json.loads(rv.data)
         self.assertIn("value", json["subsonic-response"]["lyrics"])
         self.assertIn("live by the river", json["subsonic-response"]["lyrics"]["value"])
-
-        # Local file
-        rv, child = self._make_request(
-            "getLyrics", {"artist": "artist", "title": "nope"}, tag="lyrics"
-        )
-        self.assertIn("text file", child.text)
-
-        # Metadata
-        rv, child = self._make_request(
-            "getLyrics", {"artist": "artist", "title": "yay"}, tag="lyrics"
-        )
-        self.assertIn("Some words", child.text)
 
 
 if __name__ == "__main__":

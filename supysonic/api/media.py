@@ -985,6 +985,14 @@ def lyrics_response_for_track(track, lyrics):
     )
 
 
+def _chartlyrics_text(root: ElementTree.Element, name: str) -> str:
+    ns = {"cl": "http://api.chartlyrics.com/"}
+    elem = root.find(f"cl:{name}", namespaces=ns)
+    if elem is None or elem.text is None:
+        return ""
+    return elem.text
+
+
 @api_routing("/getLyrics")
 def lyrics():
 
@@ -1049,18 +1057,21 @@ def lyrics():
                 timeout=5,
             )
             root = ElementTree.fromstring(r.content)
-
-            ns = {"cl": "http://api.chartlyrics.com/"}
             lyrics = {
-                "artist": root.find("cl:LyricArtist", namespaces=ns).text,
-                "title": root.find("cl:LyricSong", namespaces=ns).text,
-                "value": root.find("cl:Lyric", namespaces=ns).text,
+                "artist": _chartlyrics_text(root, "LyricArtist"),
+                "title": _chartlyrics_text(root, "LyricSong"),
+                "value": _chartlyrics_text(root, "Lyric"),
             }
+            if not lyrics["value"]:
+                lyrics = {}
 
             current_app.cache.set(
                 cache_key, zlib.compress(json.dumps(lyrics).encode("utf-8"), 9)
             )
-        except requests.exceptions.RequestException as e:  # pragma: nocover
+        except (
+            requests.exceptions.RequestException,
+            ElementTree.ParseError,
+        ) as e:  # pragma: nocover
             _log_media_event(
                 logging.WARNING,
                 "lyrics_external_failed",
