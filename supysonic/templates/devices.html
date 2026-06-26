@@ -73,7 +73,7 @@
           >
             <div class="console-device-card-top">
               <div>
-                <div class="console-table-title">{{ device.deviceName }}</div>
+                <div class="console-table-title">{{ device.alias or device.deviceName or device.clientId }}</div>
                 <small class="console-muted">{{ device.clientId }}</small>
               </div>
               <span class="console-status status-{{ device.state or 'unknown' }}">{{ device.state or 'unknown' }}</span>
@@ -175,6 +175,13 @@
       .replace(/'/g, "&#039;");
   }
 
+  function getDeviceDisplayName(device) {
+    const alias = typeof device?.alias === "string" ? device.alias.trim() : "";
+    const deviceName = typeof device?.deviceName === "string" ? device.deviceName.trim() : "";
+    const clientId = typeof device?.clientId === "string" ? device.clientId.trim() : "";
+    return alias || deviceName || clientId || "-";
+  }
+
   function updateSummary(summary) {
     devicesSummaryState = summary || {};
     document.getElementById("summary-online").textContent = summary.onlineDevices || 0;
@@ -196,11 +203,12 @@
       const status = device.state || "unknown";
       const active = device.clientId === selectedClientId ? "is-active" : "";
       const roles = Array.isArray(device.roles) ? device.roles.join(", ") : "";
+      const displayName = getDeviceDisplayName(device);
       return `
         <button type="button" class="console-device-card ${active}" data-client-id="${escapeHtml(device.clientId || "")}">
           <div class="console-device-card-top">
             <div>
-              <div class="console-table-title">${escapeHtml(device.deviceName || "")}</div>
+              <div class="console-table-title">${escapeHtml(displayName)}</div>
               <small class="console-muted">${escapeHtml(device.clientId || "")}</small>
             </div>
             <span class="console-status status-${status}">${escapeHtml(status)}</span>
@@ -247,6 +255,7 @@
     const playbackDurationMs = Number(device.durationMs);
     const playbackProgressPercent = getPlaybackProgressPercent(device);
     const hasDuration = Number.isFinite(playbackDurationMs) && playbackDurationMs > 0;
+    const displayName = getDeviceDisplayName(device);
 
     const trackBlock = device.trackLabel
       ? `<div class="console-track-preview">${device.trackCoverUrl ? `<img class="console-cover-thumb" src="${escapeHtml(device.trackCoverUrl)}" alt="${i18nText("cover art", "封面图")}">` : ""}<div class="console-queue-preview"><div><strong>${escapeHtml(device.trackLabel)}</strong></div><small class="console-muted">${escapeHtml(device.trackId || "")}</small></div></div>`
@@ -272,7 +281,7 @@
                     <div class="console-signal-grid">
                       <div class="console-signal-cell">
                         <span class="console-signal-label">${i18nText("Device", "设备")}</span>
-                        <div class="console-signal-value">${escapeHtml(device.deviceName || "-")}</div>
+                        <div class="console-signal-value">${escapeHtml(displayName)}</div>
                       </div>
                       <div class="console-signal-cell">
                         <span class="console-signal-label">${i18nText("Playback", "播放")}</span>

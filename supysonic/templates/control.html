@@ -208,6 +208,13 @@
       .replace(/'/g, '&#039;');
   }
 
+  function getDeviceDisplayName(device) {
+    const alias = typeof device?.alias === 'string' ? device.alias.trim() : '';
+    const deviceName = typeof device?.deviceName === 'string' ? device.deviceName.trim() : '';
+    const clientId = typeof device?.clientId === 'string' ? device.clientId.trim() : '';
+    return alias || deviceName || clientId || '-';
+  }
+
   function formatTimestamp(timestamp) {
     if (!timestamp) return '-';
     return new Date(timestamp * 1000).toLocaleString();
@@ -377,11 +384,11 @@
     document.getElementById('control-player-label').textContent = i18nText(`${players.length} available`, `${players.length} 个可用`);
 
     const target = players.find((device) => device.clientId === controlState.selectedClientId);
-    document.getElementById('control-target-name').textContent = target ? target.deviceName : '-';
+    document.getElementById('control-target-name').textContent = target ? getDeviceDisplayName(target) : '-';
     const selectedBanner = document.getElementById('control-selected-banner');
     if (target) {
       selectedBanner.innerHTML = `
-        <div><strong>${escapeHtml(target.deviceName)}</strong></div>
+        <div><strong>${escapeHtml(getDeviceDisplayName(target))}</strong></div>
         <small class="console-muted">${escapeHtml(target.clientId)} · ${escapeHtml(target.sessionId || '')}</small>
       `;
       selectedBanner.classList.add('is-active');
@@ -430,11 +437,12 @@
       const playback = controlState.playbackByClientSession[getPlaybackKey(device.sessionId, device.clientId)] || {};
       const status = playback.state || 'unknown';
       const trackLabel = playback.trackLabel || controlState.trackMeta[playback.trackId]?.label || playback.trackId || i18nText('No track', '暂无曲目');
+      const displayName = getDeviceDisplayName(device);
       return `
         <button type="button" class="console-device-card ${active}" data-client-id="${escapeHtml(device.clientId)}">
           <div class="console-device-card-top">
             <div>
-              <div class="console-table-title">${escapeHtml(device.deviceName)}</div>
+              <div class="console-table-title">${escapeHtml(displayName)}</div>
               <small class="console-muted">${escapeHtml(device.clientId)}</small>
             </div>
             <span class="console-status status-${escapeHtml(status)}">${escapeHtml(status)}</span>
@@ -548,6 +556,7 @@
     const playbackDurationMs = getPlaybackDurationMs(playback);
     const playbackProgressPercent = getComputedPlaybackProgressPercent(playback);
     const hasDuration = Boolean(playbackDurationMs);
+    const displayName = getDeviceDisplayName(target);
     const trackBlock = playback?.trackId
       ? `<div class="console-track-preview mt-3">${coverUrl ? `<img class="console-cover-thumb" src="${escapeHtml(coverUrl)}" alt="${i18nText('cover art', '封面图')}">` : ''}<div class="console-queue-preview"><div><strong>${escapeHtml(trackLabel)}</strong></div><small class="console-muted">${escapeHtml(playback.trackId || '')}</small></div></div>`
       : `<div class="text-body-secondary mt-3">${i18nText('No current track metadata.', '暂无当前曲目元数据。')}</div>`;
@@ -559,7 +568,7 @@
           <div class="console-signal-grid">
             <div class="console-signal-cell">
               <span class="console-signal-label">${i18nText('Device', '设备')}</span>
-              <div class="console-signal-value">${escapeHtml(target.deviceName)}</div>
+              <div class="console-signal-value">${escapeHtml(displayName)}</div>
             </div>
             <div class="console-signal-cell">
               <span class="console-signal-label">${i18nText('Client ID', '客户端 ID')}</span>
