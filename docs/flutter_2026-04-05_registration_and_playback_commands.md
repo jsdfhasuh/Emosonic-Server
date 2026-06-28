@@ -348,7 +348,8 @@ local queue 示例：
 
 其中：
 
-- `queue.local.set` 建议用 `payload.sourceClientId` 作为 local queue 所属设备标识
+- 接收 `queue.local.set` 广播时，用 `payload.sourceClientId` 作为 local queue 所属设备标识
+- 发送 `queue.local.set` 请求时，用 `payload.clientId` 指定 local queue owner；省略时表示当前连接自己的 local queue
 - `playback.update` 建议用 `payload.sourceClientId` 作为 playback 所属设备标识
 
 ## 9. 推荐对接顺序

@@ -569,6 +569,8 @@ Future<String> getOrCreateSessionId(String userName, String logicalPlayerName) a
   - 获取某个设备在某个房间中的本地草稿队列
 - `queue.local.set`
   - 更新某个设备在某个房间中的本地草稿队列
+  - `payload.clientId` 表示要保存的 local queue owner
+  - 如果省略 `payload.clientId`，服务端使用当前连接注册的 `clientId`
 
 本地队列更新会推送给：
 
@@ -610,6 +612,7 @@ Future<String> getOrCreateSessionId(String userName, String logicalPlayerName) a
 
 - 服务端返回 `system.ack`
 - 并广播一条 `state / queue.local.set` 快照给同 session 成员和订阅者
+- 广播 payload 的 `sourceClientId` 表示 local queue owner，不一定是发起请求的控制器
 
 本地队列快照示例：
 
