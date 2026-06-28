@@ -235,6 +235,9 @@ class AudioWatcherTestCase(WatcherTestCase):
     def assertTrackCountEqual(self, expected):
         self.assertEqual(Track.select().count(), expected)
 
+    def _has_track_path(self, path):
+        return Track.select().where(Track.path == path).count() == 1
+
     def _queue(self):
         return self._WatcherTestBase__watcher._SupysonicWatcher__queue
 
@@ -304,7 +307,7 @@ class AudioWatcherTestCase(WatcherTestCase):
         self.assertTrue(
             self._wait_until(
                 lambda: Track.select().count() == 1
-                and Track.select().first().path == newpath
+                and self._has_track_path(newpath)
             )
         )
 
@@ -345,7 +348,7 @@ class AudioWatcherTestCase(WatcherTestCase):
         self.assertTrue(
             self._wait_until(
                 lambda: Track.select().count() == 1
-                and Track.select().first().path == path
+                and self._has_track_path(path)
             )
         )
 
@@ -380,7 +383,7 @@ class AudioWatcherTestCase(WatcherTestCase):
         self.assertTrue(
             self._wait_until(
                 lambda: Track.select().count() == 1
-                and Track.select().first().path == new_path
+                and self._has_track_path(new_path)
                 and not Folder.select().where(Folder.path == old_dir).exists()
             )
         )
@@ -403,7 +406,7 @@ class AudioWatcherTestCase(WatcherTestCase):
         self.assertTrue(
             self._wait_until(
                 lambda: Track.select().count() == 1
-                and Track.select().first().path == sibling_path
+                and self._has_track_path(sibling_path)
                 and not Folder.select().where(Folder.path == dirpath).exists()
                 and Folder.select().where(Folder.path == sibling_dir).exists()
             )
