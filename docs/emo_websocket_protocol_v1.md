@@ -247,6 +247,8 @@ Recommended payload fields:
 - `trackId`
 - `volume`
 - `sourceClientId`
+- `queueType`: `session` or `local`, when the player can report the active queue surface
+- `queueClientId`: owner `clientId` for `local` queue playback
 
 Server broadcast note:
 
@@ -297,6 +299,10 @@ Server broadcast note:
 - `queue.local.set`
 
 These actions operate on the device-local draft queue keyed by `sessionId + clientId`.
+For `queue.local.set`, `payload.clientId` is the local queue owner. If it is
+omitted, the server uses the current registered client's `clientId`. When
+`payload.clientId` names another device, the server verifies that device belongs
+to the same user and the requested `sessionId`.
 
 `queue.local.get` request example:
 
@@ -334,6 +340,7 @@ Server response behavior:
 - `system.ack` confirms the request
 - the server emits a `state / queue.local.set` snapshot to devices in the same session and active session subscribers
 - `session.subscribe` snapshots also include the current local queues for that session
+- the emitted snapshot uses `payload.sourceClientId` as the local queue owner, not necessarily the sender of the request
 
 ### Device List State
 
@@ -347,7 +354,7 @@ This is both a requestable state snapshot and a server broadcast when device pre
 - Commands are always routed through the server.
 - Command routing uses `targetClientId`.
 - Shared queue state is authoritative at the `sessionId` level.
-- Local queue state is authoritative at the `sessionId + clientId` level.
+- Local queue state is authoritative at the `sessionId + clientId` level; for `queue.local.set`, `payload.clientId` chooses that `clientId`.
 - Playback state is authoritative at the `sessionId + sourceClientId` level.
 - Every request-style message should end with either `system.ack` or `system.error`.
 - Playback devices should send `playback.update` after they execute commands.

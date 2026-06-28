@@ -441,6 +441,46 @@ def _validate_player_request_state(payload):
             raise ValueError(f"player.requestState {field_name} must be a boolean")
 
 
+def _resolve_local_queue_owner(current_user_name, current_client, payload):
+    if current_client is None:
+        raise PermissionError("Register the device before updating local queue")
+
+    if "sessionId" in payload:
+        session_id = payload.get("sessionId")
+    else:
+        session_id = current_client.get("sessionId")
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("queue.local.set requires a non-empty sessionId")
+
+    if "clientId" in payload:
+        owner_client_id = payload.get("clientId")
+    else:
+        owner_client_id = current_client.get("clientId")
+    if not isinstance(owner_client_id, str) or not owner_client_id:
+        raise ValueError("queue.local.set clientId must be a non-empty string")
+
+    owner_client = state.get_client(owner_client_id)
+    if owner_client is None:
+        raise LookupError("Local queue client is offline")
+    if owner_client.get("userName") != current_user_name:
+        raise PermissionError("Cross-user local queue update is not allowed")
+    if owner_client.get("sessionId") != session_id:
+        raise ValueError("queue.local.set clientId must belong to sessionId")
+
+    return session_id, owner_client_id
+
+
+def _validate_local_queue_target(current_user_name, target_client_id):
+    if not isinstance(target_client_id, str) or not target_client_id:
+        raise ValueError("targetClientId must be a non-empty string")
+
+    target_client = state.get_client(target_client_id)
+    if target_client is None:
+        raise LookupError("Target client is offline")
+    if target_client.get("userName") != current_user_name:
+        raise PermissionError("Cross-user local queue routing is not allowed")
+
+
 def _build_ready_complete_payload(current_client, payload):
     if current_client is None:
         raise PermissionError("Register the device before sending ready signal")
@@ -742,12 +782,15 @@ class EmoNamespace(Namespace):
                         _build_message("state", "queue.local.set", local_queue),
                     )
             elif action == "queue.local.set":
-                if current_client is None and not payload.get("clientId"):
-                    raise PermissionError("Register the device before updating local queue")
-                current_client_id = current_client.get("clientId")
-                session_id = payload.get("sessionId") or current_client.get("sessionId")
+                session_id, owner_client_id = _resolve_local_queue_owner(
+                    current_user_name,
+                    current_client,
+                    payload,
+                )
                 queue_song_ids = payload.get("queueSongIds")
-                targetClientId = message.get("targetClientId","")
+                targetClientId = message.get("targetClientId")
+                if "targetClientId" in message:
+                    _validate_local_queue_target(current_user_name, targetClientId)
                 if not isinstance(queue_song_ids, list):
                     raise ValueError("queueSongIds must be a list")
                 if not all(isinstance(song_id, str) and song_id for song_id in queue_song_ids):
@@ -766,14 +809,14 @@ class EmoNamespace(Namespace):
 
                 local_queue = state.update_local_queue(
                     session_id,
-                    current_client_id,
+                    owner_client_id,
                     queue_song_ids,
                     current_index,
                     position_ms,
                 )
                 saveLocalQueueState(
                     session_id,
-                    current_client_id,
+                    owner_client_id,
                     queue_song_ids,
                     current_index,
                     position_ms,
@@ -781,32 +824,32 @@ class EmoNamespace(Namespace):
                 _log_emo_event(
                     logging.INFO,
                     "queue_local_set",
-                    result="direct" if targetClientId else "broadcast",
+                    result="direct" if targetClientId is not None else "broadcast",
                     user=current_user_name,
                     client_request_id=request_id,
                     target_client_id=targetClientId or "-",
                     **_build_queue_summary(
                         session_id,
-                        current_client_id,
+                        owner_client_id,
                         queue_song_ids,
                         current_index,
                         position_ms,
                     ),
                 )
                 _send_ack(request_id, {"updated": True})
-                if targetClientId:
+                if targetClientId is not None:
                     logger.info("Broadcasting local queue update to specific client %s", targetClientId)
                     _broadcast_local_queue_to_client(
                         targetClientId,
                         session_id,
-                        current_client_id,
+                        owner_client_id,
                     )
                 else:
                     logger.info("Broadcasting local queue update to all clients in session %s", session_id)
                     _broadcast_local_queue(
                         current_user_name,
                         session_id,
-                        current_client_id,
+                        owner_client_id,
                     )
             elif action == "queue.session.sync":
                 if current_client is None and not payload.get("clientId"):

@@ -5,6 +5,7 @@ import unittest
 
 from supysonic.db import release_database
 from supysonic.emo.ws import socketio
+from supysonic.emo.ws_store import getLocalQueueState
 from supysonic.emo.ws_state import get_state
 from supysonic.managers.user import UserManager
 from supysonic.web import create_application
@@ -519,6 +520,178 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertEqual(local_queue["payload"]["sourceClientId"], "player-1")
     self.assertEqual(local_queue["payload"]["currentIndex"], 1)
 
+  def test_controller_sets_local_queue_for_payload_client_id(self):
+    self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"])
+    controller = self.connect_device("alice", "Alic3", "controller-1", "sess-1", ["controller"])
+
+    controller.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.local.set",
+        "requestId": "local-set-target-owner-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "clientId": "player-1",
+          "queueSongIds": ["song-1", "song-2"],
+          "currentIndex": 0,
+          "positionMs": 500,
+        },
+      },
+      namespace="/emo",
+    )
+
+    controller_messages = self.get_messages(controller)
+    local_queue = next(message for message in controller_messages if message["action"] == "queue.local.set")
+    self.assertEqual(local_queue["payload"]["sourceClientId"], "player-1")
+    self.assertEqual(local_queue["payload"]["positionMs"], 500)
+
+    state = get_state()
+    self.assertIsNotNone(state.get_local_queue("sess-1", "player-1"))
+    self.assertIsNone(state.get_local_queue("sess-1", "controller-1"))
+
+    persisted_queue = getLocalQueueState("sess-1", "player-1")
+    self.assertIsNotNone(persisted_queue)
+    self.assertEqual(persisted_queue["sourceClientId"], "player-1")
+    self.assertIsNone(getLocalQueueState("sess-1", "controller-1"))
+
+  def test_reject_local_queue_set_for_cross_user_payload_client_id(self):
+    self.connect_device("bob", "B0b", "player-bob", "sess-bob", ["player"])
+    controller = self.connect_device("alice", "Alic3", "controller-1", "sess-1", ["controller"])
+
+    controller.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.local.set",
+        "requestId": "local-set-cross-user-1",
+        "payload": {
+          "sessionId": "sess-bob",
+          "clientId": "player-bob",
+          "queueSongIds": ["song-1"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+
+    controller_messages = self.get_messages(controller)
+    error = next(message for message in controller_messages if message["action"] == "system.error")
+    self.assertEqual(error["requestId"], "local-set-cross-user-1")
+    self.assertEqual(error["payload"]["code"], "forbidden")
+
+  def test_reject_local_queue_set_when_payload_client_id_is_outside_session(self):
+    self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"])
+    controller = self.connect_device("alice", "Alic3", "controller-1", "sess-1", ["controller"])
+
+    controller.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.local.set",
+        "requestId": "local-set-session-mismatch-1",
+        "payload": {
+          "sessionId": "other-session",
+          "clientId": "player-1",
+          "queueSongIds": ["song-1"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+
+    controller_messages = self.get_messages(controller)
+    error = next(message for message in controller_messages if message["action"] == "system.error")
+    self.assertEqual(error["requestId"], "local-set-session-mismatch-1")
+    self.assertEqual(error["payload"]["code"], "bad_request")
+
+  def test_reject_local_queue_set_with_explicit_empty_owner_fields(self):
+    self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"])
+    controller = self.connect_device("alice", "Alic3", "controller-1", "sess-1", ["controller"])
+
+    cases = (
+      (
+        "local-set-empty-session-1",
+        {
+          "sessionId": "",
+          "clientId": "player-1",
+          "queueSongIds": ["song-1"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      ),
+      (
+        "local-set-empty-client-1",
+        {
+          "sessionId": "sess-1",
+          "clientId": "",
+          "queueSongIds": ["song-1"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      ),
+    )
+
+    for request_id, payload in cases:
+      with self.subTest(request_id=request_id):
+        controller.emit(
+          "message",
+          {
+            "type": "state",
+            "action": "queue.local.set",
+            "requestId": request_id,
+            "payload": payload,
+          },
+          namespace="/emo",
+        )
+
+        controller_messages = self.get_messages(controller)
+        error = next(message for message in controller_messages if message["action"] == "system.error")
+        self.assertEqual(error["requestId"], request_id)
+        self.assertEqual(error["payload"]["code"], "bad_request")
+
+    state = get_state()
+    self.assertIsNone(state.get_local_queue("sess-1", "player-1"))
+    self.assertIsNone(state.get_local_queue("sess-1", "controller-1"))
+
+  def test_reject_local_queue_set_with_explicit_invalid_target_client_id(self):
+    self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"])
+    controller = self.connect_device("alice", "Alic3", "controller-1", "sess-1", ["controller"])
+
+    cases = (
+      ("local-set-empty-target-1", ""),
+      ("local-set-null-target-1", None),
+    )
+
+    for request_id, target_client_id in cases:
+      with self.subTest(request_id=request_id):
+        controller.emit(
+          "message",
+          {
+            "type": "state",
+            "action": "queue.local.set",
+            "requestId": request_id,
+            "targetClientId": target_client_id,
+            "payload": {
+              "sessionId": "sess-1",
+              "clientId": "player-1",
+              "queueSongIds": ["song-1"],
+              "currentIndex": 0,
+              "positionMs": 0,
+            },
+          },
+          namespace="/emo",
+        )
+
+        controller_messages = self.get_messages(controller)
+        error = next(message for message in controller_messages if message["action"] == "system.error")
+        self.assertEqual(error["requestId"], request_id)
+        self.assertEqual(error["payload"]["code"], "bad_request")
+
+    self.assertIsNone(get_state().get_local_queue("sess-1", "player-1"))
+
   def test_session_subscribe_receives_local_queue_snapshot(self):
     player = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"])
     observer = self.connect_device("alice", "Alic3", "observer-1", "observer-room", ["controller"])
@@ -547,3 +720,103 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertEqual(local_queue["payload"]["sessionId"], "sess-1")
     self.assertEqual(local_queue["payload"]["sourceClientId"], "player-1")
     self.assertEqual(local_queue["payload"]["currentIndex"], 2)
+
+  def test_session_subscribe_receives_session_queue_and_playback_snapshot(self):
+    player = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"])
+    observer = self.connect_device("alice", "Alic3", "observer-1", "observer-room", ["controller"])
+
+    player.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.session.sync",
+        "requestId": "queue-snapshot-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "queueSongIds": ["song-1", "song-2"],
+          "currentIndex": 1,
+          "positionMs": 1000,
+        },
+      },
+      namespace="/emo",
+    )
+    player.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "playback-snapshot-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "state": "playing",
+          "trackId": "song-2",
+          "positionMs": 1000,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(player)
+
+    self.subscribe_session(observer, "sess-1", request_id="subscribe-snapshot-1")
+    observer_messages = self.get_messages(observer)
+
+    queue = next(message for message in observer_messages if message["action"] == "queue.session.sync")
+    playback = next(message for message in observer_messages if message["action"] == "playback.update")
+    self.assertEqual(queue["payload"]["sourceClientId"], "player-1")
+    self.assertEqual(queue["payload"]["currentIndex"], 1)
+    self.assertEqual(playback["payload"]["sourceClientId"], "player-1")
+    self.assertEqual(playback["payload"]["trackId"], "song-2")
+
+  def test_playback_update_broadcasts_to_session_subscriber(self):
+    player = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"])
+    observer = self.connect_device("alice", "Alic3", "observer-1", "observer-room", ["controller"])
+    self.subscribe_session(observer, "sess-1", request_id="subscribe-playback-live-1")
+    self.get_messages(observer)
+
+    player.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "playback-live-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "state": "playing",
+          "trackId": "song-1",
+          "positionMs": 2500,
+        },
+      },
+      namespace="/emo",
+    )
+
+    observer_messages = self.get_messages(observer)
+    playback = next(message for message in observer_messages if message["action"] == "playback.update")
+    self.assertEqual(playback["payload"]["sourceClientId"], "player-1")
+    self.assertEqual(playback["payload"]["positionMs"], 2500)
+
+  def test_session_queue_update_broadcasts_to_session_subscriber(self):
+    controller = self.connect_device("alice", "Alic3", "controller-1", "sess-1", ["controller"])
+    observer = self.connect_device("alice", "Alic3", "observer-1", "observer-room", ["controller"])
+    self.subscribe_session(observer, "sess-1", request_id="subscribe-queue-live-1")
+    self.get_messages(observer)
+
+    controller.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.session.sync",
+        "requestId": "queue-live-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "queueSongIds": ["song-1", "song-2", "song-3"],
+          "currentIndex": 2,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+
+    observer_messages = self.get_messages(observer)
+    queue = next(message for message in observer_messages if message["action"] == "queue.session.sync")
+    self.assertEqual(queue["payload"]["sourceClientId"], "controller-1")
+    self.assertEqual(queue["payload"]["queueSongIds"], ["song-1", "song-2", "song-3"])
