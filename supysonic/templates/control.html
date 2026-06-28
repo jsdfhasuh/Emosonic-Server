@@ -96,6 +96,24 @@
             <button type="button" class="btn btn-outline-dark btn-sm" id="stop-follow-playback"><span data-i18n-en="Stop follow" data-i18n-zh="停止跟播">Stop follow</span></button>
           </div>
         </div>
+        <div class="control-follow-panel" id="control-broadcast-panel">
+          <div class="d-flex justify-content-between align-items-center gap-2 mb-2">
+            <strong data-i18n-en="Broadcast playback" data-i18n-zh="群播">Broadcast playback</strong>
+            <span class="console-scope-badge scope-session" id="control-broadcast-badge" data-i18n-en="Idle" data-i18n-zh="空闲">Idle</span>
+          </div>
+          <div class="console-muted mb-3" id="control-broadcast-summary" data-i18n-en="No active broadcast." data-i18n-zh="当前没有群播。">No active broadcast.</div>
+          <div class="d-grid gap-2 control-grid-2 mb-2">
+            <button type="button" class="btn btn-outline-dark btn-sm" id="start-broadcast-selected"><span data-i18n-en="Start selected" data-i18n-zh="群播所选">Start selected</span></button>
+            <button type="button" class="btn btn-outline-dark btn-sm" id="start-broadcast-all"><span data-i18n-en="Start all" data-i18n-zh="群播全部">Start all</span></button>
+            <button type="button" class="btn btn-outline-dark btn-sm" id="sync-broadcast-queue"><span data-i18n-en="Sync queue" data-i18n-zh="同步队列">Sync queue</span></button>
+            <button type="button" class="btn btn-outline-dark btn-sm" id="broadcast-play-current"><span data-i18n-en="Play index" data-i18n-zh="播放索引">Play index</span></button>
+            <button type="button" class="btn btn-outline-dark btn-sm" id="broadcast-play"><span data-i18n-en="Play all" data-i18n-zh="全部播放">Play all</span></button>
+            <button type="button" class="btn btn-outline-dark btn-sm" id="broadcast-pause"><span data-i18n-en="Pause all" data-i18n-zh="全部暂停">Pause all</span></button>
+            <button type="button" class="btn btn-outline-dark btn-sm" id="broadcast-seek"><span data-i18n-en="Seek all" data-i18n-zh="全部跳转">Seek all</span></button>
+            <button type="button" class="btn btn-outline-danger btn-sm" id="stop-broadcast"><span data-i18n-en="Stop broadcast" data-i18n-zh="结束群播">Stop broadcast</span></button>
+          </div>
+          <button type="button" class="btn btn-light btn-sm w-100" id="refresh-broadcast-status"><span data-i18n-en="Refresh broadcast" data-i18n-zh="刷新群播">Refresh broadcast</span></button>
+        </div>
         <div class="console-auth-note">
           <strong data-i18n-en="Emosonic signal flow" data-i18n-zh="Emosonic 播放链路">Emosonic signal flow</strong>
           <div class="console-muted mt-1" data-i18n-en="Pick a player, shape the queue, and inspect how session playback and local device state move through the current Emosonic workspace." data-i18n-zh="选定播放器，编排队列，查看播放会话与设备状态是如何在 Emosonic 中流转的。">Pick a player, shape the queue, and inspect how session playback and local device state move through the current Emosonic workspace.</div>
@@ -211,6 +229,11 @@
       followQueue: false,
       followPlayback: false,
       serverClockOffsetMs: 0,
+    },
+    broadcast: {
+      activeBroadcastId: null,
+      broadcast: null,
+      participantStates: [],
     },
   };
 
@@ -600,6 +623,237 @@
     `;
   }
 
+  function getActiveBroadcast() {
+    return controlState.broadcast.broadcast || null;
+  }
+
+  function parseQueueEditor() {
+    const queueSongIds = document.getElementById('queue-song-ids').value
+      .split('\n')
+      .map((item) => item.trim())
+      .filter(Boolean);
+    const currentIndex = parseInt(document.getElementById('queue-current-index').value, 10) || 0;
+    const positionMs = parseInt(document.getElementById('queue-position-ms').value, 10) || 0;
+
+    if (queueSongIds.length === 0 && (currentIndex !== 0 || positionMs !== 0)) {
+      return {
+        error: i18nText(
+          'Queue update failed: empty queue must use currentIndex=0 and positionMs=0.',
+          '队列更新失败：空队列必须使用 currentIndex=0 且 positionMs=0。'
+        ),
+      };
+    }
+    if (queueSongIds.length > 0 && (currentIndex < 0 || currentIndex >= queueSongIds.length)) {
+      return {
+        error: i18nText(
+          'Queue update failed: current index is out of bounds.',
+          '队列更新失败：当前索引超出范围。'
+        ),
+      };
+    }
+    if (positionMs < 0) {
+      return {
+        error: i18nText(
+          'Queue update failed: position must be non-negative.',
+          '队列更新失败：位置必须为非负数。'
+        ),
+      };
+    }
+    return { queueSongIds, currentIndex, positionMs };
+  }
+
+  function updateBroadcastFromPayload(payload, action = '') {
+    if (!payload) {
+      return;
+    }
+
+    const incomingBroadcast = payload.broadcast || (payload.broadcastId ? payload : null);
+    if (incomingBroadcast) {
+      const previousBroadcast = controlState.broadcast.broadcast || {};
+      controlState.broadcast.broadcast = {
+        ...previousBroadcast,
+        ...incomingBroadcast,
+        participants: incomingBroadcast.participants || previousBroadcast.participants || [],
+      };
+      if (
+        action === 'broadcast.start' ||
+        incomingBroadcast.state !== 'stopped' ||
+        controlState.broadcast.activeBroadcastId === incomingBroadcast.broadcastId
+      ) {
+        controlState.broadcast.activeBroadcastId = controlState.broadcast.broadcast.broadcastId || null;
+      }
+      ensureTrackMeta(controlState.broadcast.broadcast.queueSongIds || []).then(renderBroadcastPanel);
+    }
+    if (Array.isArray(payload.participantStates)) {
+      controlState.broadcast.participantStates = payload.participantStates;
+    }
+    if (action === 'broadcast.stop') {
+      controlState.broadcast.activeBroadcastId = null;
+    }
+    renderBroadcastPanel();
+  }
+
+  function sendBroadcastMessage(action, type, payload) {
+    const requestId = nextRequestId(action);
+    controlState.pendingCommands.set(requestId, action);
+    socket.emit('message', {
+      type,
+      action,
+      requestId,
+      payload,
+      timestamp: Date.now() / 1000,
+    });
+    pushEventLine(`Sent ${action}`, 'info');
+    setCommandStatus(i18nText(`Sending ${action}...`, `正在发送 ${action}...`), 'pending');
+  }
+
+  function startBroadcastPlayback(targetMode) {
+    const parsedQueue = parseQueueEditor();
+    if (parsedQueue.error) {
+      setCommandStatus(parsedQueue.error, 'error');
+      return;
+    }
+
+    const payload = {
+      targetMode,
+      queueSongIds: parsedQueue.queueSongIds,
+      currentIndex: parsedQueue.currentIndex,
+      positionMs: parsedQueue.positionMs,
+      autoPlay: parsedQueue.queueSongIds.length > 0,
+      controlPolicy: 'participants_and_controllers_can_control',
+    };
+    if (targetMode === 'selectedClients') {
+      if (!controlState.selectedClientId) {
+        setCommandStatus(i18nText('Broadcast start failed: no player selected.', '群播启动失败：尚未选择播放器。'), 'error');
+        return;
+      }
+      payload.targetClientIds = [controlState.selectedClientId];
+    }
+
+    sendBroadcastMessage('broadcast.start', 'command', payload);
+  }
+
+  function requireBroadcastControl(actionLabel) {
+    const broadcast = getActiveBroadcast();
+    if (!broadcast?.broadcastId) {
+      setCommandStatus(
+        i18nText(`${actionLabel} failed: no active broadcast.`, `${actionLabel} 失败：当前没有群播。`),
+        'error'
+      );
+      return null;
+    }
+    return broadcast;
+  }
+
+  function sendBroadcastQueueSync() {
+    const broadcast = requireBroadcastControl('broadcast.queue.sync');
+    if (!broadcast) {
+      return;
+    }
+    const parsedQueue = parseQueueEditor();
+    if (parsedQueue.error) {
+      setCommandStatus(parsedQueue.error, 'error');
+      return;
+    }
+
+    sendBroadcastMessage('broadcast.queue.sync', 'state', {
+      broadcastId: broadcast.broadcastId,
+      queueSongIds: parsedQueue.queueSongIds,
+      currentIndex: parsedQueue.currentIndex,
+      positionMs: parsedQueue.positionMs,
+      baseVersion: controlState.broadcast.broadcast?.version,
+    });
+  }
+
+  function sendBroadcastPlayItem(index) {
+    const broadcast = requireBroadcastControl('broadcast.playItem');
+    if (!broadcast) {
+      return;
+    }
+    const queueSongIds = broadcast.queueSongIds || [];
+    if (index < 0 || index >= queueSongIds.length) {
+      setCommandStatus(i18nText('broadcast.playItem failed: invalid queue index.', 'broadcast.playItem 失败：队列索引无效。'), 'error');
+      return;
+    }
+
+    sendBroadcastMessage('broadcast.playItem', 'command', {
+      broadcastId: broadcast.broadcastId,
+      queueIndex: index,
+      positionMs: parseInt(document.getElementById('queue-position-ms').value, 10) || 0,
+      baseVersion: controlState.broadcast.broadcast?.version,
+    });
+  }
+
+  function sendBroadcastTransport(action, payload = {}) {
+    const broadcast = requireBroadcastControl(action);
+    if (!broadcast) {
+      return;
+    }
+    sendBroadcastMessage(action, 'command', {
+      broadcastId: broadcast.broadcastId,
+      ...payload,
+    });
+  }
+
+  function requestBroadcastStatus() {
+    const broadcast = getActiveBroadcast();
+    const broadcastId = controlState.broadcast.activeBroadcastId || broadcast?.broadcastId;
+    if (!broadcastId) {
+      setCommandStatus(i18nText('Broadcast status failed: no broadcast selected.', '群播状态查询失败：没有可查询的群播。'), 'error');
+      return;
+    }
+    sendBroadcastMessage('broadcast.status', 'state', { broadcastId });
+  }
+
+  function renderBroadcastPanel() {
+    const badge = document.getElementById('control-broadcast-badge');
+    const summary = document.getElementById('control-broadcast-summary');
+    const broadcast = getActiveBroadcast();
+    const hasBroadcast = Boolean(broadcast?.broadcastId);
+    const activeBroadcast = hasBroadcast && controlState.broadcast.activeBroadcastId === broadcast.broadcastId;
+    const selectedTarget = getPlayers().find((device) => device.clientId === controlState.selectedClientId);
+    const participantStates = controlState.broadcast.participantStates || [];
+
+    document.getElementById('start-broadcast-selected').disabled = !selectedTarget;
+    document.getElementById('start-broadcast-all').disabled = getPlayers().length === 0;
+    document.getElementById('sync-broadcast-queue').disabled = !activeBroadcast;
+    document.getElementById('broadcast-play-current').disabled = !activeBroadcast || !(broadcast.queueSongIds || []).length;
+    document.getElementById('broadcast-play').disabled = !activeBroadcast || !(broadcast.queueSongIds || []).length;
+    document.getElementById('broadcast-pause').disabled = !activeBroadcast || broadcast.state !== 'playing';
+    document.getElementById('broadcast-seek').disabled = !activeBroadcast;
+    document.getElementById('stop-broadcast').disabled = !activeBroadcast;
+    document.getElementById('refresh-broadcast-status').disabled = !hasBroadcast;
+
+    if (!hasBroadcast) {
+      badge.textContent = i18nText('Idle', '空闲');
+      summary.innerHTML = escapeHtml(i18nText('No active broadcast.', '当前没有群播。'));
+      return;
+    }
+
+    const currentTrackLabel = broadcast.trackId
+      ? controlState.trackMeta[broadcast.trackId]?.label || broadcast.trackId
+      : i18nText('No track', '暂无曲目');
+    const participantRows = participantStates.length
+      ? participantStates.map((participantState) => `
+        <li><span>${escapeHtml(participantState.clientId)}</span><strong>${escapeHtml(participantState.online === false ? 'offline' : (participantState.state || 'online'))} · ${formatPosition(participantState.positionMs)}</strong></li>
+      `).join('')
+      : `<li><span>${i18nText('Participants', '参与设备')}</span><strong>${(broadcast.participants || []).length}</strong></li>`;
+
+    badge.textContent = broadcast.state || i18nText('Broadcast', '群播');
+    summary.innerHTML = `
+      <ul class="console-info-list mb-2">
+        <li><span>broadcastId</span><code>${escapeHtml(broadcast.broadcastId)}</code></li>
+        <li><span>${i18nText('State', '状态')}</span><strong>${escapeHtml(broadcast.state || '-')}</strong></li>
+        <li><span>${i18nText('Track', '曲目')}</span><strong>${escapeHtml(currentTrackLabel)}</strong></li>
+        <li><span>${i18nText('Queue', '队列')}</span><strong>${broadcast.queueSongIds?.length ?? 0}</strong></li>
+        <li><span>${i18nText('Version', '版本')}</span><strong>${broadcast.version ?? '-'}</strong></li>
+        <li><span>${i18nText('Updated by', '最近修改')}</span><code>${escapeHtml(broadcast.updatedByClientId || '-')}</code></li>
+        ${participantRows}
+      </ul>
+      ${renderQueueEntries(broadcast, 'broadcast', i18nText('No broadcast queue available.', '暂无群播队列。'))}
+    `;
+  }
+
   function renderPlayerCards() {
     const players = getPlayers();
     const list = document.getElementById('control-player-list');
@@ -655,6 +909,7 @@
         renderPlayerCards();
         renderTargetPanels();
         renderFollowPanel();
+        renderBroadcastPanel();
         updateSummary();
       });
     });
@@ -1112,6 +1367,7 @@
       renderPlayerCards();
       renderTargetPanels();
       renderFollowPanel();
+      renderBroadcastPanel();
       updateSummary();
       if (previousSessionId && previousSessionId !== controlState.selectedSessionId) {
         sendSessionAction('session.unsubscribe', previousSessionId);
@@ -1215,6 +1471,23 @@
       return;
     }
 
+    if (
+      [
+        'broadcast.start',
+        'broadcast.status',
+        'broadcast.queue.sync',
+        'broadcast.playItem',
+        'broadcast.play',
+        'broadcast.pause',
+        'broadcast.seek',
+        'broadcast.stop',
+      ].includes(action)
+    ) {
+      updateBroadcastFromPayload(message.payload || {}, action);
+      pushEventLine(`Broadcast update: ${action}`, 'info');
+      return;
+    }
+
     if (action === 'system.error') {
       if (controlState.pendingFollow && message.requestId === controlState.pendingFollow.requestId) {
         const errorMessage = message.payload?.message || i18nText('Unknown error', '未知错误');
@@ -1271,6 +1544,9 @@
       const pendingAction = controlState.pendingCommands.get(message.requestId);
       if (pendingAction) {
         controlState.pendingCommands.delete(message.requestId);
+        if (pendingAction.startsWith('broadcast.')) {
+          updateBroadcastFromPayload(message.payload || {}, pendingAction);
+        }
         setCommandStatus(i18nText(`${pendingAction} acknowledged by server.`, `服务器已确认 ${pendingAction}。`), 'success');
       }
       pushEventLine(`Ack: ${message.requestId || 'command'}`, 'success');
@@ -1299,6 +1575,20 @@
   document.getElementById('send-local-queue').addEventListener('click', sendLocalQueue);
   document.getElementById('start-follow-playback').addEventListener('click', startFollowPlayback);
   document.getElementById('stop-follow-playback').addEventListener('click', () => stopFollowPlayback(true));
+  document.getElementById('start-broadcast-selected').addEventListener('click', () => startBroadcastPlayback('selectedClients'));
+  document.getElementById('start-broadcast-all').addEventListener('click', () => startBroadcastPlayback('allOnlinePlayers'));
+  document.getElementById('sync-broadcast-queue').addEventListener('click', sendBroadcastQueueSync);
+  document.getElementById('broadcast-play-current').addEventListener('click', () => {
+    sendBroadcastPlayItem(parseInt(document.getElementById('queue-current-index').value, 10) || 0);
+  });
+  document.getElementById('broadcast-play').addEventListener('click', () => sendBroadcastTransport('broadcast.play'));
+  document.getElementById('broadcast-pause').addEventListener('click', () => sendBroadcastTransport('broadcast.pause'));
+  document.getElementById('broadcast-seek').addEventListener('click', () => {
+    const positionMs = parseInt(document.getElementById('seek-position').value, 10) || 0;
+    sendBroadcastTransport('broadcast.seek', { positionMs });
+  });
+  document.getElementById('stop-broadcast').addEventListener('click', () => sendBroadcastTransport('broadcast.stop'));
+  document.getElementById('refresh-broadcast-status').addEventListener('click', requestBroadcastStatus);
   document.getElementById('load-current-queue').addEventListener('click', () => {
     const queue = controlState.selectedSessionId ? controlState.queueBySession[controlState.selectedSessionId] : null;
     document.getElementById('queue-song-ids').value = (queue?.queueSongIds || []).join('\n');
@@ -1318,6 +1608,10 @@
     if (!chip) {
       return;
     }
+    if (chip.dataset.queueScope === 'broadcast') {
+      sendBroadcastPlayItem(parseInt(chip.dataset.queueIndex, 10));
+      return;
+    }
     sendQueuePlayItem(chip.dataset.queueScope || 'session', parseInt(chip.dataset.queueIndex, 10));
   });
 
@@ -1327,6 +1621,7 @@
         renderPlayerCards();
         renderTargetPanels();
         renderFollowPanel();
+        renderBroadcastPanel();
         updateSummary();
       }, 0);
     });
@@ -1334,6 +1629,7 @@
 
   updateSummary();
   renderFollowPanel();
+  renderBroadcastPanel();
   window.setInterval(() => {
     updateControlPlaybackProgress();
     if (controlState.follow.mode === 'follow') {

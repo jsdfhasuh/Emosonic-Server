@@ -23,6 +23,10 @@ def clear_emo_state():
     state._local_queues.clear()
     state._playback_states.clear()
     state._session_subscriptions.clear()
+    state._broadcasts.clear()
+    state._broadcast_participants.clear()
+    state._broadcast_playback_states.clear()
+    state._client_active_broadcast.clear()
 
 
 class DeviceAliasDisplayTestCase(FrontendTestBase):
@@ -84,6 +88,21 @@ class DeviceAliasDisplayTestCase(FrontendTestBase):
         self.assertIn("pendingFollow", template)
         self.assertIn("message.requestId === controlState.pendingFollow.requestId", template)
         self.assertIn("sendSessionAction('session.unsubscribe', offlineFollowSessionId)", template)
+
+    def test_control_template_exposes_broadcast_playback_panel(self):
+        template = read_project_file("supysonic", "templates", "control.html")
+
+        self.assertIn('id="control-broadcast-panel"', template)
+        self.assertIn("roles: ['controller']", template)
+        self.assertIn("function startBroadcastPlayback(targetMode)", template)
+        self.assertIn("function renderBroadcastPanel()", template)
+        self.assertIn("function sendBroadcastQueueSync()", template)
+        self.assertIn("function sendBroadcastPlayItem(index)", template)
+        self.assertIn("sendBroadcastMessage('broadcast.start', 'command', payload)", template)
+        self.assertIn("startBroadcastPlayback('allOnlinePlayers')", template)
+        self.assertIn("startBroadcastPlayback('selectedClients')", template)
+        self.assertIn("baseVersion: controlState.broadcast.broadcast?.version", template)
+        self.assertIn("sendBroadcastTransport('broadcast.seek', { positionMs })", template)
 
     def test_devices_template_uses_alias_display_helper_for_refreshes(self):
         template = read_project_file("supysonic", "templates", "devices.html")
