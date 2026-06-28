@@ -36,6 +36,10 @@ class EmoWebSocketTestCase(unittest.TestCase):
     state._local_queues.clear()
     state._playback_states.clear()
     state._session_subscriptions.clear()
+    state._broadcasts.clear()
+    state._broadcast_participants.clear()
+    state._broadcast_playback_states.clear()
+    state._client_active_broadcast.clear()
 
     self.clients = []
 
@@ -139,6 +143,34 @@ class EmoWebSocketTestCase(unittest.TestCase):
         "payload": {"sessionId": session_id},
       },
       namespace="/emo",
+    )
+
+  def start_broadcast(self, client, target_client_ids, request_id="broadcast-start-1", **payload_overrides):
+    payload = {
+      "targetMode": "selectedClients",
+      "targetClientIds": target_client_ids,
+      "queueSongIds": ["song-1", "song-2", "song-3"],
+      "currentIndex": 0,
+      "positionMs": 0,
+      "autoPlay": True,
+    }
+    payload.update(payload_overrides)
+    client.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "broadcast.start",
+        "requestId": request_id,
+        "payload": payload,
+      },
+      namespace="/emo",
+    )
+
+  def get_ack(self, messages, request_id):
+    return next(
+      message
+      for message in messages
+      if message["action"] == "system.ack" and message["requestId"] == request_id
     )
 
   def test_device_register_keeps_alias_in_device_list(self):
@@ -820,3 +852,559 @@ class EmoWebSocketTestCase(unittest.TestCase):
     queue = next(message for message in observer_messages if message["action"] == "queue.session.sync")
     self.assertEqual(queue["payload"]["sourceClientId"], "controller-1")
     self.assertEqual(queue["payload"]["queueSongIds"], ["song-1", "song-2", "song-3"])
+
+  def test_broadcast_start_selected_clients(self):
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
+    pc = self.connect_device("alice", "Alic3", "pc-1", "root:pc", ["player"])
+    self.get_messages(phone)
+    self.get_messages(pc)
+
+    self.start_broadcast(phone, ["phone-1", "pc-1"], request_id="broadcast-start-selected-1")
+
+    phone_messages = self.get_messages(phone)
+    pc_messages = self.get_messages(pc)
+    ack = self.get_ack(phone_messages, "broadcast-start-selected-1")
+    broadcast_id = ack["payload"]["broadcastId"]
+
+    self.assertEqual(ack["payload"]["participants"], ["phone-1", "pc-1"])
+    self.assertEqual(ack["payload"]["broadcast"]["version"], 1)
+    self.assertEqual(ack["payload"]["broadcast"]["trackId"], "song-1")
+
+    pc_start = next(message for message in pc_messages if message["action"] == "broadcast.start")
+    self.assertEqual(pc_start["sourceClientId"], "phone-1")
+    self.assertEqual(pc_start["targetClientId"], "pc-1")
+    self.assertEqual(pc_start["payload"]["broadcastId"], broadcast_id)
+    self.assertEqual(pc_start["payload"]["state"], "playing")
+    self.assertTrue(pc_start["payload"]["autoPlay"])
+
+    state = get_state()
+    self.assertEqual(state.get_active_broadcast_for_client("phone-1"), broadcast_id)
+    self.assertEqual(state.get_active_broadcast_for_client("pc-1"), broadcast_id)
+
+  def test_broadcast_start_all_online_players_excludes_controller(self):
+    self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
+    self.connect_device("alice", "Alic3", "pc-1", "root:pc", ["player"])
+    controller = self.connect_device("alice", "Alic3", "web-control-1", "web-control:alice", ["controller"])
+    self.get_messages(controller)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "broadcast.start",
+        "requestId": "broadcast-start-all-1",
+        "payload": {
+          "targetMode": "allOnlinePlayers",
+          "queueSongIds": ["song-1"],
+          "currentIndex": 0,
+          "positionMs": 0,
+          "autoPlay": True,
+        },
+      },
+      namespace="/emo",
+    )
+
+    controller_messages = self.get_messages(controller)
+    ack = self.get_ack(controller_messages, "broadcast-start-all-1")
+    self.assertEqual(ack["payload"]["participants"], ["phone-1", "pc-1"])
+    self.assertNotIn("web-control-1", ack["payload"]["participants"])
+
+  def test_broadcast_start_skips_offline_and_non_player_targets(self):
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
+    self.connect_device("alice", "Alic3", "controller-target", "root:controller", ["controller"])
+    self.get_messages(phone)
+
+    self.start_broadcast(
+      phone,
+      ["phone-1", "offline-player", "controller-target"],
+      request_id="broadcast-start-skipped-1",
+      queueSongIds=["song-1"],
+    )
+
+    phone_messages = self.get_messages(phone)
+    ack = self.get_ack(phone_messages, "broadcast-start-skipped-1")
+    self.assertEqual(ack["payload"]["participants"], ["phone-1"])
+    self.assertEqual(ack["payload"]["skippedClientIds"], ["offline-player", "controller-target"])
+
+  def test_broadcast_start_empty_queue_creates_stopped_state(self):
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
+    self.get_messages(phone)
+
+    self.start_broadcast(
+      phone,
+      ["phone-1"],
+      request_id="broadcast-start-empty-1",
+      queueSongIds=[],
+      currentIndex=0,
+      positionMs=0,
+      autoPlay=True,
+    )
+
+    phone_messages = self.get_messages(phone)
+    ack = self.get_ack(phone_messages, "broadcast-start-empty-1")
+    start = next(message for message in phone_messages if message["action"] == "broadcast.start")
+    self.assertEqual(ack["payload"]["broadcast"]["state"], "stopped")
+    self.assertIsNone(ack["payload"]["broadcast"]["trackId"])
+    self.assertFalse(start["payload"]["autoPlay"])
+    self.assertEqual(start["payload"]["state"], "stopped")
+
+  def test_broadcast_empty_queue_can_sync_queue_before_stop(self):
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
+    self.get_messages(phone)
+
+    self.start_broadcast(
+      phone,
+      ["phone-1"],
+      request_id="broadcast-start-empty-sync-1",
+      queueSongIds=[],
+      currentIndex=0,
+      positionMs=0,
+      autoPlay=True,
+    )
+    ack = self.get_ack(self.get_messages(phone), "broadcast-start-empty-sync-1")
+    broadcast_id = ack["payload"]["broadcastId"]
+
+    phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "broadcast.queue.sync",
+        "requestId": "broadcast-empty-sync-1",
+        "payload": {
+          "broadcastId": broadcast_id,
+          "queueSongIds": ["song-1"],
+          "currentIndex": 0,
+          "positionMs": 0,
+          "baseVersion": 1,
+        },
+      },
+      namespace="/emo",
+    )
+
+    sync_ack = self.get_ack(self.get_messages(phone), "broadcast-empty-sync-1")
+    self.assertEqual(sync_ack["payload"]["broadcast"]["version"], 2)
+    self.assertEqual(sync_ack["payload"]["broadcast"]["trackId"], "song-1")
+    self.assertEqual(sync_ack["payload"]["broadcast"]["state"], "stopped")
+
+  def test_broadcast_play_rejects_empty_queue(self):
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
+    self.get_messages(phone)
+
+    self.start_broadcast(
+      phone,
+      ["phone-1"],
+      request_id="broadcast-start-empty-play-1",
+      queueSongIds=[],
+      currentIndex=0,
+      positionMs=0,
+      autoPlay=True,
+    )
+    ack = self.get_ack(self.get_messages(phone), "broadcast-start-empty-play-1")
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "broadcast.play",
+        "requestId": "broadcast-play-empty-1",
+        "payload": {"broadcastId": ack["payload"]["broadcastId"]},
+      },
+      namespace="/emo",
+    )
+
+    messages = self.get_messages(phone)
+    error = next(message for message in messages if message["action"] == "system.error")
+    self.assertEqual(error["requestId"], "broadcast-play-empty-1")
+    self.assertEqual(error["payload"]["code"], "bad_request")
+    self.assertEqual(
+      get_state().get_broadcast(ack["payload"]["broadcastId"])["state"],
+      "stopped",
+    )
+
+  def test_broadcast_start_rejects_cross_user_target(self):
+    self.connect_device("bob", "B0b", "bob-player", "bob:player", ["player"])
+    controller = self.connect_device("alice", "Alic3", "controller-1", "alice:controller", ["controller"])
+
+    self.start_broadcast(
+      controller,
+      ["bob-player"],
+      request_id="broadcast-cross-user-1",
+      queueSongIds=["song-1"],
+    )
+
+    controller_messages = self.get_messages(controller)
+    error = next(message for message in controller_messages if message["action"] == "system.error")
+    self.assertEqual(error["requestId"], "broadcast-cross-user-1")
+    self.assertEqual(error["payload"]["code"], "forbidden")
+
+  def test_controller_can_start_broadcast_without_becoming_participant_and_control_queue(self):
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
+    pc = self.connect_device("alice", "Alic3", "pc-1", "root:pc", ["player"])
+    controller = self.connect_device("alice", "Alic3", "web-control-1", "web-control:alice", ["controller"])
+    self.get_messages(phone)
+    self.get_messages(pc)
+    self.get_messages(controller)
+
+    self.start_broadcast(
+      controller,
+      ["phone-1", "pc-1"],
+      request_id="broadcast-controller-start-1",
+      queueSongIds=["song-1", "song-2"],
+    )
+
+    controller_messages = self.get_messages(controller)
+    ack = self.get_ack(controller_messages, "broadcast-controller-start-1")
+    broadcast_id = ack["payload"]["broadcastId"]
+    self.assertEqual(ack["payload"]["participants"], ["phone-1", "pc-1"])
+    self.assertFalse(any(message["action"] == "broadcast.start" for message in controller_messages))
+    self.assertIsNone(get_state().get_active_broadcast_for_client("web-control-1"))
+
+    self.get_messages(phone)
+    self.get_messages(pc)
+    controller.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "broadcast.queue.sync",
+        "requestId": "broadcast-controller-queue-1",
+        "payload": {
+          "broadcastId": broadcast_id,
+          "queueSongIds": ["song-3", "song-4"],
+          "currentIndex": 1,
+          "positionMs": 0,
+          "baseVersion": 1,
+        },
+      },
+      namespace="/emo",
+    )
+
+    controller_messages = self.get_messages(controller)
+    phone_messages = self.get_messages(phone)
+    queue_ack = self.get_ack(controller_messages, "broadcast-controller-queue-1")
+    self.assertEqual(queue_ack["payload"]["broadcast"]["version"], 2)
+    self.assertEqual(queue_ack["payload"]["broadcast"]["trackId"], "song-4")
+    phone_queue = next(message for message in phone_messages if message["action"] == "broadcast.queue.sync")
+    self.assertEqual(phone_queue["payload"]["updatedByClientId"], "web-control-1")
+    self.assertEqual(phone_queue["payload"]["queueSongIds"], ["song-3", "song-4"])
+
+  def test_broadcast_queue_version_conflict(self):
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
+    self.get_messages(phone)
+    self.start_broadcast(phone, ["phone-1"], request_id="broadcast-start-conflict-1")
+    ack = self.get_ack(self.get_messages(phone), "broadcast-start-conflict-1")
+
+    phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "broadcast.queue.sync",
+        "requestId": "broadcast-conflict-1",
+        "payload": {
+          "broadcastId": ack["payload"]["broadcastId"],
+          "queueSongIds": ["song-1", "song-2"],
+          "currentIndex": 0,
+          "positionMs": 0,
+          "baseVersion": 0,
+        },
+      },
+      namespace="/emo",
+    )
+
+    messages = self.get_messages(phone)
+    error = next(message for message in messages if message["action"] == "system.error")
+    self.assertEqual(error["requestId"], "broadcast-conflict-1")
+    self.assertEqual(error["payload"]["code"], "conflict")
+    self.assertEqual(error["payload"]["currentVersion"], 1)
+    self.assertEqual(get_state().get_broadcast(ack["payload"]["broadcastId"])["version"], 1)
+
+  def test_broadcast_status_returns_broadcast_and_participant_states(self):
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
+    controller = self.connect_device("alice", "Alic3", "controller-1", "root:controller", ["controller"])
+    self.get_messages(phone)
+    self.get_messages(controller)
+    self.start_broadcast(phone, ["phone-1"], request_id="broadcast-start-status-1")
+    ack = self.get_ack(self.get_messages(phone), "broadcast-start-status-1")
+    broadcast_id = ack["payload"]["broadcastId"]
+
+    controller.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "broadcast.status",
+        "requestId": "broadcast-status-1",
+        "payload": {"broadcastId": broadcast_id},
+      },
+      namespace="/emo",
+    )
+
+    controller_messages = self.get_messages(controller)
+    status_ack = self.get_ack(controller_messages, "broadcast-status-1")
+    status = next(message for message in controller_messages if message["action"] == "broadcast.status")
+    self.assertEqual(status_ack["payload"]["broadcast"]["broadcastId"], broadcast_id)
+    self.assertEqual(status["payload"]["broadcast"]["broadcastId"], broadcast_id)
+    self.assertEqual(status["payload"]["participantStates"][0]["clientId"], "phone-1")
+    self.assertTrue(status["payload"]["participantStates"][0]["online"])
+
+  def test_broadcast_play_item_broadcasts_command(self):
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
+    pc = self.connect_device("alice", "Alic3", "pc-1", "root:pc", ["player"])
+    self.get_messages(phone)
+    self.get_messages(pc)
+    self.start_broadcast(phone, ["phone-1", "pc-1"], request_id="broadcast-start-play-item-1")
+    ack = self.get_ack(self.get_messages(phone), "broadcast-start-play-item-1")
+    self.get_messages(pc)
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "broadcast.playItem",
+        "requestId": "broadcast-play-item-1",
+        "payload": {
+          "broadcastId": ack["payload"]["broadcastId"],
+          "queueIndex": 1,
+          "positionMs": 0,
+          "baseVersion": 1,
+        },
+      },
+      namespace="/emo",
+    )
+
+    phone_messages = self.get_messages(phone)
+    pc_messages = self.get_messages(pc)
+    play_ack = self.get_ack(phone_messages, "broadcast-play-item-1")
+    self.assertEqual(play_ack["payload"]["broadcast"]["currentIndex"], 1)
+    self.assertEqual(play_ack["payload"]["broadcast"]["trackId"], "song-2")
+    self.assertEqual(play_ack["payload"]["broadcast"]["version"], 2)
+    pc_command = next(message for message in pc_messages if message["action"] == "broadcast.playItem")
+    self.assertEqual(pc_command["payload"]["queueIndex"], 1)
+    self.assertEqual(pc_command["payload"]["trackId"], "song-2")
+    self.assertEqual(pc_command["payload"]["state"], "playing")
+
+  def test_broadcast_seek_and_pause_broadcast_commands(self):
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
+    pc = self.connect_device("alice", "Alic3", "pc-1", "root:pc", ["player"])
+    self.get_messages(phone)
+    self.get_messages(pc)
+    self.start_broadcast(phone, ["phone-1", "pc-1"], request_id="broadcast-start-seek-1")
+    ack = self.get_ack(self.get_messages(phone), "broadcast-start-seek-1")
+    broadcast_id = ack["payload"]["broadcastId"]
+    self.get_messages(pc)
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "broadcast.seek",
+        "requestId": "broadcast-seek-1",
+        "payload": {"broadcastId": broadcast_id, "positionMs": 45000},
+      },
+      namespace="/emo",
+    )
+
+    pc_messages = self.get_messages(pc)
+    seek = next(message for message in pc_messages if message["action"] == "broadcast.seek")
+    self.assertEqual(seek["payload"]["positionMs"], 45000)
+    self.assertEqual(seek["payload"]["version"], 2)
+
+    self.get_messages(phone)
+    self.get_messages(pc)
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "broadcast.pause",
+        "requestId": "broadcast-pause-1",
+        "payload": {"broadcastId": broadcast_id, "positionMs": 46000},
+      },
+      namespace="/emo",
+    )
+
+    pc_messages = self.get_messages(pc)
+    pause = next(message for message in pc_messages if message["action"] == "broadcast.pause")
+    self.assertEqual(pause["payload"]["state"], "paused")
+    self.assertEqual(pause["payload"]["positionMs"], 46000)
+    self.assertEqual(pause["payload"]["version"], 3)
+
+  def test_broadcast_playback_update_records_participant_state(self):
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
+    pc = self.connect_device("alice", "Alic3", "pc-1", "root:pc", ["player"])
+    self.get_messages(phone)
+    self.get_messages(pc)
+    self.start_broadcast(phone, ["phone-1", "pc-1"], request_id="broadcast-start-feedback-1")
+    ack = self.get_ack(self.get_messages(phone), "broadcast-start-feedback-1")
+    broadcast_id = ack["payload"]["broadcastId"]
+
+    pc.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "broadcast-feedback-1",
+        "payload": {
+          "sessionId": "root:pc",
+          "mode": "broadcast",
+          "broadcastId": broadcast_id,
+          "state": "playing",
+          "trackId": "song-2",
+          "positionMs": 12000,
+          "syncDriftMs": -200,
+        },
+      },
+      namespace="/emo",
+    )
+
+    pc_messages = self.get_messages(pc)
+    self.get_ack(pc_messages, "broadcast-feedback-1")
+    participant_state = get_state().get_broadcast_participant_state(broadcast_id, "pc-1")
+    self.assertEqual(participant_state["state"], "playing")
+    self.assertEqual(participant_state["trackId"], "song-2")
+    self.assertEqual(participant_state["positionMs"], 12000)
+    self.assertEqual(participant_state["syncDriftMs"], -200)
+    self.assertTrue(participant_state["online"])
+
+  def test_broadcast_stale_participant_is_marked_offline(self):
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
+    pc = self.connect_device("alice", "Alic3", "pc-1", "root:pc", ["player"])
+    self.get_messages(phone)
+    self.get_messages(pc)
+    self.start_broadcast(phone, ["phone-1", "pc-1"], request_id="broadcast-start-stale-1")
+    ack = self.get_ack(self.get_messages(phone), "broadcast-start-stale-1")
+    broadcast_id = ack["payload"]["broadcastId"]
+
+    state = get_state()
+    state._clients["pc-1"]["lastSeenAt"] = 1
+    state.prune_stale_clients(stale_after_seconds=5, now=10)
+
+    participant_state = state.get_broadcast_participant_state(broadcast_id, "pc-1")
+    self.assertFalse(participant_state["online"])
+
+  def test_broadcast_stop_clears_active_broadcast_and_notifies_participants(self):
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
+    pc = self.connect_device("alice", "Alic3", "pc-1", "root:pc", ["player"])
+    self.get_messages(phone)
+    self.get_messages(pc)
+    self.start_broadcast(phone, ["phone-1", "pc-1"], request_id="broadcast-start-stop-1")
+    ack = self.get_ack(self.get_messages(phone), "broadcast-start-stop-1")
+    broadcast_id = ack["payload"]["broadcastId"]
+    self.get_messages(pc)
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "broadcast.stop",
+        "requestId": "broadcast-stop-1",
+        "payload": {"broadcastId": broadcast_id},
+      },
+      namespace="/emo",
+    )
+
+    phone_messages = self.get_messages(phone)
+    pc_messages = self.get_messages(pc)
+    stop_ack = self.get_ack(phone_messages, "broadcast-stop-1")
+    self.assertEqual(stop_ack["payload"]["broadcast"]["state"], "stopped")
+    pc_stop = next(message for message in pc_messages if message["action"] == "broadcast.stop")
+    self.assertEqual(pc_stop["payload"]["state"], "stopped")
+    self.assertIsNone(get_state().get_active_broadcast_for_client("phone-1"))
+    self.assertIsNone(get_state().get_active_broadcast_for_client("pc-1"))
+
+  def test_broadcast_control_after_stop_is_rejected(self):
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
+    pc = self.connect_device("alice", "Alic3", "pc-1", "root:pc", ["player"])
+    self.get_messages(phone)
+    self.get_messages(pc)
+    self.start_broadcast(phone, ["phone-1", "pc-1"], request_id="broadcast-start-stop-control-1")
+    ack = self.get_ack(self.get_messages(phone), "broadcast-start-stop-control-1")
+    broadcast_id = ack["payload"]["broadcastId"]
+    self.get_messages(pc)
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "broadcast.stop",
+        "requestId": "broadcast-stop-control-1",
+        "payload": {"broadcastId": broadcast_id},
+      },
+      namespace="/emo",
+    )
+    stop_ack = self.get_ack(self.get_messages(phone), "broadcast-stop-control-1")
+    stopped_version = stop_ack["payload"]["broadcast"]["version"]
+    self.get_messages(pc)
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "broadcast.playItem",
+        "requestId": "broadcast-play-item-after-stop-1",
+        "payload": {
+          "broadcastId": broadcast_id,
+          "queueIndex": 1,
+          "positionMs": 0,
+          "baseVersion": stopped_version,
+        },
+      },
+      namespace="/emo",
+    )
+
+    phone_messages = self.get_messages(phone)
+    pc_messages = self.get_messages(pc)
+    error = next(message for message in phone_messages if message["action"] == "system.error")
+    self.assertEqual(error["requestId"], "broadcast-play-item-after-stop-1")
+    self.assertEqual(error["payload"]["code"], "bad_request")
+    self.assertFalse(any(message["action"] == "broadcast.playItem" for message in pc_messages))
+
+    broadcast = get_state().get_broadcast(broadcast_id)
+    self.assertEqual(broadcast["state"], "stopped")
+    self.assertEqual(broadcast["version"], stopped_version)
+
+  def test_broadcast_playback_update_after_stop_is_rejected(self):
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
+    pc = self.connect_device("alice", "Alic3", "pc-1", "root:pc", ["player"])
+    self.get_messages(phone)
+    self.get_messages(pc)
+    self.start_broadcast(phone, ["phone-1", "pc-1"], request_id="broadcast-start-stop-feedback-1")
+    ack = self.get_ack(self.get_messages(phone), "broadcast-start-stop-feedback-1")
+    broadcast_id = ack["payload"]["broadcastId"]
+    self.get_messages(pc)
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "broadcast.stop",
+        "requestId": "broadcast-stop-feedback-1",
+        "payload": {"broadcastId": broadcast_id},
+      },
+      namespace="/emo",
+    )
+    self.get_ack(self.get_messages(phone), "broadcast-stop-feedback-1")
+    self.get_messages(pc)
+
+    pc.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "broadcast-feedback-after-stop-1",
+        "payload": {
+          "sessionId": "root:pc",
+          "mode": "broadcast",
+          "broadcastId": broadcast_id,
+          "state": "playing",
+          "trackId": "song-2",
+          "positionMs": 88000,
+        },
+      },
+      namespace="/emo",
+    )
+
+    pc_messages = self.get_messages(pc)
+    error = next(message for message in pc_messages if message["action"] == "system.error")
+    self.assertEqual(error["requestId"], "broadcast-feedback-after-stop-1")
+    self.assertEqual(error["payload"]["code"], "forbidden")
+
+    participant_state = get_state().get_broadcast_participant_state(broadcast_id, "pc-1")
+    self.assertNotEqual(participant_state["positionMs"], 88000)

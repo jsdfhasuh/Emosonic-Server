@@ -5,6 +5,16 @@ import time
 DEFAULT_CLIENT_STALE_SECONDS = 90
 
 
+class BroadcastInactiveError(Exception):
+    pass
+
+
+class BroadcastVersionMismatchError(Exception):
+    def __init__(self, current_version):
+        super().__init__("Broadcast version mismatch")
+        self.current_version = current_version
+
+
 class WebSocketState:
     def __init__(self):
         self._lock = threading.RLock()
@@ -22,6 +32,14 @@ class WebSocketState:
         self._playback_states = {}
         # sid -> subscribed sessionIds for passive observers/controllers
         self._session_subscriptions = {}
+        # broadcastId -> authoritative broadcast playback state
+        self._broadcasts = {}
+        # broadcastId -> set(clientId) for playback participants
+        self._broadcast_participants = {}
+        # (broadcastId, clientId) -> participant execution state
+        self._broadcast_playback_states = {}
+        # clientId -> active broadcastId for playback participants
+        self._client_active_broadcast = {}
 
     def register_session(self, sid, now=None):
         now = time.time() if now is None else now
@@ -106,7 +124,9 @@ class WebSocketState:
                     if session_info is not None and session_info.get("clientId") == client_id:
                         session_info["clientId"] = None
                 self._client_to_sid.pop(client_id, None)
-                removed.append(self._clients.pop(client_id))
+                removed_client = self._clients.pop(client_id)
+                self._mark_broadcast_participant_offline_locked(client_id, now=now)
+                removed.append(removed_client)
             return [dict(client) for client in removed]
 
     def unregister_session(self, sid):
@@ -122,6 +142,7 @@ class WebSocketState:
                 if current_sid == sid:
                     self._client_to_sid.pop(client_id, None)
                     client_info = self._clients.pop(client_id, None)
+                    self._mark_broadcast_participant_offline_locked(client_id)
             return session_info, client_info
 
     def get_client(self, client_id):
@@ -294,6 +315,217 @@ class WebSocketState:
                     continue
                 items.append(dict(playback_state))
             return items
+
+    def create_broadcast(
+        self,
+        broadcast_id,
+        user_name,
+        owner_client_id,
+        participants,
+        queue_song_ids,
+        current_index=0,
+        position_ms=0,
+        state_name="stopped",
+        control_policy="participants_and_controllers_can_control",
+        updated_by_client_id=None,
+        now=None,
+    ):
+        now = time.time() if now is None else now
+        participant_ids = list(participants)
+        track_id = queue_song_ids[current_index] if queue_song_ids else None
+        broadcast = {
+            "broadcastId": broadcast_id,
+            "userName": user_name,
+            "ownerClientId": owner_client_id,
+            "participants": participant_ids,
+            "queueSongIds": list(queue_song_ids),
+            "currentIndex": current_index,
+            "trackId": track_id,
+            "positionMs": position_ms,
+            "state": state_name,
+            "version": 1,
+            "updatedByClientId": updated_by_client_id or owner_client_id,
+            "createdAt": now,
+            "updatedAt": now,
+            "controlPolicy": control_policy,
+        }
+        with self._lock:
+            self._broadcasts[broadcast_id] = broadcast
+            self._broadcast_participants[broadcast_id] = set(participant_ids)
+            for client_id in participant_ids:
+                self._client_active_broadcast[client_id] = broadcast_id
+        return dict(broadcast)
+
+    def get_broadcast(self, broadcast_id):
+        with self._lock:
+            broadcast = self._broadcasts.get(broadcast_id)
+            return dict(broadcast) if broadcast is not None else None
+
+    def list_broadcasts(self, user_name=None):
+        with self._lock:
+            broadcasts = []
+            for broadcast in self._broadcasts.values():
+                if user_name is not None and broadcast.get("userName") != user_name:
+                    continue
+                broadcasts.append(dict(broadcast))
+            return broadcasts
+
+    def list_broadcast_participants(self, broadcast_id):
+        with self._lock:
+            broadcast = self._broadcasts.get(broadcast_id)
+            if broadcast is None:
+                return []
+            return list(broadcast.get("participants") or [])
+
+    def is_broadcast_participant(self, broadcast_id, client_id):
+        with self._lock:
+            return client_id in self._broadcast_participants.get(broadcast_id, set())
+
+    def get_active_broadcast_for_client(self, client_id):
+        with self._lock:
+            return self._client_active_broadcast.get(client_id)
+
+    def is_broadcast_active(self, broadcast_id):
+        with self._lock:
+            return self._is_broadcast_active_locked(broadcast_id)
+
+    def _is_broadcast_active_locked(self, broadcast_id):
+        for client_id in self._broadcast_participants.get(broadcast_id, set()):
+            if self._client_active_broadcast.get(client_id) == broadcast_id:
+                return True
+        return False
+
+    def set_active_broadcast_for_client(self, client_id, broadcast_id):
+        with self._lock:
+            self._client_active_broadcast[client_id] = broadcast_id
+
+    def clear_active_broadcast_for_client(self, client_id, broadcast_id=None):
+        with self._lock:
+            active_broadcast_id = self._client_active_broadcast.get(client_id)
+            if broadcast_id is not None and active_broadcast_id != broadcast_id:
+                return
+            self._client_active_broadcast.pop(client_id, None)
+
+    def update_broadcast_state(
+        self,
+        broadcast_id,
+        updated_by_client_id,
+        queue_song_ids=None,
+        current_index=None,
+        position_ms=None,
+        state_name=None,
+        increment_version=True,
+        expected_version=None,
+        require_active=False,
+        now=None,
+    ):
+        now = time.time() if now is None else now
+        with self._lock:
+            broadcast = self._broadcasts.get(broadcast_id)
+            if broadcast is None:
+                return None
+            if require_active and not self._is_broadcast_active_locked(broadcast_id):
+                raise BroadcastInactiveError("Broadcast is not active")
+            if (
+                expected_version is not None
+                and broadcast.get("version") != expected_version
+            ):
+                raise BroadcastVersionMismatchError(broadcast.get("version"))
+
+            if queue_song_ids is not None:
+                broadcast["queueSongIds"] = list(queue_song_ids)
+            if current_index is not None:
+                broadcast["currentIndex"] = current_index
+            if position_ms is not None:
+                broadcast["positionMs"] = position_ms
+            if state_name is not None:
+                broadcast["state"] = state_name
+
+            queue = broadcast.get("queueSongIds") or []
+            index = broadcast.get("currentIndex", 0)
+            broadcast["trackId"] = queue[index] if queue and 0 <= index < len(queue) else None
+            broadcast["updatedByClientId"] = updated_by_client_id
+            broadcast["updatedAt"] = now
+            if increment_version:
+                broadcast["version"] = broadcast.get("version", 0) + 1
+            return dict(broadcast)
+
+    def stop_broadcast(self, broadcast_id, updated_by_client_id, now=None):
+        now = time.time() if now is None else now
+        with self._lock:
+            broadcast = self._broadcasts.get(broadcast_id)
+            if broadcast is None:
+                return None
+            if not self._is_broadcast_active_locked(broadcast_id):
+                raise BroadcastInactiveError("Broadcast is not active")
+
+            broadcast["state"] = "stopped"
+            queue = broadcast.get("queueSongIds") or []
+            index = broadcast.get("currentIndex", 0)
+            broadcast["trackId"] = queue[index] if queue and 0 <= index < len(queue) else None
+            broadcast["updatedByClientId"] = updated_by_client_id
+            broadcast["updatedAt"] = now
+            broadcast["version"] = broadcast.get("version", 0) + 1
+
+            for client_id in self._broadcast_participants.get(broadcast_id, set()):
+                if self._client_active_broadcast.get(client_id) == broadcast_id:
+                    self._client_active_broadcast.pop(client_id, None)
+            return dict(broadcast)
+
+    def update_broadcast_participant_state(
+        self,
+        broadcast_id,
+        client_id,
+        session_id,
+        playback_state=None,
+        now=None,
+        online=True,
+    ):
+        now = time.time() if now is None else now
+        playback_state = dict(playback_state or {})
+        participant_state = {
+            "broadcastId": broadcast_id,
+            "clientId": client_id,
+            "sessionId": session_id,
+            "state": playback_state.get("state") or "unknown",
+            "trackId": playback_state.get("trackId"),
+            "positionMs": playback_state.get("positionMs", 0),
+            "syncDriftMs": playback_state.get("syncDriftMs"),
+            "online": online,
+            "errorCode": playback_state.get("errorCode"),
+            "errorMessage": playback_state.get("errorMessage"),
+            "lastSeenAt": now,
+        }
+        with self._lock:
+            self._broadcast_playback_states[(broadcast_id, client_id)] = participant_state
+        return dict(participant_state)
+
+    def get_broadcast_participant_state(self, broadcast_id, client_id):
+        with self._lock:
+            participant_state = self._broadcast_playback_states.get((broadcast_id, client_id))
+            return dict(participant_state) if participant_state is not None else None
+
+    def list_broadcast_participant_states(self, broadcast_id):
+        with self._lock:
+            participant_states = []
+            for (state_broadcast_id, _client_id), participant_state in self._broadcast_playback_states.items():
+                if state_broadcast_id != broadcast_id:
+                    continue
+                participant_states.append(dict(participant_state))
+            return participant_states
+
+    def mark_broadcast_participant_offline(self, client_id, now=None):
+        now = time.time() if now is None else now
+        with self._lock:
+            self._mark_broadcast_participant_offline_locked(client_id, now=now)
+
+    def _mark_broadcast_participant_offline_locked(self, client_id, now=None):
+        now = time.time() if now is None else now
+        for (broadcast_id, state_client_id), participant_state in self._broadcast_playback_states.items():
+            if state_client_id != client_id:
+                continue
+            participant_state["online"] = False
+            participant_state["lastSeenAt"] = now
 
 
 _state = WebSocketState()

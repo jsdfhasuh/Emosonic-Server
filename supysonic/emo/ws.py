@@ -1,6 +1,7 @@
 import os
 import logging
 import time
+import uuid
 
 from flask import current_app, request, session
 from flask_socketio import Namespace, SocketIO, emit
@@ -18,7 +19,12 @@ from .ws_store import (
     savePlaybackState,
     saveQueueState,
 )
-from .ws_state import DEFAULT_CLIENT_STALE_SECONDS, get_state
+from .ws_state import (
+    BroadcastInactiveError,
+    BroadcastVersionMismatchError,
+    DEFAULT_CLIENT_STALE_SECONDS,
+    get_state,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -41,6 +47,16 @@ CONTROL_ACTIONS = {
     "queue.playItem",
 }
 SESSION_ACTIONS = {"session.subscribe", "session.unsubscribe"}
+BROADCAST_ACTIONS = {
+    "broadcast.start",
+    "broadcast.stop",
+    "broadcast.queue.sync",
+    "broadcast.playItem",
+    "broadcast.play",
+    "broadcast.pause",
+    "broadcast.seek",
+    "broadcast.status",
+}
 ACTION_EVENT_NAMES = {
     "auth.login": "auth_login",
     "device.register": "device_register",
@@ -51,7 +67,28 @@ ACTION_EVENT_NAMES = {
     "queue.local.set": "queue_local_set",
     "queue.session.sync": "queue_session_sync",
     "queue.ready.complete": "queue_ready_complete",
+    "broadcast.start": "broadcast_start",
+    "broadcast.stop": "broadcast_stop",
+    "broadcast.queue.sync": "broadcast_queue_sync",
+    "broadcast.playItem": "broadcast_play_item",
+    "broadcast.play": "broadcast_play",
+    "broadcast.pause": "broadcast_pause",
+    "broadcast.seek": "broadcast_seek",
+    "broadcast.status": "broadcast_status",
 }
+
+CONTROL_POLICIES = {
+    "owner_only",
+    "controllers_only",
+    "participants_can_control",
+    "participants_and_controllers_can_control",
+}
+
+
+class BroadcastConflictError(Exception):
+    def __init__(self, message, current_version=None):
+        super().__init__(message)
+        self.current_version = current_version
 
 
 def _log_emo_event(level, event, **fields):
@@ -246,7 +283,8 @@ def _broadcast_local_queue(user_name, session_id, client_id):
     target_sids.update(state.list_subscribers(session_id, user_name=user_name))
     for target_sid in target_sids:
         socketio.emit("message", message, to=target_sid, namespace="/emo")
-        
+
+
 def _broadcast_local_queue_to_client(target_client_id, session_id, client_id):
     local_queue = state.get_local_queue(session_id, client_id)
     if local_queue is None:
@@ -404,6 +442,508 @@ def _route_command(sender, message):
         targetClientId=target_client_id,
     )
     socketio.emit("message", outgoing, to=target_sid, namespace="/emo")
+
+
+def _new_broadcast_id():
+    return f"broadcast-{uuid.uuid4().hex[:12]}"
+
+
+def _is_non_negative_int(value):
+    return type(value) is int and value >= 0
+
+
+def _is_int(value):
+    return type(value) is int
+
+
+def _build_broadcast_core_payload(broadcast, extra=None):
+    payload = {
+        "broadcastId": broadcast.get("broadcastId"),
+        "queueSongIds": list(broadcast.get("queueSongIds") or []),
+        "currentIndex": broadcast.get("currentIndex", 0),
+        "trackId": broadcast.get("trackId"),
+        "positionMs": broadcast.get("positionMs", 0),
+        "state": broadcast.get("state") or "stopped",
+        "version": broadcast.get("version", 0),
+        "updatedByClientId": broadcast.get("updatedByClientId"),
+        "updatedAt": broadcast.get("updatedAt"),
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _build_broadcast_status_payload(broadcast):
+    return {
+        "broadcast": dict(broadcast),
+        "participantStates": state.list_broadcast_participant_states(
+            broadcast.get("broadcastId")
+        ),
+    }
+
+
+def _get_broadcast_from_payload(current_user_name, payload):
+    broadcast_id = payload.get("broadcastId")
+    if not isinstance(broadcast_id, str) or not broadcast_id:
+        raise ValueError("broadcastId must be a non-empty string")
+
+    broadcast = state.get_broadcast(broadcast_id)
+    if broadcast is None:
+        raise LookupError("Broadcast not found")
+    if broadcast.get("userName") != current_user_name:
+        raise PermissionError("Cross-user broadcast access is not allowed")
+    return broadcast
+
+
+def _validate_control_policy(control_policy):
+    if control_policy is None:
+        return "participants_and_controllers_can_control"
+    if control_policy not in CONTROL_POLICIES:
+        raise ValueError("Unsupported broadcast controlPolicy")
+    return control_policy
+
+
+def _validate_broadcast_queue(queue_song_ids, current_index, position_ms):
+    if not isinstance(queue_song_ids, list):
+        raise ValueError("queueSongIds must be a list")
+    if not all(isinstance(song_id, str) and song_id for song_id in queue_song_ids):
+        raise ValueError("queueSongIds must contain non-empty strings")
+    if not _is_int(current_index):
+        raise ValueError("currentIndex must be an integer")
+    if not _is_int(position_ms):
+        raise ValueError("positionMs must be an integer")
+    if queue_song_ids:
+        if current_index < 0 or current_index >= len(queue_song_ids):
+            raise ValueError("currentIndex is out of bounds")
+        if position_ms < 0:
+            raise ValueError("positionMs must be >= 0")
+    elif current_index != 0 or position_ms != 0:
+        raise ValueError("empty queue must use currentIndex=0 and positionMs=0")
+
+
+def _get_broadcast_base_version(payload):
+    base_version = payload.get("baseVersion")
+    if not _is_int(base_version):
+        raise ValueError("baseVersion must be an integer")
+    return base_version
+
+
+def _update_active_broadcast_state(broadcast_id, updated_by_client_id, **kwargs):
+    try:
+        updated = state.update_broadcast_state(
+            broadcast_id,
+            updated_by_client_id,
+            require_active=True,
+            **kwargs,
+        )
+    except BroadcastInactiveError as exc:
+        raise ValueError(str(exc))
+    except BroadcastVersionMismatchError as exc:
+        raise BroadcastConflictError(
+            "Broadcast queue version conflict",
+            current_version=exc.current_version,
+        )
+    if updated is None:
+        raise LookupError("Broadcast not found")
+    return updated
+
+
+def _has_role(client, role):
+    return role in (client.get("roles") or [])
+
+
+def _can_control_broadcast(client, broadcast):
+    if client.get("userName") != broadcast.get("userName"):
+        return False
+
+    client_id = client.get("clientId")
+    if client_id == broadcast.get("ownerClientId"):
+        return True
+
+    is_participant = client_id in (broadcast.get("participants") or [])
+    is_controller = _has_role(client, "controller")
+    control_policy = broadcast.get("controlPolicy") or "participants_and_controllers_can_control"
+
+    if control_policy == "participants_can_control":
+        return is_participant
+    if control_policy == "controllers_only":
+        return is_controller
+    if control_policy == "participants_and_controllers_can_control":
+        return is_participant or is_controller
+    if control_policy == "owner_only":
+        return False
+    return False
+
+
+def _require_broadcast_control(current_client, broadcast):
+    if current_client is None:
+        raise PermissionError("Register the device before controlling broadcast")
+    if not _can_control_broadcast(current_client, broadcast):
+        raise PermissionError("Broadcast control is not allowed")
+
+
+def _resolve_broadcast_start_participants(current_user_name, current_client, payload):
+    target_mode = payload.get("targetMode")
+    if target_mode not in (
+        "selectedClients",
+        "allOnlinePlayers",
+        "allOnlinePlayersExceptSelf",
+    ):
+        raise ValueError("Unsupported broadcast targetMode")
+
+    participants = []
+    skipped_client_ids = []
+    seen = set()
+
+    def maybe_add_client(client_id):
+        if not isinstance(client_id, str) or not client_id:
+            raise ValueError("targetClientIds must contain non-empty strings")
+        if client_id in seen:
+            return
+        seen.add(client_id)
+
+        client = state.get_client(client_id)
+        if client is None:
+            skipped_client_ids.append(client_id)
+            return
+        if client.get("userName") != current_user_name:
+            raise PermissionError("Cross-user broadcast target is not allowed")
+        if not _has_role(client, "player"):
+            skipped_client_ids.append(client_id)
+            return
+        participants.append(client_id)
+
+    if target_mode == "selectedClients":
+        target_client_ids = payload.get("targetClientIds")
+        if not isinstance(target_client_ids, list):
+            raise ValueError("targetClientIds must be a list")
+        for client_id in target_client_ids:
+            maybe_add_client(client_id)
+    else:
+        for client in _list_clients(user_name=current_user_name):
+            if not _has_role(client, "player"):
+                continue
+            if (
+                target_mode == "allOnlinePlayersExceptSelf"
+                and client.get("clientId") == current_client.get("clientId")
+            ):
+                continue
+            maybe_add_client(client.get("clientId"))
+
+    if not participants:
+        raise ValueError("broadcast.start requires at least one online player participant")
+    return participants, skipped_client_ids
+
+
+def _broadcast_to_participants(broadcast, action, msg_type, source_client_id, request_id=None, extra_payload=None):
+    payload = _build_broadcast_core_payload(broadcast, extra_payload)
+    for target_client_id in broadcast.get("participants") or []:
+        target_sid = state.get_sid_for_client(target_client_id)
+        if target_sid is None:
+            continue
+        message = _build_message(
+            msg_type,
+            action,
+            payload,
+            requestId=request_id,
+            sourceClientId=source_client_id,
+            targetClientId=target_client_id,
+        )
+        socketio.emit("message", message, to=target_sid, namespace="/emo")
+
+
+def _broadcast_status_to_requester(broadcast):
+    emit(
+        "message",
+        _build_message(
+            "state",
+            "broadcast.status",
+            _build_broadcast_status_payload(broadcast),
+        ),
+    )
+
+
+def _estimate_broadcast_position_ms(broadcast, now=None):
+    position_ms = broadcast.get("positionMs", 0)
+    if broadcast.get("state") != "playing":
+        return position_ms
+
+    now = time.time() if now is None else now
+    updated_at = broadcast.get("updatedAt")
+    if not isinstance(updated_at, (int, float)):
+        return position_ms
+    return max(0, int(position_ms + ((now - updated_at) * 1000)))
+
+
+def _handle_broadcast_start(current_user_name, current_client, payload, request_id):
+    if current_client is None:
+        raise PermissionError("Register the device before starting broadcast")
+
+    queue_song_ids = payload.get("queueSongIds")
+    current_index = payload.get("currentIndex", 0)
+    position_ms = payload.get("positionMs", 0)
+    auto_play = payload.get("autoPlay", False)
+    if not isinstance(auto_play, bool):
+        raise ValueError("autoPlay must be a boolean")
+
+    _validate_broadcast_queue(queue_song_ids, current_index, position_ms)
+    queue_song_ids = list(queue_song_ids)
+    if not queue_song_ids:
+        auto_play = False
+        state_name = "stopped"
+        current_index = 0
+        position_ms = 0
+    else:
+        state_name = "playing" if auto_play else "stopped"
+
+    control_policy = _validate_control_policy(payload.get("controlPolicy"))
+    participant_ids, skipped_client_ids = _resolve_broadcast_start_participants(
+        current_user_name,
+        current_client,
+        payload,
+    )
+    broadcast = state.create_broadcast(
+        _new_broadcast_id(),
+        current_user_name,
+        current_client.get("clientId"),
+        participant_ids,
+        queue_song_ids,
+        current_index,
+        position_ms,
+        state_name,
+        control_policy,
+        current_client.get("clientId"),
+    )
+
+    for participant_id in participant_ids:
+        participant = state.get_client(participant_id)
+        if participant is None:
+            continue
+        state.update_broadcast_participant_state(
+            broadcast["broadcastId"],
+            participant_id,
+            participant.get("sessionId"),
+            {
+                "state": state_name,
+                "trackId": broadcast.get("trackId"),
+                "positionMs": position_ms,
+            },
+            online=True,
+        )
+
+    _send_ack(
+        request_id,
+        {
+            "started": True,
+            "broadcastId": broadcast["broadcastId"],
+            "participants": list(broadcast.get("participants") or []),
+            "skippedClientIds": skipped_client_ids,
+            "broadcast": broadcast,
+        },
+    )
+    _broadcast_to_participants(
+        broadcast,
+        "broadcast.start",
+        "command",
+        current_client.get("clientId"),
+        request_id=request_id,
+        extra_payload={"autoPlay": auto_play, "serverStartAt": None},
+    )
+    return broadcast
+
+
+def _handle_broadcast_status(current_user_name, current_client, payload, request_id):
+    if current_client is None:
+        raise PermissionError("Register the device before requesting broadcast status")
+    broadcast = _get_broadcast_from_payload(current_user_name, payload)
+    _send_ack(request_id, _build_broadcast_status_payload(broadcast))
+    _broadcast_status_to_requester(broadcast)
+    return broadcast
+
+
+def _handle_broadcast_queue_sync(current_user_name, current_client, payload, request_id):
+    broadcast = _get_broadcast_from_payload(current_user_name, payload)
+    _require_broadcast_control(current_client, broadcast)
+    base_version = _get_broadcast_base_version(payload)
+
+    queue_song_ids = payload.get("queueSongIds")
+    current_index = payload.get("currentIndex", 0)
+    position_ms = payload.get("positionMs", 0)
+    _validate_broadcast_queue(queue_song_ids, current_index, position_ms)
+
+    state_name = "stopped" if not queue_song_ids else broadcast.get("state") or "stopped"
+    updated = _update_active_broadcast_state(
+        broadcast["broadcastId"],
+        current_client.get("clientId"),
+        queue_song_ids=queue_song_ids,
+        current_index=current_index,
+        position_ms=position_ms,
+        state_name=state_name,
+        expected_version=base_version,
+    )
+    _send_ack(request_id, {"updated": True, "broadcast": updated})
+    _broadcast_to_participants(
+        updated,
+        "broadcast.queue.sync",
+        "state",
+        current_client.get("clientId"),
+        request_id=request_id,
+    )
+    return updated
+
+
+def _handle_broadcast_play_item(current_user_name, current_client, payload, request_id):
+    broadcast = _get_broadcast_from_payload(current_user_name, payload)
+    _require_broadcast_control(current_client, broadcast)
+    base_version = _get_broadcast_base_version(payload)
+
+    queue_index = payload.get("queueIndex")
+    if not _is_int(queue_index) or queue_index < 0:
+        raise ValueError("queueIndex must be a non-negative integer")
+    queue_song_ids = broadcast.get("queueSongIds") or []
+    if queue_index >= len(queue_song_ids):
+        raise ValueError("queueIndex is out of bounds")
+
+    position_ms = payload.get("positionMs", 0)
+    if not _is_non_negative_int(position_ms):
+        raise ValueError("positionMs must be a non-negative integer")
+
+    updated = _update_active_broadcast_state(
+        broadcast["broadcastId"],
+        current_client.get("clientId"),
+        current_index=queue_index,
+        position_ms=position_ms,
+        state_name="playing",
+        expected_version=base_version,
+    )
+    _send_ack(request_id, {"updated": True, "broadcast": updated})
+    _broadcast_to_participants(
+        updated,
+        "broadcast.playItem",
+        "command",
+        current_client.get("clientId"),
+        request_id=request_id,
+        extra_payload={"queueIndex": queue_index},
+    )
+    return updated
+
+
+def _handle_broadcast_play(current_user_name, current_client, payload, request_id):
+    broadcast = _get_broadcast_from_payload(current_user_name, payload)
+    _require_broadcast_control(current_client, broadcast)
+    queue_song_ids = broadcast.get("queueSongIds") or []
+    current_index = broadcast.get("currentIndex", 0)
+    if not queue_song_ids:
+        raise ValueError("broadcast.play requires a non-empty queue")
+    if not _is_int(current_index) or current_index < 0 or current_index >= len(queue_song_ids):
+        raise ValueError("broadcast.play requires a valid currentIndex")
+
+    updated = _update_active_broadcast_state(
+        broadcast["broadcastId"],
+        current_client.get("clientId"),
+        state_name="playing",
+    )
+    _send_ack(request_id, {"updated": True, "broadcast": updated})
+    _broadcast_to_participants(
+        updated,
+        "broadcast.play",
+        "command",
+        current_client.get("clientId"),
+        request_id=request_id,
+    )
+    return updated
+
+
+def _handle_broadcast_pause(current_user_name, current_client, payload, request_id):
+    broadcast = _get_broadcast_from_payload(current_user_name, payload)
+    _require_broadcast_control(current_client, broadcast)
+    position_ms = payload.get("positionMs")
+    if position_ms is None:
+        position_ms = _estimate_broadcast_position_ms(broadcast)
+    if not _is_non_negative_int(position_ms):
+        raise ValueError("positionMs must be a non-negative integer")
+
+    updated = _update_active_broadcast_state(
+        broadcast["broadcastId"],
+        current_client.get("clientId"),
+        position_ms=position_ms,
+        state_name="paused",
+    )
+    _send_ack(request_id, {"updated": True, "broadcast": updated})
+    _broadcast_to_participants(
+        updated,
+        "broadcast.pause",
+        "command",
+        current_client.get("clientId"),
+        request_id=request_id,
+    )
+    return updated
+
+
+def _handle_broadcast_seek(current_user_name, current_client, payload, request_id):
+    broadcast = _get_broadcast_from_payload(current_user_name, payload)
+    _require_broadcast_control(current_client, broadcast)
+    position_ms = payload.get("positionMs")
+    if not _is_non_negative_int(position_ms):
+        raise ValueError("positionMs must be a non-negative integer")
+
+    updated = _update_active_broadcast_state(
+        broadcast["broadcastId"],
+        current_client.get("clientId"),
+        position_ms=position_ms,
+    )
+    _send_ack(request_id, {"updated": True, "broadcast": updated})
+    _broadcast_to_participants(
+        updated,
+        "broadcast.seek",
+        "command",
+        current_client.get("clientId"),
+        request_id=request_id,
+    )
+    return updated
+
+
+def _handle_broadcast_stop(current_user_name, current_client, payload, request_id):
+    broadcast = _get_broadcast_from_payload(current_user_name, payload)
+    _require_broadcast_control(current_client, broadcast)
+    try:
+        updated = state.stop_broadcast(
+            broadcast["broadcastId"],
+            current_client.get("clientId"),
+        )
+    except BroadcastInactiveError as exc:
+        raise ValueError(str(exc))
+    if updated is None:
+        raise LookupError("Broadcast not found")
+    _send_ack(request_id, {"stopped": True, "broadcast": updated})
+    _broadcast_to_participants(
+        updated,
+        "broadcast.stop",
+        "command",
+        current_client.get("clientId"),
+        request_id=request_id,
+    )
+    return updated
+
+
+def _handle_broadcast_action(current_user_name, current_client, action, payload, request_id):
+    if action == "broadcast.start":
+        return _handle_broadcast_start(current_user_name, current_client, payload, request_id)
+    if action == "broadcast.status":
+        return _handle_broadcast_status(current_user_name, current_client, payload, request_id)
+    if action == "broadcast.queue.sync":
+        return _handle_broadcast_queue_sync(current_user_name, current_client, payload, request_id)
+    if action == "broadcast.playItem":
+        return _handle_broadcast_play_item(current_user_name, current_client, payload, request_id)
+    if action == "broadcast.play":
+        return _handle_broadcast_play(current_user_name, current_client, payload, request_id)
+    if action == "broadcast.pause":
+        return _handle_broadcast_pause(current_user_name, current_client, payload, request_id)
+    if action == "broadcast.seek":
+        return _handle_broadcast_seek(current_user_name, current_client, payload, request_id)
+    if action == "broadcast.stop":
+        return _handle_broadcast_stop(current_user_name, current_client, payload, request_id)
+    return None
 
 
 def _validate_queue_play_item(target_client_id, payload):
@@ -703,12 +1243,46 @@ class EmoNamespace(Namespace):
                     client_request_id=request_id,
                 )
                 _send_ack(request_id, {"forwarded": True})
+            elif action in BROADCAST_ACTIONS:
+                updated_broadcast = _handle_broadcast_action(
+                    current_user_name,
+                    current_client,
+                    action,
+                    payload,
+                    request_id,
+                )
+                _log_emo_event(
+                    logging.INFO,
+                    _get_action_event_name(action),
+                    result="success",
+                    user=current_user_name,
+                    client_request_id=request_id,
+                    source_client_id=None if current_client is None else current_client.get("clientId"),
+                    broadcast_id=None if updated_broadcast is None else updated_broadcast.get("broadcastId"),
+                    version=None if updated_broadcast is None else updated_broadcast.get("version"),
+                )
             elif action == "playback.update":
                 if current_client is None:
                     raise PermissionError("Register the device before publishing state")
                 session_id = payload.get("sessionId") or current_client.get("sessionId")
                 playback_payload = dict(payload)
                 playback_payload["sourceClientId"] = current_client.get("clientId")
+                broadcast_for_update = None
+                if payload.get("broadcastId") is not None:
+                    broadcast_for_update = _get_broadcast_from_payload(current_user_name, payload)
+                    broadcast_id = broadcast_for_update["broadcastId"]
+                    if not state.is_broadcast_participant(
+                        broadcast_id,
+                        current_client.get("clientId"),
+                    ):
+                        raise PermissionError("Broadcast playback update requires participant")
+                    if (
+                        state.get_active_broadcast_for_client(current_client.get("clientId"))
+                        != broadcast_id
+                    ):
+                        raise PermissionError(
+                            "Broadcast playback update requires active participant"
+                        )
                 state.update_playback_state(
                     session_id,
                     current_client.get("clientId"),
@@ -732,6 +1306,14 @@ class EmoNamespace(Namespace):
                         playback_payload,
                     ),
                 )
+                if broadcast_for_update is not None:
+                    state.update_broadcast_participant_state(
+                        broadcast_for_update["broadcastId"],
+                        current_client.get("clientId"),
+                        session_id,
+                        playback_payload,
+                        online=True,
+                    )
                 _send_ack(request_id, {"updated": True})
                 _broadcast_playback_state(current_user_name, session_id)
             elif action == "queue.local.get":
@@ -936,6 +1518,34 @@ class EmoNamespace(Namespace):
                     source_client_id=None if current_client is None else current_client.get("clientId"),
                 )
                 _send_error("not_supported", f"Unsupported action: {action}", request_id)
+        except BroadcastConflictError as exc:
+            event_name = _get_action_event_name(action) or "bad_message"
+            _log_emo_event(
+                logging.WARNING,
+                event_name,
+                result="conflict",
+                reason=str(exc),
+                **_build_action_log_context(
+                    action,
+                    request_id,
+                    current_user_name,
+                    current_client,
+                    payload,
+                    message,
+                ),
+            )
+            error_payload = {"code": "conflict", "message": str(exc)}
+            if exc.current_version is not None:
+                error_payload["currentVersion"] = exc.current_version
+            emit(
+                "message",
+                _build_message(
+                    "system",
+                    "system.error",
+                    error_payload,
+                    requestId=request_id,
+                ),
+            )
         except PermissionError as exc:
             _log_emo_event(
                 logging.WARNING,
