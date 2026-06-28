@@ -91,7 +91,10 @@ def patch_method(f):
 
     def patched(*args, **kwargs):
         rv = original(*args, **kwargs)
-        return MockResponse(rv)
+        try:
+            return MockResponse(rv)
+        finally:
+            rv.close()
 
     return patched
 

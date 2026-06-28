@@ -81,6 +81,7 @@ class WatcherQueueRecoveryTestCase(unittest.TestCase):
     def _fake_scanner(scan_file):
         return SimpleNamespace(
             scan_file=scan_file,
+            find_cover=Mock(),
             find_lost_information=Mock(),
             prune=Mock(),
             stats=lambda: SimpleNamespace(
