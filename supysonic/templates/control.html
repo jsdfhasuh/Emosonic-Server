@@ -85,6 +85,17 @@
         <div class="control-selected-banner" id="control-selected-banner">
           <div class="console-muted" data-i18n-en="No player selected." data-i18n-zh="尚未选择播放器。">No player selected.</div>
         </div>
+        <div class="control-follow-panel" id="control-follow-panel">
+          <div class="d-flex justify-content-between align-items-center gap-2 mb-2">
+            <strong data-i18n-en="Follow playback" data-i18n-zh="跟播">Follow playback</strong>
+            <span class="console-scope-badge scope-follow" id="control-follow-badge" data-i18n-en="Solo" data-i18n-zh="单独">Solo</span>
+          </div>
+          <div class="console-muted mb-3" id="control-follow-summary" data-i18n-en="Not following any device." data-i18n-zh="当前未跟随任何设备。">Not following any device.</div>
+          <div class="d-grid gap-2 control-grid-2">
+            <button type="button" class="btn btn-outline-dark btn-sm" id="start-follow-playback"><span data-i18n-en="Follow selected" data-i18n-zh="跟随所选">Follow selected</span></button>
+            <button type="button" class="btn btn-outline-dark btn-sm" id="stop-follow-playback"><span data-i18n-en="Stop follow" data-i18n-zh="停止跟播">Stop follow</span></button>
+          </div>
+        </div>
         <div class="console-auth-note">
           <strong data-i18n-en="Emosonic signal flow" data-i18n-zh="Emosonic 播放链路">Emosonic signal flow</strong>
           <div class="console-muted mt-1" data-i18n-en="Pick a player, shape the queue, and inspect how session playback and local device state move through the current Emosonic workspace." data-i18n-zh="选定播放器，编排队列，查看播放会话与设备状态是如何在 Emosonic 中流转的。">Pick a player, shape the queue, and inspect how session playback and local device state move through the current Emosonic workspace.</div>
@@ -191,7 +202,16 @@
     eventLines: [],
     subscriptions: new Set(),
     pendingCommands: new Map(),
+    pendingFollow: null,
     heartbeatTimer: null,
+    follow: {
+      mode: 'solo',
+      followSourceClientId: null,
+      followSessionId: null,
+      followQueue: false,
+      followPlayback: false,
+      serverClockOffsetMs: 0,
+    },
   };
 
   const socket = io(window.location.origin + '/emo', {
@@ -269,6 +289,18 @@
 
   function nextRequestId(prefix) {
     return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  function updateServerClockOffset(message) {
+    const timestamp = Number(message?.timestamp);
+    if (!Number.isFinite(timestamp)) {
+      return;
+    }
+    controlState.follow.serverClockOffsetMs = (timestamp * 1000) - Date.now();
+  }
+
+  function getServerNowMs() {
+    return Date.now() + controlState.follow.serverClockOffsetMs;
   }
 
   function sendHeartbeat() {
@@ -367,15 +399,17 @@
 
   function sendSessionAction(action, sessionId) {
     if (!sessionId) {
-      return;
+      return null;
     }
+    const requestId = nextRequestId(action);
     socket.emit('message', {
       type: 'state',
       action,
-      requestId: nextRequestId(action),
+      requestId,
       payload: { sessionId },
       timestamp: Date.now() / 1000,
     });
+    return requestId;
   }
 
   function updateSummary() {
@@ -424,6 +458,148 @@
     return controlState.playbackByClientSession[getPlaybackKey(controlState.selectedSessionId, controlState.selectedClientId)] || null;
   }
 
+  function getFollowSourceDevice() {
+    if (controlState.follow.mode !== 'follow' || !controlState.follow.followSourceClientId) {
+      return null;
+    }
+    return controlState.devices.find((device) => device.clientId === controlState.follow.followSourceClientId) || null;
+  }
+
+  function getFollowPlayback() {
+    return controlState.playbackByClientSession[
+      getPlaybackKey(controlState.follow.followSessionId, controlState.follow.followSourceClientId)
+    ] || null;
+  }
+
+  function getFollowSessionQueue() {
+    return controlState.follow.followSessionId
+      ? controlState.queueBySession[controlState.follow.followSessionId] || null
+      : null;
+  }
+
+  function getFollowLocalQueue() {
+    if (!controlState.follow.followSessionId || !controlState.follow.followSourceClientId) {
+      return null;
+    }
+    return controlState.localQueueByClientSession[
+      `${controlState.follow.followSessionId}::${controlState.follow.followSourceClientId}`
+    ] || null;
+  }
+
+  function getFollowTargetPosition(playback) {
+    if (!playback || playback.positionMs === null || playback.positionMs === undefined) {
+      return null;
+    }
+    const basePositionMs = Number(playback.positionMs) || 0;
+    if (playback.state !== 'playing' || !playback.updatedAt) {
+      return basePositionMs;
+    }
+    return Math.max(0, basePositionMs + (getServerNowMs() - playback.updatedAt * 1000));
+  }
+
+  function clearFollowState() {
+    controlState.follow.mode = 'solo';
+    controlState.follow.followSourceClientId = null;
+    controlState.follow.followSessionId = null;
+    controlState.follow.followQueue = false;
+    controlState.follow.followPlayback = false;
+  }
+
+  function startFollowPlayback() {
+    const players = getPlayers();
+    const target = players.find((device) => device.clientId === controlState.selectedClientId);
+    if (!target || !target.sessionId) {
+      setCommandStatus(i18nText('Follow failed: no target player selected.', '跟播失败：尚未选择目标播放器。'), 'error');
+      return;
+    }
+    if (controlState.pendingFollow) {
+      setCommandStatus(i18nText('Follow request is already pending.', '跟播请求正在处理中。'), 'pending');
+      return;
+    }
+
+    const previousFollowSessionId = controlState.follow.followSessionId;
+    const requestId = sendSessionAction('session.subscribe', target.sessionId);
+    controlState.pendingFollow = {
+      requestId,
+      targetClientId: target.clientId,
+      targetSessionId: target.sessionId,
+      previousFollowSessionId,
+    };
+    setCommandStatus(i18nText('Starting follow playback...', '正在启动跟播...'), 'pending');
+    pushEventLine(`Starting follow playback for ${target.clientId} (${target.sessionId}).`, 'info');
+    renderPlayerCards();
+    renderFollowPanel();
+  }
+
+  function stopFollowPlayback(sendUnsubscribe = true) {
+    const pendingFollow = controlState.pendingFollow;
+    const previousFollowSessionId = controlState.follow.followSessionId;
+    controlState.pendingFollow = null;
+    clearFollowState();
+    if (sendUnsubscribe) {
+      const sessionsToUnsubscribe = new Set();
+      if (pendingFollow?.targetSessionId && pendingFollow.targetSessionId !== controlState.selectedSessionId) {
+        sessionsToUnsubscribe.add(pendingFollow.targetSessionId);
+      }
+      if (previousFollowSessionId && previousFollowSessionId !== controlState.selectedSessionId) {
+        sessionsToUnsubscribe.add(previousFollowSessionId);
+      }
+      sessionsToUnsubscribe.forEach((sessionId) => sendSessionAction('session.unsubscribe', sessionId));
+    }
+    pushEventLine(i18nText('Follow playback stopped.', '已停止跟播。'), 'info');
+    renderPlayerCards();
+    renderFollowPanel();
+  }
+
+  function renderFollowPanel() {
+    const badge = document.getElementById('control-follow-badge');
+    const summary = document.getElementById('control-follow-summary');
+    const startButton = document.getElementById('start-follow-playback');
+    const stopButton = document.getElementById('stop-follow-playback');
+    const selectedTarget = getPlayers().find((device) => device.clientId === controlState.selectedClientId);
+    const pendingFollow = controlState.pendingFollow;
+
+    startButton.disabled = !selectedTarget || !!pendingFollow;
+    stopButton.disabled = controlState.follow.mode !== 'follow' && !pendingFollow;
+
+    if (pendingFollow) {
+      badge.textContent = i18nText('Pending', '等待中');
+      summary.innerHTML = escapeHtml(
+        i18nText(
+          `Starting follow for ${pendingFollow.targetClientId}.`,
+          `正在启动跟播：${pendingFollow.targetClientId}。`
+        )
+      );
+      return;
+    }
+
+    if (controlState.follow.mode !== 'follow') {
+      badge.textContent = i18nText('Solo', '单独');
+      summary.innerHTML = escapeHtml(i18nText('Not following any device.', '当前未跟随任何设备。'));
+      return;
+    }
+
+    const source = getFollowSourceDevice();
+    const playback = getFollowPlayback();
+    const sessionQueue = getFollowSessionQueue();
+    const localQueue = getFollowLocalQueue();
+    const sourceLabel = source ? getDeviceDisplayName(source) : controlState.follow.followSourceClientId;
+    const sourcePositionMs = getFollowTargetPosition(playback);
+
+    badge.textContent = i18nText('Follow', '跟播');
+    summary.innerHTML = `
+      <ul class="console-info-list mb-2">
+        <li><span>${i18nText('Source', '源设备')}</span><strong>${escapeHtml(sourceLabel || '-')}</strong></li>
+        <li><span>${i18nText('Session', '会话')}</span><code>${escapeHtml(controlState.follow.followSessionId || '-')}</code></li>
+        <li><span>${i18nText('Playback', '播放')}</span><strong>${escapeHtml(playback?.state || 'unknown')}</strong></li>
+        <li><span>${i18nText('Source position', '源进度')}</span><strong>${formatPosition(sourcePositionMs)}</strong></li>
+        <li><span>${i18nText('Session queue', '会话队列')}</span><strong>${sessionQueue?.queueSongIds?.length ?? 0}</strong></li>
+        <li><span>${i18nText('Source local queue', '源本地队列')}</span><strong>${localQueue?.queueSongIds?.length ?? 0}</strong></li>
+      </ul>
+      <div class="console-muted">${i18nText('Console observes follow state only; Flutter player executes audio sync.', '控制台仅观察跟播状态；Flutter 播放器负责执行音频同步。')}</div>
+    `;
+  }
+
   function renderPlayerCards() {
     const players = getPlayers();
     const list = document.getElementById('control-player-list');
@@ -434,18 +610,25 @@
 
     list.innerHTML = players.map((device) => {
       const active = device.clientId === controlState.selectedClientId ? 'is-active' : '';
+      const followActive = controlState.follow.mode === 'follow' && device.clientId === controlState.follow.followSourceClientId ? 'is-follow-source' : '';
       const playback = controlState.playbackByClientSession[getPlaybackKey(device.sessionId, device.clientId)] || {};
       const status = playback.state || 'unknown';
       const trackLabel = playback.trackLabel || controlState.trackMeta[playback.trackId]?.label || playback.trackId || i18nText('No track', '暂无曲目');
       const displayName = getDeviceDisplayName(device);
+      const followBadge = followActive
+        ? `<span class="console-scope-badge scope-follow">${i18nText('Follow', '跟播')}</span>`
+        : '';
       return `
-        <button type="button" class="console-device-card ${active}" data-client-id="${escapeHtml(device.clientId)}">
+        <button type="button" class="console-device-card ${active} ${followActive}" data-client-id="${escapeHtml(device.clientId)}">
           <div class="console-device-card-top">
             <div>
               <div class="console-table-title">${escapeHtml(displayName)}</div>
               <small class="console-muted">${escapeHtml(device.clientId)}</small>
             </div>
-            <span class="console-status status-${escapeHtml(status)}">${escapeHtml(status)}</span>
+            <div class="d-flex flex-column align-items-end gap-1">
+              <span class="console-status status-${escapeHtml(status)}">${escapeHtml(status)}</span>
+              ${followBadge}
+            </div>
           </div>
           <div class="console-device-card-meta">
             <span>${escapeHtml(device.userName)}</span>
@@ -471,6 +654,7 @@
         }
         renderPlayerCards();
         renderTargetPanels();
+        renderFollowPanel();
         updateSummary();
       });
     });
@@ -872,6 +1056,7 @@
 
   socket.on('message', (message) => {
     const action = message.action;
+    updateServerClockOffset(message);
     if (action === 'system.ack' && message.requestId === 'web-auth-1') {
       socket.emit('message', {
         type: 'device',
@@ -899,9 +1084,34 @@
       const devices = Array.isArray(message.payload?.devices) ? message.payload.devices : [];
       const previousSessionId = controlState.selectedSessionId;
       controlState.devices = devices;
+      if (
+        controlState.pendingFollow &&
+        !devices.some((device) => device.clientId === controlState.pendingFollow.targetClientId)
+      ) {
+        const pendingFollowSessionId = controlState.pendingFollow.targetSessionId;
+        controlState.pendingFollow = null;
+        if (pendingFollowSessionId && pendingFollowSessionId !== controlState.selectedSessionId) {
+          sendSessionAction('session.unsubscribe', pendingFollowSessionId);
+        }
+        setCommandStatus(i18nText('Follow failed: source went offline.', '跟播失败：源设备已离线。'), 'error');
+        pushEventLine(i18nText('Pending follow source went offline; follow request cleared.', '待跟播源设备已离线，已清除跟播请求。'), 'error');
+      }
+      if (
+        controlState.follow.mode === 'follow' &&
+        controlState.follow.followSourceClientId &&
+        !devices.some((device) => device.clientId === controlState.follow.followSourceClientId)
+      ) {
+        const offlineFollowSessionId = controlState.follow.followSessionId;
+        clearFollowState();
+        if (offlineFollowSessionId && offlineFollowSessionId !== controlState.selectedSessionId) {
+          sendSessionAction('session.unsubscribe', offlineFollowSessionId);
+        }
+        pushEventLine(i18nText('Follow source went offline; follow mode cleared.', '源设备已离线，已退出跟播模式。'), 'error');
+      }
       ensureSelection();
       renderPlayerCards();
       renderTargetPanels();
+      renderFollowPanel();
       updateSummary();
       if (previousSessionId && previousSessionId !== controlState.selectedSessionId) {
         sendSessionAction('session.unsubscribe', previousSessionId);
@@ -927,6 +1137,7 @@
           ) {
             renderPlayerCards();
             renderTargetPanels();
+            renderFollowPanel();
             updateSummary();
           }
         });
@@ -937,7 +1148,14 @@
       ) {
         renderPlayerCards();
         renderTargetPanels();
+        renderFollowPanel();
         updateSummary();
+      }
+      if (
+        payload.sessionId === controlState.follow.followSessionId &&
+        payload.sourceClientId === controlState.follow.followSourceClientId
+      ) {
+        renderFollowPanel();
       }
       pushEventLine(`Playback update for ${payload.sourceClientId || 'unknown client'} in ${payload.sessionId || 'unknown session'}: ${payload.state || 'unknown'}`, 'info');
       return;
@@ -950,6 +1168,9 @@
         ensureTrackMeta(payload.queueSongIds || []).then(() => {
           if (payload.sessionId === controlState.selectedSessionId) {
             renderTargetPanels();
+          }
+          if (payload.sessionId === controlState.follow.followSessionId) {
+            renderFollowPanel();
           }
         });
       }
@@ -984,11 +1205,23 @@
         document.getElementById('queue-position-ms').value = payload.positionMs ?? 0;
         renderTargetPanels();
       }
+      if (
+        payload.sessionId === controlState.follow.followSessionId &&
+        payload.sourceClientId === controlState.follow.followSourceClientId
+      ) {
+        renderFollowPanel();
+      }
       pushEventLine(`Local queue update for ${payload.sourceClientId || 'unknown client'} (${(payload.queueSongIds || []).length} items).`, 'info');
       return;
     }
 
     if (action === 'system.error') {
+      if (controlState.pendingFollow && message.requestId === controlState.pendingFollow.requestId) {
+        const errorMessage = message.payload?.message || i18nText('Unknown error', '未知错误');
+        controlState.pendingFollow = null;
+        setCommandStatus(i18nText(`Follow failed: ${errorMessage}`, `跟播失败：${errorMessage}`), 'error');
+        renderFollowPanel();
+      }
       const pendingAction = controlState.pendingCommands.get(message.requestId);
       if (pendingAction) {
         controlState.pendingCommands.delete(message.requestId);
@@ -1000,6 +1233,29 @@
     }
 
     if (action === 'system.ack') {
+      if (controlState.pendingFollow && message.requestId === controlState.pendingFollow.requestId) {
+        const subscriptions = message.payload?.subscriptions || [];
+        const pendingFollow = controlState.pendingFollow;
+        controlState.subscriptions = new Set(subscriptions);
+        controlState.follow.mode = 'follow';
+        controlState.follow.followSourceClientId = pendingFollow.targetClientId;
+        controlState.follow.followSessionId = pendingFollow.targetSessionId;
+        controlState.follow.followQueue = true;
+        controlState.follow.followPlayback = true;
+        controlState.pendingFollow = null;
+        if (
+          pendingFollow.previousFollowSessionId &&
+          pendingFollow.previousFollowSessionId !== pendingFollow.targetSessionId &&
+          pendingFollow.previousFollowSessionId !== controlState.selectedSessionId
+        ) {
+          sendSessionAction('session.unsubscribe', pendingFollow.previousFollowSessionId);
+        }
+        setCommandStatus(i18nText('Follow playback started.', '跟播已启动。'), 'success');
+        pushEventLine(`Follow playback source set to ${pendingFollow.targetClientId} (${pendingFollow.targetSessionId}).`, 'success');
+        renderPlayerCards();
+        renderFollowPanel();
+        return;
+      }
       if ((message.requestId || '').includes('session.subscribe')) {
         const subscriptions = message.payload?.subscriptions || [];
         controlState.subscriptions = new Set(subscriptions);
@@ -1041,6 +1297,8 @@
 
   document.getElementById('send-queue-sync').addEventListener('click', sendQueueSync);
   document.getElementById('send-local-queue').addEventListener('click', sendLocalQueue);
+  document.getElementById('start-follow-playback').addEventListener('click', startFollowPlayback);
+  document.getElementById('stop-follow-playback').addEventListener('click', () => stopFollowPlayback(true));
   document.getElementById('load-current-queue').addEventListener('click', () => {
     const queue = controlState.selectedSessionId ? controlState.queueBySession[controlState.selectedSessionId] : null;
     document.getElementById('queue-song-ids').value = (queue?.queueSongIds || []).join('\n');
@@ -1068,12 +1326,19 @@
       window.setTimeout(() => {
         renderPlayerCards();
         renderTargetPanels();
+        renderFollowPanel();
         updateSummary();
       }, 0);
     });
   });
 
   updateSummary();
-  window.setInterval(updateControlPlaybackProgress, 500);
+  renderFollowPanel();
+  window.setInterval(() => {
+    updateControlPlaybackProgress();
+    if (controlState.follow.mode === 'follow') {
+      renderFollowPanel();
+    }
+  }, 500);
 </script>
 {% endblock %}

@@ -73,6 +73,18 @@ class DeviceAliasDisplayTestCase(FrontendTestBase):
             template,
         )
 
+    def test_control_template_exposes_follow_playback_panel(self):
+        template = read_project_file("supysonic", "templates", "control.html")
+
+        self.assertIn('id="control-follow-panel"', template)
+        self.assertIn("function startFollowPlayback()", template)
+        self.assertIn("function renderFollowPanel()", template)
+        self.assertIn("payload.sourceClientId === controlState.follow.followSourceClientId", template)
+        self.assertIn("clientId: controlState.selectedClientId", template)
+        self.assertIn("pendingFollow", template)
+        self.assertIn("message.requestId === controlState.pendingFollow.requestId", template)
+        self.assertIn("sendSessionAction('session.unsubscribe', offlineFollowSessionId)", template)
+
     def test_devices_template_uses_alias_display_helper_for_refreshes(self):
         template = read_project_file("supysonic", "templates", "devices.html")
 

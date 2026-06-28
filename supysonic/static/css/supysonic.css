@@ -526,6 +526,11 @@ body[data-bs-theme="dark"] code {
   box-shadow: 0 12px 24px rgba(82, 168, 255, 0.14);
 }
 
+.console-device-card.is-follow-source {
+  border-color: rgba(47, 138, 91, 0.46);
+  box-shadow: 0 12px 24px rgba(47, 138, 91, 0.12);
+}
+
 .console-device-card-top {
   display: flex;
   justify-content: space-between;
@@ -638,6 +643,17 @@ body[data-bs-theme="dark"] code {
   border-style: solid;
   border-color: rgba(82, 168, 255, 0.4);
   background: linear-gradient(135deg, rgba(82, 168, 255, 0.12), rgba(142, 137, 255, 0.1));
+}
+
+.control-follow-panel {
+  padding: 0.9rem 1rem;
+  border-radius: 16px;
+  border: 1px solid rgba(47, 138, 91, 0.28);
+  background: rgba(47, 138, 91, 0.08);
+}
+
+.control-follow-panel .console-info-list {
+  font-size: 0.84rem;
 }
 
 .control-command-status {
@@ -834,6 +850,11 @@ body[data-bs-theme="dark"] code {
 .console-scope-badge.scope-local {
   color: #2c9b8f;
   background: rgba(92, 214, 190, 0.12);
+}
+
+.console-scope-badge.scope-follow {
+  color: #2f8a5b;
+  background: rgba(47, 138, 91, 0.12);
 }
 
 .console-section-lead {
