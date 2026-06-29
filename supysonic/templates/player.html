@@ -1,0 +1,253 @@
+{#-
+This file is part of Supysonic / Emosonic Server.
+Distributed under terms of the GNU AGPLv3 license.
+-#}
+{% extends "layout.html" %}
+{% block title %}Web Player · Emosonic Server{% endblock %}
+{% block document_title_en %}Web Player · Emosonic Server{% endblock %}
+{% block document_title_zh %}网页播放器 · Emosonic Server{% endblock %}
+{% block navbar_player %}
+<a class="nav-link active" aria-current="page" href="{{ url_for('player.player_index') }}"><span data-i18n-en="Player" data-i18n-zh="播放器">Player</span></a>
+{% endblock %}
+{% block page_title %}<span data-i18n-en="Web Player" data-i18n-zh="网页播放器">Web Player</span>{% endblock %}
+{% block page_subtitle %}<span data-i18n-en="Search the indexed library and play music directly in the browser." data-i18n-zh="搜索已索引曲库，并直接在浏览器中播放音乐。">Search the indexed library and play music directly in the browser.</span>{% endblock %}
+{% block body %}
+<style>
+  .web-player-now {
+    border: 1px solid var(--console-border);
+    border-radius: 1.5rem;
+    background: linear-gradient(135deg, rgba(82, 168, 255, 0.14), rgba(142, 137, 255, 0.10));
+  }
+  .web-player-cover {
+    width: 180px;
+    height: 180px;
+    object-fit: cover;
+    border-radius: 1.25rem;
+    background: rgba(127, 127, 127, 0.12);
+  }
+  .web-player-track-row {
+    cursor: pointer;
+  }
+  .web-player-track-row.active td {
+    background: rgba(82, 168, 255, 0.12);
+  }
+  .web-player-empty-cover {
+    width: 180px;
+    height: 180px;
+    border-radius: 1.25rem;
+    display: grid;
+    place-items: center;
+    background: rgba(127, 127, 127, 0.12);
+    font-size: 3rem;
+  }
+</style>
+
+<div class="row g-3">
+  <div class="col-xl-4">
+    <div class="card h-100 web-player-now">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span data-i18n-en="Now playing" data-i18n-zh="正在播放">Now playing</span>
+        <span class="console-chip" id="playerStatus" data-i18n-en="Idle" data-i18n-zh="空闲">Idle</span>
+      </div>
+      <div class="card-body text-center">
+        <img id="playerCover" class="web-player-cover d-none mx-auto mb-3" alt="Cover art">
+        <div id="playerEmptyCover" class="web-player-empty-cover mx-auto mb-3">♪</div>
+        <h4 id="playerTitle" class="mb-1" data-i18n-en="Select a track" data-i18n-zh="请选择曲目">Select a track</h4>
+        <p id="playerArtist" class="console-muted mb-3" data-i18n-en="Pick a song from the list to start playback." data-i18n-zh="从列表中选择歌曲开始播放。">Pick a song from the list to start playback.</p>
+        <audio id="audioPlayer" controls preload="metadata" class="w-100 mb-3"></audio>
+        <div class="d-flex justify-content-center gap-2 flex-wrap">
+          <button type="button" class="btn btn-outline-dark" id="prevTrack"><span data-i18n-en="Previous" data-i18n-zh="上一首">Previous</span></button>
+          <button type="button" class="btn btn-dark" id="playPause"><span data-i18n-en="Play / Pause" data-i18n-zh="播放 / 暂停">Play / Pause</span></button>
+          <button type="button" class="btn btn-outline-dark" id="nextTrack"><span data-i18n-en="Next" data-i18n-zh="下一首">Next</span></button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-xl-8">
+    <div class="card h-100">
+      <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+        <span data-i18n-en="Library queue" data-i18n-zh="曲库队列">Library queue</span>
+        <form id="playerSearchForm" class="d-flex gap-2" role="search">
+          <input id="playerSearch" class="form-control form-control-sm" type="search" placeholder="Search title, artist, album" data-i18n-en="Search title, artist, album" data-i18n-zh="搜索歌名、艺人、专辑" data-i18n-attr="placeholder">
+          <button class="btn btn-sm btn-dark" type="submit"><span data-i18n-en="Search" data-i18n-zh="搜索">Search</span></button>
+        </form>
+      </div>
+      <div class="card-body p-0">
+        <div class="table-responsive">
+          <table class="table table-hover align-middle mb-0">
+            <thead>
+              <tr>
+                <th style="width: 42%" data-i18n-en="Title" data-i18n-zh="歌曲">Title</th>
+                <th data-i18n-en="Artist" data-i18n-zh="艺人">Artist</th>
+                <th data-i18n-en="Album" data-i18n-zh="专辑">Album</th>
+                <th class="text-end" data-i18n-en="Time" data-i18n-zh="时长">Time</th>
+              </tr>
+            </thead>
+            <tbody id="trackList">
+              <tr>
+                <td colspan="4" class="text-center py-4 console-muted" data-i18n-en="Loading tracks..." data-i18n-zh="正在加载曲目...">Loading tracks...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card-footer d-flex justify-content-between align-items-center flex-wrap gap-2">
+        <span id="trackCount" class="console-muted">0 tracks</span>
+        <button type="button" class="btn btn-sm btn-outline-dark" id="reloadTracks"><span data-i18n-en="Reload" data-i18n-zh="刷新">Reload</span></button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  var tracks = [];
+  var currentIndex = -1;
+  var audio = document.getElementById('audioPlayer');
+  var trackList = document.getElementById('trackList');
+  var trackCount = document.getElementById('trackCount');
+  var playerTitle = document.getElementById('playerTitle');
+  var playerArtist = document.getElementById('playerArtist');
+  var playerCover = document.getElementById('playerCover');
+  var playerEmptyCover = document.getElementById('playerEmptyCover');
+  var playerStatus = document.getElementById('playerStatus');
+  var searchInput = document.getElementById('playerSearch');
+
+  function text(enText, zhText) {
+    return window.i18nText ? window.i18nText(enText, zhText) : enText;
+  }
+
+  function setStatus(enText, zhText) {
+    playerStatus.textContent = text(enText, zhText);
+  }
+
+  function escapeHtml(value) {
+    return String(value || '').replace(/[&<>'"]/g, function (char) {
+      return {
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        "'": '&#39;',
+        '"': '&quot;'
+      }[char];
+    });
+  }
+
+  function renderTracks() {
+    if (!tracks.length) {
+      trackList.innerHTML = '<tr><td colspan="4" class="text-center py-4 console-muted">' + escapeHtml(text('No tracks found.', '没有找到曲目。')) + '</td></tr>';
+      trackCount.textContent = text('0 tracks', '0 首歌曲');
+      return;
+    }
+
+    trackList.innerHTML = tracks.map(function (track, index) {
+      return '<tr class="web-player-track-row' + (index === currentIndex ? ' active' : '') + '" data-index="' + index + '">' +
+        '<td><strong>' + escapeHtml(track.title) + '</strong><div class="console-muted small">' + escapeHtml(track.playCount || 0) + ' plays</div></td>' +
+        '<td>' + escapeHtml(track.artist) + '</td>' +
+        '<td>' + escapeHtml(track.album) + '</td>' +
+        '<td class="text-end text-nowrap">' + escapeHtml(track.durationText) + '</td>' +
+        '</tr>';
+    }).join('');
+
+    trackCount.textContent = text(tracks.length + ' tracks', tracks.length + ' 首歌曲');
+    Array.prototype.forEach.call(trackList.querySelectorAll('tr[data-index]'), function (row) {
+      row.addEventListener('click', function () {
+        playTrack(Number(row.getAttribute('data-index')));
+      });
+    });
+  }
+
+  function playTrack(index) {
+    if (index < 0 || index >= tracks.length) {
+      return;
+    }
+    currentIndex = index;
+    var track = tracks[currentIndex];
+    playerTitle.textContent = track.title || text('Untitled track', '未命名曲目');
+    playerArtist.textContent = [track.artist, track.album].filter(Boolean).join(' · ');
+    playerCover.src = track.coverUrl;
+    playerCover.classList.remove('d-none');
+    playerEmptyCover.classList.add('d-none');
+    audio.src = track.streamUrl;
+    audio.play().then(function () {
+      setStatus('Playing', '播放中');
+    }).catch(function () {
+      setStatus('Ready', '已就绪');
+    });
+    renderTracks();
+  }
+
+  function nextTrack() {
+    if (!tracks.length) {
+      return;
+    }
+    playTrack((currentIndex + 1) % tracks.length);
+  }
+
+  function prevTrack() {
+    if (!tracks.length) {
+      return;
+    }
+    var index = currentIndex <= 0 ? tracks.length - 1 : currentIndex - 1;
+    playTrack(index);
+  }
+
+  function loadTracks() {
+    setStatus('Loading', '加载中');
+    var params = new URLSearchParams();
+    params.set('limit', '200');
+    if (searchInput.value.trim()) {
+      params.set('q', searchInput.value.trim());
+    }
+    fetch('{{ url_for("player.player_tracks") }}?' + params.toString(), { credentials: 'same-origin' })
+      .then(function (response) {
+        if (!response.ok) {
+          throw new Error('Failed to load tracks');
+        }
+        return response.json();
+      })
+      .then(function (payload) {
+        tracks = payload.tracks || [];
+        currentIndex = -1;
+        renderTracks();
+        setStatus('Idle', '空闲');
+      })
+      .catch(function () {
+        tracks = [];
+        trackList.innerHTML = '<tr><td colspan="4" class="text-center py-4 text-danger">' + escapeHtml(text('Failed to load tracks.', '曲目加载失败。')) + '</td></tr>';
+        trackCount.textContent = text('0 tracks', '0 首歌曲');
+        setStatus('Error', '错误');
+      });
+  }
+
+  document.getElementById('playerSearchForm').addEventListener('submit', function (event) {
+    event.preventDefault();
+    loadTracks();
+  });
+  document.getElementById('reloadTracks').addEventListener('click', loadTracks);
+  document.getElementById('nextTrack').addEventListener('click', nextTrack);
+  document.getElementById('prevTrack').addEventListener('click', prevTrack);
+  document.getElementById('playPause').addEventListener('click', function () {
+    if (!audio.src && tracks.length) {
+      playTrack(currentIndex >= 0 ? currentIndex : 0);
+      return;
+    }
+    if (audio.paused) {
+      audio.play();
+    } else {
+      audio.pause();
+    }
+  });
+  audio.addEventListener('play', function () { setStatus('Playing', '播放中'); });
+  audio.addEventListener('pause', function () { setStatus('Paused', '已暂停'); });
+  audio.addEventListener('ended', nextTrack);
+  playerCover.addEventListener('error', function () {
+    playerCover.classList.add('d-none');
+    playerEmptyCover.classList.remove('d-none');
+  });
+
+  loadTracks();
+})();
+</script>
+{% endblock %}
