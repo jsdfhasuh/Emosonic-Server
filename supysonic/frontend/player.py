@@ -1,9 +1,20 @@
 # This file is part of Supysonic / Emosonic Server.
 # Distributed under terms of the GNU AGPLv3 license.
 
-from flask import Blueprint, flash, jsonify, redirect, render_template, request, session, url_for
+from flask import (
+    Blueprint,
+    current_app,
+    flash,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 from peewee import fn
 
+from .. import DOWNLOAD_URL, VERSION
 from ..db import Album, Artist, Track, User
 from ..managers.user import UserManager
 
@@ -11,6 +22,17 @@ player = Blueprint("player", __name__)
 WEB_PLAYER_CLIENT_NAME = "emosonic-web-player"
 DEFAULT_TRACK_LIMIT = 100
 MAX_TRACK_LIMIT = 500
+
+
+@player.context_processor
+def inject_metadata():
+    return {
+        "version": VERSION,
+        "download_url": DOWNLOAD_URL,
+        "allow_user_registration": current_app.config["WEBAPP"].get(
+            "allow_user_registration", True
+        ),
+    }
 
 
 @player.before_request
