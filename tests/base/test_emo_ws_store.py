@@ -39,6 +39,8 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertEqual(queue_state["currentIndex"], 1)
         self.assertEqual(queue_state["positionMs"], 4200)
         self.assertEqual(queue_state["queueSongIds"][0], "songId1")
+        self.assertEqual(queue_state["queueRevision"], 1)
+        self.assertIn("serverUpdatedAtMs", queue_state)
 
     def test_save_and_load_playback_state(self):
         savePlaybackState(
@@ -61,6 +63,8 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertEqual(playback_state["trackId"], "track-1")
         self.assertEqual(playback_state["positionMs"], 4200)
         self.assertEqual(playback_state["volume"], 65)
+        self.assertIn("serverUpdatedAtMs", playback_state)
+        self.assertNotIn("serverTimeMs", playback_state)
 
         all_states = getPlaybackStates("root:living-room")
         self.assertEqual(len(all_states), 1)
@@ -78,3 +82,4 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertEqual(queue_state["sourceClientId"], "player-1")
         self.assertEqual(queue_state["currentIndex"], 1)
         self.assertEqual(queue_state["queueSongIds"][1], "songId4")
+        self.assertIn("serverUpdatedAtMs", queue_state)

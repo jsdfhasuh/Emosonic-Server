@@ -11,6 +11,8 @@ if MODULE_SPEC is None or MODULE_SPEC.loader is None:
 MODULE = module_from_spec(MODULE_SPEC)
 MODULE_SPEC.loader.exec_module(MODULE)
 WebSocketState = MODULE.WebSocketState
+ClientSeqStaleError = MODULE.ClientSeqStaleError
+QueueRevisionMismatchError = MODULE.QueueRevisionMismatchError
 
 
 class EmoWebSocketStateTestCase(unittest.TestCase):
@@ -103,6 +105,260 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
         self.assertEqual(playback_state["state"], "playing")
         self.assertEqual(self.state.get_playback_state("sess-1", "player-1")["trackId"], "2")
         self.assertEqual(self.state.list_playback_states("sess-1")[0]["sourceClientId"], "player-1")
+        self.assertEqual(playback_state["timelineId"], "session:sess-1:client:player-1")
+        self.assertEqual(playback_state["authorityClientId"], "player-1")
+        self.assertEqual(playback_state["version"], 1)
+        self.assertEqual(playback_state["epoch"], 1)
+        self.assertIn("serverUpdatedAtMs", playback_state)
+
+    def test_playback_client_seq_is_scoped_by_client_instance(self):
+        first = self.state.update_playback_state(
+            "sess-1",
+            "player-1",
+            {
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 1000,
+                "clientInstanceId": "boot-a",
+                "clientSeq": 2,
+            },
+            now=10,
+        )
+
+        self.assertEqual(first["serverUpdatedAtMs"], 10000)
+        self.assertEqual(first["updatedAt"], 10)
+        self.assertEqual(first["version"], 1)
+        self.assertEqual(first["epoch"], 1)
+
+        with self.assertRaises(ClientSeqStaleError):
+            self.state.update_playback_state(
+                "sess-1",
+                "player-1",
+                {
+                    "state": "playing",
+                    "trackId": "song-1",
+                    "positionMs": 1200,
+                    "clientInstanceId": "boot-a",
+                    "clientSeq": 2,
+                },
+                now=11,
+            )
+
+        restarted = self.state.update_playback_state(
+            "sess-1",
+            "player-1",
+            {
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 1300,
+                "clientInstanceId": "boot-b",
+                "clientSeq": 1,
+            },
+            now=12,
+        )
+
+        self.assertEqual(restarted["version"], 2)
+        self.assertEqual(restarted["epoch"], 1)
+
+    def test_queue_revision_conflict_is_independent_from_playback_version(self):
+        queue = self.state.update_queue(
+            "sess-1",
+            ["song-1", "song-2"],
+            current_index=0,
+            position_ms=0,
+            source_client_id="player-1",
+            now=10,
+        )
+        self.assertEqual(queue["queueRevision"], 1)
+
+        for seq in range(1, 4):
+            self.state.update_playback_state(
+                "sess-1",
+                "player-1",
+                {
+                    "state": "playing",
+                    "trackId": "song-1",
+                    "positionMs": seq * 1000,
+                    "clientInstanceId": "boot-a",
+                    "clientSeq": seq,
+                },
+                now=10 + seq,
+            )
+
+        playback = self.state.get_playback_state("sess-1", "player-1")
+        self.assertGreater(playback["version"], queue["version"])
+        self.assertEqual(playback["queueRevision"], 1)
+
+        updated_queue = self.state.update_queue(
+            "sess-1",
+            ["song-1", "song-2", "song-3"],
+            current_index=0,
+            position_ms=0,
+            source_client_id="player-1",
+            expected_queue_revision=1,
+            now=20,
+        )
+        self.assertEqual(updated_queue["queueRevision"], 2)
+
+        with self.assertRaises(QueueRevisionMismatchError):
+            self.state.update_queue(
+                "sess-1",
+                ["song-1"],
+                current_index=0,
+                position_ms=0,
+                source_client_id="player-1",
+                expected_queue_revision=1,
+                now=21,
+            )
+
+    def test_queue_position_update_does_not_increment_queue_revision_or_epoch(self):
+        queue = self.state.update_queue(
+            "sess-1",
+            ["song-1", "song-2"],
+            current_index=0,
+            position_ms=0,
+            source_client_id="player-1",
+            now=10,
+        )
+
+        updated = self.state.update_queue(
+            "sess-1",
+            ["song-1", "song-2"],
+            current_index=0,
+            position_ms=1500,
+            source_client_id="player-1",
+            expected_queue_revision=1,
+            now=11,
+        )
+
+        self.assertEqual(updated["queueRevision"], queue["queueRevision"])
+        self.assertEqual(updated["epoch"], queue["epoch"])
+        self.assertGreater(updated["version"], queue["version"])
+
+    def test_restore_snapshots_preserves_timeline_versions(self):
+        queue = self.state.restore_queue(
+            "sess-1",
+            {
+                "sourceClientId": "player-1",
+                "queueSongIds": ["song-1", "song-2"],
+                "currentIndex": 1,
+                "positionMs": 300,
+                "version": 7,
+                "epoch": 3,
+                "queueRevision": 5,
+                "controlVersion": 6,
+                "serverUpdatedAtMs": 10000,
+            },
+        )
+        playback = self.state.restore_playback_state(
+            "sess-1",
+            "player-1",
+            {
+                "state": "playing",
+                "trackId": "song-2",
+                "positionMs": 400,
+                "version": 8,
+                "epoch": 3,
+                "queueRevision": 5,
+                "controlVersion": 6,
+                "serverUpdatedAtMs": 11000,
+                "serverTimeMs": 99999,
+                "clientInstanceId": "boot-a",
+                "clientSeq": 4,
+            },
+        )
+        local_queue = self.state.restore_local_queue(
+            "sess-1",
+            "player-1",
+            {
+                "queueSongIds": ["song-2"],
+                "currentIndex": 0,
+                "positionMs": 0,
+                "serverUpdatedAtMs": 12000,
+            },
+        )
+
+        self.assertEqual(queue["version"], 7)
+        self.assertEqual(queue["epoch"], 3)
+        self.assertEqual(queue["queueRevision"], 5)
+        self.assertEqual(playback["version"], 8)
+        self.assertEqual(playback["epoch"], 3)
+        self.assertEqual(playback["queueRevision"], 5)
+        self.assertEqual(playback["serverUpdatedAtMs"], 11000)
+        self.assertNotIn("serverTimeMs", playback)
+        self.assertEqual(local_queue["serverUpdatedAtMs"], 12000)
+
+        with self.assertRaises(ClientSeqStaleError):
+            self.state.update_playback_state(
+                "sess-1",
+                "player-1",
+                {
+                    "state": "playing",
+                    "trackId": "song-2",
+                    "positionMs": 500,
+                    "clientInstanceId": "boot-a",
+                    "clientSeq": 4,
+                },
+            )
+
+    def test_broadcast_timeline_versions_and_epoch_rules(self):
+        broadcast = self.state.create_broadcast(
+            "broadcast-1",
+            "alice",
+            "phone-1",
+            ["phone-1", "pc-1"],
+            ["song-1", "song-2"],
+            current_index=0,
+            position_ms=0,
+            state_name="playing",
+            updated_by_client_id="phone-1",
+            now=10,
+        )
+        self.assertEqual(broadcast["timelineId"], "broadcast:broadcast-1")
+        self.assertEqual(broadcast["version"], 1)
+        self.assertEqual(broadcast["epoch"], 1)
+        self.assertEqual(broadcast["queueRevision"], 1)
+        self.assertEqual(broadcast["controlVersion"], 1)
+
+        seek = self.state.update_broadcast_state(
+            "broadcast-1",
+            "phone-1",
+            position_ms=45000,
+            now=11,
+        )
+        self.assertEqual(seek["version"], 2)
+        self.assertEqual(seek["controlVersion"], 2)
+        self.assertEqual(seek["epoch"], 1)
+        self.assertEqual(seek["queueRevision"], 1)
+
+        play_item = self.state.update_broadcast_state(
+            "broadcast-1",
+            "phone-1",
+            current_index=1,
+            position_ms=0,
+            state_name="playing",
+            expected_version=2,
+            now=12,
+        )
+        self.assertEqual(play_item["version"], 3)
+        self.assertEqual(play_item["controlVersion"], 3)
+        self.assertEqual(play_item["epoch"], 2)
+        self.assertEqual(play_item["queueRevision"], 1)
+
+        queue = self.state.update_broadcast_state(
+            "broadcast-1",
+            "phone-1",
+            queue_song_ids=["song-3", "song-4"],
+            current_index=0,
+            position_ms=0,
+            expected_version=3,
+            increment_queue_revision=True,
+            now=13,
+        )
+        self.assertEqual(queue["version"], 4)
+        self.assertEqual(queue["controlVersion"], 4)
+        self.assertEqual(queue["queueRevision"], 2)
+        self.assertEqual(queue["epoch"], 3)
 
     def test_re_registering_same_client_id_keeps_latest_session_mapping(self):
         self.state.register_session("sid-1")

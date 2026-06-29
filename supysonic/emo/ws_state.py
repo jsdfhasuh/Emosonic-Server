@@ -3,6 +3,38 @@ import time
 
 
 DEFAULT_CLIENT_STALE_SECONDS = 90
+DEFAULT_FOLLOW_DELAY_MS = 700
+
+
+def _timestamp_ms(now=None):
+    now = time.time() if now is None else now
+    return int(now * 1000)
+
+
+def _timestamp_ms_from_payload(payload, now=None):
+    if not isinstance(payload, dict):
+        return _timestamp_ms(now)
+    server_updated_at_ms = payload.get("serverUpdatedAtMs")
+    if isinstance(server_updated_at_ms, (int, float)):
+        return int(server_updated_at_ms)
+    updated_at = payload.get("updatedAt")
+    if isinstance(updated_at, (int, float)):
+        return int(updated_at * 1000)
+    return _timestamp_ms(now)
+
+
+def _int_or_default(value, default=0):
+    if type(value) is int:
+        return value
+    return default
+
+
+def _session_timeline_id(session_id, client_id):
+    return f"session:{session_id}:client:{client_id}"
+
+
+def _broadcast_timeline_id(broadcast_id):
+    return f"broadcast:{broadcast_id}"
 
 
 class BroadcastInactiveError(Exception):
@@ -10,9 +42,22 @@ class BroadcastInactiveError(Exception):
 
 
 class BroadcastVersionMismatchError(Exception):
-    def __init__(self, current_version):
+    def __init__(self, current_version, current_control_version=None):
         super().__init__("Broadcast version mismatch")
         self.current_version = current_version
+        self.current_control_version = current_control_version
+
+
+class QueueRevisionMismatchError(Exception):
+    def __init__(self, current_revision):
+        super().__init__("Queue revision mismatch")
+        self.current_revision = current_revision
+
+
+class ClientSeqStaleError(Exception):
+    def __init__(self, current_seq):
+        super().__init__("Client sequence is stale")
+        self.current_seq = current_seq
 
 
 class WebSocketState:
@@ -30,6 +75,8 @@ class WebSocketState:
         self._local_queues = {}
         # (sessionId, clientId) -> device playback snapshot
         self._playback_states = {}
+        # timelineId -> authoritative playback ordering metadata
+        self._playback_timelines = {}
         # sid -> subscribed sessionIds for passive observers/controllers
         self._session_subscriptions = {}
         # broadcastId -> authoritative broadcast playback state
@@ -40,6 +87,8 @@ class WebSocketState:
         self._broadcast_playback_states = {}
         # clientId -> active broadcastId for playback participants
         self._client_active_broadcast = {}
+        # follower clientId -> server-owned follow relationship
+        self._follow_relationships = {}
 
     def register_session(self, sid, now=None):
         now = time.time() if now is None else now
@@ -126,6 +175,7 @@ class WebSocketState:
                 self._client_to_sid.pop(client_id, None)
                 removed_client = self._clients.pop(client_id)
                 self._mark_broadcast_participant_offline_locked(client_id, now=now)
+                self._deactivate_follow_relationships_for_client_locked(client_id, now=now)
                 removed.append(removed_client)
             return [dict(client) for client in removed]
 
@@ -143,6 +193,7 @@ class WebSocketState:
                     self._client_to_sid.pop(client_id, None)
                     client_info = self._clients.pop(client_id, None)
                     self._mark_broadcast_participant_offline_locked(client_id)
+                    self._deactivate_follow_relationships_for_client_locked(client_id)
             return session_info, client_info
 
     def get_client(self, client_id):
@@ -235,25 +286,217 @@ class WebSocketState:
                 items.append(sid)
             return items
 
-    def update_queue(self, session_id, queue_song_ids, current_index=0, position_ms=0, source_client_id=None):
+    def _get_or_create_playback_timeline_locked(self, session_id, client_id):
+        timeline_id = _session_timeline_id(session_id, client_id)
+        timeline = self._playback_timelines.get(timeline_id)
+        if timeline is None:
+            timeline = {
+                "timelineId": timeline_id,
+                "sessionId": session_id,
+                "authorityClientId": client_id,
+                "originClientId": client_id,
+                "trackId": None,
+                "state": "stopped",
+                "positionMs": 0,
+                "playbackRate": 1.0,
+                "version": 0,
+                "epoch": 0,
+                "queueRevision": 0,
+                "controlVersion": 0,
+                "serverUpdatedAtMs": 0,
+                "lastClientSeqByClientInstance": {},
+            }
+            self._playback_timelines[timeline_id] = timeline
+        return timeline
+
+    def _copy_playback_timeline_fields(self, timeline, server_time_ms=None):
+        fields = {
+            "timelineId": timeline.get("timelineId"),
+            "authorityClientId": timeline.get("authorityClientId"),
+            "originClientId": timeline.get("originClientId"),
+            "version": timeline.get("version", 0),
+            "epoch": timeline.get("epoch", 0),
+            "queueRevision": timeline.get("queueRevision", 0),
+            "controlVersion": timeline.get("controlVersion", 0),
+            "serverUpdatedAtMs": timeline.get("serverUpdatedAtMs", 0),
+            "updatedAt": (timeline.get("serverUpdatedAtMs", 0) or 0) / 1000,
+            "playbackRate": timeline.get("playbackRate", 1.0),
+        }
+        if server_time_ms is not None:
+            fields["serverTimeMs"] = server_time_ms
+        return fields
+
+    def update_queue(
+        self,
+        session_id,
+        queue_song_ids,
+        current_index=0,
+        position_ms=0,
+        source_client_id=None,
+        expected_queue_revision=None,
+        now=None,
+    ):
         if not session_id:
             return None
+        server_updated_at_ms = _timestamp_ms(now)
         # Shared room queue keyed only by sessionId.
-        queue_state = {
-            "sessionId": session_id,
-            "queueSongIds": list(queue_song_ids),
-            "currentIndex": current_index,
-            "positionMs": position_ms,
-            "sourceClientId": source_client_id,
-            "updatedAt": time.time(),
-        }
         with self._lock:
+            previous_queue = self._queues.get(session_id)
+            current_revision = 0
+            if previous_queue is not None:
+                current_revision = previous_queue.get("queueRevision", 0)
+            if (
+                expected_queue_revision is not None
+                and expected_queue_revision != current_revision
+            ):
+                raise QueueRevisionMismatchError(current_revision)
+
+            previous_queue_song_ids = (
+                [] if previous_queue is None else previous_queue.get("queueSongIds") or []
+            )
+            previous_index = (
+                0 if previous_queue is None else previous_queue.get("currentIndex", 0)
+            )
+            queue_identity_changed = (
+                previous_queue is None
+                or previous_queue_song_ids != list(queue_song_ids)
+                or previous_index != current_index
+            )
+            queue_revision = (
+                current_revision + 1 if queue_identity_changed else current_revision
+            )
+            timeline_fields = {}
+            if source_client_id:
+                timeline = self._get_or_create_playback_timeline_locked(
+                    session_id,
+                    source_client_id,
+                )
+                previous_track_id = (
+                    previous_queue_song_ids[previous_index]
+                    if previous_queue_song_ids
+                    and 0 <= previous_index < len(previous_queue_song_ids)
+                    else None
+                )
+                next_track_id = (
+                    queue_song_ids[current_index]
+                    if queue_song_ids and 0 <= current_index < len(queue_song_ids)
+                    else None
+                )
+                timeline["originClientId"] = source_client_id
+                timeline["queueRevision"] = queue_revision
+                timeline["controlVersion"] = timeline.get("controlVersion", 0) + 1
+                timeline["version"] = timeline.get("version", 0) + 1
+                if timeline.get("epoch", 0) == 0:
+                    timeline["epoch"] = 1
+                elif (
+                    queue_identity_changed
+                    or previous_track_id != next_track_id
+                ):
+                    timeline["epoch"] = timeline.get("epoch", 0) + 1
+                timeline["trackId"] = next_track_id
+                timeline["positionMs"] = position_ms
+                timeline["currentIndex"] = current_index
+                timeline["queueSongIds"] = list(queue_song_ids)
+                timeline["serverUpdatedAtMs"] = server_updated_at_ms
+                timeline_fields = self._copy_playback_timeline_fields(
+                    timeline,
+                )
+
+            queue_state = {
+                "sessionId": session_id,
+                "queueSongIds": list(queue_song_ids),
+                "currentIndex": current_index,
+                "positionMs": position_ms,
+                "sourceClientId": source_client_id,
+                "queueRevision": queue_revision,
+                "serverUpdatedAtMs": server_updated_at_ms,
+                "updatedAt": server_updated_at_ms / 1000,
+            }
+            queue_state.update(timeline_fields)
             self._queues[session_id] = queue_state
         return dict(queue_state)
+
+    def restore_queue(self, session_id, queue_state, now=None):
+        if not session_id or queue_state is None:
+            return None
+        queue_song_ids = list(queue_state.get("queueSongIds") or [])
+        current_index = _int_or_default(queue_state.get("currentIndex"), 0)
+        position_ms = _int_or_default(queue_state.get("positionMs"), 0)
+        source_client_id = queue_state.get("sourceClientId")
+        queue_revision = _int_or_default(queue_state.get("queueRevision"), 1)
+        if queue_revision <= 0:
+            queue_revision = 1
+        server_updated_at_ms = _timestamp_ms_from_payload(queue_state, now)
+
+        with self._lock:
+            timeline_fields = {}
+            if source_client_id:
+                timeline = self._get_or_create_playback_timeline_locked(
+                    session_id,
+                    source_client_id,
+                )
+                next_track_id = (
+                    queue_song_ids[current_index]
+                    if queue_song_ids and 0 <= current_index < len(queue_song_ids)
+                    else None
+                )
+                version = _int_or_default(
+                    queue_state.get("version"),
+                    max(timeline.get("version", 0), queue_revision),
+                )
+                if version <= 0:
+                    version = 1
+                epoch = _int_or_default(
+                    queue_state.get("epoch"),
+                    timeline.get("epoch", 0),
+                )
+                if epoch <= 0:
+                    epoch = 1
+                control_version = _int_or_default(
+                    queue_state.get("controlVersion"),
+                    max(timeline.get("controlVersion", 0), version),
+                )
+                if control_version <= 0:
+                    control_version = version
+
+                timeline["originClientId"] = (
+                    queue_state.get("originClientId") or source_client_id
+                )
+                timeline["trackId"] = next_track_id
+                timeline["positionMs"] = position_ms
+                timeline["currentIndex"] = current_index
+                timeline["queueSongIds"] = queue_song_ids
+                timeline["queueRevision"] = queue_revision
+                timeline["version"] = version
+                timeline["epoch"] = epoch
+                timeline["controlVersion"] = control_version
+                timeline["serverUpdatedAtMs"] = server_updated_at_ms
+                timeline["mediaIdentity"] = (
+                    next_track_id,
+                    current_index,
+                    queue_revision,
+                    source_client_id,
+                )
+                timeline_fields = self._copy_playback_timeline_fields(timeline)
+
+            restored = {
+                "sessionId": session_id,
+                "queueSongIds": queue_song_ids,
+                "currentIndex": current_index,
+                "positionMs": position_ms,
+                "sourceClientId": source_client_id,
+                "queueRevision": queue_revision,
+                "serverUpdatedAtMs": server_updated_at_ms,
+                "updatedAt": server_updated_at_ms / 1000,
+            }
+            restored.update(timeline_fields)
+            self._queues[session_id] = restored
+        return dict(restored)
 
     def update_local_queue(self, session_id, client_id, queue_song_ids, current_index=0, position_ms=0):
         if not session_id or not client_id:
             return None
+        server_updated_at_ms = _timestamp_ms()
         # Device-local queue keyed by (sessionId, clientId).
         local_queue = {
             "sessionId": session_id,
@@ -261,7 +504,25 @@ class WebSocketState:
             "queueSongIds": list(queue_song_ids),
             "currentIndex": current_index,
             "positionMs": position_ms,
-            "updatedAt": time.time(),
+            "serverUpdatedAtMs": server_updated_at_ms,
+            "updatedAt": server_updated_at_ms / 1000,
+        }
+        with self._lock:
+            self._local_queues[(session_id, client_id)] = local_queue
+        return dict(local_queue)
+
+    def restore_local_queue(self, session_id, client_id, queue_state, now=None):
+        if not session_id or not client_id or queue_state is None:
+            return None
+        server_updated_at_ms = _timestamp_ms_from_payload(queue_state, now)
+        local_queue = {
+            "sessionId": session_id,
+            "sourceClientId": client_id,
+            "queueSongIds": list(queue_state.get("queueSongIds") or []),
+            "currentIndex": _int_or_default(queue_state.get("currentIndex"), 0),
+            "positionMs": _int_or_default(queue_state.get("positionMs"), 0),
+            "serverUpdatedAtMs": server_updated_at_ms,
+            "updatedAt": server_updated_at_ms / 1000,
         }
         with self._lock:
             self._local_queues[(session_id, client_id)] = local_queue
@@ -290,15 +551,168 @@ class WebSocketState:
             queue_state = self._queues.get(session_id)
             return dict(queue_state) if queue_state is not None else None
 
-    def update_playback_state(self, session_id, client_id, state):
+    def update_playback_state(self, session_id, client_id, state, now=None):
         if not session_id or not client_id:
             return None
         # Playback state is also device-scoped, so the key is (sessionId, clientId).
-        playback_state = dict(state)
-        playback_state["sessionId"] = session_id
-        playback_state["sourceClientId"] = client_id
-        playback_state["updatedAt"] = time.time()
+        server_updated_at_ms = _timestamp_ms(now)
         with self._lock:
+            previous_state = self._playback_states.get((session_id, client_id))
+            timeline = self._get_or_create_playback_timeline_locked(session_id, client_id)
+
+            client_instance_id = state.get("clientInstanceId")
+            client_seq = state.get("clientSeq")
+            if client_instance_id and type(client_seq) is int:
+                last_seq_by_instance = timeline.setdefault(
+                    "lastClientSeqByClientInstance",
+                    {},
+                )
+                last_seq = last_seq_by_instance.get(client_instance_id)
+                if last_seq is not None and client_seq <= last_seq:
+                    raise ClientSeqStaleError(last_seq)
+                last_seq_by_instance[client_instance_id] = client_seq
+
+            queue_state = self._queues.get(session_id)
+            queue_revision = timeline.get("queueRevision", 0)
+            if (
+                queue_state is not None
+                and queue_state.get("sourceClientId") == client_id
+            ):
+                queue_revision = queue_state.get("queueRevision", queue_revision)
+
+            playback_state = dict(state)
+            playback_state["sessionId"] = session_id
+            playback_state["sourceClientId"] = client_id
+
+            playback_rate = playback_state.get("playbackRate", timeline.get("playbackRate", 1.0))
+            if not isinstance(playback_rate, (int, float)) or playback_rate <= 0:
+                playback_rate = 1.0
+
+            current_index = playback_state.get("currentIndex")
+            if not isinstance(current_index, int):
+                current_index = None
+                if queue_state is not None:
+                    current_index = queue_state.get("currentIndex")
+
+            previous_media_identity = timeline.get("mediaIdentity")
+            media_identity = (
+                playback_state.get("trackId"),
+                current_index,
+                queue_revision,
+                client_id,
+            )
+
+            timeline["originClientId"] = playback_state.get("originClientId") or client_id
+            timeline["trackId"] = playback_state.get("trackId")
+            timeline["state"] = playback_state.get("state") or "unknown"
+            timeline["positionMs"] = playback_state.get("positionMs", 0)
+            timeline["playbackRate"] = playback_rate
+            timeline["queueRevision"] = queue_revision
+            timeline["version"] = timeline.get("version", 0) + 1
+            if timeline.get("epoch", 0) == 0:
+                timeline["epoch"] = 1
+            elif previous_media_identity is not None and previous_media_identity != media_identity:
+                timeline["epoch"] = timeline.get("epoch", 0) + 1
+            elif previous_media_identity is None and previous_state is not None:
+                previous_track_id = previous_state.get("trackId")
+                if previous_track_id != playback_state.get("trackId"):
+                    timeline["epoch"] = timeline.get("epoch", 0) + 1
+            timeline["mediaIdentity"] = media_identity
+            timeline["serverUpdatedAtMs"] = server_updated_at_ms
+
+            playback_state.update(
+                self._copy_playback_timeline_fields(
+                    timeline,
+                )
+            )
+            if client_instance_id:
+                playback_state["clientInstanceId"] = client_instance_id
+            if type(client_seq) is int:
+                playback_state["clientSeq"] = client_seq
+            playback_state.setdefault("followDelayMs", DEFAULT_FOLLOW_DELAY_MS)
+            self._playback_states[(session_id, client_id)] = playback_state
+        return dict(playback_state)
+
+    def restore_playback_state(self, session_id, client_id, state, now=None):
+        if not session_id or not client_id or state is None:
+            return None
+        server_updated_at_ms = _timestamp_ms_from_payload(state, now)
+        with self._lock:
+            queue_state = self._queues.get(session_id)
+            timeline = self._get_or_create_playback_timeline_locked(session_id, client_id)
+
+            queue_revision = _int_or_default(
+                state.get("queueRevision"),
+                timeline.get("queueRevision", 0),
+            )
+            if (
+                queue_state is not None
+                and queue_state.get("sourceClientId") == client_id
+            ):
+                queue_revision = max(
+                    queue_revision,
+                    _int_or_default(queue_state.get("queueRevision"), queue_revision),
+                )
+
+            version = _int_or_default(state.get("version"), timeline.get("version", 0))
+            if version <= 0:
+                version = 1
+            epoch = _int_or_default(state.get("epoch"), timeline.get("epoch", 0))
+            if epoch <= 0:
+                epoch = 1
+            control_version = _int_or_default(
+                state.get("controlVersion"),
+                timeline.get("controlVersion", version),
+            )
+            if control_version <= 0:
+                control_version = version
+
+            playback_state = dict(state)
+            playback_state.pop("serverTimeMs", None)
+            playback_state["sessionId"] = session_id
+            playback_state["sourceClientId"] = client_id
+            playback_state["updatedAt"] = server_updated_at_ms / 1000
+
+            playback_rate = playback_state.get(
+                "playbackRate",
+                timeline.get("playbackRate", 1.0),
+            )
+            if not isinstance(playback_rate, (int, float)) or playback_rate <= 0:
+                playback_rate = 1.0
+
+            current_index = playback_state.get("currentIndex")
+            if not isinstance(current_index, int):
+                current_index = None
+                if queue_state is not None:
+                    current_index = queue_state.get("currentIndex")
+
+            media_identity = (
+                playback_state.get("trackId"),
+                current_index,
+                queue_revision,
+                client_id,
+            )
+            timeline["originClientId"] = playback_state.get("originClientId") or client_id
+            timeline["trackId"] = playback_state.get("trackId")
+            timeline["state"] = playback_state.get("state") or "unknown"
+            timeline["positionMs"] = playback_state.get("positionMs", 0)
+            timeline["playbackRate"] = playback_rate
+            timeline["queueRevision"] = queue_revision
+            timeline["version"] = version
+            timeline["epoch"] = epoch
+            timeline["controlVersion"] = control_version
+            timeline["mediaIdentity"] = media_identity
+            timeline["serverUpdatedAtMs"] = server_updated_at_ms
+
+            client_instance_id = playback_state.get("clientInstanceId")
+            client_seq = playback_state.get("clientSeq")
+            if client_instance_id and type(client_seq) is int:
+                timeline.setdefault("lastClientSeqByClientInstance", {})[
+                    client_instance_id
+                ] = client_seq
+
+            playback_state.update(self._copy_playback_timeline_fields(timeline))
+            playback_state.setdefault("followDelayMs", DEFAULT_FOLLOW_DELAY_MS)
             self._playback_states[(session_id, client_id)] = playback_state
         return dict(playback_state)
 
@@ -331,22 +745,32 @@ class WebSocketState:
         now=None,
     ):
         now = time.time() if now is None else now
+        server_updated_at_ms = _timestamp_ms(now)
         participant_ids = list(participants)
         track_id = queue_song_ids[current_index] if queue_song_ids else None
         broadcast = {
             "broadcastId": broadcast_id,
+            "timelineId": _broadcast_timeline_id(broadcast_id),
             "userName": user_name,
             "ownerClientId": owner_client_id,
+            "authorityClientId": "server",
+            "originClientId": updated_by_client_id or owner_client_id,
             "participants": participant_ids,
             "queueSongIds": list(queue_song_ids),
             "currentIndex": current_index,
             "trackId": track_id,
             "positionMs": position_ms,
             "state": state_name,
+            "playbackRate": 1.0,
             "version": 1,
+            "epoch": 1,
+            "queueRevision": 1,
+            "controlVersion": 1,
             "updatedByClientId": updated_by_client_id or owner_client_id,
             "createdAt": now,
-            "updatedAt": now,
+            "serverUpdatedAtMs": server_updated_at_ms,
+            "updatedAt": server_updated_at_ms / 1000,
+            "followDelayMs": DEFAULT_FOLLOW_DELAY_MS,
             "controlPolicy": control_policy,
         }
         with self._lock:
@@ -416,10 +840,13 @@ class WebSocketState:
         state_name=None,
         increment_version=True,
         expected_version=None,
+        increment_queue_revision=False,
+        increment_control_version=True,
         require_active=False,
         now=None,
     ):
         now = time.time() if now is None else now
+        server_updated_at_ms = _timestamp_ms(now)
         with self._lock:
             broadcast = self._broadcasts.get(broadcast_id)
             if broadcast is None:
@@ -428,10 +855,16 @@ class WebSocketState:
                 raise BroadcastInactiveError("Broadcast is not active")
             if (
                 expected_version is not None
-                and broadcast.get("version") != expected_version
+                and broadcast.get("controlVersion", broadcast.get("version")) != expected_version
             ):
-                raise BroadcastVersionMismatchError(broadcast.get("version"))
+                raise BroadcastVersionMismatchError(
+                    broadcast.get("version"),
+                    broadcast.get("controlVersion", broadcast.get("version")),
+                )
 
+            previous_queue = list(broadcast.get("queueSongIds") or [])
+            previous_index = broadcast.get("currentIndex", 0)
+            previous_track_id = broadcast.get("trackId")
             if queue_song_ids is not None:
                 broadcast["queueSongIds"] = list(queue_song_ids)
             if current_index is not None:
@@ -444,27 +877,58 @@ class WebSocketState:
             queue = broadcast.get("queueSongIds") or []
             index = broadcast.get("currentIndex", 0)
             broadcast["trackId"] = queue[index] if queue and 0 <= index < len(queue) else None
+            if (
+                broadcast.get("epoch", 0) == 0
+                or previous_track_id != broadcast.get("trackId")
+                or previous_index != index
+                or (queue_song_ids is not None and previous_queue != list(queue_song_ids))
+            ):
+                broadcast["epoch"] = broadcast.get("epoch", 0) + 1
+            if increment_queue_revision:
+                broadcast["queueRevision"] = broadcast.get("queueRevision", 0) + 1
+            if increment_control_version:
+                broadcast["controlVersion"] = broadcast.get(
+                    "controlVersion",
+                    broadcast.get("version", 0),
+                ) + 1
+            broadcast["originClientId"] = updated_by_client_id
             broadcast["updatedByClientId"] = updated_by_client_id
-            broadcast["updatedAt"] = now
+            broadcast["serverUpdatedAtMs"] = server_updated_at_ms
+            broadcast["updatedAt"] = server_updated_at_ms / 1000
             if increment_version:
                 broadcast["version"] = broadcast.get("version", 0) + 1
             return dict(broadcast)
 
-    def stop_broadcast(self, broadcast_id, updated_by_client_id, now=None):
+    def stop_broadcast(self, broadcast_id, updated_by_client_id, expected_version=None, now=None):
         now = time.time() if now is None else now
+        server_updated_at_ms = _timestamp_ms(now)
         with self._lock:
             broadcast = self._broadcasts.get(broadcast_id)
             if broadcast is None:
                 return None
             if not self._is_broadcast_active_locked(broadcast_id):
                 raise BroadcastInactiveError("Broadcast is not active")
+            if (
+                expected_version is not None
+                and broadcast.get("controlVersion", broadcast.get("version")) != expected_version
+            ):
+                raise BroadcastVersionMismatchError(
+                    broadcast.get("version"),
+                    broadcast.get("controlVersion", broadcast.get("version")),
+                )
 
             broadcast["state"] = "stopped"
             queue = broadcast.get("queueSongIds") or []
             index = broadcast.get("currentIndex", 0)
             broadcast["trackId"] = queue[index] if queue and 0 <= index < len(queue) else None
+            broadcast["originClientId"] = updated_by_client_id
             broadcast["updatedByClientId"] = updated_by_client_id
-            broadcast["updatedAt"] = now
+            broadcast["controlVersion"] = broadcast.get(
+                "controlVersion",
+                broadcast.get("version", 0),
+            ) + 1
+            broadcast["serverUpdatedAtMs"] = server_updated_at_ms
+            broadcast["updatedAt"] = server_updated_at_ms / 1000
             broadcast["version"] = broadcast.get("version", 0) + 1
 
             for client_id in self._broadcast_participants.get(broadcast_id, set()):
@@ -526,6 +990,67 @@ class WebSocketState:
                 continue
             participant_state["online"] = False
             participant_state["lastSeenAt"] = now
+
+    def start_follow_relationship(
+        self,
+        follower_client_id,
+        follower_session_id,
+        source_client_id,
+        source_session_id,
+        user_name,
+        now=None,
+    ):
+        if not follower_client_id or not source_client_id:
+            return None
+        now_ms = _timestamp_ms(now)
+        relationship = {
+            "followerClientId": follower_client_id,
+            "followerSessionId": follower_session_id,
+            "sourceClientId": source_client_id,
+            "sourceSessionId": source_session_id,
+            "userName": user_name,
+            "active": True,
+            "createdAtMs": now_ms,
+            "updatedAtMs": now_ms,
+        }
+        with self._lock:
+            existing = self._follow_relationships.get(follower_client_id)
+            if existing is not None and existing.get("createdAtMs"):
+                relationship["createdAtMs"] = existing["createdAtMs"]
+            self._follow_relationships[follower_client_id] = relationship
+        return dict(relationship)
+
+    def stop_follow_relationship(self, follower_client_id, now=None):
+        now_ms = _timestamp_ms(now)
+        with self._lock:
+            relationship = self._follow_relationships.get(follower_client_id)
+            if relationship is None:
+                return None
+            relationship["active"] = False
+            relationship["updatedAtMs"] = now_ms
+            return dict(relationship)
+
+    def get_follow_relationship(self, follower_client_id, active_only=True):
+        with self._lock:
+            relationship = self._follow_relationships.get(follower_client_id)
+            if relationship is None:
+                return None
+            if active_only and not relationship.get("active"):
+                return None
+            return dict(relationship)
+
+    def _deactivate_follow_relationships_for_client_locked(self, client_id, now=None):
+        now_ms = _timestamp_ms(now)
+        for relationship in self._follow_relationships.values():
+            if not relationship.get("active"):
+                continue
+            if (
+                relationship.get("followerClientId") != client_id
+                and relationship.get("sourceClientId") != client_id
+            ):
+                continue
+            relationship["active"] = False
+            relationship["updatedAtMs"] = now_ms
 
 
 _state = WebSocketState()

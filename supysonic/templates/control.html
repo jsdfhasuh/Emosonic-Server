@@ -293,12 +293,14 @@
 
     const durationMs = getPlaybackDurationMs(playback);
     const basePositionMs = Number(playback.positionMs) || 0;
-    if (playback.state !== 'playing' || !playback.updatedAt) {
+    const serverUpdatedAtMs = Number(playback.serverUpdatedAtMs ?? (playback.updatedAt ? playback.updatedAt * 1000 : null));
+    if (playback.state !== 'playing' || !Number.isFinite(serverUpdatedAtMs)) {
       return clampPlaybackPosition(basePositionMs, durationMs);
     }
 
-    const elapsedMs = Math.max(0, (Date.now() / 1000 - playback.updatedAt) * 1000);
-    return clampPlaybackPosition(basePositionMs + elapsedMs, durationMs);
+    const playbackRate = Number(playback.playbackRate ?? 1) || 1;
+    const elapsedMs = Math.max(0, getServerNowMs() - serverUpdatedAtMs);
+    return clampPlaybackPosition(basePositionMs + (elapsedMs * playbackRate), durationMs);
   }
 
   function getComputedPlaybackProgressPercent(playback) {
@@ -315,6 +317,11 @@
   }
 
   function updateServerClockOffset(message) {
+    const serverTimeMs = Number(message?.payload?.serverTimeMs);
+    if (Number.isFinite(serverTimeMs)) {
+      controlState.follow.serverClockOffsetMs = serverTimeMs - Date.now();
+      return;
+    }
     const timestamp = Number(message?.timestamp);
     if (!Number.isFinite(timestamp)) {
       return;
@@ -435,6 +442,33 @@
     return requestId;
   }
 
+  function sendFollowStart(target) {
+    const requestId = nextRequestId('follow.start');
+    socket.emit('message', {
+      type: 'state',
+      action: 'follow.start',
+      requestId,
+      payload: {
+        sourceClientId: target.clientId,
+        sourceSessionId: target.sessionId,
+      },
+      timestamp: Date.now() / 1000,
+    });
+    return requestId;
+  }
+
+  function sendFollowStop(sourceSessionId) {
+    const requestId = nextRequestId('follow.stop');
+    socket.emit('message', {
+      type: 'state',
+      action: 'follow.stop',
+      requestId,
+      payload: sourceSessionId ? { sourceSessionId } : {},
+      timestamp: Date.now() / 1000,
+    });
+    return requestId;
+  }
+
   function updateSummary() {
     const players = getPlayers();
     document.getElementById('control-player-count').textContent = players.length;
@@ -514,10 +548,13 @@
       return null;
     }
     const basePositionMs = Number(playback.positionMs) || 0;
-    if (playback.state !== 'playing' || !playback.updatedAt) {
+    const serverUpdatedAtMs = Number(playback.serverUpdatedAtMs ?? (playback.updatedAt ? playback.updatedAt * 1000 : null));
+    if (playback.state !== 'playing' || !Number.isFinite(serverUpdatedAtMs)) {
       return basePositionMs;
     }
-    return Math.max(0, basePositionMs + (getServerNowMs() - playback.updatedAt * 1000));
+    const playbackRate = Number(playback.playbackRate ?? 1) || 1;
+    const followDelayMs = Number(playback.followDelayMs ?? 700) || 700;
+    return Math.max(0, basePositionMs + ((getServerNowMs() - serverUpdatedAtMs) * playbackRate) - followDelayMs);
   }
 
   function clearFollowState() {
@@ -541,7 +578,7 @@
     }
 
     const previousFollowSessionId = controlState.follow.followSessionId;
-    const requestId = sendSessionAction('session.subscribe', target.sessionId);
+    const requestId = sendFollowStart(target);
     controlState.pendingFollow = {
       requestId,
       targetClientId: target.clientId,
@@ -560,12 +597,12 @@
     controlState.pendingFollow = null;
     clearFollowState();
     if (sendUnsubscribe) {
+      if (previousFollowSessionId) {
+        sendFollowStop(previousFollowSessionId);
+      }
       const sessionsToUnsubscribe = new Set();
       if (pendingFollow?.targetSessionId && pendingFollow.targetSessionId !== controlState.selectedSessionId) {
         sessionsToUnsubscribe.add(pendingFollow.targetSessionId);
-      }
-      if (previousFollowSessionId && previousFollowSessionId !== controlState.selectedSessionId) {
-        sessionsToUnsubscribe.add(previousFollowSessionId);
       }
       sessionsToUnsubscribe.forEach((sessionId) => sendSessionAction('session.unsubscribe', sessionId));
     }
@@ -761,6 +798,7 @@
       queueSongIds: parsedQueue.queueSongIds,
       currentIndex: parsedQueue.currentIndex,
       positionMs: parsedQueue.positionMs,
+      baseControlVersion: controlState.broadcast.broadcast?.controlVersion,
       baseVersion: controlState.broadcast.broadcast?.version,
     });
   }
@@ -780,6 +818,7 @@
       broadcastId: broadcast.broadcastId,
       queueIndex: index,
       positionMs: parseInt(document.getElementById('queue-position-ms').value, 10) || 0,
+      baseControlVersion: controlState.broadcast.broadcast?.controlVersion,
       baseVersion: controlState.broadcast.broadcast?.version,
     });
   }
@@ -791,6 +830,8 @@
     }
     sendBroadcastMessage(action, 'command', {
       broadcastId: broadcast.broadcastId,
+      baseControlVersion: controlState.broadcast.broadcast?.controlVersion,
+      baseVersion: controlState.broadcast.broadcast?.version,
       ...payload,
     });
   }
@@ -847,6 +888,9 @@
         <li><span>${i18nText('Track', '曲目')}</span><strong>${escapeHtml(currentTrackLabel)}</strong></li>
         <li><span>${i18nText('Queue', '队列')}</span><strong>${broadcast.queueSongIds?.length ?? 0}</strong></li>
         <li><span>${i18nText('Version', '版本')}</span><strong>${broadcast.version ?? '-'}</strong></li>
+        <li><span>${i18nText('Control version', '控制版本')}</span><strong>${broadcast.controlVersion ?? '-'}</strong></li>
+        <li><span>${i18nText('Queue revision', '队列版本')}</span><strong>${broadcast.queueRevision ?? '-'}</strong></li>
+        <li><span>epoch</span><strong>${broadcast.epoch ?? '-'}</strong></li>
         <li><span>${i18nText('Updated by', '最近修改')}</span><code>${escapeHtml(broadcast.updatedByClientId || '-')}</code></li>
         ${participantRows}
       </ul>
@@ -1048,6 +1092,10 @@
       <ul class="console-info-list">
         <li><span>${i18nText('Connected', '连接时间')}</span><strong>${formatTimestamp(target.connectedAt)}</strong></li>
         <li><span>${i18nText('Track source', '曲目来源')}</span><code>${escapeHtml(playback?.sourceClientId || target.clientId)}</code></li>
+        <li><span>timelineId</span><code>${escapeHtml(playback?.timelineId || '-')}</code></li>
+        <li><span>${i18nText('Version', '版本')}</span><strong>${playback?.version ?? '-'}</strong></li>
+        <li><span>epoch</span><strong>${playback?.epoch ?? '-'}</strong></li>
+        <li><span>${i18nText('Queue revision', '队列版本')}</span><strong>${playback?.queueRevision ?? '-'}</strong></li>
       </ul>
       ${trackBlock}
     `;
@@ -1085,6 +1133,8 @@
           <li><span>${i18nText('Queue size', '队列数量')}</span><strong>${queue?.queueSongIds?.length ?? 0}</strong></li>
           <li><span>${i18nText('Current index', '当前索引')}</span><strong>${queue?.currentIndex ?? '-'}</strong></li>
           <li><span>${i18nText('Queue position', '队列位置')}</span><strong>${formatPosition(queue?.positionMs)}</strong></li>
+          <li><span>${i18nText('Queue revision', '队列版本')}</span><strong>${queue?.queueRevision ?? '-'}</strong></li>
+          <li><span>${i18nText('Timeline version', '时间线版本')}</span><strong>${queue?.version ?? '-'}</strong></li>
           <li><span>${i18nText('Last update', '最近更新')}</span><strong>${formatTimestamp(queue?.updatedAt)}</strong></li>
         </ul>
         ${currentQueueBlock}
@@ -1187,9 +1237,9 @@
   }
 
   function sendQueueSync() {
-    if (!controlState.selectedSessionId) {
-      pushEventLine(i18nText('No session selected for queue sync.', '尚未选择用于队列同步的会话。'), 'error');
-      setCommandStatus(i18nText('Queue sync failed: no target session selected.', '队列同步失败：尚未选择目标会话。'), 'error');
+    if (!controlState.selectedSessionId || !controlState.selectedClientId) {
+      pushEventLine(i18nText('No target player selected for queue sync.', '尚未选择用于队列同步的播放器。'), 'error');
+      setCommandStatus(i18nText('Queue sync failed: no target player selected.', '队列同步失败：尚未选择目标播放器。'), 'error');
       return;
     }
 
@@ -1212,15 +1262,18 @@
 
     const requestId = nextRequestId('queue.session.sync');
     controlState.pendingCommands.set(requestId, 'queue.session.sync');
+    const currentQueue = controlState.queueBySession[controlState.selectedSessionId] || null;
     socket.emit('message', {
       type: 'state',
       action: 'queue.session.sync',
       requestId,
       payload: {
         sessionId: controlState.selectedSessionId,
+        clientId: controlState.selectedClientId,
         queueSongIds,
         currentIndex,
         positionMs,
+        baseQueueRevision: currentQueue?.queueRevision,
       },
       timestamp: Date.now() / 1000,
     });

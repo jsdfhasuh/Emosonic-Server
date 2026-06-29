@@ -247,12 +247,20 @@ Recommended payload fields:
 - `trackId`
 - `volume`
 - `sourceClientId`
+- `clientInstanceId`: stable for one app/player process instance
+- `clientSeq`: monotonic within `clientInstanceId`; stale values are rejected with `stale_client_seq`
 - `queueType`: `session` or `local`, when the player can report the active queue surface
 - `queueClientId`: owner `clientId` for `local` queue playback
 
 Server broadcast note:
 
 - When the server rebroadcasts `playback.update`, it includes `sourceClientId` to identify which device last reported the session state.
+- Server rebroadcasts are authoritative and include additive timeline fields:
+  `timelineId`, `authorityClientId`, `originClientId`, `version`, `epoch`,
+  `queueRevision`, `controlVersion`, `serverUpdatedAtMs`, `serverTimeMs`,
+  `playbackRate`, and `followDelayMs`.
+- New clients should order playback state by `timelineId + version` and reject
+  older `epoch` values so old track progress cannot overwrite a newer track.
 
 ### Session Queue State
 
@@ -292,6 +300,37 @@ Validation rules:
 Server broadcast note:
 
 - When the server rebroadcasts `queue.session.sync`, it includes `sourceClientId` to identify which device last pushed the session queue.
+- New clients may send `baseQueueRevision`; the server rejects stale queue
+  submissions with `system.error` code `conflict` and `currentQueueRevision`.
+- Server queue broadcasts include the same timeline fields as playback state.
+  Playback heartbeats increment `version` but do not increment
+  `queueRevision`, so queue edits should use `baseQueueRevision` instead of
+  playback `version`.
+
+### Follow Relationship
+
+- `follow.start`
+- `follow.stop`
+
+`follow.start` creates a server-owned relationship. This prevents the follower
+from controlling the source timeline even if the follower omits `mode=follow`
+from later messages.
+
+```json
+{
+  "type": "state",
+  "action": "follow.start",
+  "requestId": "follow-start-1",
+  "payload": {
+    "sourceClientId": "phone-1",
+    "sourceSessionId": "root:phone"
+  }
+}
+```
+
+`follow.stop` closes that relationship and unsubscribes the source session when
+`sourceSessionId` is provided. Follow feedback still uses the follower's own
+`playback.update`; it never overwrites the source playback timeline.
 
 ### Local Queue State
 
@@ -356,6 +395,11 @@ This is both a requestable state snapshot and a server broadcast when device pre
 - Shared queue state is authoritative at the `sessionId` level.
 - Local queue state is authoritative at the `sessionId + clientId` level; for `queue.local.set`, `payload.clientId` chooses that `clientId`.
 - Playback state is authoritative at the `sessionId + sourceClientId` level.
+- Playback and queue broadcasts carry server-authored timeline fields; clients
+  should prefer `serverUpdatedAtMs/serverTimeMs` over client-provided
+  `updatedAt`.
+- Follow permissions come from server-side `follow.start/follow.stop` state,
+  not from `payload.mode` or `payload.followSourceClientId`.
 - Every request-style message should end with either `system.ack` or `system.error`.
 - Playback devices should send `playback.update` after they execute commands.
 - `queue.session.sync` replaces the full authoritative queue for that session.

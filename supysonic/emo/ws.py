@@ -22,7 +22,10 @@ from .ws_store import (
 from .ws_state import (
     BroadcastInactiveError,
     BroadcastVersionMismatchError,
+    ClientSeqStaleError,
     DEFAULT_CLIENT_STALE_SECONDS,
+    DEFAULT_FOLLOW_DELAY_MS,
+    QueueRevisionMismatchError,
     get_state,
 )
 
@@ -47,6 +50,7 @@ CONTROL_ACTIONS = {
     "queue.playItem",
 }
 SESSION_ACTIONS = {"session.subscribe", "session.unsubscribe"}
+FOLLOW_ACTIONS = {"follow.start", "follow.stop"}
 BROADCAST_ACTIONS = {
     "broadcast.start",
     "broadcast.stop",
@@ -62,6 +66,8 @@ ACTION_EVENT_NAMES = {
     "device.register": "device_register",
     "session.subscribe": "session_subscribe",
     "session.unsubscribe": "session_unsubscribe",
+    "follow.start": "follow_start",
+    "follow.stop": "follow_stop",
     "playback.update": "playback_update",
     "queue.local.get": "queue_local_get",
     "queue.local.set": "queue_local_set",
@@ -86,9 +92,20 @@ CONTROL_POLICIES = {
 
 
 class BroadcastConflictError(Exception):
-    def __init__(self, message, current_version=None):
+    def __init__(self, message, current_version=None, current_control_version=None):
         super().__init__(message)
         self.current_version = current_version
+        self.current_control_version = current_control_version
+
+
+class QueueConflictError(Exception):
+    def __init__(self, message, current_queue_revision=None):
+        super().__init__(message)
+        self.current_queue_revision = current_queue_revision
+
+
+class FollowControlForbiddenError(PermissionError):
+    pass
 
 
 def _log_emo_event(level, event, **fields):
@@ -188,14 +205,24 @@ def _log_socket_access(event):
 
 
 def _build_message(msg_type, action, payload=None, **extra):
+    timestamp = time.time()
+    message_payload = payload or {}
+    if isinstance(message_payload, dict):
+        message_payload = dict(message_payload)
+        if "serverUpdatedAtMs" in message_payload:
+            message_payload["serverTimeMs"] = int(timestamp * 1000)
     message = {
         "type": msg_type,
         "action": action,
-        "payload": payload or {},
-        "timestamp": time.time(),
+        "payload": message_payload,
+        "timestamp": timestamp,
     }
     message.update(extra)
     return message
+
+
+def _server_time_ms():
+    return int(time.time() * 1000)
 
 
 def _send_ack(request_id=None, payload=None):
@@ -314,16 +341,16 @@ def _push_session_snapshot(sid, session_id):
 
 
 def _restorePersistedState(sid, session_id):
+    client_info = state.get_client_for_sid(sid)
+    client_id = None if client_info is None else client_info.get("clientId")
+
     queue_state = state.get_queue(session_id)
     if queue_state is None:
         queue_state = getQueueState(session_id)
         if queue_state is not None:
-            state.update_queue(
+            queue_state = state.restore_queue(
                 session_id,
-                queue_state.get("queueSongIds") or [],
-                queue_state.get("currentIndex", 0),
-                queue_state.get("positionMs", 0),
-                queue_state.get("sourceClientId"),
+                queue_state,
             )
 
     if queue_state is not None:
@@ -337,19 +364,28 @@ def _restorePersistedState(sid, session_id):
     local_queues = state.list_local_queues(session_id)
     if not local_queues:
         local_queues = getLocalQueueStates(session_id)
+        restored_local_queues = []
         for local_queue in local_queues:
-            state.update_local_queue(
-                session_id,
-                local_queue.get("sourceClientId"),
-                local_queue.get("queueSongIds") or [],
-                local_queue.get("currentIndex", 0),
-                local_queue.get("positionMs", 0),
+            restored_local_queues.append(
+                state.restore_local_queue(
+                    session_id,
+                    local_queue.get("sourceClientId"),
+                    local_queue,
+                )
             )
+        local_queues = [
+            local_queue
+            for local_queue in restored_local_queues
+            if local_queue is not None
+        ]
     logger.debug("First Restoring %d local queues for session %s, sid %s", len(local_queues), session_id, sid)
     for local_queue in local_queues:
-        client_info = state.get_client_for_sid(sid) # Try to find the client_id associated with this sid
-        logger.debug(f"test local_queue sourceClientId={local_queue.get('sourceClientId')}, client_id={client_info['clientId']}")
-        if client_info and local_queue.get("sourceClientId") == client_info['clientId']:
+        logger.debug(
+            "Restoring local_queue sourceClientId=%s, client_id=%s",
+            local_queue.get("sourceClientId"),
+            client_id,
+        )
+        if client_id and local_queue.get("sourceClientId") == client_id:
             continue  # Skip sending the local queue back to its own client, as it should already have the latest state
         socketio.emit(
             "message",
@@ -358,15 +394,51 @@ def _restorePersistedState(sid, session_id):
             namespace="/emo",
         )
 
+    if client_id:
+        active_broadcast_id = state.get_active_broadcast_for_client(client_id)
+        active_broadcast = (
+            None if active_broadcast_id is None else state.get_broadcast(active_broadcast_id)
+        )
+        if active_broadcast is not None:
+            participant_state = (
+                state.get_broadcast_participant_state(active_broadcast_id, client_id)
+                or {}
+            )
+            state.update_broadcast_participant_state(
+                active_broadcast_id,
+                client_id,
+                session_id,
+                participant_state,
+                online=True,
+            )
+            socketio.emit(
+                "message",
+                _build_message(
+                    "state",
+                    "broadcast.status",
+                    _build_broadcast_status_payload(active_broadcast),
+                ),
+                to=sid,
+                namespace="/emo",
+            )
+
     playback_states = state.list_playback_states(session_id)
     if not playback_states:
         playback_states = getPlaybackStates(session_id)
+        restored_playback_states = []
         for playback_state in playback_states:
-            state.update_playback_state(
-                session_id,
-                playback_state.get("sourceClientId"),
-                playback_state,
+            restored_playback_states.append(
+                state.restore_playback_state(
+                    session_id,
+                    playback_state.get("sourceClientId"),
+                    playback_state,
+                )
             )
+        playback_states = [
+            playback_state
+            for playback_state in restored_playback_states
+            if playback_state is not None
+        ]
 
     for playback_state in playback_states:
         socketio.emit(
@@ -433,6 +505,8 @@ def _route_command(sender, message):
     if target_client.get("userName") != sender.get("userName"):
         raise PermissionError("Cross-user control is not allowed")
 
+    _ensure_not_follow_source_control(sender, target_client_id, message["action"])
+
     outgoing = _build_message(
         "command",
         message["action"],
@@ -442,6 +516,44 @@ def _route_command(sender, message):
         targetClientId=target_client_id,
     )
     socketio.emit("message", outgoing, to=target_sid, namespace="/emo")
+
+
+def _get_active_follow_relationship(client_id):
+    if not client_id:
+        return None
+    return state.get_follow_relationship(client_id)
+
+
+def _ensure_not_follow_source_control(current_client, target_client_id, action):
+    if current_client is None:
+        return
+    relationship = _get_active_follow_relationship(current_client.get("clientId"))
+    if relationship is None:
+        return
+    if relationship.get("sourceClientId") != target_client_id:
+        return
+    if action in CONTROL_ACTIONS:
+        raise FollowControlForbiddenError(
+            "Follow participants cannot control the source timeline"
+        )
+
+
+def _ensure_not_follow_source_queue_update(current_client, session_id, owner_client_id=None):
+    if current_client is None:
+        return
+    relationship = _get_active_follow_relationship(current_client.get("clientId"))
+    if relationship is None:
+        return
+    if (
+        relationship.get("sourceSessionId") == session_id
+        or (
+            owner_client_id is not None
+            and relationship.get("sourceClientId") == owner_client_id
+        )
+    ):
+        raise FollowControlForbiddenError(
+            "Follow participants cannot control the source timeline"
+        )
 
 
 def _new_broadcast_id():
@@ -457,16 +569,33 @@ def _is_int(value):
 
 
 def _build_broadcast_core_payload(broadcast, extra=None):
+    server_time_ms = _server_time_ms()
+    server_updated_at_ms = broadcast.get("serverUpdatedAtMs")
+    if server_updated_at_ms is None and isinstance(broadcast.get("updatedAt"), (int, float)):
+        server_updated_at_ms = int(broadcast["updatedAt"] * 1000)
     payload = {
         "broadcastId": broadcast.get("broadcastId"),
+        "timelineId": broadcast.get("timelineId") or f"broadcast:{broadcast.get('broadcastId')}",
+        "authorityClientId": broadcast.get("authorityClientId") or "server",
+        "originClientId": broadcast.get("originClientId") or broadcast.get("updatedByClientId"),
+        "ownerClientId": broadcast.get("ownerClientId"),
+        "participants": list(broadcast.get("participants") or []),
         "queueSongIds": list(broadcast.get("queueSongIds") or []),
         "currentIndex": broadcast.get("currentIndex", 0),
         "trackId": broadcast.get("trackId"),
         "positionMs": broadcast.get("positionMs", 0),
         "state": broadcast.get("state") or "stopped",
         "version": broadcast.get("version", 0),
+        "epoch": broadcast.get("epoch", 0),
+        "queueRevision": broadcast.get("queueRevision", 0),
+        "controlVersion": broadcast.get("controlVersion", broadcast.get("version", 0)),
+        "serverUpdatedAtMs": server_updated_at_ms,
+        "serverTimeMs": server_time_ms,
+        "playbackRate": broadcast.get("playbackRate", 1.0),
+        "followDelayMs": broadcast.get("followDelayMs", DEFAULT_FOLLOW_DELAY_MS),
         "updatedByClientId": broadcast.get("updatedByClientId"),
-        "updatedAt": broadcast.get("updatedAt"),
+        "controlPolicy": broadcast.get("controlPolicy"),
+        "updatedAt": None if server_updated_at_ms is None else server_updated_at_ms / 1000,
     }
     if extra:
         payload.update(extra)
@@ -475,7 +604,7 @@ def _build_broadcast_core_payload(broadcast, extra=None):
 
 def _build_broadcast_status_payload(broadcast):
     return {
-        "broadcast": dict(broadcast),
+        "broadcast": _build_broadcast_core_payload(broadcast),
         "participantStates": state.list_broadcast_participant_states(
             broadcast.get("broadcastId")
         ),
@@ -521,11 +650,31 @@ def _validate_broadcast_queue(queue_song_ids, current_index, position_ms):
         raise ValueError("empty queue must use currentIndex=0 and positionMs=0")
 
 
-def _get_broadcast_base_version(payload):
+def _get_broadcast_base_control_version(payload):
+    if "baseControlVersion" in payload:
+        base_version = payload.get("baseControlVersion")
+        if not _is_int(base_version):
+            raise ValueError("baseControlVersion must be an integer")
+        return base_version
     base_version = payload.get("baseVersion")
     if not _is_int(base_version):
         raise ValueError("baseVersion must be an integer")
     return base_version
+
+
+def _get_optional_broadcast_base_control_version(payload):
+    if "baseControlVersion" in payload or "baseVersion" in payload:
+        return _get_broadcast_base_control_version(payload)
+    return None
+
+
+def _get_base_queue_revision(payload):
+    if "baseQueueRevision" not in payload:
+        return None
+    base_revision = payload.get("baseQueueRevision")
+    if not _is_int(base_revision):
+        raise ValueError("baseQueueRevision must be an integer")
+    return base_revision
 
 
 def _update_active_broadcast_state(broadcast_id, updated_by_client_id, **kwargs):
@@ -540,8 +689,9 @@ def _update_active_broadcast_state(broadcast_id, updated_by_client_id, **kwargs)
         raise ValueError(str(exc))
     except BroadcastVersionMismatchError as exc:
         raise BroadcastConflictError(
-            "Broadcast queue version conflict",
+            "Broadcast control version conflict",
             current_version=exc.current_version,
+            current_control_version=exc.current_control_version,
         )
     if updated is None:
         raise LookupError("Broadcast not found")
@@ -764,7 +914,7 @@ def _handle_broadcast_status(current_user_name, current_client, payload, request
 def _handle_broadcast_queue_sync(current_user_name, current_client, payload, request_id):
     broadcast = _get_broadcast_from_payload(current_user_name, payload)
     _require_broadcast_control(current_client, broadcast)
-    base_version = _get_broadcast_base_version(payload)
+    base_version = _get_broadcast_base_control_version(payload)
 
     queue_song_ids = payload.get("queueSongIds")
     current_index = payload.get("currentIndex", 0)
@@ -780,6 +930,7 @@ def _handle_broadcast_queue_sync(current_user_name, current_client, payload, req
         position_ms=position_ms,
         state_name=state_name,
         expected_version=base_version,
+        increment_queue_revision=True,
     )
     _send_ack(request_id, {"updated": True, "broadcast": updated})
     _broadcast_to_participants(
@@ -795,7 +946,7 @@ def _handle_broadcast_queue_sync(current_user_name, current_client, payload, req
 def _handle_broadcast_play_item(current_user_name, current_client, payload, request_id):
     broadcast = _get_broadcast_from_payload(current_user_name, payload)
     _require_broadcast_control(current_client, broadcast)
-    base_version = _get_broadcast_base_version(payload)
+    base_version = _get_broadcast_base_control_version(payload)
 
     queue_index = payload.get("queueIndex")
     if not _is_int(queue_index) or queue_index < 0:
@@ -842,6 +993,7 @@ def _handle_broadcast_play(current_user_name, current_client, payload, request_i
         broadcast["broadcastId"],
         current_client.get("clientId"),
         state_name="playing",
+        expected_version=_get_optional_broadcast_base_control_version(payload),
     )
     _send_ack(request_id, {"updated": True, "broadcast": updated})
     _broadcast_to_participants(
@@ -868,6 +1020,7 @@ def _handle_broadcast_pause(current_user_name, current_client, payload, request_
         current_client.get("clientId"),
         position_ms=position_ms,
         state_name="paused",
+        expected_version=_get_optional_broadcast_base_control_version(payload),
     )
     _send_ack(request_id, {"updated": True, "broadcast": updated})
     _broadcast_to_participants(
@@ -891,6 +1044,7 @@ def _handle_broadcast_seek(current_user_name, current_client, payload, request_i
         broadcast["broadcastId"],
         current_client.get("clientId"),
         position_ms=position_ms,
+        expected_version=_get_optional_broadcast_base_control_version(payload),
     )
     _send_ack(request_id, {"updated": True, "broadcast": updated})
     _broadcast_to_participants(
@@ -910,9 +1064,16 @@ def _handle_broadcast_stop(current_user_name, current_client, payload, request_i
         updated = state.stop_broadcast(
             broadcast["broadcastId"],
             current_client.get("clientId"),
+            expected_version=_get_optional_broadcast_base_control_version(payload),
         )
     except BroadcastInactiveError as exc:
         raise ValueError(str(exc))
+    except BroadcastVersionMismatchError as exc:
+        raise BroadcastConflictError(
+            "Broadcast control version conflict",
+            current_version=exc.current_version,
+            current_control_version=exc.current_control_version,
+        )
     if updated is None:
         raise LookupError("Broadcast not found")
     _send_ack(request_id, {"stopped": True, "broadcast": updated})
@@ -979,6 +1140,73 @@ def _validate_player_request_state(payload):
         field_value = payload.get(field_name)
         if field_value is not None and not isinstance(field_value, bool):
             raise ValueError(f"player.requestState {field_name} must be a boolean")
+
+
+def _handle_follow_start(current_user_name, current_client, payload, request_id, sid):
+    if current_client is None:
+        raise PermissionError("Register the device before starting follow playback")
+
+    source_client_id = payload.get("sourceClientId") or payload.get("followSourceClientId")
+    if not isinstance(source_client_id, str) or not source_client_id:
+        raise ValueError("follow.start requires a non-empty sourceClientId")
+    if source_client_id == current_client.get("clientId"):
+        raise ValueError("follow.start sourceClientId cannot be the current client")
+
+    source_client = state.get_client(source_client_id)
+    if source_client is None:
+        raise LookupError("Follow source client is offline")
+    if source_client.get("userName") != current_user_name:
+        raise PermissionError("Cross-user follow is not allowed")
+
+    source_session_id = (
+        payload.get("sourceSessionId")
+        or payload.get("followSessionId")
+        or payload.get("sessionId")
+        or source_client.get("sessionId")
+    )
+    if not isinstance(source_session_id, str) or not source_session_id:
+        raise ValueError("follow.start requires a non-empty sourceSessionId")
+    if source_client.get("sessionId") != source_session_id:
+        raise ValueError("follow.start sourceSessionId must match the source client")
+
+    relationship = state.start_follow_relationship(
+        current_client.get("clientId"),
+        current_client.get("sessionId"),
+        source_client_id,
+        source_session_id,
+        current_user_name,
+    )
+    subscriptions = state.subscribe_session(sid, source_session_id)
+    _send_ack(
+        request_id,
+        {"relationship": relationship, "subscriptions": subscriptions},
+    )
+    _push_session_snapshot(sid, source_session_id)
+    return relationship
+
+
+def _handle_follow_stop(current_client, payload, request_id, sid):
+    if current_client is None:
+        raise PermissionError("Register the device before stopping follow playback")
+
+    relationship = state.stop_follow_relationship(current_client.get("clientId"))
+    session_id = payload.get("sourceSessionId") or payload.get("followSessionId") or payload.get("sessionId")
+    if session_id is None and relationship is not None:
+        session_id = relationship.get("sourceSessionId")
+
+    subscriptions = []
+    if session_id:
+        if not isinstance(session_id, str):
+            raise ValueError("follow.stop sessionId must be a string")
+        subscriptions = state.unsubscribe_session(sid, session_id)
+    else:
+        subscriptions = state.unsubscribe_session(sid)
+
+    _send_ack(
+        request_id,
+        {"relationship": relationship, "subscriptions": subscriptions},
+    )
+    return relationship
 
 
 def _resolve_local_queue_owner(current_user_name, current_client, payload):
@@ -1118,7 +1346,15 @@ class EmoNamespace(Namespace):
         state.prune_stale_clients(_get_client_stale_seconds())
 
         if action == "system.ping":
-            emit("message", _build_message("system", "system.pong", {}, requestId=request_id))
+            emit(
+                "message",
+                _build_message(
+                    "system",
+                    "system.pong",
+                    {"serverTimeMs": _server_time_ms()},
+                    requestId=request_id,
+                ),
+            )
             return
 
         if (session_info is None or not session_info.get("authenticated")) and action not in ALLOWED_PRE_AUTH:
@@ -1223,6 +1459,32 @@ class EmoNamespace(Namespace):
                         client_request_id=request_id,
                     )
                     _send_ack(request_id, {"subscriptions": subscriptions})
+            elif action in FOLLOW_ACTIONS:
+                if action == "follow.start":
+                    relationship = _handle_follow_start(
+                        current_user_name,
+                        current_client,
+                        payload,
+                        request_id,
+                        request.sid,
+                    )
+                else:
+                    relationship = _handle_follow_stop(
+                        current_client,
+                        payload,
+                        request_id,
+                        request.sid,
+                    )
+                _log_emo_event(
+                    logging.INFO,
+                    _get_action_event_name(action),
+                    result="success",
+                    user=current_user_name,
+                    client_request_id=request_id,
+                    source_client_id=None if current_client is None else current_client.get("clientId"),
+                    target_client_id=None if relationship is None else relationship.get("sourceClientId"),
+                    session_id=None if relationship is None else relationship.get("sourceSessionId"),
+                )
             elif action in CONTROL_ACTIONS:
                 if current_client is None:
                     raise PermissionError("Register the device before sending commands")
@@ -1265,6 +1527,14 @@ class EmoNamespace(Namespace):
                 if current_client is None:
                     raise PermissionError("Register the device before publishing state")
                 session_id = payload.get("sessionId") or current_client.get("sessionId")
+                if not isinstance(session_id, str) or not session_id:
+                    raise ValueError("playback.update requires a non-empty sessionId")
+                payload_source_client_id = payload.get("sourceClientId")
+                if (
+                    payload_source_client_id is not None
+                    and payload_source_client_id != current_client.get("clientId")
+                ):
+                    raise PermissionError("Cannot publish playback for another client")
                 playback_payload = dict(payload)
                 playback_payload["sourceClientId"] = current_client.get("clientId")
                 broadcast_for_update = None
@@ -1283,7 +1553,7 @@ class EmoNamespace(Namespace):
                         raise PermissionError(
                             "Broadcast playback update requires active participant"
                         )
-                state.update_playback_state(
+                playback_payload = state.update_playback_state(
                     session_id,
                     current_client.get("clientId"),
                     playback_payload,
@@ -1325,12 +1595,10 @@ class EmoNamespace(Namespace):
                 if local_queue is None:
                     local_queue = getLocalQueueState(session_id, client_id)
                     if local_queue is not None:
-                        state.update_local_queue(
+                        local_queue = state.restore_local_queue(
                             session_id,
                             client_id,
-                            local_queue.get("queueSongIds") or [],
-                            local_queue.get("currentIndex", 0),
-                            local_queue.get("positionMs", 0),
+                            local_queue,
                         )
                 if local_queue is None:
                     _log_emo_event(
@@ -1368,6 +1636,11 @@ class EmoNamespace(Namespace):
                     current_user_name,
                     current_client,
                     payload,
+                )
+                _ensure_not_follow_source_queue_update(
+                    current_client,
+                    session_id,
+                    owner_client_id,
                 )
                 queue_song_ids = payload.get("queueSongIds")
                 targetClientId = message.get("targetClientId")
@@ -1434,10 +1707,27 @@ class EmoNamespace(Namespace):
                         owner_client_id,
                     )
             elif action == "queue.session.sync":
-                if current_client is None and not payload.get("clientId"):
+                if current_client is None:
                     raise PermissionError("Register the device before syncing queue")
                 session_id = payload.get("sessionId") or current_client.get("sessionId")
+                if not isinstance(session_id, str) or not session_id:
+                    raise ValueError("queue.session.sync requires a non-empty sessionId")
                 current_client_id = payload.get("clientId") or current_client.get("clientId")
+                if not isinstance(current_client_id, str) or not current_client_id:
+                    raise ValueError("queue.session.sync clientId must be a non-empty string")
+                if payload.get("clientId"):
+                    owner_client = state.get_client(current_client_id)
+                    if owner_client is None:
+                        raise LookupError("Queue owner client is offline")
+                    if owner_client.get("userName") != current_user_name:
+                        raise PermissionError("Cross-user queue sync is not allowed")
+                    if owner_client.get("sessionId") != session_id:
+                        raise ValueError("queue.session.sync clientId must belong to sessionId")
+                _ensure_not_follow_source_queue_update(
+                    current_client,
+                    session_id,
+                    current_client_id,
+                )
                 queue_song_ids = payload.get("queueSongIds")
                 if not isinstance(queue_song_ids, list):
                     raise ValueError("queueSongIds must be a list")
@@ -1455,13 +1745,20 @@ class EmoNamespace(Namespace):
                 elif current_index != 0 or position_ms != 0:
                     raise ValueError("empty queue must use currentIndex=0 and positionMs=0")
 
-                state.update_queue(
-                    session_id,
-                    queue_song_ids,
-                    current_index,
-                    position_ms,
-                    current_client_id,
-                )
+                try:
+                    queue_state = state.update_queue(
+                        session_id,
+                        queue_song_ids,
+                        current_index,
+                        position_ms,
+                        current_client_id,
+                        expected_queue_revision=_get_base_queue_revision(payload),
+                    )
+                except QueueRevisionMismatchError as exc:
+                    raise QueueConflictError(
+                        "Queue revision conflict",
+                        current_queue_revision=exc.current_revision,
+                    )
                 saveQueueState(
                     session_id,
                     current_user_name,
@@ -1484,7 +1781,7 @@ class EmoNamespace(Namespace):
                         position_ms,
                     ),
                 )
-                _send_ack(request_id, {"updated": True})
+                _send_ack(request_id, {"updated": True, "queue": queue_state})
                 _broadcast_queue(current_user_name, session_id)
             elif action == "queue.ready.complete":
                 ready_payload = _build_ready_complete_payload(current_client, payload)
@@ -1518,6 +1815,34 @@ class EmoNamespace(Namespace):
                     source_client_id=None if current_client is None else current_client.get("clientId"),
                 )
                 _send_error("not_supported", f"Unsupported action: {action}", request_id)
+        except QueueConflictError as exc:
+            event_name = _get_action_event_name(action) or "bad_message"
+            _log_emo_event(
+                logging.WARNING,
+                event_name,
+                result="conflict",
+                reason=str(exc),
+                **_build_action_log_context(
+                    action,
+                    request_id,
+                    current_user_name,
+                    current_client,
+                    payload,
+                    message,
+                ),
+            )
+            error_payload = {"code": "conflict", "message": str(exc)}
+            if exc.current_queue_revision is not None:
+                error_payload["currentQueueRevision"] = exc.current_queue_revision
+            emit(
+                "message",
+                _build_message(
+                    "system",
+                    "system.error",
+                    error_payload,
+                    requestId=request_id,
+                ),
+            )
         except BroadcastConflictError as exc:
             event_name = _get_action_event_name(action) or "bad_message"
             _log_emo_event(
@@ -1537,6 +1862,8 @@ class EmoNamespace(Namespace):
             error_payload = {"code": "conflict", "message": str(exc)}
             if exc.current_version is not None:
                 error_payload["currentVersion"] = exc.current_version
+            if exc.current_control_version is not None:
+                error_payload["currentControlVersion"] = exc.current_control_version
             emit(
                 "message",
                 _build_message(
@@ -1546,6 +1873,50 @@ class EmoNamespace(Namespace):
                     requestId=request_id,
                 ),
             )
+        except ClientSeqStaleError as exc:
+            _log_emo_event(
+                logging.WARNING,
+                _get_action_event_name(action) or "bad_message",
+                result="stale_client_seq",
+                reason=str(exc),
+                **_build_action_log_context(
+                    action,
+                    request_id,
+                    current_user_name,
+                    current_client,
+                    payload,
+                    message,
+                ),
+            )
+            emit(
+                "message",
+                _build_message(
+                    "system",
+                    "system.error",
+                    {
+                        "code": "stale_client_seq",
+                        "message": str(exc),
+                        "currentClientSeq": exc.current_seq,
+                    },
+                    requestId=request_id,
+                ),
+            )
+        except FollowControlForbiddenError as exc:
+            _log_emo_event(
+                logging.WARNING,
+                "unauthorized_action",
+                result="follow_control_forbidden",
+                reason=str(exc),
+                **_build_action_log_context(
+                    action,
+                    request_id,
+                    current_user_name,
+                    current_client,
+                    payload,
+                    message,
+                ),
+            )
+            _send_error("follow_control_forbidden", str(exc), request_id)
         except PermissionError as exc:
             _log_emo_event(
                 logging.WARNING,

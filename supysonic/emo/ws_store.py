@@ -22,6 +22,10 @@ def getQueueState(session_id):
             "currentIndex": record.current_index,
             "positionMs": record.position_ms,
             "sourceClientId": record.owner_client_id,
+            "queueRevision": record.version,
+            "version": record.version,
+            "controlVersion": record.version,
+            "serverUpdatedAtMs": int(record.updated_at.timestamp() * 1000),
             "updatedAt": record.updated_at.timestamp(),
         }
     finally:
@@ -71,6 +75,7 @@ def getLocalQueueState(session_id, client_id):
             "queueSongIds": json.loads(record.queue_json),
             "currentIndex": record.current_index,
             "positionMs": record.position_ms,
+            "serverUpdatedAtMs": int(record.updated_at.timestamp() * 1000),
             "updatedAt": record.updated_at.timestamp(),
         }
     finally:
@@ -90,6 +95,7 @@ def getLocalQueueStates(session_id):
                     "queueSongIds": json.loads(record.queue_json),
                     "currentIndex": record.current_index,
                     "positionMs": record.position_ms,
+                    "serverUpdatedAtMs": int(record.updated_at.timestamp() * 1000),
                     "updatedAt": record.updated_at.timestamp(),
                 }
             )
@@ -136,6 +142,7 @@ def getPlaybackState(session_id, client_id):
             return None
 
         payload = json.loads(record.playback_json) if record.playback_json else {}
+        payload.pop("serverTimeMs", None)
         payload.update(
             {
                 "sessionId": record.session_id,
@@ -147,6 +154,7 @@ def getPlaybackState(session_id, client_id):
                 "updatedAt": record.updated_at.timestamp(),
             }
         )
+        payload.setdefault("serverUpdatedAtMs", int(record.updated_at.timestamp() * 1000))
         return payload
     finally:
         close_connection()
@@ -159,6 +167,7 @@ def getPlaybackStates(session_id):
         query = EmoPlaybackState.select().where(EmoPlaybackState.session_id == session_id)
         for record in query:
             payload = json.loads(record.playback_json) if record.playback_json else {}
+            payload.pop("serverTimeMs", None)
             payload.update(
                 {
                     "sessionId": record.session_id,
@@ -170,6 +179,7 @@ def getPlaybackStates(session_id):
                     "updatedAt": record.updated_at.timestamp(),
                 }
             )
+            payload.setdefault("serverUpdatedAtMs", int(record.updated_at.timestamp() * 1000))
             payloads.append(payload)
         return payloads
     finally:
@@ -184,6 +194,7 @@ def savePlaybackState(session_id, user_name, client_id, playback_state):
     volume = payload.get("volume")
     payload.pop("sessionId", None)
     payload.pop("updatedAt", None)
+    payload.pop("serverTimeMs", None)
 
     open_connection(reuse=True)
     try:

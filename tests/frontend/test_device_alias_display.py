@@ -22,11 +22,13 @@ def clear_emo_state():
     state._queues.clear()
     state._local_queues.clear()
     state._playback_states.clear()
+    state._playback_timelines.clear()
     state._session_subscriptions.clear()
     state._broadcasts.clear()
     state._broadcast_participants.clear()
     state._broadcast_playback_states.clear()
     state._client_active_broadcast.clear()
+    state._follow_relationships.clear()
 
 
 class DeviceAliasDisplayTestCase(FrontendTestBase):
@@ -83,6 +85,9 @@ class DeviceAliasDisplayTestCase(FrontendTestBase):
         self.assertIn('id="control-follow-panel"', template)
         self.assertIn("function startFollowPlayback()", template)
         self.assertIn("function renderFollowPanel()", template)
+        self.assertIn("action: 'follow.start'", template)
+        self.assertIn("sourceClientId: target.clientId", template)
+        self.assertIn("action: 'follow.stop'", template)
         self.assertIn("payload.sourceClientId === controlState.follow.followSourceClientId", template)
         self.assertIn("clientId: controlState.selectedClientId", template)
         self.assertIn("pendingFollow", template)
@@ -101,8 +106,23 @@ class DeviceAliasDisplayTestCase(FrontendTestBase):
         self.assertIn("sendBroadcastMessage('broadcast.start', 'command', payload)", template)
         self.assertIn("startBroadcastPlayback('allOnlinePlayers')", template)
         self.assertIn("startBroadcastPlayback('selectedClients')", template)
+        self.assertIn("baseControlVersion: controlState.broadcast.broadcast?.controlVersion", template)
         self.assertIn("baseVersion: controlState.broadcast.broadcast?.version", template)
+        self.assertIn("baseQueueRevision: currentQueue?.queueRevision", template)
         self.assertIn("sendBroadcastTransport('broadcast.seek', { positionMs })", template)
+
+    def test_control_template_session_queue_sync_uses_selected_player_owner(self):
+        template = read_project_file("supysonic", "templates", "control.html")
+        start = template.index("function sendQueueSync()")
+        end = template.index("function sendLocalQueue()", start)
+        body = template[start:end]
+
+        self.assertIn(
+            "!controlState.selectedSessionId || !controlState.selectedClientId",
+            body,
+        )
+        self.assertIn("clientId: controlState.selectedClientId", body)
+        self.assertIn("baseQueueRevision: currentQueue?.queueRevision", body)
 
     def test_devices_template_uses_alias_display_helper_for_refreshes(self):
         template = read_project_file("supysonic", "templates", "devices.html")
