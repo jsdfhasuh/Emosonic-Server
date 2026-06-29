@@ -78,6 +78,11 @@
                 {% endblock %}
               </li>
               <li class="nav-item">
+                {% block navbar_player %}
+                <a class="nav-link" href="{{ url_for('frontend.player_index') }}"><span data-i18n-en="Player" data-i18n-zh="播放器">Player</span></a>
+                {% endblock %}
+              </li>
+              <li class="nav-item">
                 {% block navbar_recommendations %}
                 <a class="nav-link" href="{{ url_for('frontend.recommendation_index') }}"><span data-i18n-en="Recommendations" data-i18n-zh="推荐">Recommendations</span></a>
                 {% endblock %}

@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from typing import Dict, List, Optional, Sequence
 
 from flask import (
@@ -1196,6 +1197,102 @@ def control_index():
     return render_template("control.html")
 
 
+PLAYER_SEARCH_LIMIT = 50
+PLAYER_MAX_SEARCH_LIMIT = 100
+
+
+def _player_stream_url(track_id):
+    return f"{request.script_root}/rest/stream.view?id={track_id}&c=web-player"
+
+
+def _player_track_payload(track):
+    track_id = str(track.id)
+    artist_name = track.artist.get_artist_name()
+    album_name = track.album.name
+    return {
+        "id": track_id,
+        "title": track.title,
+        "artist": artist_name,
+        "album": album_name,
+        "label": f"{track.title} - {artist_name}",
+        "durationMs": (track.duration or 0) * 1000,
+        "coverUrl": url_for("frontend.player_cover", eid=track_id),
+        "streamUrl": _player_stream_url(track_id),
+    }
+
+
+def _player_query_limit(default=PLAYER_SEARCH_LIMIT):
+    raw_limit = request.args.get("limit", default)
+    try:
+        limit = int(raw_limit)
+    except (TypeError, ValueError):
+        limit = default
+    return max(1, min(limit, PLAYER_MAX_SEARCH_LIMIT))
+
+
+def _valid_track_ids(raw_ids):
+    valid_ids = []
+    for track_id in raw_ids:
+        try:
+            uuid.UUID(track_id)
+            valid_ids.append(track_id)
+        except ValueError:
+            continue
+    return valid_ids
+
+
+@frontend.route("/player")
+@login_only
+def player_index():
+    return render_template("player.html")
+
+
+@frontend.route("/player/search")
+@login_only
+def player_search():
+    query = (request.args.get("q") or request.args.get("query") or "").strip()
+    limit = _player_query_limit()
+
+    tracks = (
+        Track.select(Track, Artist, Album)
+        .join(Artist, on=(Track.artist == Artist.id))
+        .switch(Track)
+        .join(Album, on=(Track.album == Album.id))
+    )
+    if query:
+        tracks = tracks.where(
+            (Track.title.contains(query))
+            | (Artist.name.contains(query))
+            | (Album.name.contains(query))
+        )
+    tracks = tracks.order_by(Track.created.desc()).limit(limit)
+
+    return jsonify({"tracks": [_player_track_payload(track) for track in tracks]})
+
+
+@frontend.route("/player/track-meta")
+@login_only
+def player_track_meta():
+    valid_ids = _valid_track_ids(request.args.getlist("ids"))
+    result = {}
+    if valid_ids:
+        tracks = (
+            Track.select(Track, Artist, Album)
+            .join(Artist, on=(Track.artist == Artist.id))
+            .switch(Track)
+            .join(Album, on=(Track.album == Album.id))
+            .where(Track.id.in_(valid_ids))
+        )
+        result = {str(track.id): _player_track_payload(track) for track in tracks}
+    return jsonify(result)
+
+
+@frontend.route("/player/cover/<eid>")
+@login_only
+def player_cover(eid):
+    return control_cover(eid)
+
+
 @frontend.route("/control/cover/<eid>")
 @login_only
 def control_cover(eid):
@@ -1240,14 +1337,7 @@ def control_cover(eid):
 @frontend.route("/control/track-meta")
 @login_only
 def control_track_meta():
-    ids = request.args.getlist("ids")
-    valid_ids = []
-    for track_id in ids:
-        try:
-            uuid.UUID(track_id)
-            valid_ids.append(track_id)
-        except ValueError:
-            continue
+    valid_ids = _valid_track_ids(request.args.getlist("ids"))
 
     result = {}
     if valid_ids:

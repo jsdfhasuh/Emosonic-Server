@@ -1314,6 +1314,185 @@ body[data-bs-theme="dark"] .recommendation-agent-health {
   background: rgba(255, 255, 255, 0.06);
 }
 
+.player-workspace .card {
+  border-color: var(--console-border);
+}
+
+.player-accent .console-metric-value {
+  font-size: clamp(1.15rem, 1.8vw, 2rem);
+}
+
+.player-id-value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.player-now-layout {
+  display: grid;
+  grid-template-columns: minmax(132px, 180px) minmax(0, 1fr);
+  gap: 1.25rem;
+  align-items: center;
+}
+
+.player-cover-frame {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  aspect-ratio: 1;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--console-border-strong);
+  border-radius: 8px;
+  background: var(--console-surface-strong);
+}
+
+.player-cover-frame img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.player-cover-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  color: var(--console-text);
+  font-family: "Consolas", "SFMono-Regular", monospace;
+  font-size: 2.4rem;
+  font-weight: 700;
+  background:
+    linear-gradient(135deg, rgba(82, 168, 255, 0.18), rgba(47, 138, 91, 0.16)),
+    var(--console-surface);
+}
+
+.player-now-meta {
+  min-width: 0;
+}
+
+.player-now-meta h2 {
+  margin: 0 0 0.4rem;
+  overflow-wrap: anywhere;
+  font-size: 1.7rem;
+  line-height: 1.18;
+}
+
+.player-track-detail {
+  overflow: hidden;
+  color: var(--console-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.player-status-line {
+  margin-top: 0.9rem;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid var(--console-border);
+  border-radius: 8px;
+  color: var(--console-muted);
+  background: var(--console-surface);
+}
+
+.player-transport {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(52px, 1fr));
+  gap: 0.75rem;
+}
+
+.player-transport .btn {
+  min-height: 48px;
+  font-size: 1.15rem;
+}
+
+.player-play-button {
+  font-size: 1.25rem;
+}
+
+.player-progress-block {
+  color: var(--console-muted);
+  font-family: "Consolas", "SFMono-Regular", monospace;
+  font-size: 0.9rem;
+}
+
+.player-search-results,
+.player-queue-list {
+  min-height: 320px;
+  max-height: 58vh;
+  overflow: auto;
+  border: 1px solid var(--console-border);
+  border-radius: 8px;
+  background: var(--console-surface);
+}
+
+.player-search-item,
+.player-queue-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  gap: 0.85rem;
+  padding: 0.85rem;
+  border: 0;
+  border-bottom: 1px solid var(--console-border);
+  color: var(--console-text);
+  text-align: left;
+  background: transparent;
+}
+
+.player-search-item:last-child,
+.player-queue-item:last-child {
+  border-bottom: 0;
+}
+
+.player-search-item strong,
+.player-queue-item strong {
+  display: block;
+  overflow-wrap: anywhere;
+  line-height: 1.2;
+}
+
+.player-search-item small,
+.player-queue-item small {
+  display: block;
+  margin-top: 0.2rem;
+  color: var(--console-muted);
+}
+
+.player-search-item .btn-group {
+  flex-shrink: 0;
+}
+
+.player-queue-item {
+  justify-content: flex-start;
+}
+
+.player-queue-item:hover,
+.player-queue-item.active {
+  background: var(--console-brand-soft);
+}
+
+.player-queue-index {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 2rem;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 8px;
+  color: var(--console-text);
+  background: var(--console-surface-strong);
+  font-family: "Consolas", "SFMono-Regular", monospace;
+  font-size: 0.8rem;
+}
+
+.player-queue-summary {
+  color: var(--console-muted);
+  font-size: 0.9rem;
+}
+
 @media (max-width: 991.98px) {
   body {
     padding-top: 78px;
@@ -1392,5 +1571,27 @@ body[data-bs-theme="dark"] .recommendation-agent-health {
 
   .recommendation-agent-form {
     grid-template-columns: 1fr;
+  }
+
+  .player-now-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .player-cover-frame {
+    max-width: 240px;
+    margin: 0 auto;
+  }
+
+  .player-search-item {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .player-search-item .btn-group {
+    width: 100%;
+  }
+
+  .player-search-item .btn {
+    flex: 1 1 auto;
   }
 }

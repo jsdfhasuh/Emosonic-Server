@@ -1,0 +1,1054 @@
+{% extends "layout.html" %}
+{% block title %}Player · Emosonic Server{% endblock %}
+{% block document_title_en %}Player · Emosonic Server{% endblock %}
+{% block document_title_zh %}播放器 · Emosonic Server{% endblock %}
+{% block page_container_class %}console-container-wide{% endblock %}
+{% block navbar_player %}
+<a class="nav-link active" aria-current="page" href="{{ url_for('frontend.player_index') }}"><span data-i18n-en="Player" data-i18n-zh="播放器">Player</span></a>
+{% endblock %}
+{% block page_title %}<span data-i18n-en="Web player" data-i18n-zh="网页播放器">Web player</span>{% endblock %}
+{% block page_subtitle %}<span data-i18n-en="Play music in this browser and expose it as a standard realtime player for the Emosonic control console." data-i18n-zh="在浏览器中播放音乐，并作为 Emosonic 控制台可发现、可控制的标准实时播放器。">Play music in this browser and expose it as a standard realtime player for the Emosonic control console.</span>{% endblock %}
+{% block body %}
+<div class="player-workspace"
+     data-player-search-url="{{ url_for('frontend.player_search') }}"
+     data-player-meta-url="{{ url_for('frontend.player_track_meta') }}">
+  <div class="row row-cols-1 row-cols-md-4 g-3 mb-3">
+    <div class="col">
+      <div class="card text-center h-100 console-metric-card player-accent">
+        <div class="card-header"><span data-i18n-en="Connection" data-i18n-zh="连接">Connection</span></div>
+        <div class="card-body">
+          <div class="console-metric-value" id="player-connection-state">OFFLINE</div>
+          <div class="console-metric-caption" data-i18n-en="Socket.IO player registration." data-i18n-zh="Socket.IO 播放器注册状态。">Socket.IO player registration.</div>
+        </div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card text-center h-100 console-metric-card player-accent">
+        <div class="card-header"><span data-i18n-en="Mode" data-i18n-zh="模式">Mode</span></div>
+        <div class="card-body">
+          <div class="console-metric-value" id="player-mode">LOCAL</div>
+          <div class="console-metric-caption" data-i18n-en="Local, session, or broadcast queue." data-i18n-zh="本地、会话或群播队列。">Local, session, or broadcast queue.</div>
+        </div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card text-center h-100 console-metric-card player-accent">
+        <div class="card-header"><span data-i18n-en="Client ID" data-i18n-zh="Client ID">Client ID</span></div>
+        <div class="card-body">
+          <div class="console-metric-value player-id-value" id="player-client-id">-</div>
+          <div class="console-metric-caption" data-i18n-en="Stable browser device id." data-i18n-zh="稳定浏览器设备 ID。">Stable browser device id.</div>
+        </div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card text-center h-100 console-metric-card player-accent">
+        <div class="card-header"><span data-i18n-en="Session ID" data-i18n-zh="Session ID">Session ID</span></div>
+        <div class="card-body">
+          <div class="console-metric-value player-id-value" id="player-session-id">-</div>
+          <div class="console-metric-caption" data-i18n-en="Shared playback session." data-i18n-zh="共享播放会话。">Shared playback session.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row g-3">
+    <div class="col-xl-5">
+      <div class="card h-100 player-now-card">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <span data-i18n-en="Now playing" data-i18n-zh="正在播放">Now playing</span>
+          <span class="console-scope-badge scope-local" id="player-active-queue">Local</span>
+        </div>
+        <div class="card-body">
+          <div class="player-now-layout">
+            <div class="player-cover-frame">
+              <img id="player-cover" alt="" src="" hidden>
+              <div class="player-cover-fallback" id="player-cover-fallback">EM</div>
+            </div>
+            <div class="player-now-meta">
+              <h2 id="player-track-title" data-i18n-en="No track loaded" data-i18n-zh="尚未载入歌曲">No track loaded</h2>
+              <div class="player-track-detail" id="player-track-artist">-</div>
+              <div class="player-track-detail" id="player-track-album">-</div>
+              <div class="player-status-line" id="player-status-line" data-i18n-en="Search for a track or accept a command from /control." data-i18n-zh="搜索歌曲，或等待 /control 下发命令。">Search for a track or accept a command from /control.</div>
+            </div>
+          </div>
+
+          <audio id="player-audio" preload="metadata"></audio>
+
+          <div class="player-transport mt-4">
+            <button type="button" class="btn btn-outline-dark" id="player-prev" aria-label="Previous" title="Previous" data-i18n-en="Previous" data-i18n-zh="上一首" data-i18n-attr="aria-label, title"><span aria-hidden="true">⏮</span></button>
+            <button type="button" class="btn btn-dark player-play-button" id="player-play" aria-label="Play" title="Play" data-i18n-en="Play" data-i18n-zh="播放" data-i18n-attr="aria-label, title"><span aria-hidden="true">▶</span></button>
+            <button type="button" class="btn btn-outline-dark" id="player-pause" aria-label="Pause" title="Pause" data-i18n-en="Pause" data-i18n-zh="暂停" data-i18n-attr="aria-label, title"><span aria-hidden="true">⏸</span></button>
+            <button type="button" class="btn btn-outline-dark" id="player-next" aria-label="Next" title="Next" data-i18n-en="Next" data-i18n-zh="下一首" data-i18n-attr="aria-label, title"><span aria-hidden="true">⏭</span></button>
+          </div>
+
+          <div class="player-progress-block mt-4">
+            <div class="d-flex justify-content-between gap-3">
+              <span id="player-position-label">0:00</span>
+              <span id="player-duration-label">0:00</span>
+            </div>
+            <input type="range" class="form-range" id="player-progress" min="0" max="1000" value="0">
+          </div>
+
+          <div class="row g-3 mt-2">
+            <div class="col-md-7">
+              <label class="form-label" for="player-volume"><span data-i18n-en="Volume" data-i18n-zh="音量">Volume</span></label>
+              <input type="range" class="form-range" id="player-volume" min="0" max="100" value="70">
+            </div>
+            <div class="col-md-5">
+              <label class="form-label" for="player-reset-device"><span data-i18n-en="Device identity" data-i18n-zh="设备身份">Device identity</span></label>
+              <button type="button" class="btn btn-light w-100" id="player-reset-device"><span data-i18n-en="Reset identity" data-i18n-zh="重置身份">Reset identity</span></button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-xl-4">
+      <div class="card h-100">
+        <div class="card-header"><span data-i18n-en="Library search" data-i18n-zh="曲库搜索">Library search</span></div>
+        <div class="card-body d-flex flex-column gap-3">
+          <form id="player-search-form" class="input-group">
+            <input type="search" class="form-control" id="player-search-input" placeholder="Search songs, artists, albums" data-i18n-en="Search songs, artists, albums" data-i18n-zh="搜索歌曲、艺人、专辑" data-i18n-attr="placeholder">
+            <button type="submit" class="btn btn-dark"><span data-i18n-en="Search" data-i18n-zh="搜索">Search</span></button>
+          </form>
+          <div class="player-search-results" id="player-search-results">
+            <div class="text-body-secondary p-3" data-i18n-en="Search results will appear here." data-i18n-zh="搜索结果会显示在这里。">Search results will appear here.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-xl-3">
+      <div class="card h-100">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <span data-i18n-en="Queue" data-i18n-zh="队列">Queue</span>
+          <div class="btn-group btn-group-sm" role="group" aria-label="Queue surface" data-i18n-en="Queue surface" data-i18n-zh="队列面板" data-i18n-attr="aria-label">
+            <button type="button" class="btn btn-outline-dark active" data-player-queue-tab="local">Local</button>
+            <button type="button" class="btn btn-outline-dark" data-player-queue-tab="session">Session</button>
+            <button type="button" class="btn btn-outline-dark" data-player-queue-tab="broadcast">Cast</button>
+          </div>
+        </div>
+        <div class="card-body d-flex flex-column gap-3">
+          <div class="player-queue-summary" id="player-queue-summary">0 items</div>
+          <div class="player-queue-list" id="player-queue-list">
+            <div class="text-body-secondary p-3" data-i18n-en="The current queue is empty." data-i18n-zh="当前队列为空。">The current queue is empty.</div>
+          </div>
+          <button type="button" class="btn btn-outline-danger btn-sm" id="player-clear-local"><span data-i18n-en="Clear local queue" data-i18n-zh="清空本地队列">Clear local queue</span></button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+<script>
+  const playerRoot = document.querySelector('.player-workspace');
+  const playerAudio = document.getElementById('player-audio');
+  const playerState = {
+    searchUrl: playerRoot.dataset.playerSearchUrl,
+    metaUrl: playerRoot.dataset.playerMetaUrl,
+    selfClientId: getStableId('emosonic.webPlayer.clientId', 'web-player'),
+    sessionId: getStableId('emosonic.webPlayer.sessionId', 'web-session'),
+    registered: false,
+    heartbeatTimer: null,
+    authRequestId: null,
+    registerRequestId: null,
+    trackMeta: {},
+    localQueue: [],
+    sessionQueue: [],
+    broadcastQueue: [],
+    localIndex: 0,
+    sessionIndex: 0,
+    broadcastIndex: 0,
+    activeQueueType: 'local',
+    visibleQueueType: 'local',
+    currentTrackId: null,
+    playbackState: 'stopped',
+    pendingSeekMs: 0,
+    pendingPlayIntent: false,
+    userGestureSeen: false,
+    lastProgressReportAt: 0,
+    initialReportTimer: null,
+    coverRequestToken: 0,
+    coverRequestKey: null,
+    broadcast: {
+      active: false,
+      broadcastId: null,
+      state: 'stopped',
+      version: null,
+    },
+  };
+
+  const socket = io(window.location.origin + '/emo', {
+    path: '/emo/ws',
+    transports: ['polling'],
+  });
+
+  function getStableId(storageKey, prefix) {
+    const existing = window.localStorage.getItem(storageKey);
+    if (existing) {
+      return existing;
+    }
+    const suffix = window.crypto && window.crypto.randomUUID
+      ? window.crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    const created = `${prefix}-${suffix}`;
+    window.localStorage.setItem(storageKey, created);
+    return created;
+  }
+
+  function escapeHtml(value) {
+    return String(value ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  }
+
+  function nextRequestId(prefix) {
+    return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  function formatPosition(positionMs) {
+    const totalSeconds = Math.max(0, Math.floor((Number(positionMs) || 0) / 1000));
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${minutes}:${String(seconds).padStart(2, '0')}`;
+  }
+
+  function currentPositionMs() {
+    return Math.max(0, Math.floor((playerAudio.currentTime || 0) * 1000));
+  }
+
+  function currentDurationMs() {
+    const duration = Number(playerAudio.duration);
+    if (Number.isFinite(duration) && duration > 0) {
+      return Math.floor(duration * 1000);
+    }
+    const metaDuration = Number(playerState.trackMeta[playerState.currentTrackId]?.durationMs);
+    return Number.isFinite(metaDuration) && metaDuration > 0 ? metaDuration : 0;
+  }
+
+  function activeQueueType() {
+    return playerState.broadcast.active ? 'broadcast' : playerState.activeQueueType;
+  }
+
+  function queueIds(queueType) {
+    if (queueType === 'broadcast') return playerState.broadcastQueue;
+    if (queueType === 'session') return playerState.sessionQueue;
+    return playerState.localQueue;
+  }
+
+  function queueIndex(queueType) {
+    if (queueType === 'broadcast') return playerState.broadcastIndex;
+    if (queueType === 'session') return playerState.sessionIndex;
+    return playerState.localIndex;
+  }
+
+  function setQueueIndex(queueType, index) {
+    if (queueType === 'broadcast') playerState.broadcastIndex = index;
+    else if (queueType === 'session') playerState.sessionIndex = index;
+    else playerState.localIndex = index;
+  }
+
+  function normalizeQueueIndex(ids, index) {
+    if (!ids.length) {
+      return 0;
+    }
+    const parsedIndex = Number.isInteger(index) ? index : 0;
+    return Math.max(0, Math.min(parsedIndex, ids.length - 1));
+  }
+
+  function activeQueueSongIds() {
+    return queueIds(activeQueueType());
+  }
+
+  function activeQueueIndex() {
+    return queueIndex(activeQueueType());
+  }
+
+  function setStatus(enText, zhText) {
+    document.getElementById('player-status-line').textContent = i18nText(enText, zhText);
+  }
+
+  function emitPlayerMessage(type, action, payload = {}, extra = {}) {
+    if (!socket.connected) {
+      return null;
+    }
+    const requestId = extra.requestId || nextRequestId(action);
+    socket.emit('message', {
+      type,
+      action,
+      requestId,
+      payload,
+      timestamp: Date.now() / 1000,
+      ...extra,
+    });
+    return requestId;
+  }
+
+  function sendHeartbeat() {
+    emitPlayerMessage('system', 'system.ping', {});
+  }
+
+  function startHeartbeat() {
+    window.clearInterval(playerState.heartbeatTimer);
+    sendHeartbeat();
+    playerState.heartbeatTimer = window.setInterval(sendHeartbeat, 30000);
+  }
+
+  function stopHeartbeat() {
+    window.clearInterval(playerState.heartbeatTimer);
+    playerState.heartbeatTimer = null;
+  }
+
+  function registerPlayer() {
+    playerState.registerRequestId = nextRequestId('web-player-register');
+    emitPlayerMessage('device', 'device.register', {
+      clientId: playerState.selfClientId,
+      deviceName: 'Web Player',
+      alias: i18nText('Web Player', '网页播放器'),
+      roles: ['player'],
+      sessionId: playerState.sessionId,
+      capabilities: {
+        playback: true,
+        localQueue: true,
+        sessionQueue: true,
+        broadcast: true,
+        volume: true,
+        seek: true,
+      },
+    }, { requestId: playerState.registerRequestId });
+  }
+
+  function requestLocalQueue() {
+    emitPlayerMessage('state', 'queue.local.get', {
+      sessionId: playerState.sessionId,
+      clientId: playerState.selfClientId,
+    });
+  }
+
+  function reportPlayback(stateName = playerState.playbackState) {
+    const payload = {
+      sessionId: playerState.sessionId,
+      trackId: playerState.currentTrackId,
+      state: stateName,
+      positionMs: currentPositionMs(),
+      volume: Math.round(playerAudio.volume * 100),
+      durationMs: currentDurationMs(),
+      queueType: activeQueueType() === 'broadcast' ? 'session' : activeQueueType(),
+    };
+    if (activeQueueType() === 'local') {
+      payload.queueClientId = playerState.selfClientId;
+    }
+    if (playerState.broadcast.active && playerState.broadcast.broadcastId) {
+      payload.broadcastId = playerState.broadcast.broadcastId;
+    }
+    emitPlayerMessage('event', 'playback.update', payload);
+  }
+
+  function syncLocalQueue(positionMs = currentPositionMs()) {
+    const currentIndex = playerState.localQueue.length ? playerState.localIndex : 0;
+    emitPlayerMessage('state', 'queue.local.set', {
+      sessionId: playerState.sessionId,
+      clientId: playerState.selfClientId,
+      queueSongIds: playerState.localQueue,
+      currentIndex,
+      positionMs: playerState.localQueue.length ? Math.max(0, Math.floor(positionMs)) : 0,
+    });
+  }
+
+  function syncSessionQueue(positionMs = currentPositionMs()) {
+    const currentIndex = playerState.sessionQueue.length ? playerState.sessionIndex : 0;
+    emitPlayerMessage('state', 'queue.session.sync', {
+      sessionId: playerState.sessionId,
+      queueSongIds: playerState.sessionQueue,
+      currentIndex,
+      positionMs: playerState.sessionQueue.length ? Math.max(0, Math.floor(positionMs)) : 0,
+    });
+  }
+
+  function syncActiveQueue(positionMs = currentPositionMs()) {
+    if (activeQueueType() === 'local') {
+      syncLocalQueue(positionMs);
+    } else if (activeQueueType() === 'session') {
+      syncSessionQueue(positionMs);
+    }
+  }
+
+  function sendReadyState(queueType = activeQueueType()) {
+    if (queueType !== 'local' && queueType !== 'session') {
+      return;
+    }
+    const payload = {
+      sessionId: playerState.sessionId,
+      queueType,
+      queueSongIds: queueIds(queueType),
+    };
+    if (queueType === 'local') {
+      payload.clientId = playerState.selfClientId;
+    }
+    emitPlayerMessage('state', 'queue.ready.complete', payload);
+  }
+
+  function ensureTrackMeta(trackIds) {
+    const missing = [...new Set(trackIds.filter(Boolean))]
+      .filter((trackId) => !playerState.trackMeta[trackId]);
+    if (!missing.length) {
+      return Promise.resolve();
+    }
+    const params = new URLSearchParams();
+    missing.forEach((trackId) => params.append('ids', trackId));
+    return fetch(`${playerState.metaUrl}?${params.toString()}`)
+      .then((response) => response.json())
+      .then((payload) => {
+        Object.assign(playerState.trackMeta, payload || {});
+      });
+  }
+
+  function setTrackMedia(trackId, positionMs = 0, autoplay = false, reportState = 'paused') {
+    return ensureTrackMeta([trackId]).then(() => {
+      const meta = playerState.trackMeta[trackId];
+      if (!meta) {
+        setStatus('Track metadata could not be loaded.', '歌曲元数据载入失败。');
+        return;
+      }
+      playerState.currentTrackId = trackId;
+      playerState.pendingSeekMs = Math.max(0, Number(positionMs) || 0);
+      playerAudio.src = meta.streamUrl;
+      playerAudio.load();
+      playerAudio.addEventListener('loadedmetadata', () => {
+        if (playerState.pendingSeekMs > 0) {
+          playerAudio.currentTime = playerState.pendingSeekMs / 1000;
+          playerState.pendingSeekMs = 0;
+        }
+        sendReadyState(activeQueueType());
+        updateProgress();
+      }, { once: true });
+      renderNowPlaying();
+      if (autoplay) {
+        attemptPlay();
+      } else if (reportState !== null) {
+        playerState.playbackState = reportState;
+        reportPlayback(reportState);
+      }
+    });
+  }
+
+  function playQueueItem(queueType, index, positionMs = 0, autoplay = true, reportState = 'paused', syncQueue = true) {
+    const ids = queueIds(queueType);
+    if (!ids.length || index < 0 || index >= ids.length) {
+      setStatus('Queue index is out of bounds.', '队列索引超出范围。');
+      return Promise.resolve(false);
+    }
+    if (queueType !== 'broadcast') {
+      playerState.activeQueueType = queueType;
+    }
+    playerState.visibleQueueType = queueType;
+    setQueueIndex(queueType, index);
+    return setTrackMedia(ids[index], positionMs, autoplay, reportState).then(() => {
+      if (syncQueue) {
+        syncActiveQueue(positionMs);
+      }
+      renderAll();
+      return true;
+    });
+  }
+
+  function attemptPlay() {
+    if (!playerAudio.src && playerState.currentTrackId) {
+      setTrackMedia(playerState.currentTrackId, currentPositionMs(), true);
+      return;
+    }
+    if (!playerAudio.src) {
+      const ids = activeQueueSongIds();
+      if (ids.length) {
+        playQueueItem(activeQueueType(), activeQueueIndex(), 0, true);
+      }
+      return;
+    }
+    playerState.pendingPlayIntent = true;
+    playerAudio.play()
+      .then(() => {
+        playerState.pendingPlayIntent = false;
+        playerState.playbackState = 'playing';
+        setStatus('Playing.', '正在播放。');
+        reportPlayback('playing');
+      })
+      .catch(() => {
+        playerState.playbackState = 'paused';
+        setStatus('Playback is waiting for a browser user gesture.', '浏览器正在等待用户点击后继续播放。');
+        reportPlayback('paused');
+      });
+  }
+
+  function pausePlayback() {
+    playerAudio.pause();
+    playerState.playbackState = 'paused';
+    reportPlayback('paused');
+  }
+
+  function seekTo(positionMs) {
+    const safePositionMs = Math.max(0, Math.floor(Number(positionMs) || 0));
+    if (playerAudio.src) {
+      playerAudio.currentTime = safePositionMs / 1000;
+    }
+    syncActiveQueue(safePositionMs);
+    reportPlayback(playerAudio.paused ? 'paused' : 'playing');
+    updateProgress();
+  }
+
+  function nextTrack() {
+    const type = activeQueueType();
+    const nextIndex = queueIndex(type) + 1;
+    if (nextIndex >= queueIds(type).length) {
+      playerState.playbackState = 'stopped';
+      reportPlayback('stopped');
+      setStatus('End of queue.', '已到队列末尾。');
+      return;
+    }
+    playQueueItem(type, nextIndex, 0, true);
+  }
+
+  function previousTrack() {
+    const type = activeQueueType();
+    const previousIndex = Math.max(0, queueIndex(type) - 1);
+    playQueueItem(type, previousIndex, 0, true);
+  }
+
+  function addToLocalQueue(trackId, playNow = false) {
+    if (!playerState.localQueue.includes(trackId)) {
+      playerState.localQueue.push(trackId);
+    }
+    if (playNow) {
+      playerState.localIndex = playerState.localQueue.indexOf(trackId);
+      playQueueItem('local', playerState.localIndex, 0, true);
+    } else {
+      syncLocalQueue(0);
+    }
+    playerState.visibleQueueType = 'local';
+    renderAll();
+  }
+
+  function applySessionQueue(payload) {
+    if (payload.sessionId && payload.sessionId !== playerState.sessionId) {
+      return;
+    }
+    playerState.sessionQueue = Array.isArray(payload.queueSongIds) ? payload.queueSongIds.slice() : [];
+    playerState.sessionIndex = normalizeQueueIndex(playerState.sessionQueue, payload.currentIndex);
+    ensureTrackMeta(playerState.sessionQueue).then(renderAll);
+    if (
+      playerState.sessionQueue.length &&
+      playerState.activeQueueType === 'session' &&
+      !playerState.broadcast.active
+    ) {
+      const currentTrackStillActive = playerState.currentTrackId === playerState.sessionQueue[playerState.sessionIndex];
+      if (!currentTrackStillActive) {
+        setTrackMedia(playerState.sessionQueue[playerState.sessionIndex], payload.positionMs || 0, false, null)
+          .then(renderAll);
+      } else {
+        renderAll();
+      }
+    }
+  }
+
+  function applyLocalQueue(payload) {
+    const ownerClientId = payload.sourceClientId || payload.clientId;
+    if (ownerClientId !== playerState.selfClientId) {
+      return;
+    }
+    if (payload.sessionId && payload.sessionId !== playerState.sessionId) {
+      return;
+    }
+    playerState.localQueue = Array.isArray(payload.queueSongIds) ? payload.queueSongIds.slice() : [];
+    playerState.localIndex = normalizeQueueIndex(playerState.localQueue, payload.currentIndex);
+    ensureTrackMeta(playerState.localQueue).then(renderAll);
+    if (
+      playerState.localQueue.length &&
+      !playerState.broadcast.active &&
+      (playerState.activeQueueType === 'local' || !playerState.currentTrackId)
+    ) {
+      const currentTrackStillActive = playerState.currentTrackId === playerState.localQueue[playerState.localIndex];
+      if (!currentTrackStillActive) {
+        playerState.activeQueueType = 'local';
+        setTrackMedia(playerState.localQueue[playerState.localIndex], payload.positionMs || 0, false, null)
+          .then(renderAll);
+      } else {
+        renderAll();
+      }
+    }
+  }
+
+  function applyBroadcastPayload(payload, autoplay = false) {
+    const broadcast = payload.broadcast || payload;
+    if (!broadcast || !broadcast.broadcastId) {
+      return;
+    }
+    playerState.broadcast.active = true;
+    playerState.broadcast.broadcastId = broadcast.broadcastId;
+    playerState.broadcast.state = broadcast.state || 'stopped';
+    playerState.broadcast.version = broadcast.version ?? null;
+    playerState.broadcastQueue = Array.isArray(broadcast.queueSongIds) ? broadcast.queueSongIds.slice() : [];
+    playerState.broadcastIndex = normalizeQueueIndex(playerState.broadcastQueue, broadcast.currentIndex);
+    playerState.visibleQueueType = 'broadcast';
+    ensureTrackMeta(playerState.broadcastQueue).then(renderAll);
+    if (playerState.broadcastQueue.length) {
+      const shouldAutoplay = autoplay || (broadcast.state === 'playing' && playerState.userGestureSeen);
+      playQueueItem(
+        'broadcast',
+        playerState.broadcastIndex,
+        broadcast.positionMs || 0,
+        shouldAutoplay,
+        null,
+        false
+      );
+      if (broadcast.state === 'playing' && !shouldAutoplay) {
+        setStatus('Playback restored. Click Play to resume in this browser.', '播放状态已恢复。点击播放即可在此浏览器继续。');
+      }
+    }
+  }
+
+  function applyPlaybackUpdate(payload) {
+    const ownerClientId = payload.sourceClientId || payload.clientId || payload.queueClientId;
+    if (ownerClientId && ownerClientId !== playerState.selfClientId) {
+      return;
+    }
+    if (payload.sessionId && payload.sessionId !== playerState.sessionId) {
+      return;
+    }
+    const trackId = payload.trackId || null;
+    if (
+      ownerClientId === playerState.selfClientId &&
+      !playerState.initialReportTimer &&
+      playerState.currentTrackId === trackId
+    ) {
+      return;
+    }
+    if (playerState.initialReportTimer) {
+      window.clearTimeout(playerState.initialReportTimer);
+      playerState.initialReportTimer = null;
+    }
+
+    const stateName = payload.state || (payload.trackId ? 'paused' : 'stopped');
+    const positionMs = Math.max(0, Number(payload.positionMs) || 0);
+    playerState.playbackState = stateName;
+
+    if (!trackId) {
+      if (stateName === 'stopped') {
+        playerAudio.pause();
+        playerAudio.removeAttribute('src');
+        playerAudio.load();
+        playerState.currentTrackId = null;
+      }
+      renderAll();
+      return;
+    }
+
+    const payloadQueueType = payload.queueType || payload.mode;
+    let queueType = 'session';
+    if (payload.broadcastId) {
+      playerState.broadcast.active = true;
+      playerState.broadcast.broadcastId = payload.broadcastId;
+      playerState.broadcast.state = stateName;
+      queueType = 'broadcast';
+    } else if (
+      payloadQueueType === 'local' ||
+      payload.queueClientId === playerState.selfClientId ||
+      (!payloadQueueType && playerState.localQueue.includes(trackId))
+    ) {
+      queueType = 'local';
+    }
+
+    if (queueType !== 'broadcast') {
+      playerState.activeQueueType = queueType;
+    }
+    playerState.visibleQueueType = queueType;
+
+    const ids = queueIds(queueType);
+    const index = ids.indexOf(trackId);
+    const shouldAutoplay = stateName === 'playing' && playerState.userGestureSeen;
+    if (index >= 0) {
+      playQueueItem(queueType, index, positionMs, shouldAutoplay, null, false)
+        .then(() => {
+          if (stateName === 'playing' && !shouldAutoplay) {
+            setStatus('Playback restored. Click Play to resume in this browser.', '播放状态已恢复。点击播放即可在此浏览器继续。');
+          }
+        });
+    } else {
+      setTrackMedia(trackId, positionMs, shouldAutoplay, null).then(() => {
+        renderAll();
+        if (stateName === 'playing' && !shouldAutoplay) {
+          setStatus('Playback restored. Click Play to resume in this browser.', '播放状态已恢复。点击播放即可在此浏览器继续。');
+        }
+      });
+    }
+  }
+
+  function stopBroadcast() {
+    playerState.broadcast.active = false;
+    playerState.broadcast.broadcastId = null;
+    playerState.broadcast.state = 'stopped';
+    playerState.broadcast.version = null;
+    if (activeQueueType() === 'broadcast') {
+      playerState.activeQueueType = 'local';
+    }
+    playerAudio.pause();
+    renderAll();
+    reportPlayback('paused');
+  }
+
+  function handleCommand(message) {
+    if (message.targetClientId && message.targetClientId !== playerState.selfClientId) {
+      return;
+    }
+    const payload = message.payload || {};
+    if (message.action === 'player.play') {
+      attemptPlay();
+    } else if (message.action === 'player.pause') {
+      pausePlayback();
+    } else if (message.action === 'player.next') {
+      nextTrack();
+    } else if (message.action === 'player.prev') {
+      previousTrack();
+    } else if (message.action === 'player.seek') {
+      seekTo(payload.positionMs);
+    } else if (message.action === 'player.setVolume') {
+      const volume = Math.max(0, Math.min(100, Number(payload.volume) || 0));
+      playerAudio.volume = volume / 100;
+      document.getElementById('player-volume').value = String(volume);
+      reportPlayback(playerAudio.paused ? 'paused' : 'playing');
+    } else if (message.action === 'player.requestState') {
+      if (payload.includeLocalQueue !== false) syncLocalQueue();
+      if (payload.includeSessionQueue) syncSessionQueue();
+      if (payload.includeReadyState) sendReadyState();
+      if (payload.includePlayback !== false) reportPlayback(playerAudio.paused ? 'paused' : 'playing');
+    } else if (message.action === 'queue.playItem') {
+      if (payload.clientId && payload.clientId !== playerState.selfClientId) {
+        setStatus('Ignoring local queue command for another client.', '已忽略其他设备的本地队列命令。');
+        return;
+      }
+      playQueueItem(payload.clientId ? 'local' : 'session', payload.queueIndex, payload.positionMs || 0, true);
+    } else if (message.action === 'broadcast.start') {
+      applyBroadcastPayload(payload, Boolean(payload.autoPlay));
+    } else if (message.action === 'broadcast.playItem') {
+      applyBroadcastPayload(payload, false);
+      playQueueItem('broadcast', payload.queueIndex ?? playerState.broadcastIndex, payload.positionMs || 0, true);
+    } else if (message.action === 'broadcast.play') {
+      applyBroadcastPayload(payload, false);
+      attemptPlay();
+    } else if (message.action === 'broadcast.pause') {
+      applyBroadcastPayload(payload, false);
+      pausePlayback();
+    } else if (message.action === 'broadcast.seek') {
+      applyBroadcastPayload(payload, false);
+      seekTo(payload.positionMs);
+    } else if (message.action === 'broadcast.stop') {
+      stopBroadcast();
+    }
+  }
+
+  function handleSocketMessage(message) {
+    const action = message.action;
+    const payload = message.payload || {};
+    if (action === 'system.ack' && message.requestId === playerState.authRequestId) {
+      registerPlayer();
+      return;
+    }
+    if (action === 'system.ack' && message.requestId === playerState.registerRequestId) {
+      playerState.registered = true;
+      document.getElementById('player-connection-state').textContent = 'REGISTERED';
+      startHeartbeat();
+      requestLocalQueue();
+      window.clearTimeout(playerState.initialReportTimer);
+      playerState.initialReportTimer = window.setTimeout(() => {
+        playerState.initialReportTimer = null;
+        if (!playerState.currentTrackId) {
+          reportPlayback('stopped');
+        }
+      }, 1000);
+      return;
+    }
+    if (action === 'system.error') {
+      setStatus(payload.message || 'Socket error.', payload.message || 'Socket 错误。');
+      return;
+    }
+    if (message.type === 'command' || (typeof action === 'string' && action.startsWith('broadcast.'))) {
+      handleCommand(message);
+    }
+    if (action === 'queue.session.sync') {
+      applySessionQueue(payload);
+    } else if (action === 'queue.local.set') {
+      applyLocalQueue(payload);
+    } else if (action === 'playback.update') {
+      applyPlaybackUpdate(payload);
+    } else if (action === 'broadcast.queue.sync' || action === 'broadcast.status') {
+      applyBroadcastPayload(payload, false);
+    }
+  }
+
+  function renderIdentity() {
+    document.getElementById('player-client-id').textContent = playerState.selfClientId;
+    document.getElementById('player-session-id').textContent = playerState.sessionId;
+  }
+
+  function renderNowPlaying() {
+    const meta = playerState.trackMeta[playerState.currentTrackId] || {};
+    const cover = document.getElementById('player-cover');
+    const fallback = document.getElementById('player-cover-fallback');
+    document.getElementById('player-track-title').textContent = meta.title || i18nText('No track loaded', '尚未载入歌曲');
+    document.getElementById('player-track-artist').textContent = meta.artist || '-';
+    document.getElementById('player-track-album').textContent = meta.album || '-';
+    const currentTrackId = playerState.currentTrackId || '';
+    if (meta.coverUrl && !meta.coverFailed) {
+      const coverKey = `${currentTrackId}:${meta.coverUrl}`;
+      if (cover.dataset.coverKey === coverKey && cover.getAttribute('src')) {
+        cover.hidden = false;
+        fallback.hidden = true;
+      } else {
+        cover.hidden = true;
+        fallback.hidden = false;
+        if (playerState.coverRequestKey !== coverKey) {
+          playerState.coverRequestToken += 1;
+          playerState.coverRequestKey = coverKey;
+          const requestToken = playerState.coverRequestToken;
+          const probe = new Image();
+          probe.onload = () => {
+            if (
+              requestToken !== playerState.coverRequestToken ||
+              String(playerState.currentTrackId || '') !== currentTrackId ||
+              playerState.coverRequestKey !== coverKey
+            ) {
+              return;
+            }
+            playerState.coverRequestKey = null;
+            cover.dataset.trackId = currentTrackId;
+            cover.dataset.coverKey = coverKey;
+            cover.src = meta.coverUrl;
+            cover.hidden = false;
+            fallback.hidden = true;
+          };
+          probe.onerror = () => {
+            if (
+              requestToken !== playerState.coverRequestToken ||
+              String(playerState.currentTrackId || '') !== currentTrackId ||
+              playerState.coverRequestKey !== coverKey
+            ) {
+              return;
+            }
+            playerState.coverRequestKey = null;
+            meta.coverFailed = true;
+            cover.removeAttribute('src');
+            cover.dataset.trackId = '';
+            cover.dataset.coverKey = '';
+            cover.hidden = true;
+            fallback.hidden = false;
+          };
+          probe.src = meta.coverUrl;
+        }
+      }
+    } else {
+      playerState.coverRequestToken += 1;
+      playerState.coverRequestKey = null;
+      cover.removeAttribute('src');
+      cover.dataset.trackId = '';
+      cover.dataset.coverKey = '';
+      cover.hidden = true;
+      fallback.hidden = false;
+    }
+    document.getElementById('player-active-queue').textContent = activeQueueType();
+  }
+
+  function renderMode() {
+    const mode = activeQueueType();
+    document.getElementById('player-mode').textContent = mode.toUpperCase();
+    document.getElementById('player-active-queue').textContent = mode;
+  }
+
+  function renderQueueTabs() {
+    document.querySelectorAll('[data-player-queue-tab]').forEach((button) => {
+      button.classList.toggle('active', button.dataset.playerQueueTab === playerState.visibleQueueType);
+    });
+  }
+
+  function renderQueue() {
+    const ids = queueIds(playerState.visibleQueueType);
+    const activeIndex = queueIndex(playerState.visibleQueueType);
+    document.getElementById('player-queue-summary').textContent = i18nText(
+      `${ids.length} items in ${playerState.visibleQueueType} queue`,
+      `${playerState.visibleQueueType} 队列 ${ids.length} 首`
+    );
+    const list = document.getElementById('player-queue-list');
+    if (!ids.length) {
+      list.innerHTML = `<div class="text-body-secondary p-3">${escapeHtml(i18nText('The current queue is empty.', '当前队列为空。'))}</div>`;
+      return;
+    }
+    list.innerHTML = ids.map((trackId, index) => {
+      const meta = playerState.trackMeta[trackId] || {};
+      const active = playerState.visibleQueueType === activeQueueType() && index === activeIndex;
+      return `
+        <button type="button" class="player-queue-item${active ? ' active' : ''}" data-queue-index="${index}">
+          <span class="player-queue-index">${index + 1}</span>
+          <span>
+            <strong>${escapeHtml(meta.title || trackId)}</strong>
+            <small>${escapeHtml(meta.artist || '')}</small>
+          </span>
+        </button>
+      `;
+    }).join('');
+  }
+
+  function updateProgress() {
+    const positionMs = currentPositionMs();
+    const durationMs = currentDurationMs();
+    const progress = document.getElementById('player-progress');
+    document.getElementById('player-position-label').textContent = formatPosition(positionMs);
+    document.getElementById('player-duration-label').textContent = formatPosition(durationMs);
+    progress.value = durationMs > 0 ? String(Math.min(1000, Math.floor((positionMs / durationMs) * 1000))) : '0';
+  }
+
+  function renderAll() {
+    renderIdentity();
+    renderMode();
+    renderNowPlaying();
+    renderQueueTabs();
+    renderQueue();
+    updateProgress();
+  }
+
+  function renderSearchResults(tracks) {
+    const container = document.getElementById('player-search-results');
+    if (!tracks.length) {
+      container.innerHTML = `<div class="text-body-secondary p-3">${escapeHtml(i18nText('No tracks found.', '没有找到歌曲。'))}</div>`;
+      return;
+    }
+    container.innerHTML = tracks.map((track) => {
+      playerState.trackMeta[track.id] = track;
+      return `
+        <div class="player-search-item">
+          <div>
+            <strong>${escapeHtml(track.title)}</strong>
+            <small>${escapeHtml(track.artist)} · ${escapeHtml(track.album)}</small>
+          </div>
+          <div class="btn-group btn-group-sm">
+            <button type="button" class="btn btn-outline-dark" data-search-add="${escapeHtml(track.id)}">${escapeHtml(i18nText('Add', '加入'))}</button>
+            <button type="button" class="btn btn-dark" data-search-play="${escapeHtml(track.id)}">${escapeHtml(i18nText('Play', '播放'))}</button>
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  function runSearch(query) {
+    const params = new URLSearchParams({ q: query, limit: '50' });
+    return fetch(`${playerState.searchUrl}?${params.toString()}`)
+      .then((response) => response.json())
+      .then((payload) => renderSearchResults(payload.tracks || []));
+  }
+
+  document.getElementById('player-search-form').addEventListener('submit', (event) => {
+    event.preventDefault();
+    runSearch(document.getElementById('player-search-input').value.trim());
+  });
+
+  document.getElementById('player-search-results').addEventListener('click', (event) => {
+    const addTrackId = event.target.closest('[data-search-add]')?.dataset.searchAdd;
+    const playTrackId = event.target.closest('[data-search-play]')?.dataset.searchPlay;
+    if (addTrackId) addToLocalQueue(addTrackId, false);
+    if (playTrackId) {
+      playerState.userGestureSeen = true;
+      addToLocalQueue(playTrackId, true);
+    }
+  });
+
+  document.getElementById('player-queue-list').addEventListener('click', (event) => {
+    const item = event.target.closest('[data-queue-index]');
+    if (!item) return;
+    playerState.userGestureSeen = true;
+    playQueueItem(playerState.visibleQueueType, Number(item.dataset.queueIndex), 0, true);
+  });
+
+  document.querySelectorAll('[data-player-queue-tab]').forEach((button) => {
+    button.addEventListener('click', () => {
+      playerState.visibleQueueType = button.dataset.playerQueueTab;
+      renderAll();
+    });
+  });
+
+  document.getElementById('player-play').addEventListener('click', () => {
+    playerState.userGestureSeen = true;
+    attemptPlay();
+  });
+  document.getElementById('player-pause').addEventListener('click', pausePlayback);
+  document.getElementById('player-next').addEventListener('click', () => {
+    playerState.userGestureSeen = true;
+    nextTrack();
+  });
+  document.getElementById('player-prev').addEventListener('click', () => {
+    playerState.userGestureSeen = true;
+    previousTrack();
+  });
+  document.getElementById('player-volume').addEventListener('input', (event) => {
+    playerAudio.volume = Number(event.target.value) / 100;
+  });
+  document.getElementById('player-progress').addEventListener('change', (event) => {
+    const durationMs = currentDurationMs();
+    seekTo(durationMs > 0 ? (Number(event.target.value) / 1000) * durationMs : 0);
+  });
+  document.getElementById('player-clear-local').addEventListener('click', () => {
+    playerState.localQueue = [];
+    playerState.localIndex = 0;
+    syncLocalQueue(0);
+    renderAll();
+  });
+  document.getElementById('player-reset-device').addEventListener('click', () => {
+    window.localStorage.removeItem('emosonic.webPlayer.clientId');
+    window.localStorage.removeItem('emosonic.webPlayer.sessionId');
+    window.location.reload();
+  });
+
+  playerAudio.volume = 0.7;
+  playerAudio.addEventListener('play', () => {
+    playerState.playbackState = 'playing';
+    reportPlayback('playing');
+  });
+  playerAudio.addEventListener('pause', () => {
+    if (!playerAudio.ended) {
+      playerState.playbackState = 'paused';
+      reportPlayback('paused');
+    }
+  });
+  playerAudio.addEventListener('ended', () => {
+    nextTrack();
+  });
+  playerAudio.addEventListener('timeupdate', () => {
+    updateProgress();
+    if (!playerAudio.paused && Date.now() - playerState.lastProgressReportAt > 5000) {
+      playerState.lastProgressReportAt = Date.now();
+      syncActiveQueue();
+      reportPlayback('playing');
+    }
+  });
+  playerAudio.addEventListener('volumechange', () => {
+    reportPlayback(playerAudio.paused ? 'paused' : 'playing');
+  });
+
+  socket.on('connect', () => {
+    document.getElementById('player-connection-state').textContent = 'ONLINE';
+    playerState.authRequestId = nextRequestId('web-player-auth');
+    emitPlayerMessage('auth', 'auth.login', {}, { requestId: playerState.authRequestId });
+  });
+  socket.on('disconnect', () => {
+    playerState.registered = false;
+    stopHeartbeat();
+    document.getElementById('player-connection-state').textContent = 'OFFLINE';
+  });
+  socket.on('connect_error', () => {
+    document.getElementById('player-connection-state').textContent = 'ERROR';
+  });
+  socket.on('message', handleSocketMessage);
+
+  renderAll();
+  runSearch('');
+</script>
+{% endblock %}
