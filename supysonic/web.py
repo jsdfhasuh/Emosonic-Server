@@ -2,8 +2,6 @@
 # Supysonic is a Python implementation of the Subsonic server API.
 #
 # Copyright (C) 2013-2023 Alban 'spl0k' Féron
-#               2018-2019 Carey 'pR0Ps' Metcalfe
-#                    2017 Óscar García Amor
 #
 # Distributed under terms of the GNU AGPLv3 license.
 
@@ -69,9 +67,11 @@ def create_application(config=None):
     # Import app sections
     if app.config["WEBAPP"]["mount_webui"]:
         from .frontend import frontend
+        from .frontend.player import player
         from .frontend.share import share
 
         app.register_blueprint(frontend)
+        app.register_blueprint(player)
         app.register_blueprint(share)
     if app.config["WEBAPP"]["mount_api"]:
         from .api import api
