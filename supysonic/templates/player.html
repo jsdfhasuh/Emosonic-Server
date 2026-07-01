@@ -12,132 +12,122 @@
 <div class="player-workspace"
      data-player-search-url="{{ url_for('frontend.player_search') }}"
      data-player-meta-url="{{ url_for('frontend.player_track_meta') }}">
-  <div class="row row-cols-1 row-cols-md-4 g-3 mb-3">
-    <div class="col">
-      <div class="card text-center h-100 console-metric-card player-accent">
-        <div class="card-header"><span data-i18n-en="Connection" data-i18n-zh="连接">Connection</span></div>
-        <div class="card-body">
-          <div class="console-metric-value" id="player-connection-state">OFFLINE</div>
-          <div class="console-metric-caption" data-i18n-en="Socket.IO player registration." data-i18n-zh="Socket.IO 播放器注册状态。">Socket.IO player registration.</div>
+  <section class="player-status-strip" aria-label="Player status" data-i18n-en="Player status" data-i18n-zh="播放器状态" data-i18n-attr="aria-label">
+    <div class="player-status-pill">
+      <span class="player-status-label" data-i18n-en="Connection" data-i18n-zh="连接">Connection</span>
+      <strong id="player-connection-state">OFFLINE</strong>
+      <small data-i18n-en="Socket.IO player registration." data-i18n-zh="Socket.IO 播放器注册状态。">Socket.IO player registration.</small>
+    </div>
+    <div class="player-status-pill">
+      <span class="player-status-label" data-i18n-en="Mode" data-i18n-zh="模式">Mode</span>
+      <strong id="player-mode">LOCAL</strong>
+      <small data-i18n-en="Local, session, or broadcast queue." data-i18n-zh="本地、会话或群播队列。">Local, session, or broadcast queue.</small>
+    </div>
+    <div class="player-status-pill">
+      <span class="player-status-label">Client ID</span>
+      <strong class="player-id-value" id="player-client-id">-</strong>
+      <small data-i18n-en="Stable browser device id." data-i18n-zh="稳定浏览器设备 ID。">Stable browser device id.</small>
+    </div>
+    <div class="player-status-pill">
+      <span class="player-status-label">Session ID</span>
+      <strong class="player-id-value" id="player-session-id">-</strong>
+      <small data-i18n-en="Shared playback session." data-i18n-zh="共享播放会话。">Shared playback session.</small>
+    </div>
+  </section>
+
+  <div class="player-immersive-grid">
+    <aside class="player-glass-panel player-library-panel">
+      <div class="player-panel-header">
+        <div>
+          <span class="player-panel-kicker" data-i18n-en="Library" data-i18n-zh="曲库">Library</span>
+          <h2 data-i18n-en="Search" data-i18n-zh="搜索">Search</h2>
         </div>
       </div>
-    </div>
-    <div class="col">
-      <div class="card text-center h-100 console-metric-card player-accent">
-        <div class="card-header"><span data-i18n-en="Mode" data-i18n-zh="模式">Mode</span></div>
-        <div class="card-body">
-          <div class="console-metric-value" id="player-mode">LOCAL</div>
-          <div class="console-metric-caption" data-i18n-en="Local, session, or broadcast queue." data-i18n-zh="本地、会话或群播队列。">Local, session, or broadcast queue.</div>
+      <form id="player-search-form" class="input-group player-search-form">
+        <input type="search" class="form-control" id="player-search-input" placeholder="Search songs, artists, albums" data-i18n-en="Search songs, artists, albums" data-i18n-zh="搜索歌曲、艺人、专辑" data-i18n-attr="placeholder">
+        <button type="submit" class="btn btn-dark"><span data-i18n-en="Search" data-i18n-zh="搜索">Search</span></button>
+      </form>
+      <div class="player-search-results" id="player-search-results">
+        <div class="text-body-secondary p-3" data-i18n-en="Search results will appear here." data-i18n-zh="搜索结果会显示在这里。">Search results will appear here.</div>
+      </div>
+    </aside>
+
+    <section class="player-stage player-glass-panel">
+      <div class="player-stage-topline">
+        <span class="console-scope-badge scope-local" id="player-active-queue">Local</span>
+        <span class="player-quality-badge" data-i18n-en="Browser player" data-i18n-zh="浏览器播放器">Browser player</span>
+      </div>
+
+      <div class="player-cover-frame player-cover-hero">
+        <img id="player-cover" alt="" src="" hidden>
+        <div class="player-cover-fallback" id="player-cover-fallback">EM</div>
+      </div>
+
+      <div class="player-now-meta player-now-meta-centered">
+        <h2 id="player-track-title">No track loaded</h2>
+        <div class="player-track-detail" id="player-track-artist">-</div>
+        <div class="player-track-detail" id="player-track-album">-</div>
+        <div class="player-status-line" id="player-status-line" data-i18n-en="Search for a track or accept a command from /control." data-i18n-zh="搜索歌曲，或等待 /control 下发命令。">Search for a track or accept a command from /control.</div>
+      </div>
+
+      <audio id="player-audio" preload="metadata"></audio>
+    </section>
+
+    <aside class="player-glass-panel player-queue-panel">
+      <div class="player-panel-header player-panel-header-row">
+        <div>
+          <span class="player-panel-kicker" data-i18n-en="Queue" data-i18n-zh="队列">Queue</span>
+          <h2 data-i18n-en="Up next" data-i18n-zh="即将播放">Up next</h2>
+        </div>
+        <div class="btn-group btn-group-sm player-queue-tabs" role="group" aria-label="Queue surface" data-i18n-en="Queue surface" data-i18n-zh="队列面板" data-i18n-attr="aria-label">
+          <button type="button" class="btn btn-outline-dark active" data-player-queue-tab="local">Local</button>
+          <button type="button" class="btn btn-outline-dark" data-player-queue-tab="session">Session</button>
+          <button type="button" class="btn btn-outline-dark" data-player-queue-tab="broadcast">Cast</button>
         </div>
       </div>
-    </div>
-    <div class="col">
-      <div class="card text-center h-100 console-metric-card player-accent">
-        <div class="card-header"><span data-i18n-en="Client ID" data-i18n-zh="Client ID">Client ID</span></div>
-        <div class="card-body">
-          <div class="console-metric-value player-id-value" id="player-client-id">-</div>
-          <div class="console-metric-caption" data-i18n-en="Stable browser device id." data-i18n-zh="稳定浏览器设备 ID。">Stable browser device id.</div>
-        </div>
+      <div class="player-queue-summary" id="player-queue-summary">0 items</div>
+      <div class="player-queue-list" id="player-queue-list">
+        <div class="text-body-secondary p-3" data-i18n-en="The current queue is empty." data-i18n-zh="当前队列为空。">The current queue is empty.</div>
       </div>
-    </div>
-    <div class="col">
-      <div class="card text-center h-100 console-metric-card player-accent">
-        <div class="card-header"><span data-i18n-en="Session ID" data-i18n-zh="Session ID">Session ID</span></div>
-        <div class="card-body">
-          <div class="console-metric-value player-id-value" id="player-session-id">-</div>
-          <div class="console-metric-caption" data-i18n-en="Shared playback session." data-i18n-zh="共享播放会话。">Shared playback session.</div>
-        </div>
-      </div>
-    </div>
+      <button type="button" class="btn btn-outline-danger btn-sm player-clear-button" id="player-clear-local"><span data-i18n-en="Clear local queue" data-i18n-zh="清空本地队列">Clear local queue</span></button>
+    </aside>
   </div>
 
-  <div class="row g-3">
-    <div class="col-xl-5">
-      <div class="card h-100 player-now-card">
-        <div class="card-header d-flex justify-content-between align-items-center">
-          <span data-i18n-en="Now playing" data-i18n-zh="正在播放">Now playing</span>
-          <span class="console-scope-badge scope-local" id="player-active-queue">Local</span>
-        </div>
-        <div class="card-body">
-          <div class="player-now-layout">
-            <div class="player-cover-frame">
-              <img id="player-cover" alt="" src="" hidden>
-              <div class="player-cover-fallback" id="player-cover-fallback">EM</div>
-            </div>
-            <div class="player-now-meta">
-              <h2 id="player-track-title" data-i18n-en="No track loaded" data-i18n-zh="尚未载入歌曲">No track loaded</h2>
-              <div class="player-track-detail" id="player-track-artist">-</div>
-              <div class="player-track-detail" id="player-track-album">-</div>
-              <div class="player-status-line" id="player-status-line" data-i18n-en="Search for a track or accept a command from /control." data-i18n-zh="搜索歌曲，或等待 /control 下发命令。">Search for a track or accept a command from /control.</div>
-            </div>
-          </div>
-
-          <audio id="player-audio" preload="metadata"></audio>
-
-          <div class="player-transport mt-4">
-            <button type="button" class="btn btn-outline-dark" id="player-prev" aria-label="Previous" title="Previous" data-i18n-en="Previous" data-i18n-zh="上一首" data-i18n-attr="aria-label, title"><span aria-hidden="true">⏮</span></button>
-            <button type="button" class="btn btn-dark player-play-button" id="player-play" aria-label="Play" title="Play" data-i18n-en="Play" data-i18n-zh="播放" data-i18n-attr="aria-label, title"><span aria-hidden="true">▶</span></button>
-            <button type="button" class="btn btn-outline-dark" id="player-pause" aria-label="Pause" title="Pause" data-i18n-en="Pause" data-i18n-zh="暂停" data-i18n-attr="aria-label, title"><span aria-hidden="true">⏸</span></button>
-            <button type="button" class="btn btn-outline-dark" id="player-next" aria-label="Next" title="Next" data-i18n-en="Next" data-i18n-zh="下一首" data-i18n-attr="aria-label, title"><span aria-hidden="true">⏭</span></button>
-          </div>
-
-          <div class="player-progress-block mt-4">
-            <div class="d-flex justify-content-between gap-3">
-              <span id="player-position-label">0:00</span>
-              <span id="player-duration-label">0:00</span>
-            </div>
-            <input type="range" class="form-range" id="player-progress" min="0" max="1000" value="0">
-          </div>
-
-          <div class="row g-3 mt-2">
-            <div class="col-md-7">
-              <label class="form-label" for="player-volume"><span data-i18n-en="Volume" data-i18n-zh="音量">Volume</span></label>
-              <input type="range" class="form-range" id="player-volume" min="0" max="100" value="70">
-            </div>
-            <div class="col-md-5">
-              <label class="form-label" for="player-reset-device"><span data-i18n-en="Device identity" data-i18n-zh="设备身份">Device identity</span></label>
-              <button type="button" class="btn btn-light w-100" id="player-reset-device"><span data-i18n-en="Reset identity" data-i18n-zh="重置身份">Reset identity</span></button>
-            </div>
-          </div>
-        </div>
+  <footer class="player-control-dock" aria-label="Playback controls" data-i18n-en="Playback controls" data-i18n-zh="播放控制" data-i18n-attr="aria-label">
+    <div class="player-dock-now">
+      <div class="player-dock-cover">
+        <img id="player-dock-cover" alt="" src="" hidden>
+        <span id="player-dock-cover-fallback">EM</span>
+      </div>
+      <div class="player-dock-copy">
+        <strong id="player-dock-title">No track loaded</strong>
+        <small id="player-dock-subtitle">-</small>
       </div>
     </div>
 
-    <div class="col-xl-4">
-      <div class="card h-100">
-        <div class="card-header"><span data-i18n-en="Library search" data-i18n-zh="曲库搜索">Library search</span></div>
-        <div class="card-body d-flex flex-column gap-3">
-          <form id="player-search-form" class="input-group">
-            <input type="search" class="form-control" id="player-search-input" placeholder="Search songs, artists, albums" data-i18n-en="Search songs, artists, albums" data-i18n-zh="搜索歌曲、艺人、专辑" data-i18n-attr="placeholder">
-            <button type="submit" class="btn btn-dark"><span data-i18n-en="Search" data-i18n-zh="搜索">Search</span></button>
-          </form>
-          <div class="player-search-results" id="player-search-results">
-            <div class="text-body-secondary p-3" data-i18n-en="Search results will appear here." data-i18n-zh="搜索结果会显示在这里。">Search results will appear here.</div>
-          </div>
-        </div>
+    <div class="player-dock-center">
+      <div class="player-transport">
+        <button type="button" class="btn btn-outline-dark" id="player-prev" aria-label="Previous" title="Previous" data-i18n-en="Previous" data-i18n-zh="上一首" data-i18n-attr="aria-label, title"><span aria-hidden="true">⏮</span></button>
+        <button type="button" class="btn btn-dark player-play-button" id="player-play" aria-label="Play" title="Play" data-i18n-en="Play" data-i18n-zh="播放" data-i18n-attr="aria-label, title"><span aria-hidden="true">▶</span></button>
+        <button type="button" class="btn btn-outline-dark" id="player-pause" aria-label="Pause" title="Pause" data-i18n-en="Pause" data-i18n-zh="暂停" data-i18n-attr="aria-label, title"><span aria-hidden="true">⏸</span></button>
+        <button type="button" class="btn btn-outline-dark" id="player-next" aria-label="Next" title="Next" data-i18n-en="Next" data-i18n-zh="下一首" data-i18n-attr="aria-label, title"><span aria-hidden="true">⏭</span></button>
+      </div>
+
+      <div class="player-progress-block">
+        <span id="player-position-label">0:00</span>
+        <input type="range" class="form-range" id="player-progress" min="0" max="1000" value="0">
+        <span id="player-duration-label">0:00</span>
       </div>
     </div>
 
-    <div class="col-xl-3">
-      <div class="card h-100">
-        <div class="card-header d-flex justify-content-between align-items-center">
-          <span data-i18n-en="Queue" data-i18n-zh="队列">Queue</span>
-          <div class="btn-group btn-group-sm" role="group" aria-label="Queue surface" data-i18n-en="Queue surface" data-i18n-zh="队列面板" data-i18n-attr="aria-label">
-            <button type="button" class="btn btn-outline-dark active" data-player-queue-tab="local">Local</button>
-            <button type="button" class="btn btn-outline-dark" data-player-queue-tab="session">Session</button>
-            <button type="button" class="btn btn-outline-dark" data-player-queue-tab="broadcast">Cast</button>
-          </div>
-        </div>
-        <div class="card-body d-flex flex-column gap-3">
-          <div class="player-queue-summary" id="player-queue-summary">0 items</div>
-          <div class="player-queue-list" id="player-queue-list">
-            <div class="text-body-secondary p-3" data-i18n-en="The current queue is empty." data-i18n-zh="当前队列为空。">The current queue is empty.</div>
-          </div>
-          <button type="button" class="btn btn-outline-danger btn-sm" id="player-clear-local"><span data-i18n-en="Clear local queue" data-i18n-zh="清空本地队列">Clear local queue</span></button>
-        </div>
-      </div>
+    <div class="player-dock-tools">
+      <label class="player-volume-control" for="player-volume">
+        <span data-i18n-en="Volume" data-i18n-zh="音量">Volume</span>
+        <input type="range" class="form-range" id="player-volume" min="0" max="100" value="70">
+      </label>
+      <button type="button" class="btn btn-light" id="player-reset-device"><span data-i18n-en="Reset identity" data-i18n-zh="重置身份">Reset identity</span></button>
     </div>
-  </div>
+  </footer>
 </div>
 
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
@@ -796,18 +786,39 @@
     const meta = playerState.trackMeta[playerState.currentTrackId] || {};
     const cover = document.getElementById('player-cover');
     const fallback = document.getElementById('player-cover-fallback');
-    document.getElementById('player-track-title').textContent = meta.title || i18nText('No track loaded', '尚未载入歌曲');
-    document.getElementById('player-track-artist').textContent = meta.artist || '-';
-    document.getElementById('player-track-album').textContent = meta.album || '-';
+    const title = meta.title || i18nText('No track loaded', '尚未载入歌曲');
+    const artist = meta.artist || '-';
+    const album = meta.album || '-';
+    const dockCover = document.getElementById('player-dock-cover');
+    const dockFallback = document.getElementById('player-dock-cover-fallback');
+    const showDockCover = (src) => {
+      dockCover.src = src;
+      dockCover.hidden = false;
+      dockFallback.hidden = true;
+    };
+    const hideDockCover = () => {
+      dockCover.removeAttribute('src');
+      dockCover.hidden = true;
+      dockFallback.hidden = false;
+    };
+    document.getElementById('player-track-title').textContent = title;
+    document.getElementById('player-track-artist').textContent = artist;
+    document.getElementById('player-track-album').textContent = album;
+    document.getElementById('player-dock-title').textContent = title;
+    document.getElementById('player-dock-subtitle').textContent = meta.artist
+      ? `${meta.artist}${meta.album ? ` - ${meta.album}` : ''}`
+      : '-';
     const currentTrackId = playerState.currentTrackId || '';
     if (meta.coverUrl && !meta.coverFailed) {
       const coverKey = `${currentTrackId}:${meta.coverUrl}`;
       if (cover.dataset.coverKey === coverKey && cover.getAttribute('src')) {
         cover.hidden = false;
         fallback.hidden = true;
+        showDockCover(cover.getAttribute('src'));
       } else {
         cover.hidden = true;
         fallback.hidden = false;
+        hideDockCover();
         if (playerState.coverRequestKey !== coverKey) {
           playerState.coverRequestToken += 1;
           playerState.coverRequestKey = coverKey;
@@ -827,6 +838,7 @@
             cover.src = meta.coverUrl;
             cover.hidden = false;
             fallback.hidden = true;
+            showDockCover(meta.coverUrl);
           };
           probe.onerror = () => {
             if (
@@ -843,6 +855,7 @@
             cover.dataset.coverKey = '';
             cover.hidden = true;
             fallback.hidden = false;
+            hideDockCover();
           };
           probe.src = meta.coverUrl;
         }
@@ -855,6 +868,7 @@
       cover.dataset.coverKey = '';
       cover.hidden = true;
       fallback.hidden = false;
+      hideDockCover();
     }
     document.getElementById('player-active-queue').textContent = activeQueueType();
   }

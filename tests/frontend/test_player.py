@@ -61,6 +61,8 @@ class PlayerTestCase(FrontendTestBase):
         self.assertIn("coverFailed", rv.data)
         self.assertIn("new Image()", rv.data)
         self.assertIn("removeAttribute('src')", rv.data)
+        self.assertIn('id="player-dock-title"', rv.data)
+        self.assertNotIn('id="player-dock-title" data-i18n', rv.data)
         self.assertIn("player.setVolume", rv.data)
         self.assertIn("broadcast.start", rv.data)
         self.assertIn("broadcastId", rv.data)
