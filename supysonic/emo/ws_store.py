@@ -1,4 +1,5 @@
 import json
+import time
 
 from ..db import (
     EmoLocalQueue,
@@ -8,6 +9,16 @@ from ..db import (
     now,
     open_connection,
 )
+
+
+def _strip_transient_playback_fields(payload):
+    payload.pop("serverTimeMs", None)
+    effective_at_server_ms = payload.get("effectiveAtServerMs")
+    if not isinstance(effective_at_server_ms, (int, float)):
+        payload.pop("effectiveAtServerMs", None)
+        return
+    if effective_at_server_ms <= int(time.time() * 1000):
+        payload.pop("effectiveAtServerMs", None)
 
 
 def getQueueState(session_id):
@@ -142,7 +153,7 @@ def getPlaybackState(session_id, client_id):
             return None
 
         payload = json.loads(record.playback_json) if record.playback_json else {}
-        payload.pop("serverTimeMs", None)
+        _strip_transient_playback_fields(payload)
         payload.update(
             {
                 "sessionId": record.session_id,
@@ -167,7 +178,7 @@ def getPlaybackStates(session_id):
         query = EmoPlaybackState.select().where(EmoPlaybackState.session_id == session_id)
         for record in query:
             payload = json.loads(record.playback_json) if record.playback_json else {}
-            payload.pop("serverTimeMs", None)
+            _strip_transient_playback_fields(payload)
             payload.update(
                 {
                     "sessionId": record.session_id,

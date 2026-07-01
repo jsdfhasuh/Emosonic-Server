@@ -4,8 +4,12 @@ import tempfile
 import unittest
 
 from supysonic.db import release_database
-from supysonic.emo.ws import _build_message, socketio
-from supysonic.emo.ws_store import getLocalQueueState, saveLocalQueueState
+from supysonic.emo.ws import _build_message, _commit_prepare, _expire_prepare, socketio
+from supysonic.emo.ws_store import (
+  getLocalQueueState,
+  getPlaybackState,
+  saveLocalQueueState,
+)
 from supysonic.emo.ws_state import get_state
 from supysonic.managers.user import UserManager
 from supysonic.web import create_application
@@ -42,6 +46,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     state._broadcast_playback_states.clear()
     state._client_active_broadcast.clear()
     state._follow_relationships.clear()
+    state._pending_prepares.clear()
 
     self.clients = []
 
@@ -86,7 +91,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     return self.get_messages(client)
 
-  def connect_device(self, user_name, password, client_id, session_id, roles):
+  def connect_device(self, user_name, password, client_id, session_id, roles, capabilities=None):
     client = socketio.test_client(self.app, namespace="/emo", flask_test_client=self.http_client)
     self.clients.append(client)
 
@@ -114,6 +119,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
           "deviceName": client_id,
           "roles": roles,
           "sessionId": session_id,
+          "capabilities": capabilities or {},
         },
       },
       namespace="/emo",
@@ -348,6 +354,28 @@ class EmoWebSocketTestCase(unittest.TestCase):
     ack = next(message for message in messages if message["action"] == "system.ack")
     self.assertEqual(ack["payload"]["client"]["alias"], "\u7535\u8111\u64ad\u653e\u5668")
 
+  def test_device_register_preserves_playback_timing_capabilities(self):
+    client = self.connect_authenticated_client("alice", "Alic3", "auth-player-cap")
+
+    messages = self.register_device(
+      client,
+      "register-player-cap",
+      {
+        "clientId": "player-cap",
+        "deviceName": "Timing Player",
+        "roles": ["player"],
+        "sessionId": "sess-cap",
+        "capabilities": {
+          "effectiveAtPlayback": True,
+          "playbackPrepare": True,
+        },
+      },
+    )
+
+    ack = next(message for message in messages if message["action"] == "system.ack")
+    self.assertTrue(ack["payload"]["client"]["capabilities"]["effectiveAtPlayback"])
+    self.assertTrue(ack["payload"]["client"]["capabilities"]["playbackPrepare"])
+
   def test_system_ping_refreshes_registered_client_last_seen(self):
     client = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"])
     state = get_state()
@@ -401,6 +429,1013 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertEqual(forwarded["payload"], {"sessionId": "sess-1", "queueIndex": 2})
     self.assertEqual(forwarded["sourceClientId"], "controller-1")
     self.assertEqual(forwarded["targetClientId"], "player-1")
+
+  def test_web_player_without_timing_capabilities_uses_legacy_direct_forwarding(self):
+    web_player = self.connect_device("alice", "Alic3", "web-player-1", "web:player", ["player"])
+    controller = self.connect_device("alice", "Alic3", "controller-1", "web:controller", ["controller"])
+    self.get_messages(web_player)
+    self.get_messages(controller)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "player.play",
+        "requestId": "web-player-play-legacy-1",
+        "targetClientId": "web-player-1",
+        "payload": {"sessionId": "web:player"},
+      },
+      namespace="/emo",
+    )
+
+    controller_messages = self.get_messages(controller)
+    web_messages = self.get_messages(web_player)
+    ack = self.get_ack(controller_messages, "web-player-play-legacy-1")
+    play_command = next(message for message in web_messages if message["action"] == "player.play")
+
+    self.assertTrue(ack["payload"]["forwarded"])
+    self.assertNotIn("effectiveAtServerMs", play_command["payload"])
+    self.assertFalse(any(message["action"] == "playback.prepare" for message in web_messages))
+    self.assertFalse(any(message["action"] == "playback.update" for message in web_messages))
+
+  def test_player_play_uses_single_future_for_effective_at_player(self):
+    capabilities = {"effectiveAtPlayback": True}
+    player = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"], capabilities=capabilities)
+    controller = self.connect_device("alice", "Alic3", "controller-1", "sess-1", ["controller"])
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    player.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.session.sync",
+        "requestId": "source-queue-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "queueSongIds": ["song-1", "song-2"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "player.play",
+        "requestId": "player-play-future-1",
+        "targetClientId": "player-1",
+        "payload": {"sessionId": "sess-1"},
+      },
+      namespace="/emo",
+    )
+
+    controller_messages = self.get_messages(controller)
+    player_messages = self.get_messages(player)
+    ack = self.get_ack(controller_messages, "player-play-future-1")
+    playback = next(message for message in player_messages if message["action"] == "playback.update")
+    play_command = next(message for message in player_messages if message["action"] == "player.play")
+
+    self.assertEqual(ack["payload"]["protocolPath"], "single_future")
+    self.assertEqual(playback["payload"]["trackId"], "song-1")
+    self.assertEqual(playback["payload"]["state"], "playing")
+    self.assertIn("effectiveAtServerMs", playback["payload"])
+    self.assertEqual(play_command["payload"]["effectiveAtServerMs"], playback["payload"]["effectiveAtServerMs"])
+    persisted = getPlaybackState("sess-1", "player-1")
+    self.assertIsNotNone(persisted)
+    self.assertEqual(persisted["state"], "playing")
+    self.assertEqual(persisted["trackId"], "song-1")
+
+  def test_player_play_keeps_reserved_control_version_after_controller_queue_sync(self):
+    capabilities = {"effectiveAtPlayback": True}
+    player = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"], capabilities=capabilities)
+    controller = self.connect_device("alice", "Alic3", "controller-1", "sess-1", ["controller"])
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    controller.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.session.sync",
+        "requestId": "controller-queue-before-play-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "queueSongIds": ["song-1", "song-2"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    queue_ack = self.get_ack(self.get_messages(controller), "controller-queue-before-play-1")
+    self.get_messages(player)
+    self.assertEqual(queue_ack["payload"]["queue"]["controlVersion"], 1)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "player.play",
+        "requestId": "controller-queue-player-play-1",
+        "targetClientId": "player-1",
+        "payload": {"sessionId": "sess-1"},
+      },
+      namespace="/emo",
+    )
+
+    controller_messages = self.get_messages(controller)
+    player_messages = self.get_messages(player)
+    ack = self.get_ack(controller_messages, "controller-queue-player-play-1")
+    playback = next(message for message in player_messages if message["action"] == "playback.update")
+    play_command = next(message for message in player_messages if message["action"] == "player.play")
+
+    self.assertEqual(ack["payload"]["playback"]["controlVersion"], 2)
+    self.assertEqual(playback["payload"]["controlVersion"], 2)
+    self.assertEqual(play_command["payload"]["controlVersion"], 2)
+
+  def test_playback_feedback_clears_previous_effective_at(self):
+    capabilities = {"effectiveAtPlayback": True}
+    player = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"], capabilities=capabilities)
+    controller = self.connect_device("alice", "Alic3", "controller-1", "sess-1", ["controller"])
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    player.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.session.sync",
+        "requestId": "source-queue-effective-clear-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "queueSongIds": ["song-1"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "player.play",
+        "requestId": "player-play-effective-clear-1",
+        "targetClientId": "player-1",
+        "payload": {"sessionId": "sess-1"},
+      },
+      namespace="/emo",
+    )
+    play_messages = self.get_messages(player)
+    self.get_ack(self.get_messages(controller), "player-play-effective-clear-1")
+    playback = next(message for message in play_messages if message["action"] == "playback.update")
+    self.assertIn("effectiveAtServerMs", playback["payload"])
+
+    player.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "playback-feedback-effective-clear-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "state": "playing",
+          "trackId": "song-1",
+          "positionMs": 1500,
+        },
+      },
+      namespace="/emo",
+    )
+
+    feedback_messages = self.get_messages(player)
+    feedback_playback = next(message for message in feedback_messages if message["action"] == "playback.update")
+    state_playback = get_state().get_playback_state("sess-1", "player-1")
+    persisted = getPlaybackState("sess-1", "player-1")
+
+    self.assertNotIn("effectiveAtServerMs", feedback_playback["payload"])
+    self.assertNotIn("effectiveAtServerMs", state_playback)
+    self.assertNotIn("effectiveAtServerMs", persisted)
+
+  def test_player_next_uses_single_future_for_effective_at_player(self):
+    capabilities = {"effectiveAtPlayback": True}
+    player = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"], capabilities=capabilities)
+    controller = self.connect_device("alice", "Alic3", "controller-1", "sess-1", ["controller"])
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    player.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.session.sync",
+        "requestId": "source-queue-next-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "queueSongIds": ["song-1", "song-2", "song-3"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "player.next",
+        "requestId": "player-next-future-1",
+        "targetClientId": "player-1",
+        "payload": {"sessionId": "sess-1"},
+      },
+      namespace="/emo",
+    )
+
+    controller_messages = self.get_messages(controller)
+    player_messages = self.get_messages(player)
+    ack = self.get_ack(controller_messages, "player-next-future-1")
+    playback = next(message for message in player_messages if message["action"] == "playback.update")
+    play_command = next(message for message in player_messages if message["action"] == "player.play")
+
+    self.assertEqual(ack["payload"]["protocolPath"], "single_future")
+    self.assertEqual(playback["payload"]["trackId"], "song-2")
+    self.assertEqual(playback["payload"]["currentIndex"], 1)
+    self.assertIn("effectiveAtServerMs", playback["payload"])
+    self.assertEqual(play_command["payload"]["effectiveAtServerMs"], playback["payload"]["effectiveAtServerMs"])
+    self.assertFalse(any(message["action"] == "player.next" for message in player_messages))
+
+  def test_player_prev_uses_single_future_for_effective_at_player(self):
+    capabilities = {"effectiveAtPlayback": True}
+    player = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"], capabilities=capabilities)
+    controller = self.connect_device("alice", "Alic3", "controller-1", "sess-1", ["controller"])
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    player.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.session.sync",
+        "requestId": "source-queue-prev-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "queueSongIds": ["song-1", "song-2", "song-3"],
+          "currentIndex": 1,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "player.prev",
+        "requestId": "player-prev-future-1",
+        "targetClientId": "player-1",
+        "payload": {"sessionId": "sess-1"},
+      },
+      namespace="/emo",
+    )
+
+    controller_messages = self.get_messages(controller)
+    player_messages = self.get_messages(player)
+    ack = self.get_ack(controller_messages, "player-prev-future-1")
+    playback = next(message for message in player_messages if message["action"] == "playback.update")
+    play_command = next(message for message in player_messages if message["action"] == "player.play")
+
+    self.assertEqual(ack["payload"]["protocolPath"], "single_future")
+    self.assertEqual(playback["payload"]["trackId"], "song-1")
+    self.assertEqual(playback["payload"]["currentIndex"], 0)
+    self.assertIn("effectiveAtServerMs", playback["payload"])
+    self.assertEqual(play_command["payload"]["effectiveAtServerMs"], playback["payload"]["effectiveAtServerMs"])
+    self.assertFalse(any(message["action"] == "player.prev" for message in player_messages))
+
+  def test_queue_play_item_uses_prepare_ready_commit_for_prepare_player(self):
+    capabilities = {"effectiveAtPlayback": True, "playbackPrepare": True}
+    player = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"], capabilities=capabilities)
+    controller = self.connect_device("alice", "Alic3", "controller-1", "sess-1", ["controller"])
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    player.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.session.sync",
+        "requestId": "source-queue-prepare-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "queueSongIds": ["song-1", "song-2"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "queue.playItem",
+        "requestId": "queue-play-prepare-1",
+        "targetClientId": "player-1",
+        "payload": {"sessionId": "sess-1", "queueIndex": 1},
+      },
+      namespace="/emo",
+    )
+
+    controller_messages = self.get_messages(controller)
+    player_messages = self.get_messages(player)
+    ack = self.get_ack(controller_messages, "queue-play-prepare-1")
+    prepare = next(message for message in player_messages if message["action"] == "playback.prepare")
+
+    self.assertTrue(ack["payload"]["preparing"])
+    self.assertEqual(prepare["payload"]["trackId"], "song-2")
+    self.assertEqual(prepare["payload"]["sourceClientId"], "player-1")
+    self.assertFalse(any(message["action"] == "player.play" for message in player_messages))
+
+    player.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.ready",
+        "requestId": "queue-play-ready-1",
+        "payload": {
+          "prepareId": ack["payload"]["prepareId"],
+          "clientId": "player-1",
+          "ready": True,
+          "positionMs": 0,
+          "controlVersion": prepare["payload"]["controlVersion"],
+        },
+      },
+      namespace="/emo",
+    )
+
+    ready_messages = self.get_messages(player)
+    self.get_ack(ready_messages, "queue-play-ready-1")
+    playback = next(message for message in ready_messages if message["action"] == "playback.update")
+    play_command = next(message for message in ready_messages if message["action"] == "player.play")
+    state_playback = get_state().get_playback_state("sess-1", "player-1")
+
+    self.assertEqual(playback["payload"]["trackId"], "song-2")
+    self.assertEqual(playback["payload"]["currentIndex"], 1)
+    self.assertIn("effectiveAtServerMs", playback["payload"])
+    self.assertEqual(play_command["payload"]["effectiveAtServerMs"], playback["payload"]["effectiveAtServerMs"])
+    self.assertEqual(state_playback["controlVersion"], prepare["payload"]["controlVersion"])
+    persisted = getPlaybackState("sess-1", "player-1")
+    self.assertIsNotNone(persisted)
+    self.assertEqual(persisted["trackId"], "song-2")
+    self.assertEqual(persisted["currentIndex"], 1)
+
+  def test_prepare_commit_is_idempotent_for_stale_prepare_copy(self):
+    capabilities = {"effectiveAtPlayback": True, "playbackPrepare": True}
+    player = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"], capabilities=capabilities)
+    controller = self.connect_device("alice", "Alic3", "controller-1", "sess-1", ["controller"])
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    player.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.session.sync",
+        "requestId": "source-queue-idempotent-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "queueSongIds": ["song-1", "song-2"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "queue.playItem",
+        "requestId": "queue-play-idempotent-1",
+        "targetClientId": "player-1",
+        "payload": {"sessionId": "sess-1", "queueIndex": 1},
+      },
+      namespace="/emo",
+    )
+
+    controller_messages = self.get_messages(controller)
+    player_messages = self.get_messages(player)
+    ack = self.get_ack(controller_messages, "queue-play-idempotent-1")
+    prepare = next(message for message in player_messages if message["action"] == "playback.prepare")
+    ready_prepare = get_state().update_prepare_ready(ack["payload"]["prepareId"], "player-1", True)
+
+    first_commit = _commit_prepare(ready_prepare)
+    second_commit = _commit_prepare(ready_prepare)
+    commit_messages = self.get_messages(player)
+    play_commands = [message for message in commit_messages if message["action"] == "player.play"]
+
+    self.assertIsNotNone(first_commit)
+    self.assertIsNone(second_commit)
+    self.assertEqual(first_commit["controlVersion"], prepare["payload"]["controlVersion"])
+    self.assertEqual(len(play_commands), 1)
+    self.assertEqual(get_state().get_prepare(ack["payload"]["prepareId"])["status"], "committed")
+
+  def test_prepare_timeout_rejects_late_ready_without_commit(self):
+    capabilities = {"effectiveAtPlayback": True, "playbackPrepare": True}
+    player = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"], capabilities=capabilities)
+    controller = self.connect_device("alice", "Alic3", "controller-1", "sess-1", ["controller"])
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    player.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.session.sync",
+        "requestId": "source-queue-timeout-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "queueSongIds": ["song-1", "song-2"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "queue.playItem",
+        "requestId": "queue-play-timeout-1",
+        "targetClientId": "player-1",
+        "payload": {"sessionId": "sess-1", "queueIndex": 1},
+      },
+      namespace="/emo",
+    )
+
+    controller_messages = self.get_messages(controller)
+    player_messages = self.get_messages(player)
+    ack = self.get_ack(controller_messages, "queue-play-timeout-1")
+    prepare = next(message for message in player_messages if message["action"] == "playback.prepare")
+    prepare_id = ack["payload"]["prepareId"]
+
+    get_state()._pending_prepares[prepare_id]["expiresAtMs"] = 0
+    expired_prepare = _expire_prepare(prepare_id)
+    self.assertEqual(expired_prepare["status"], "timed_out")
+
+    player.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.ready",
+        "requestId": "queue-play-ready-after-timeout-1",
+        "payload": {
+          "prepareId": prepare_id,
+          "clientId": "player-1",
+          "ready": True,
+          "positionMs": 0,
+          "controlVersion": prepare["payload"]["controlVersion"],
+        },
+      },
+      namespace="/emo",
+    )
+
+    ready_messages = self.get_messages(player)
+    ready_ack = self.get_ack(ready_messages, "queue-play-ready-after-timeout-1")
+
+    self.assertTrue(ready_ack["payload"]["ignored"])
+    self.assertEqual(ready_ack["payload"]["status"], "timed_out")
+    self.assertFalse(any(message["action"] == "playback.update" for message in ready_messages))
+    self.assertFalse(any(message["action"] == "player.play" for message in ready_messages))
+    self.assertIsNone(get_state().get_playback_state("sess-1", "player-1"))
+
+  def test_immediate_pause_supersedes_pending_prepare(self):
+    capabilities = {"effectiveAtPlayback": True, "playbackPrepare": True}
+    player = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"], capabilities=capabilities)
+    controller = self.connect_device("alice", "Alic3", "controller-1", "sess-1", ["controller"])
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    player.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.session.sync",
+        "requestId": "source-queue-supersede-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "queueSongIds": ["song-1", "song-2"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "queue.playItem",
+        "requestId": "queue-play-supersede-1",
+        "targetClientId": "player-1",
+        "payload": {"sessionId": "sess-1", "queueIndex": 1},
+      },
+      namespace="/emo",
+    )
+
+    controller_messages = self.get_messages(controller)
+    player_messages = self.get_messages(player)
+    prepare_ack = self.get_ack(controller_messages, "queue-play-supersede-1")
+    prepare = next(message for message in player_messages if message["action"] == "playback.prepare")
+    prepare_id = prepare_ack["payload"]["prepareId"]
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "player.pause",
+        "requestId": "pause-supersede-1",
+        "targetClientId": "player-1",
+        "payload": {"sessionId": "sess-1", "positionMs": 5000},
+      },
+      namespace="/emo",
+    )
+    self.get_ack(self.get_messages(controller), "pause-supersede-1")
+    self.get_messages(player)
+    self.assertEqual(get_state().get_prepare(prepare_id)["status"], "superseded")
+
+    player.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.ready",
+        "requestId": "ready-after-supersede-1",
+        "payload": {
+          "prepareId": prepare_id,
+          "clientId": "player-1",
+          "ready": True,
+          "positionMs": 0,
+          "controlVersion": prepare["payload"]["controlVersion"],
+        },
+      },
+      namespace="/emo",
+    )
+
+    ready_messages = self.get_messages(player)
+    ready_ack = self.get_ack(ready_messages, "ready-after-supersede-1")
+    playback_state = get_state().get_playback_state("sess-1", "player-1")
+
+    self.assertTrue(ready_ack["payload"]["ignored"])
+    self.assertEqual(ready_ack["payload"]["status"], "superseded")
+    self.assertFalse(any(message["action"] == "player.play" for message in ready_messages))
+    self.assertFalse(
+      any(
+        message["action"] == "playback.update"
+        and message["payload"].get("state") == "playing"
+        for message in ready_messages
+      )
+    )
+    self.assertEqual(playback_state["state"], "paused")
+    self.assertEqual(playback_state["positionMs"], 5000)
+
+  def test_queue_session_sync_supersedes_pending_prepare(self):
+    capabilities = {"effectiveAtPlayback": True, "playbackPrepare": True}
+    player = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"], capabilities=capabilities)
+    controller = self.connect_device("alice", "Alic3", "controller-1", "sess-1", ["controller"])
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    player.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.session.sync",
+        "requestId": "source-queue-sync-supersede-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "queueSongIds": ["song-1", "song-2"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "queue.playItem",
+        "requestId": "queue-play-before-sync-supersede-1",
+        "targetClientId": "player-1",
+        "payload": {"sessionId": "sess-1", "queueIndex": 1},
+      },
+      namespace="/emo",
+    )
+
+    controller_messages = self.get_messages(controller)
+    player_messages = self.get_messages(player)
+    prepare_ack = self.get_ack(controller_messages, "queue-play-before-sync-supersede-1")
+    prepare = next(message for message in player_messages if message["action"] == "playback.prepare")
+    prepare_id = prepare_ack["payload"]["prepareId"]
+
+    player.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.session.sync",
+        "requestId": "source-queue-sync-newer-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "queueSongIds": ["song-3"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_ack(self.get_messages(player), "source-queue-sync-newer-1")
+    self.get_messages(controller)
+    self.assertEqual(get_state().get_prepare(prepare_id)["status"], "superseded")
+
+    player.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.ready",
+        "requestId": "ready-after-queue-sync-supersede-1",
+        "payload": {
+          "prepareId": prepare_id,
+          "clientId": "player-1",
+          "ready": True,
+          "positionMs": 0,
+          "controlVersion": prepare["payload"]["controlVersion"],
+        },
+      },
+      namespace="/emo",
+    )
+
+    ready_messages = self.get_messages(player)
+    ready_ack = self.get_ack(ready_messages, "ready-after-queue-sync-supersede-1")
+    self.assertTrue(ready_ack["payload"]["ignored"])
+    self.assertEqual(ready_ack["payload"]["status"], "superseded")
+    self.assertFalse(any(message["action"] == "player.play" for message in ready_messages))
+    self.assertEqual(get_state().get_queue("sess-1")["queueSongIds"], ["song-3"])
+
+  def test_source_prepare_includes_capable_follow_participant_without_blocking_timeout_commit(self):
+    capabilities = {"effectiveAtPlayback": True, "playbackPrepare": True}
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"], capabilities=capabilities)
+    laptop = self.connect_device("alice", "Alic3", "laptop-1", "root:laptop", ["player"], capabilities=capabilities)
+    controller = self.connect_device("alice", "Alic3", "controller-1", "root:controller", ["controller"])
+    self.get_messages(phone)
+    self.get_messages(laptop)
+    self.get_messages(controller)
+
+    phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.session.sync",
+        "requestId": "source-follow-queue-1",
+        "payload": {
+          "sessionId": "root:phone",
+          "queueSongIds": ["song-1", "song-2"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(phone)
+    self.get_messages(laptop)
+    self.get_messages(controller)
+
+    laptop.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "follow.start",
+        "requestId": "follow-start-prepare-1",
+        "payload": {
+          "sourceClientId": "phone-1",
+          "sourceSessionId": "root:phone",
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(laptop)
+    self.get_messages(phone)
+    self.get_messages(controller)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "player.play",
+        "requestId": "source-follow-play-1",
+        "targetClientId": "phone-1",
+        "payload": {"sessionId": "root:phone"},
+      },
+      namespace="/emo",
+    )
+
+    controller_messages = self.get_messages(controller)
+    phone_messages = self.get_messages(phone)
+    laptop_messages = self.get_messages(laptop)
+    ack = self.get_ack(controller_messages, "source-follow-play-1")
+    phone_prepare = next(message for message in phone_messages if message["action"] == "playback.prepare")
+    laptop_prepare = next(message for message in laptop_messages if message["action"] == "playback.prepare")
+    prepare_id = ack["payload"]["prepareId"]
+
+    self.assertEqual(ack["payload"]["targetClientIds"], ["phone-1", "laptop-1"])
+    self.assertEqual(phone_prepare["payload"]["prepareId"], prepare_id)
+    self.assertEqual(laptop_prepare["payload"]["prepareId"], prepare_id)
+    self.assertEqual(laptop_prepare["payload"]["sessionId"], "root:laptop")
+    self.assertEqual(laptop_prepare["payload"]["sourceClientId"], "phone-1")
+    self.assertEqual(
+      laptop_prepare["payload"]["timelineId"],
+      "session:root:phone:client:phone-1",
+    )
+
+    phone.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.ready",
+        "requestId": "source-follow-ready-phone-1",
+        "payload": {
+          "prepareId": prepare_id,
+          "clientId": "phone-1",
+          "ready": True,
+          "positionMs": 0,
+          "controlVersion": phone_prepare["payload"]["controlVersion"],
+        },
+      },
+      namespace="/emo",
+    )
+    phone_ready_messages = self.get_messages(phone)
+    ready_ack = self.get_ack(phone_ready_messages, "source-follow-ready-phone-1")
+    self.assertEqual(ready_ack["payload"]["status"], "preparing")
+    self.assertFalse(any(message["action"] == "player.play" for message in phone_ready_messages))
+
+    get_state()._pending_prepares[prepare_id]["expiresAtMs"] = 0
+    committed = _expire_prepare(prepare_id)
+    self.assertEqual(committed["state"], "playing")
+
+    phone_commit_messages = self.get_messages(phone)
+    laptop_commit_messages = self.get_messages(laptop)
+    phone_playback = next(message for message in phone_commit_messages if message["action"] == "playback.update")
+    laptop_playback = next(message for message in laptop_commit_messages if message["action"] == "playback.update")
+    phone_play = next(message for message in phone_commit_messages if message["action"] == "player.play")
+
+    self.assertEqual(phone_playback["payload"]["sourceClientId"], "phone-1")
+    self.assertEqual(laptop_playback["payload"]["sourceClientId"], "phone-1")
+    self.assertEqual(
+      laptop_playback["payload"]["effectiveAtServerMs"],
+      phone_playback["payload"]["effectiveAtServerMs"],
+    )
+    self.assertEqual(
+      phone_play["payload"]["effectiveAtServerMs"],
+      phone_playback["payload"]["effectiveAtServerMs"],
+    )
+
+  def test_player_seek_uses_future_commit_for_effective_at_player(self):
+    capabilities = {"effectiveAtPlayback": True}
+    player = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"], capabilities=capabilities)
+    controller = self.connect_device("alice", "Alic3", "controller-1", "sess-1", ["controller"])
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    player.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "seek-source-state-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "state": "playing",
+          "trackId": "song-1",
+          "positionMs": 1000,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "player.seek",
+        "requestId": "player-seek-future-1",
+        "targetClientId": "player-1",
+        "payload": {"sessionId": "sess-1", "positionMs": 45000},
+      },
+      namespace="/emo",
+    )
+
+    controller_messages = self.get_messages(controller)
+    player_messages = self.get_messages(player)
+    ack = self.get_ack(controller_messages, "player-seek-future-1")
+    playback = next(message for message in player_messages if message["action"] == "playback.update")
+    seek_command = next(message for message in player_messages if message["action"] == "player.seek")
+
+    self.assertEqual(ack["payload"]["protocolPath"], "single_future")
+    self.assertEqual(playback["payload"]["positionMs"], 45000)
+    self.assertEqual(playback["payload"]["state"], "playing")
+    self.assertIn("effectiveAtServerMs", playback["payload"])
+    self.assertEqual(seek_command["payload"]["effectiveAtServerMs"], playback["payload"]["effectiveAtServerMs"])
+
+  def test_source_control_rejects_stale_base_control_version(self):
+    capabilities = {"effectiveAtPlayback": True}
+    player = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"], capabilities=capabilities)
+    controller = self.connect_device("alice", "Alic3", "controller-1", "sess-1", ["controller"])
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    player.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.session.sync",
+        "requestId": "source-base-queue-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "queueSongIds": ["song-1"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "player.play",
+        "requestId": "source-base-play-1",
+        "targetClientId": "player-1",
+        "payload": {"sessionId": "sess-1"},
+      },
+      namespace="/emo",
+    )
+    self.get_ack(self.get_messages(controller), "source-base-play-1")
+    self.get_messages(player)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "player.seek",
+        "requestId": "source-base-seek-stale-1",
+        "targetClientId": "player-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "positionMs": 45000,
+          "baseControlVersion": 0,
+        },
+      },
+      namespace="/emo",
+    )
+
+    controller_messages = self.get_messages(controller)
+    player_messages = self.get_messages(player)
+    error = next(message for message in controller_messages if message["action"] == "system.error")
+    playback_state = get_state().get_playback_state("sess-1", "player-1")
+
+    self.assertEqual(error["requestId"], "source-base-seek-stale-1")
+    self.assertEqual(error["payload"]["code"], "conflict")
+    self.assertEqual(
+      error["payload"]["currentControlVersion"],
+      playback_state["controlVersion"],
+    )
+    self.assertFalse(any(message["action"] == "player.seek" for message in player_messages))
+    self.assertFalse(any(message["action"] == "playback.update" for message in player_messages))
+    self.assertEqual(playback_state["positionMs"], 0)
+
+  def test_player_seek_track_change_uses_prepare_ready_commit_for_prepare_player(self):
+    capabilities = {"effectiveAtPlayback": True, "playbackPrepare": True}
+    player = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"], capabilities=capabilities)
+    controller = self.connect_device("alice", "Alic3", "controller-1", "sess-1", ["controller"])
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    player.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.session.sync",
+        "requestId": "seek-track-queue-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "queueSongIds": ["song-1", "song-2"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    player.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "seek-track-source-1",
+        "payload": {
+          "sessionId": "sess-1",
+          "state": "playing",
+          "trackId": "song-1",
+          "positionMs": 1000,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(player)
+    self.get_messages(controller)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "player.seek",
+        "requestId": "player-seek-track-change-1",
+        "targetClientId": "player-1",
+        "payload": {"sessionId": "sess-1", "queueIndex": 1, "positionMs": 12000},
+      },
+      namespace="/emo",
+    )
+
+    controller_messages = self.get_messages(controller)
+    player_messages = self.get_messages(player)
+    ack = self.get_ack(controller_messages, "player-seek-track-change-1")
+    prepare = next(message for message in player_messages if message["action"] == "playback.prepare")
+
+    self.assertTrue(ack["payload"]["preparing"])
+    self.assertEqual(prepare["payload"]["trackId"], "song-2")
+    self.assertEqual(prepare["payload"]["currentIndex"], 1)
+    self.assertEqual(prepare["payload"]["positionMs"], 12000)
+    self.assertFalse(any(message["action"] == "player.seek" for message in player_messages))
+
+    player.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.ready",
+        "requestId": "player-seek-track-ready-1",
+        "payload": {
+          "prepareId": ack["payload"]["prepareId"],
+          "clientId": "player-1",
+          "ready": True,
+          "positionMs": 12000,
+          "controlVersion": prepare["payload"]["controlVersion"],
+        },
+      },
+      namespace="/emo",
+    )
+
+    ready_messages = self.get_messages(player)
+    self.get_ack(ready_messages, "player-seek-track-ready-1")
+    playback = next(message for message in ready_messages if message["action"] == "playback.update")
+    play_command = next(message for message in ready_messages if message["action"] == "player.play")
+
+    self.assertEqual(playback["payload"]["trackId"], "song-2")
+    self.assertEqual(playback["payload"]["currentIndex"], 1)
+    self.assertEqual(playback["payload"]["positionMs"], 12000)
+    self.assertIn("effectiveAtServerMs", playback["payload"])
+    self.assertEqual(play_command["payload"]["effectiveAtServerMs"], playback["payload"]["effectiveAtServerMs"])
 
   def test_forward_queue_play_item_for_local_queue(self):
     player = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"])
@@ -952,6 +1987,164 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertEqual(state.get_active_broadcast_for_client("phone-1"), broadcast_id)
     self.assertEqual(state.get_active_broadcast_for_client("pc-1"), broadcast_id)
 
+  def test_broadcast_start_uses_single_future_for_effective_at_clients(self):
+    capabilities = {"effectiveAtPlayback": True}
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"], capabilities=capabilities)
+    pc = self.connect_device("alice", "Alic3", "pc-1", "root:pc", ["player"], capabilities=capabilities)
+    self.get_messages(phone)
+    self.get_messages(pc)
+
+    self.start_broadcast(phone, ["phone-1", "pc-1"], request_id="broadcast-start-future-1")
+
+    phone_messages = self.get_messages(phone)
+    pc_messages = self.get_messages(pc)
+    ack = self.get_ack(phone_messages, "broadcast-start-future-1")
+    pc_start = next(message for message in pc_messages if message["action"] == "broadcast.start")
+
+    self.assertEqual(ack["payload"]["protocolPath"], "single_future")
+    self.assertIn("effectiveAtServerMs", ack["payload"]["broadcast"])
+    self.assertGreater(
+      ack["payload"]["broadcast"]["effectiveAtServerMs"],
+      ack["payload"]["broadcast"]["serverUpdatedAtMs"],
+    )
+    self.assertEqual(
+      pc_start["payload"]["effectiveAtServerMs"],
+      ack["payload"]["broadcast"]["effectiveAtServerMs"],
+    )
+    self.assertFalse(any(message["action"] == "playback.prepare" for message in pc_messages))
+
+  def test_broadcast_start_with_legacy_participant_uses_whole_control_legacy_fallback(self):
+    capabilities = {"effectiveAtPlayback": True, "playbackPrepare": True}
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"], capabilities=capabilities)
+    pc = self.connect_device("alice", "Alic3", "pc-1", "root:pc", ["player"])
+    self.get_messages(phone)
+    self.get_messages(pc)
+
+    self.start_broadcast(phone, ["phone-1", "pc-1"], request_id="broadcast-start-mixed-legacy-1")
+
+    phone_messages = self.get_messages(phone)
+    pc_messages = self.get_messages(pc)
+    ack = self.get_ack(phone_messages, "broadcast-start-mixed-legacy-1")
+    pc_start = next(message for message in pc_messages if message["action"] == "broadcast.start")
+
+    self.assertEqual(ack["payload"]["protocolPath"], "legacy")
+    self.assertNotIn("effectiveAtServerMs", ack["payload"]["broadcast"])
+    self.assertNotIn("effectiveAtServerMs", pc_start["payload"])
+    self.assertFalse(any(message["action"] == "playback.prepare" for message in phone_messages))
+    self.assertFalse(any(message["action"] == "playback.prepare" for message in pc_messages))
+
+  def test_broadcast_start_uses_prepare_ready_commit_for_prepare_clients(self):
+    capabilities = {"effectiveAtPlayback": True, "playbackPrepare": True}
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"], capabilities=capabilities)
+    pc = self.connect_device("alice", "Alic3", "pc-1", "root:pc", ["player"], capabilities=capabilities)
+    self.get_messages(phone)
+    self.get_messages(pc)
+
+    self.start_broadcast(phone, ["phone-1", "pc-1"], request_id="broadcast-start-prepare-1")
+
+    phone_messages = self.get_messages(phone)
+    pc_messages = self.get_messages(pc)
+    ack = self.get_ack(phone_messages, "broadcast-start-prepare-1")
+    phone_prepare = next(message for message in phone_messages if message["action"] == "playback.prepare")
+    pc_prepare = next(message for message in pc_messages if message["action"] == "playback.prepare")
+    prepare_id = ack["payload"]["prepareId"]
+
+    self.assertTrue(ack["payload"]["preparing"])
+    self.assertEqual(phone_prepare["payload"]["prepareId"], prepare_id)
+    self.assertEqual(pc_prepare["payload"]["prepareId"], prepare_id)
+    self.assertFalse(any(message["action"] == "broadcast.start" for message in pc_messages))
+
+    phone.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.ready",
+        "requestId": "ready-phone-1",
+        "payload": {
+          "prepareId": prepare_id,
+          "clientId": "phone-1",
+          "ready": True,
+          "positionMs": 0,
+          "controlVersion": phone_prepare["payload"]["controlVersion"],
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_ack(self.get_messages(phone), "ready-phone-1")
+    self.assertIsNone(get_state().get_broadcast(ack["payload"]["broadcastId"]))
+
+    pc.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.ready",
+        "requestId": "ready-pc-1",
+        "payload": {
+          "prepareId": prepare_id,
+          "clientId": "pc-1",
+          "ready": True,
+          "positionMs": 0,
+          "controlVersion": pc_prepare["payload"]["controlVersion"],
+        },
+      },
+      namespace="/emo",
+    )
+
+    pc_ready_messages = self.get_messages(pc)
+    phone_commit_messages = self.get_messages(phone)
+    self.get_ack(pc_ready_messages, "ready-pc-1")
+    pc_start = next(message for message in pc_ready_messages if message["action"] == "broadcast.start")
+    phone_start = next(message for message in phone_commit_messages if message["action"] == "broadcast.start")
+    broadcast = get_state().get_broadcast(ack["payload"]["broadcastId"])
+
+    self.assertIsNotNone(broadcast)
+    self.assertEqual(pc_start["payload"]["protocolPath"], "two_phase")
+    self.assertEqual(phone_start["payload"]["effectiveAtServerMs"], pc_start["payload"]["effectiveAtServerMs"])
+    self.assertEqual(broadcast["effectiveAtServerMs"], pc_start["payload"]["effectiveAtServerMs"])
+
+  def test_broadcast_prepare_rejects_stale_base_control_version_before_prepare(self):
+    capabilities = {"effectiveAtPlayback": True, "playbackPrepare": True}
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"], capabilities=capabilities)
+    pc = self.connect_device("alice", "Alic3", "pc-1", "root:pc", ["player"], capabilities=capabilities)
+    self.get_messages(phone)
+    self.get_messages(pc)
+
+    self.start_broadcast(
+      phone,
+      ["phone-1", "pc-1"],
+      request_id="broadcast-start-stale-prepare-base-1",
+      autoPlay=False,
+    )
+    start_ack = self.get_ack(self.get_messages(phone), "broadcast-start-stale-prepare-base-1")
+    broadcast_id = start_ack["payload"]["broadcastId"]
+    self.get_messages(pc)
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "broadcast.playItem",
+        "requestId": "broadcast-play-item-stale-prepare-base-1",
+        "payload": {
+          "broadcastId": broadcast_id,
+          "queueIndex": 1,
+          "positionMs": 0,
+          "baseControlVersion": 0,
+        },
+      },
+      namespace="/emo",
+    )
+
+    phone_messages = self.get_messages(phone)
+    pc_messages = self.get_messages(pc)
+    error = next(message for message in phone_messages if message["action"] == "system.error")
+
+    self.assertEqual(error["requestId"], "broadcast-play-item-stale-prepare-base-1")
+    self.assertEqual(error["payload"]["code"], "conflict")
+    self.assertEqual(error["payload"]["currentControlVersion"], 1)
+    self.assertFalse(any(message["action"] == "playback.prepare" for message in phone_messages))
+    self.assertFalse(any(message["action"] == "playback.prepare" for message in pc_messages))
+
   def test_device_register_restores_active_broadcast_status(self):
     phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
     pc = self.connect_device("alice", "Alic3", "pc-1", "root:pc", ["player"])
@@ -1370,6 +2563,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertEqual(participant_state["positionMs"], 12000)
     self.assertEqual(participant_state["syncDriftMs"], -200)
     self.assertTrue(participant_state["online"])
+    self.assertIsNone(get_state().get_playback_state("root:pc", "pc-1"))
 
   def test_broadcast_stale_participant_is_marked_offline(self):
     phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
@@ -1549,6 +2743,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertEqual(playback["payload"]["epoch"], 1)
     self.assertEqual(playback["payload"]["clientInstanceId"], "boot-a")
     self.assertEqual(playback["payload"]["clientSeq"], 2)
+    self.assertEqual(playback["payload"]["followDelayMs"], 0)
     self.assertIn("serverUpdatedAtMs", playback["payload"])
     self.assertNotEqual(playback["payload"]["updatedAt"], 1)
 
@@ -1797,8 +2992,10 @@ class EmoWebSocketTestCase(unittest.TestCase):
     follower_state = get_state().get_playback_state("root:laptop", "laptop-1")
     self.assertEqual(source_state["positionMs"], 60000)
     self.assertEqual(source_state["timelineId"], "session:root:phone:client:phone-1")
+    self.assertEqual(source_state["followDelayMs"], 0)
     self.assertEqual(follower_state["positionMs"], 60300)
     self.assertEqual(follower_state["timelineId"], "session:root:laptop:client:laptop-1")
+    self.assertEqual(follower_state["followDelayMs"], 0)
 
   def test_broadcast_accepts_base_control_version_and_emits_timeline_fields(self):
     phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
@@ -1812,6 +3009,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertEqual(start_ack["payload"]["broadcast"]["timelineId"], f"broadcast:{broadcast_id}")
     self.assertEqual(start_ack["payload"]["broadcast"]["controlVersion"], 1)
     self.assertEqual(start_ack["payload"]["broadcast"]["queueRevision"], 1)
+    self.assertEqual(start_ack["payload"]["broadcast"]["followDelayMs"], 0)
     self.get_messages(pc)
 
     phone.emit(

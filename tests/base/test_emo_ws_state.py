@@ -301,6 +301,87 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
                 },
             )
 
+    def test_restore_playback_state_strips_expired_effective_at(self):
+        playback = self.state.restore_playback_state(
+            "sess-1",
+            "player-1",
+            {
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 0,
+                "effectiveAtServerMs": 9000,
+            },
+            now=10,
+        )
+
+        self.assertNotIn("effectiveAtServerMs", playback)
+
+    def test_list_followers_for_source_filters_active_relationships(self):
+        self.state.start_follow_relationship(
+            "laptop-1",
+            "root:laptop",
+            "phone-1",
+            "root:phone",
+            "alice",
+            now=10,
+        )
+        self.state.start_follow_relationship(
+            "tablet-1",
+            "root:tablet",
+            "phone-1",
+            "root:phone",
+            "alice",
+            now=20,
+        )
+        self.state.start_follow_relationship(
+            "speaker-1",
+            "root:speaker",
+            "other-1",
+            "root:other",
+            "alice",
+            now=30,
+        )
+        self.state.stop_follow_relationship("tablet-1", now=40)
+
+        followers = self.state.list_followers_for_source("phone-1")
+        all_followers = self.state.list_followers_for_source("phone-1", active_only=False)
+
+        self.assertEqual([relationship["followerClientId"] for relationship in followers], ["laptop-1"])
+        self.assertEqual(
+            [relationship["followerClientId"] for relationship in all_followers],
+            ["laptop-1", "tablet-1"],
+        )
+
+    def test_create_prepare_supersedes_existing_prepare_for_timeline(self):
+        first = self.state.create_prepare(
+            "prepare-1",
+            "player.play",
+            "timeline-1",
+            ["player-1"],
+            ["player-1"],
+            1,
+            {"timelineId": "timeline-1"},
+            1000,
+            2000,
+        )
+        self.assertEqual(first["status"], "preparing")
+
+        second = self.state.create_prepare(
+            "prepare-2",
+            "player.play",
+            "timeline-1",
+            ["player-1"],
+            ["player-1"],
+            2,
+            {"timelineId": "timeline-1"},
+            1100,
+            2100,
+        )
+
+        self.assertEqual(second["status"], "preparing")
+        self.assertEqual(self.state.get_prepare("prepare-1")["status"], "superseded")
+        self.assertEqual(self.state.get_prepare("prepare-2")["status"], "preparing")
+
     def test_broadcast_timeline_versions_and_epoch_rules(self):
         broadcast = self.state.create_broadcast(
             "broadcast-1",

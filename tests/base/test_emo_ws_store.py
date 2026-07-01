@@ -1,6 +1,7 @@
 import unittest
 import os
 import tempfile
+import time
 
 from supysonic import db
 from supysonic.emo.ws_store import (
@@ -68,6 +69,23 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
 
         all_states = getPlaybackStates("root:living-room")
         self.assertEqual(len(all_states), 1)
+
+    def test_load_playback_state_strips_expired_effective_at(self):
+        savePlaybackState(
+            "root:living-room",
+            "root",
+            "player-1",
+            {
+                "sessionId": "root:living-room",
+                "state": "playing",
+                "trackId": "track-1",
+                "positionMs": 4200,
+                "effectiveAtServerMs": int(time.time() * 1000) - 1000,
+            },
+        )
+
+        playback_state = getPlaybackState("root:living-room", "player-1")
+        self.assertNotIn("effectiveAtServerMs", playback_state)
 
     def test_save_and_load_local_queue_state(self):
         saveLocalQueueState(

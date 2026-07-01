@@ -68,6 +68,7 @@ ACTION_EVENT_NAMES = {
     "session.unsubscribe": "session_unsubscribe",
     "follow.start": "follow_start",
     "follow.stop": "follow_stop",
+    "playback.ready": "playback_ready",
     "playback.update": "playback_update",
     "queue.local.get": "queue_local_get",
     "queue.local.set": "queue_local_set",
@@ -90,6 +91,15 @@ CONTROL_POLICIES = {
     "participants_and_controllers_can_control",
 }
 
+CAPABILITY_EFFECTIVE_AT = "effectiveAtPlayback"
+CAPABILITY_PLAYBACK_PREPARE = "playbackPrepare"
+PROTOCOL_LEGACY = "legacy"
+PROTOCOL_SINGLE_FUTURE = "single_future"
+PROTOCOL_TWO_PHASE = "two_phase"
+TWO_PHASE_COMMIT_LEAD_MS = 350
+SINGLE_PHASE_COMMIT_LEAD_MS = 700
+PREPARE_TIMEOUT_MS = 1200
+
 
 class BroadcastConflictError(Exception):
     def __init__(self, message, current_version=None, current_control_version=None):
@@ -102,6 +112,12 @@ class QueueConflictError(Exception):
     def __init__(self, message, current_queue_revision=None):
         super().__init__(message)
         self.current_queue_revision = current_queue_revision
+
+
+class ControlConflictError(Exception):
+    def __init__(self, message, current_control_version=None):
+        super().__init__(message)
+        self.current_control_version = current_control_version
 
 
 class FollowControlForbiddenError(PermissionError):
@@ -225,6 +241,51 @@ def _server_time_ms():
     return int(time.time() * 1000)
 
 
+def _new_prepare_id():
+    return f"prep-{uuid.uuid4().hex[:12]}"
+
+
+def _client_capabilities(client):
+    capabilities = client.get("capabilities") if isinstance(client, dict) else None
+    return capabilities if isinstance(capabilities, dict) else {}
+
+
+def _client_supports(client, capability):
+    return _client_capabilities(client).get(capability) is True
+
+
+def _select_playback_protocol(client_ids):
+    if not client_ids:
+        return PROTOCOL_LEGACY
+
+    clients = []
+    for client_id in client_ids:
+        client = state.get_client(client_id)
+        if client is None or not _has_role(client, "player"):
+            return PROTOCOL_LEGACY
+        clients.append(client)
+
+    if all(
+        _client_supports(client, CAPABILITY_EFFECTIVE_AT)
+        and _client_supports(client, CAPABILITY_PLAYBACK_PREPARE)
+        for client in clients
+    ):
+        return PROTOCOL_TWO_PHASE
+    if all(_client_supports(client, CAPABILITY_EFFECTIVE_AT) for client in clients):
+        return PROTOCOL_SINGLE_FUTURE
+    return PROTOCOL_LEGACY
+
+
+def _commit_lead_ms(protocol):
+    if protocol == PROTOCOL_SINGLE_FUTURE:
+        return SINGLE_PHASE_COMMIT_LEAD_MS
+    return TWO_PHASE_COMMIT_LEAD_MS
+
+
+def _effective_at_server_ms(protocol):
+    return _server_time_ms() + _commit_lead_ms(protocol)
+
+
 def _send_ack(request_id=None, payload=None):
     emit("message", _build_message("system", "system.ack", payload, requestId=request_id))
 
@@ -297,6 +358,16 @@ def _broadcast_playback_state(user_name, session_id):
         message = _build_message("state", "playback.update", playback_state)
         for target_sid in target_sids:
             socketio.emit("message", message, to=target_sid, namespace="/emo")
+
+
+def _save_playback_state_snapshot(user_name, playback_state):
+    if not playback_state:
+        return
+    session_id = playback_state.get("sessionId")
+    source_client_id = playback_state.get("sourceClientId")
+    if not session_id or not source_client_id:
+        return
+    savePlaybackState(session_id, user_name, source_client_id, playback_state)
 
 
 def _broadcast_local_queue(user_name, session_id, client_id):
@@ -493,6 +564,20 @@ def _register_device(sid, user_name, payload):
 
 
 def _route_command(sender, message):
+    target_client_id, target_sid, target_client = _resolve_control_target(sender, message)
+
+    outgoing = _build_message(
+        "command",
+        message["action"],
+        message["payload"],
+        requestId=message.get("requestId"),
+        sourceClientId=sender["clientId"],
+        targetClientId=target_client_id,
+    )
+    socketio.emit("message", outgoing, to=target_sid, namespace="/emo")
+
+
+def _resolve_control_target(sender, message):
     target_client_id = message.get("targetClientId")
     if not target_client_id:
         raise ValueError("Missing targetClientId")
@@ -507,15 +592,7 @@ def _route_command(sender, message):
 
     _ensure_not_follow_source_control(sender, target_client_id, message["action"])
 
-    outgoing = _build_message(
-        "command",
-        message["action"],
-        message["payload"],
-        requestId=message.get("requestId"),
-        sourceClientId=sender["clientId"],
-        targetClientId=target_client_id,
-    )
-    socketio.emit("message", outgoing, to=target_sid, namespace="/emo")
+    return target_client_id, target_sid, target_client
 
 
 def _get_active_follow_relationship(client_id):
@@ -597,6 +674,8 @@ def _build_broadcast_core_payload(broadcast, extra=None):
         "controlPolicy": broadcast.get("controlPolicy"),
         "updatedAt": None if server_updated_at_ms is None else server_updated_at_ms / 1000,
     }
+    if broadcast.get("effectiveAtServerMs") is not None:
+        payload["effectiveAtServerMs"] = broadcast.get("effectiveAtServerMs")
     if extra:
         payload.update(extra)
     return payload
@@ -668,6 +747,30 @@ def _get_optional_broadcast_base_control_version(payload):
     return None
 
 
+def _ensure_broadcast_base_control_version_current(broadcast, expected_version):
+    if expected_version is None:
+        return
+    current_control_version = broadcast.get(
+        "controlVersion",
+        broadcast.get("version"),
+    )
+    if current_control_version != expected_version:
+        raise BroadcastConflictError(
+            "Broadcast control version conflict",
+            current_version=broadcast.get("version"),
+            current_control_version=current_control_version,
+        )
+
+
+def _get_optional_source_base_control_version(payload):
+    if "baseControlVersion" not in payload:
+        return None
+    base_version = payload.get("baseControlVersion")
+    if not _is_int(base_version):
+        raise ValueError("baseControlVersion must be an integer")
+    return base_version
+
+
 def _get_base_queue_revision(payload):
     if "baseQueueRevision" not in payload:
         return None
@@ -677,7 +780,12 @@ def _get_base_queue_revision(payload):
     return base_revision
 
 
-def _update_active_broadcast_state(broadcast_id, updated_by_client_id, **kwargs):
+def _update_active_broadcast_state(
+    broadcast_id,
+    updated_by_client_id,
+    supersede_pending=True,
+    **kwargs,
+):
     try:
         updated = state.update_broadcast_state(
             broadcast_id,
@@ -695,6 +803,10 @@ def _update_active_broadcast_state(broadcast_id, updated_by_client_id, **kwargs)
         )
     if updated is None:
         raise LookupError("Broadcast not found")
+    if supersede_pending:
+        state.supersede_prepares_for_timeline(
+            updated.get("timelineId") or f"broadcast:{broadcast_id}"
+        )
     return updated
 
 
@@ -825,6 +937,798 @@ def _estimate_broadcast_position_ms(broadcast, now=None):
     return max(0, int(position_ms + ((now - updated_at) * 1000)))
 
 
+def _required_broadcast_ready_clients(owner_client_id, participant_ids):
+    if owner_client_id in participant_ids:
+        return [owner_client_id]
+    return list(participant_ids)
+
+
+def _send_playback_prepare(prepare, payload):
+    for target_client_id in prepare.get("targetClientIds") or []:
+        target_client = state.get_client(target_client_id)
+        target_sid = state.get_sid_for_client(target_client_id)
+        if target_client is None or target_sid is None:
+            continue
+        target_payload = dict(payload)
+        target_payload["sessionId"] = target_client.get("sessionId")
+        message = _build_message(
+            "command",
+            "playback.prepare",
+            target_payload,
+            requestId=f"{prepare['prepareId']}-{target_client_id}",
+            targetClientId=target_client_id,
+        )
+        socketio.emit("message", message, to=target_sid, namespace="/emo")
+
+
+def _send_target_player_play(
+    target_client_id,
+    source_client_id,
+    request_id,
+    session_id,
+    effective_at_server_ms,
+    control_version,
+):
+    target_sid = state.get_sid_for_client(target_client_id)
+    if target_sid is None:
+        return
+    socketio.emit(
+        "message",
+        _build_message(
+            "command",
+            "player.play",
+            {
+                "sessionId": session_id,
+                "effectiveAtServerMs": effective_at_server_ms,
+                "controlVersion": control_version,
+            },
+            requestId=request_id,
+            sourceClientId=source_client_id,
+            targetClientId=target_client_id,
+        ),
+        to=target_sid,
+        namespace="/emo",
+    )
+
+
+def _prepare_ready_to_commit(prepare, now_ms=None):
+    now_ms = _server_time_ms() if now_ms is None else now_ms
+    ready = set(prepare.get("readyClientIds") or set())
+    failed = set(prepare.get("failedClientIds") or set())
+    targets = set(prepare.get("targetClientIds") or [])
+    required = set(prepare.get("requiredClientIds") or [])
+    if required & failed:
+        return False
+    if targets and targets <= ready:
+        return True
+    return bool(required and required <= ready and now_ms >= prepare.get("expiresAtMs", 0))
+
+
+def _create_broadcast_prepare(
+    action,
+    current_user_name,
+    current_client,
+    participant_ids,
+    request_id,
+    request_sid,
+    commit_payload,
+):
+    prepare_id = _new_prepare_id()
+    now_ms = _server_time_ms()
+    prepare = state.create_prepare(
+        prepare_id,
+        action,
+        commit_payload["timelineId"],
+        participant_ids,
+        _required_broadcast_ready_clients(
+            commit_payload["ownerClientId"],
+            participant_ids,
+        ),
+        commit_payload["controlVersion"],
+        commit_payload,
+        now_ms,
+        now_ms + PREPARE_TIMEOUT_MS,
+        request_sid=request_sid,
+        request_id=request_id,
+    )
+    prepare_payload = {
+        "prepareId": prepare_id,
+        "broadcastId": commit_payload["broadcastId"],
+        "ownerClientId": commit_payload["ownerClientId"],
+        "timelineId": commit_payload["timelineId"],
+        "sourceClientId": current_client.get("clientId"),
+        "queueSongIds": list(commit_payload.get("queueSongIds") or []),
+        "currentIndex": commit_payload.get("currentIndex", 0),
+        "trackId": commit_payload.get("trackId"),
+        "positionMs": commit_payload.get("positionMs", 0),
+        "controlVersion": commit_payload["controlVersion"],
+        "state": "playing",
+    }
+    _send_playback_prepare(prepare, prepare_payload)
+    socketio.start_background_task(_expire_prepare_later, prepare_id)
+    _send_ack(
+        request_id,
+        {
+            "preparing": True,
+            "prepareId": prepare_id,
+            "broadcastId": commit_payload["broadcastId"],
+            "participants": list(participant_ids),
+            "protocolPath": PROTOCOL_TWO_PHASE,
+        },
+    )
+    _log_emo_event(
+        logging.INFO,
+        "playback_prepare",
+        result="created",
+        user=current_user_name,
+        client_request_id=request_id,
+        source_client_id=current_client.get("clientId"),
+        broadcast_id=commit_payload["broadcastId"],
+        prepare_id=prepare_id,
+        protocol_path=PROTOCOL_TWO_PHASE,
+    )
+    return prepare
+
+
+def _expire_prepare_later(prepare_id):
+    socketio.sleep(PREPARE_TIMEOUT_MS / 1000)
+    _expire_prepare(prepare_id)
+
+
+def _expire_prepare(prepare_id):
+    prepare = state.get_prepare(prepare_id)
+    if prepare is None or prepare.get("status") != "preparing":
+        return None
+    now_ms = _server_time_ms()
+    if now_ms < prepare.get("expiresAtMs", 0):
+        return None
+    if _prepare_ready_to_commit(prepare, now_ms=now_ms):
+        return _commit_prepare(prepare)
+    timed_out = state.finish_prepare_if_preparing(prepare_id, "timed_out")
+    if timed_out is None:
+        return None
+    commit_payload = prepare.get("commitPayload") or {}
+    _log_emo_event(
+        logging.INFO,
+        "playback_prepare",
+        result="timed_out",
+        action=prepare.get("action"),
+        prepare_id=prepare_id,
+        timeline_id=prepare.get("timelineId"),
+        source_client_id=commit_payload.get("sourceClientId"),
+        target_client_id=commit_payload.get("targetClientId"),
+        broadcast_id=commit_payload.get("broadcastId"),
+    )
+    return timed_out
+
+
+def _commit_prepare(prepare):
+    if prepare.get("status") != "preparing":
+        return None
+    if not _prepare_ready_to_commit(prepare):
+        return None
+    commit_payload = prepare.get("commitPayload") or {}
+    action = prepare.get("action")
+    if action not in (
+        "broadcast.start",
+        "broadcast.playItem",
+        "broadcast.play",
+        "player.play",
+        "queue.playItem",
+    ):
+        return None
+
+    claimed_prepare = state.finish_prepare_if_preparing(
+        prepare["prepareId"],
+        "committed",
+    )
+    if claimed_prepare is None:
+        return None
+    prepare = claimed_prepare
+    commit_payload = prepare.get("commitPayload") or {}
+    effective_at_server_ms = _effective_at_server_ms(PROTOCOL_TWO_PHASE)
+
+    if action == "broadcast.start":
+        broadcast = state.create_broadcast(
+            commit_payload["broadcastId"],
+            commit_payload["userName"],
+            commit_payload["ownerClientId"],
+            commit_payload["participants"],
+            commit_payload["queueSongIds"],
+            commit_payload.get("currentIndex", 0),
+            commit_payload.get("positionMs", 0),
+            commit_payload.get("stateName", "playing"),
+            commit_payload.get("controlPolicy"),
+            commit_payload.get("updatedByClientId"),
+            effective_at_server_ms=effective_at_server_ms,
+        )
+        for participant_id in broadcast.get("participants") or []:
+            participant = state.get_client(participant_id)
+            if participant is None:
+                continue
+            state.update_broadcast_participant_state(
+                broadcast["broadcastId"],
+                participant_id,
+                participant.get("sessionId"),
+                {
+                    "state": broadcast.get("state"),
+                    "trackId": broadcast.get("trackId"),
+                    "positionMs": broadcast.get("positionMs", 0),
+                },
+                online=True,
+            )
+        _broadcast_to_participants(
+            broadcast,
+            "broadcast.start",
+            "command",
+            commit_payload.get("sourceClientId"),
+            request_id=prepare.get("requestId"),
+            extra_payload={
+                "autoPlay": commit_payload.get("autoPlay", True),
+                "protocolPath": PROTOCOL_TWO_PHASE,
+            },
+        )
+    elif action == "broadcast.playItem":
+        broadcast = _update_active_broadcast_state(
+            commit_payload["broadcastId"],
+            commit_payload["updatedByClientId"],
+            current_index=commit_payload["queueIndex"],
+            position_ms=commit_payload.get("positionMs", 0),
+            state_name="playing",
+            expected_version=commit_payload.get("expectedVersion"),
+            effective_at_server_ms=effective_at_server_ms,
+            supersede_pending=False,
+        )
+        _broadcast_to_participants(
+            broadcast,
+            "broadcast.playItem",
+            "command",
+            commit_payload.get("sourceClientId"),
+            request_id=prepare.get("requestId"),
+            extra_payload={
+                "queueIndex": commit_payload["queueIndex"],
+                "protocolPath": PROTOCOL_TWO_PHASE,
+            },
+        )
+    elif action == "broadcast.play":
+        broadcast = _update_active_broadcast_state(
+            commit_payload["broadcastId"],
+            commit_payload["updatedByClientId"],
+            state_name="playing",
+            expected_version=commit_payload.get("expectedVersion"),
+            effective_at_server_ms=effective_at_server_ms,
+            supersede_pending=False,
+        )
+        _broadcast_to_participants(
+            broadcast,
+            "broadcast.play",
+            "command",
+            commit_payload.get("sourceClientId"),
+            request_id=prepare.get("requestId"),
+            extra_payload={"protocolPath": PROTOCOL_TWO_PHASE},
+        )
+    elif action in ("player.play", "queue.playItem"):
+        playback_state = state.update_playback_control(
+            commit_payload["sessionId"],
+            commit_payload["targetClientId"],
+            state_name="playing",
+            track_id=commit_payload.get("trackId"),
+            position_ms=commit_payload.get("positionMs", 0),
+            queue_song_ids=commit_payload.get("queueSongIds"),
+            current_index=commit_payload.get("currentIndex"),
+            updated_by_client_id=commit_payload.get("sourceClientId"),
+            effective_at_server_ms=effective_at_server_ms,
+            control_version=commit_payload.get("controlVersion"),
+        )
+        _save_playback_state_snapshot(
+            commit_payload.get("userName"),
+            playback_state,
+        )
+        _broadcast_playback_state(
+            commit_payload["userName"],
+            commit_payload["sessionId"],
+        )
+        _send_target_player_play(
+            commit_payload["targetClientId"],
+            commit_payload.get("sourceClientId"),
+            prepare.get("requestId"),
+            commit_payload["sessionId"],
+            effective_at_server_ms,
+            playback_state["controlVersion"],
+        )
+        return playback_state
+    else:
+        return None
+
+    request_sid = prepare.get("requestSid")
+    if request_sid:
+        socketio.emit(
+            "message",
+            _build_message(
+                "state",
+                "broadcast.status",
+                _build_broadcast_status_payload(broadcast),
+                requestId=prepare.get("requestId"),
+            ),
+            to=request_sid,
+            namespace="/emo",
+        )
+    return broadcast
+
+
+def _resolve_control_queue(target_client_id, payload):
+    session_id = payload.get("sessionId")
+    queue_client_id = payload.get("clientId")
+    if queue_client_id:
+        queue_state = state.get_local_queue(session_id, queue_client_id)
+    else:
+        queue_state = state.get_queue(session_id)
+    if queue_state is None:
+        return None
+    return queue_state
+
+
+def _source_timeline_id(session_id, client_id):
+    return f"session:{session_id}:client:{client_id}"
+
+
+def _current_source_control_version(session_id, target_client_id):
+    playback_state = state.get_playback_state(session_id, target_client_id) or {}
+    current_control_version = playback_state.get("controlVersion", 0)
+    queue_state = state.get_local_queue(session_id, target_client_id) or state.get_queue(session_id)
+    if queue_state is not None:
+        current_control_version = max(
+            current_control_version,
+            queue_state.get("controlVersion", 0),
+        )
+    return current_control_version
+
+
+def _validate_source_base_control_version(
+    session_id,
+    target_client_id,
+    payload,
+    current_control_version=None,
+):
+    base_control_version = _get_optional_source_base_control_version(payload)
+    if base_control_version is None:
+        return
+    if current_control_version is None:
+        current_control_version = _current_source_control_version(
+            session_id,
+            target_client_id,
+        )
+    if base_control_version != current_control_version:
+        raise ControlConflictError(
+            "Playback control version conflict",
+            current_control_version=current_control_version,
+        )
+
+
+def _build_source_control_commit_payload(
+    current_user_name,
+    current_client,
+    target_client_id,
+    target_client,
+    action,
+    payload,
+):
+    session_id = payload.get("sessionId") or target_client.get("sessionId")
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError(f"{action} requires a non-empty sessionId")
+
+    playback_state = state.get_playback_state(session_id, target_client_id) or {}
+    queue_state = None
+    queue_song_ids = playback_state.get("queueSongIds") or []
+    current_index = playback_state.get("currentIndex", 0)
+    track_id = playback_state.get("trackId")
+    position_ms = payload.get("positionMs", playback_state.get("positionMs", 0))
+
+    if action in ("queue.playItem", "player.next", "player.prev"):
+        queue_state = _resolve_control_queue(target_client_id, payload)
+        if queue_state is None and action in ("player.next", "player.prev"):
+            queue_state = state.get_local_queue(session_id, target_client_id) or state.get_queue(session_id)
+        if queue_state is None:
+            return None
+        queue_song_ids = list(queue_state.get("queueSongIds") or [])
+        if action == "player.next":
+            queue_index = queue_state.get("currentIndex", 0) + 1
+        elif action == "player.prev":
+            queue_index = max(0, queue_state.get("currentIndex", 0) - 1)
+        else:
+            queue_index = payload.get("queueIndex")
+        if queue_index >= len(queue_song_ids):
+            raise ValueError(f"{action} queueIndex is out of bounds")
+        current_index = queue_index
+        track_id = queue_song_ids[current_index]
+        position_ms = payload.get("positionMs", 0)
+    else:
+        queue_state = state.get_local_queue(session_id, target_client_id) or state.get_queue(session_id)
+        if queue_state is not None:
+            queue_song_ids = list(queue_state.get("queueSongIds") or [])
+            current_index = queue_state.get("currentIndex", current_index)
+            if not track_id and queue_song_ids and 0 <= current_index < len(queue_song_ids):
+                track_id = queue_song_ids[current_index]
+
+    if not track_id:
+        return None
+
+    timeline_id = f"session:{session_id}:client:{target_client_id}"
+    current_control_version = playback_state.get("controlVersion", 0)
+    if queue_state is not None:
+        current_control_version = max(
+            current_control_version,
+            queue_state.get("controlVersion", 0),
+        )
+    _validate_source_base_control_version(
+        session_id,
+        target_client_id,
+        payload,
+        current_control_version=current_control_version,
+    )
+    control_version = current_control_version + 1
+    return {
+        "userName": current_user_name,
+        "action": "queue.playItem" if action in ("player.next", "player.prev") else action,
+        "sessionId": session_id,
+        "targetClientId": target_client_id,
+        "sourceClientId": current_client.get("clientId"),
+        "timelineId": timeline_id,
+        "queueSongIds": list(queue_song_ids or []),
+        "currentIndex": current_index,
+        "trackId": track_id,
+        "positionMs": position_ms,
+        "controlVersion": control_version,
+    }
+
+
+def _build_seek_media_change_commit_payload(
+    current_user_name,
+    current_client,
+    target_client_id,
+    target_client,
+    payload,
+):
+    session_id = payload.get("sessionId") or target_client.get("sessionId")
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("player.seek requires a non-empty sessionId")
+
+    position_ms = payload.get("positionMs")
+    if not _is_non_negative_int(position_ms):
+        raise ValueError("player.seek positionMs must be a non-negative integer")
+
+    playback_state = state.get_playback_state(session_id, target_client_id) or {}
+    queue_state = state.get_local_queue(session_id, target_client_id) or state.get_queue(session_id)
+    queue_song_ids = list(
+        (queue_state or {}).get("queueSongIds")
+        or playback_state.get("queueSongIds")
+        or []
+    )
+    current_index = playback_state.get("currentIndex", 0)
+    requested_index = payload.get("queueIndex", payload.get("currentIndex"))
+    requested_track_id = payload.get("trackId")
+
+    if requested_index is not None:
+        if not _is_int(requested_index) or requested_index < 0:
+            raise ValueError("player.seek queueIndex must be a non-negative integer")
+        if requested_index >= len(queue_song_ids):
+            raise ValueError("player.seek queueIndex is out of bounds")
+        current_index = requested_index
+        requested_track_id = queue_song_ids[current_index]
+    elif isinstance(requested_track_id, str) and requested_track_id:
+        if queue_song_ids and requested_track_id in queue_song_ids:
+            current_index = queue_song_ids.index(requested_track_id)
+    else:
+        return None
+
+    if requested_track_id == playback_state.get("trackId"):
+        return None
+
+    current_control_version = playback_state.get("controlVersion", 0)
+    if queue_state is not None:
+        current_control_version = max(
+            current_control_version,
+            queue_state.get("controlVersion", 0),
+        )
+    _validate_source_base_control_version(
+        session_id,
+        target_client_id,
+        payload,
+        current_control_version=current_control_version,
+    )
+
+    return {
+        "userName": current_user_name,
+        "action": "queue.playItem",
+        "sessionId": session_id,
+        "targetClientId": target_client_id,
+        "sourceClientId": current_client.get("clientId"),
+        "timelineId": f"session:{session_id}:client:{target_client_id}",
+        "queueSongIds": queue_song_ids,
+        "currentIndex": current_index,
+        "trackId": requested_track_id,
+        "positionMs": position_ms,
+        "controlVersion": current_control_version + 1,
+    }
+
+
+def _source_prepare_target_client_ids(source_client_id):
+    target_client_ids = [source_client_id]
+    for relationship in state.list_followers_for_source(source_client_id):
+        follower_client_id = relationship.get("followerClientId")
+        if not follower_client_id or follower_client_id in target_client_ids:
+            continue
+        follower_client = state.get_client(follower_client_id)
+        if follower_client is None or not _has_role(follower_client, "player"):
+            continue
+        if not (
+            _client_supports(follower_client, CAPABILITY_EFFECTIVE_AT)
+            and _client_supports(follower_client, CAPABILITY_PLAYBACK_PREPARE)
+        ):
+            continue
+        target_client_ids.append(follower_client_id)
+    return target_client_ids
+
+
+def _create_source_prepare(current_user_name, current_client, target_client_id, request_id, commit_payload):
+    prepare_id = _new_prepare_id()
+    now_ms = _server_time_ms()
+    target_client_ids = _source_prepare_target_client_ids(target_client_id)
+    prepare = state.create_prepare(
+        prepare_id,
+        commit_payload["action"],
+        commit_payload["timelineId"],
+        target_client_ids,
+        [target_client_id],
+        commit_payload["controlVersion"],
+        commit_payload,
+        now_ms,
+        now_ms + PREPARE_TIMEOUT_MS,
+        request_sid=request.sid,
+        request_id=request_id,
+    )
+    _send_playback_prepare(
+        prepare,
+        {
+            "prepareId": prepare_id,
+            "sourceClientId": target_client_id,
+            "timelineId": commit_payload["timelineId"],
+            "queueSongIds": list(commit_payload.get("queueSongIds") or []),
+            "currentIndex": commit_payload.get("currentIndex", 0),
+            "trackId": commit_payload.get("trackId"),
+            "positionMs": commit_payload.get("positionMs", 0),
+            "controlVersion": commit_payload["controlVersion"],
+            "state": "playing",
+        },
+    )
+    socketio.start_background_task(_expire_prepare_later, prepare_id)
+    _send_ack(
+        request_id,
+        {
+            "preparing": True,
+            "prepareId": prepare_id,
+            "targetClientId": target_client_id,
+            "targetClientIds": target_client_ids,
+            "protocolPath": PROTOCOL_TWO_PHASE,
+        },
+    )
+    _log_emo_event(
+        logging.INFO,
+        "playback_prepare",
+        result="created",
+        user=current_user_name,
+        client_request_id=request_id,
+        source_client_id=current_client.get("clientId"),
+        target_client_id=target_client_id,
+        prepare_id=prepare_id,
+        protocol_path=PROTOCOL_TWO_PHASE,
+    )
+    return prepare
+
+
+def _handle_server_mediated_control(current_user_name, current_client, message, request_id):
+    action = message["action"]
+    if action not in (
+        "player.play",
+        "player.pause",
+        "player.seek",
+        "player.next",
+        "player.prev",
+        "queue.playItem",
+    ):
+        return False
+
+    target_client_id, target_sid, target_client = _resolve_control_target(current_client, message)
+    protocol = _select_playback_protocol([target_client_id])
+    if protocol == PROTOCOL_LEGACY:
+        return False
+
+    payload = message.get("payload") or {}
+    if action == "player.pause":
+        session_id = payload.get("sessionId") or target_client.get("sessionId")
+        current_control_version = _current_source_control_version(
+            session_id,
+            target_client_id,
+        )
+        _validate_source_base_control_version(
+            session_id,
+            target_client_id,
+            payload,
+            current_control_version=current_control_version,
+        )
+        position_ms = payload.get("positionMs")
+        playback_state = state.update_playback_control(
+            session_id,
+            target_client_id,
+            state_name="paused",
+            position_ms=position_ms,
+            updated_by_client_id=current_client.get("clientId"),
+            control_version=current_control_version + 1,
+        )
+        state.supersede_prepares_for_timeline(
+            playback_state.get("timelineId") or _source_timeline_id(session_id, target_client_id)
+        )
+        _save_playback_state_snapshot(current_user_name, playback_state)
+        _broadcast_playback_state(current_user_name, session_id)
+        socketio.emit(
+            "message",
+            _build_message(
+                "command",
+                "player.pause",
+                payload,
+                requestId=request_id,
+                sourceClientId=current_client.get("clientId"),
+                targetClientId=target_client_id,
+            ),
+            to=target_sid,
+            namespace="/emo",
+        )
+        _send_ack(
+            request_id,
+            {
+                "updated": True,
+                "protocolPath": protocol,
+                "playback": playback_state,
+            },
+        )
+        return True
+
+    commit_payload = None
+    if action == "player.seek":
+        commit_payload = _build_seek_media_change_commit_payload(
+            current_user_name,
+            current_client,
+            target_client_id,
+            target_client,
+            payload,
+        )
+
+    if action == "player.seek" and commit_payload is None:
+        session_id = payload.get("sessionId") or target_client.get("sessionId")
+        position_ms = payload.get("positionMs")
+        if not _is_non_negative_int(position_ms):
+            raise ValueError("player.seek positionMs must be a non-negative integer")
+        current_playback = state.get_playback_state(session_id, target_client_id) or {}
+        current_control_version = _current_source_control_version(
+            session_id,
+            target_client_id,
+        )
+        _validate_source_base_control_version(
+            session_id,
+            target_client_id,
+            payload,
+            current_control_version=current_control_version,
+        )
+        state_name = current_playback.get("state") or "paused"
+        effective_at_server_ms = (
+            _server_time_ms() + 250
+            if state_name == "playing"
+            else None
+        )
+        playback_state = state.update_playback_control(
+            session_id,
+            target_client_id,
+            state_name=state_name,
+            track_id=current_playback.get("trackId"),
+            position_ms=position_ms,
+            queue_song_ids=current_playback.get("queueSongIds"),
+            current_index=current_playback.get("currentIndex"),
+            updated_by_client_id=current_client.get("clientId"),
+            effective_at_server_ms=effective_at_server_ms,
+            control_version=current_control_version + 1,
+        )
+        state.supersede_prepares_for_timeline(
+            playback_state.get("timelineId") or _source_timeline_id(session_id, target_client_id)
+        )
+        _save_playback_state_snapshot(current_user_name, playback_state)
+        _broadcast_playback_state(current_user_name, session_id)
+        command_payload = dict(payload)
+        if effective_at_server_ms is not None:
+            command_payload["effectiveAtServerMs"] = effective_at_server_ms
+            command_payload["controlVersion"] = playback_state["controlVersion"]
+        socketio.emit(
+            "message",
+            _build_message(
+                "command",
+                "player.seek",
+                command_payload,
+                requestId=request_id,
+                sourceClientId=current_client.get("clientId"),
+                targetClientId=target_client_id,
+            ),
+            to=target_sid,
+            namespace="/emo",
+        )
+        _send_ack(
+            request_id,
+            {
+                "updated": True,
+                "protocolPath": PROTOCOL_SINGLE_FUTURE,
+                "playback": playback_state,
+            },
+        )
+        return True
+
+    if commit_payload is None:
+        commit_payload = _build_source_control_commit_payload(
+            current_user_name,
+            current_client,
+            target_client_id,
+            target_client,
+            action,
+            payload,
+        )
+    if commit_payload is None:
+        return False
+
+    if protocol == PROTOCOL_TWO_PHASE:
+        _create_source_prepare(
+            current_user_name,
+            current_client,
+            target_client_id,
+            request_id,
+            commit_payload,
+        )
+        return True
+
+    effective_at_server_ms = _effective_at_server_ms(PROTOCOL_SINGLE_FUTURE)
+    playback_state = state.update_playback_control(
+        commit_payload["sessionId"],
+        target_client_id,
+        state_name="playing",
+        track_id=commit_payload.get("trackId"),
+        position_ms=commit_payload.get("positionMs", 0),
+        queue_song_ids=commit_payload.get("queueSongIds"),
+        current_index=commit_payload.get("currentIndex"),
+        updated_by_client_id=current_client.get("clientId"),
+        effective_at_server_ms=effective_at_server_ms,
+        control_version=commit_payload.get("controlVersion"),
+    )
+    state.supersede_prepares_for_timeline(
+        playback_state.get("timelineId")
+        or _source_timeline_id(commit_payload["sessionId"], target_client_id)
+    )
+    _save_playback_state_snapshot(current_user_name, playback_state)
+    _broadcast_playback_state(current_user_name, commit_payload["sessionId"])
+    _send_target_player_play(
+        target_client_id,
+        current_client.get("clientId"),
+        request_id,
+        commit_payload["sessionId"],
+        effective_at_server_ms,
+        playback_state["controlVersion"],
+    )
+    _send_ack(
+        request_id,
+        {
+            "updated": True,
+            "protocolPath": protocol,
+            "playback": playback_state,
+        },
+    )
+    return True
+
+
 def _handle_broadcast_start(current_user_name, current_client, payload, request_id):
     if current_client is None:
         raise PermissionError("Register the device before starting broadcast")
@@ -852,6 +1756,46 @@ def _handle_broadcast_start(current_user_name, current_client, payload, request_
         current_client,
         payload,
     )
+    protocol = (
+        _select_playback_protocol(participant_ids)
+        if state_name == "playing"
+        else PROTOCOL_LEGACY
+    )
+    if protocol == PROTOCOL_TWO_PHASE:
+        broadcast_id = _new_broadcast_id()
+        track_id = queue_song_ids[current_index] if queue_song_ids else None
+        return _create_broadcast_prepare(
+            "broadcast.start",
+            current_user_name,
+            current_client,
+            participant_ids,
+            request_id,
+            request.sid,
+            {
+                "broadcastId": broadcast_id,
+                "timelineId": f"broadcast:{broadcast_id}",
+                "userName": current_user_name,
+                "ownerClientId": current_client.get("clientId"),
+                "sourceClientId": current_client.get("clientId"),
+                "participants": list(participant_ids),
+                "skippedClientIds": list(skipped_client_ids),
+                "queueSongIds": list(queue_song_ids),
+                "currentIndex": current_index,
+                "trackId": track_id,
+                "positionMs": position_ms,
+                "stateName": state_name,
+                "controlPolicy": control_policy,
+                "updatedByClientId": current_client.get("clientId"),
+                "autoPlay": auto_play,
+                "controlVersion": 1,
+            },
+        )
+
+    effective_at_server_ms = (
+        _effective_at_server_ms(PROTOCOL_SINGLE_FUTURE)
+        if protocol == PROTOCOL_SINGLE_FUTURE and state_name == "playing"
+        else None
+    )
     broadcast = state.create_broadcast(
         _new_broadcast_id(),
         current_user_name,
@@ -863,6 +1807,7 @@ def _handle_broadcast_start(current_user_name, current_client, payload, request_
         state_name,
         control_policy,
         current_client.get("clientId"),
+        effective_at_server_ms=effective_at_server_ms,
     )
 
     for participant_id in participant_ids:
@@ -889,6 +1834,7 @@ def _handle_broadcast_start(current_user_name, current_client, payload, request_
             "participants": list(broadcast.get("participants") or []),
             "skippedClientIds": skipped_client_ids,
             "broadcast": broadcast,
+            "protocolPath": protocol,
         },
     )
     _broadcast_to_participants(
@@ -897,7 +1843,7 @@ def _handle_broadcast_start(current_user_name, current_client, payload, request_
         "command",
         current_client.get("clientId"),
         request_id=request_id,
-        extra_payload={"autoPlay": auto_play, "serverStartAt": None},
+        extra_payload={"autoPlay": auto_play, "serverStartAt": None, "protocolPath": protocol},
     )
     return broadcast
 
@@ -958,7 +1904,39 @@ def _handle_broadcast_play_item(current_user_name, current_client, payload, requ
     position_ms = payload.get("positionMs", 0)
     if not _is_non_negative_int(position_ms):
         raise ValueError("positionMs must be a non-negative integer")
+    _ensure_broadcast_base_control_version_current(broadcast, base_version)
 
+    protocol = _select_playback_protocol(broadcast.get("participants") or [])
+    if protocol == PROTOCOL_TWO_PHASE:
+        return _create_broadcast_prepare(
+            "broadcast.playItem",
+            current_user_name,
+            current_client,
+            broadcast.get("participants") or [],
+            request_id,
+            request.sid,
+            {
+                "broadcastId": broadcast["broadcastId"],
+                "timelineId": broadcast.get("timelineId") or f"broadcast:{broadcast['broadcastId']}",
+                "ownerClientId": broadcast.get("ownerClientId"),
+                "sourceClientId": current_client.get("clientId"),
+                "participants": list(broadcast.get("participants") or []),
+                "queueSongIds": list(queue_song_ids),
+                "currentIndex": queue_index,
+                "trackId": queue_song_ids[queue_index],
+                "positionMs": position_ms,
+                "updatedByClientId": current_client.get("clientId"),
+                "queueIndex": queue_index,
+                "expectedVersion": base_version,
+                "controlVersion": broadcast.get("controlVersion", broadcast.get("version", 0)) + 1,
+            },
+        )
+
+    effective_at_server_ms = (
+        _effective_at_server_ms(PROTOCOL_SINGLE_FUTURE)
+        if protocol == PROTOCOL_SINGLE_FUTURE
+        else None
+    )
     updated = _update_active_broadcast_state(
         broadcast["broadcastId"],
         current_client.get("clientId"),
@@ -966,6 +1944,7 @@ def _handle_broadcast_play_item(current_user_name, current_client, payload, requ
         position_ms=position_ms,
         state_name="playing",
         expected_version=base_version,
+        effective_at_server_ms=effective_at_server_ms,
     )
     _send_ack(request_id, {"updated": True, "broadcast": updated})
     _broadcast_to_participants(
@@ -974,7 +1953,7 @@ def _handle_broadcast_play_item(current_user_name, current_client, payload, requ
         "command",
         current_client.get("clientId"),
         request_id=request_id,
-        extra_payload={"queueIndex": queue_index},
+        extra_payload={"queueIndex": queue_index, "protocolPath": protocol},
     )
     return updated
 
@@ -989,11 +1968,44 @@ def _handle_broadcast_play(current_user_name, current_client, payload, request_i
     if not _is_int(current_index) or current_index < 0 or current_index >= len(queue_song_ids):
         raise ValueError("broadcast.play requires a valid currentIndex")
 
+    expected_version = _get_optional_broadcast_base_control_version(payload)
+    _ensure_broadcast_base_control_version_current(broadcast, expected_version)
+    protocol = _select_playback_protocol(broadcast.get("participants") or [])
+    if protocol == PROTOCOL_TWO_PHASE:
+        return _create_broadcast_prepare(
+            "broadcast.play",
+            current_user_name,
+            current_client,
+            broadcast.get("participants") or [],
+            request_id,
+            request.sid,
+            {
+                "broadcastId": broadcast["broadcastId"],
+                "timelineId": broadcast.get("timelineId") or f"broadcast:{broadcast['broadcastId']}",
+                "ownerClientId": broadcast.get("ownerClientId"),
+                "sourceClientId": current_client.get("clientId"),
+                "participants": list(broadcast.get("participants") or []),
+                "queueSongIds": list(queue_song_ids),
+                "currentIndex": current_index,
+                "trackId": queue_song_ids[current_index],
+                "positionMs": broadcast.get("positionMs", 0),
+                "updatedByClientId": current_client.get("clientId"),
+                "expectedVersion": expected_version,
+                "controlVersion": broadcast.get("controlVersion", broadcast.get("version", 0)) + 1,
+            },
+        )
+
+    effective_at_server_ms = (
+        _effective_at_server_ms(PROTOCOL_SINGLE_FUTURE)
+        if protocol == PROTOCOL_SINGLE_FUTURE
+        else None
+    )
     updated = _update_active_broadcast_state(
         broadcast["broadcastId"],
         current_client.get("clientId"),
         state_name="playing",
-        expected_version=_get_optional_broadcast_base_control_version(payload),
+        expected_version=expected_version,
+        effective_at_server_ms=effective_at_server_ms,
     )
     _send_ack(request_id, {"updated": True, "broadcast": updated})
     _broadcast_to_participants(
@@ -1002,6 +2014,7 @@ def _handle_broadcast_play(current_user_name, current_client, payload, request_i
         "command",
         current_client.get("clientId"),
         request_id=request_id,
+        extra_payload={"protocolPath": protocol},
     )
     return updated
 
@@ -1076,6 +2089,9 @@ def _handle_broadcast_stop(current_user_name, current_client, payload, request_i
         )
     if updated is None:
         raise LookupError("Broadcast not found")
+    state.supersede_prepares_for_timeline(
+        updated.get("timelineId") or f"broadcast:{broadcast['broadcastId']}"
+    )
     _send_ack(request_id, {"stopped": True, "broadcast": updated})
     _broadcast_to_participants(
         updated,
@@ -1286,6 +2302,96 @@ def _build_ready_complete_payload(current_client, payload):
     return ready_payload
 
 
+def _handle_playback_ready(current_client, payload, request_id):
+    if current_client is None:
+        raise PermissionError("Register the device before sending playback ready")
+
+    prepare_id = payload.get("prepareId")
+    if not isinstance(prepare_id, str) or not prepare_id:
+        raise ValueError("playback.ready requires a non-empty prepareId")
+
+    ready = payload.get("ready")
+    if not isinstance(ready, bool):
+        raise ValueError("playback.ready ready must be a boolean")
+
+    payload_client_id = payload.get("clientId")
+    current_client_id = current_client.get("clientId")
+    if payload_client_id is not None and payload_client_id != current_client_id:
+        raise PermissionError("playback.ready clientId must match the current device")
+
+    prepare = state.get_prepare(prepare_id)
+    if prepare is None:
+        _send_ack(request_id, {"ignored": True, "prepareId": prepare_id})
+        return None
+    if prepare.get("status") != "preparing":
+        _send_ack(
+            request_id,
+            {
+                "ignored": True,
+                "prepareId": prepare_id,
+                "status": prepare.get("status"),
+            },
+        )
+        return prepare
+
+    control_version = payload.get("controlVersion")
+    if control_version != prepare.get("controlVersion"):
+        raise ValueError("playback.ready controlVersion does not match prepare")
+
+    updated_prepare = state.update_prepare_ready(
+        prepare_id,
+        current_client_id,
+        ready,
+    )
+    if updated_prepare is None:
+        raise PermissionError("playback.ready sender is not a prepare target")
+    if updated_prepare.get("status") != "preparing":
+        _send_ack(
+            request_id,
+            {
+                "ignored": True,
+                "prepareId": prepare_id,
+                "status": updated_prepare.get("status"),
+            },
+        )
+        return updated_prepare
+
+    if (
+        not ready
+        and current_client_id in set(updated_prepare.get("requiredClientIds") or [])
+    ):
+        aborted_prepare = state.finish_prepare_if_preparing(prepare_id, "aborted")
+        if aborted_prepare is None:
+            latest_prepare = state.get_prepare(prepare_id) or updated_prepare
+            _send_ack(
+                request_id,
+                {
+                    "ignored": True,
+                    "prepareId": prepare_id,
+                    "status": latest_prepare.get("status"),
+                },
+            )
+            return latest_prepare
+        _send_ack(
+            request_id,
+            {"ready": False, "prepareId": prepare_id, "status": "aborted"},
+        )
+        return aborted_prepare
+
+    committed = None
+    if _prepare_ready_to_commit(updated_prepare):
+        committed = _commit_prepare(updated_prepare)
+    _send_ack(
+        request_id,
+        {
+            "ready": ready,
+            "prepareId": prepare_id,
+            "status": "committed" if committed is not None else "preparing",
+        },
+    )
+    return committed or updated_prepare
+
+
 class EmoNamespace(Namespace):
     def on_connect(self):
         if not current_app.config["WEBAPP"].get("emo_ws_enabled", True):
@@ -1492,6 +2598,24 @@ class EmoNamespace(Namespace):
                     _validate_queue_play_item(message.get("targetClientId"), payload)
                 elif action == "player.requestState":
                     _validate_player_request_state(payload)
+                if _handle_server_mediated_control(
+                    current_user_name,
+                    current_client,
+                    message,
+                    request_id,
+                ):
+                    _log_emo_event(
+                        logging.INFO,
+                        "control_forward",
+                        result="server_mediated",
+                        action=action,
+                        user=current_user_name,
+                        session_id=payload.get("sessionId") or current_client.get("sessionId"),
+                        source_client_id=current_client.get("clientId"),
+                        target_client_id=message.get("targetClientId"),
+                        client_request_id=request_id,
+                    )
+                    return
                 _route_command(current_client, message)
                 _log_emo_event(
                     logging.INFO,
@@ -1523,6 +2647,22 @@ class EmoNamespace(Namespace):
                     broadcast_id=None if updated_broadcast is None else updated_broadcast.get("broadcastId"),
                     version=None if updated_broadcast is None else updated_broadcast.get("version"),
                 )
+            elif action == "playback.ready":
+                ready_result = _handle_playback_ready(
+                    current_client,
+                    payload,
+                    request_id,
+                )
+                _log_emo_event(
+                    logging.INFO,
+                    "playback_ready",
+                    result="success",
+                    user=current_user_name,
+                    client_request_id=request_id,
+                    source_client_id=None if current_client is None else current_client.get("clientId"),
+                    prepare_id=payload.get("prepareId"),
+                    status=None if ready_result is None else ready_result.get("status"),
+                )
             elif action == "playback.update":
                 if current_client is None:
                     raise PermissionError("Register the device before publishing state")
@@ -1553,6 +2693,28 @@ class EmoNamespace(Namespace):
                         raise PermissionError(
                             "Broadcast playback update requires active participant"
                         )
+                    state.update_broadcast_participant_state(
+                        broadcast_for_update["broadcastId"],
+                        current_client.get("clientId"),
+                        session_id,
+                        playback_payload,
+                        online=True,
+                    )
+                    _log_emo_event(
+                        logging.INFO,
+                        "playback_update",
+                        result="participant_feedback",
+                        user=current_user_name,
+                        client_request_id=request_id,
+                        **_build_playback_summary(
+                            session_id,
+                            current_client.get("clientId"),
+                            playback_payload,
+                            broadcast_id=broadcast_id,
+                        ),
+                    )
+                    _send_ack(request_id, {"updated": True, "participantFeedback": True})
+                    return
                 playback_payload = state.update_playback_state(
                     session_id,
                     current_client.get("clientId"),
@@ -1576,14 +2738,6 @@ class EmoNamespace(Namespace):
                         playback_payload,
                     ),
                 )
-                if broadcast_for_update is not None:
-                    state.update_broadcast_participant_state(
-                        broadcast_for_update["broadcastId"],
-                        current_client.get("clientId"),
-                        session_id,
-                        playback_payload,
-                        online=True,
-                    )
                 _send_ack(request_id, {"updated": True})
                 _broadcast_playback_state(current_user_name, session_id)
             elif action == "queue.local.get":
@@ -1759,6 +2913,10 @@ class EmoNamespace(Namespace):
                         "Queue revision conflict",
                         current_queue_revision=exc.current_revision,
                     )
+                state.supersede_prepares_for_timeline(
+                    queue_state.get("timelineId")
+                    or _source_timeline_id(session_id, current_client_id)
+                )
                 saveQueueState(
                     session_id,
                     current_user_name,
@@ -1834,6 +2992,34 @@ class EmoNamespace(Namespace):
             error_payload = {"code": "conflict", "message": str(exc)}
             if exc.current_queue_revision is not None:
                 error_payload["currentQueueRevision"] = exc.current_queue_revision
+            emit(
+                "message",
+                _build_message(
+                    "system",
+                    "system.error",
+                    error_payload,
+                    requestId=request_id,
+                ),
+            )
+        except ControlConflictError as exc:
+            event_name = _get_action_event_name(action) or "bad_message"
+            _log_emo_event(
+                logging.WARNING,
+                event_name,
+                result="conflict",
+                reason=str(exc),
+                **_build_action_log_context(
+                    action,
+                    request_id,
+                    current_user_name,
+                    current_client,
+                    payload,
+                    message,
+                ),
+            )
+            error_payload = {"code": "conflict", "message": str(exc)}
+            if exc.current_control_version is not None:
+                error_payload["currentControlVersion"] = exc.current_control_version
             emit(
                 "message",
                 _build_message(

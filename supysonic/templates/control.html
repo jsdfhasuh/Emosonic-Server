@@ -553,7 +553,7 @@
       return basePositionMs;
     }
     const playbackRate = Number(playback.playbackRate ?? 1) || 1;
-    const followDelayMs = Number(playback.followDelayMs ?? 700) || 700;
+    const followDelayMs = Number(playback.followDelayMs ?? 0) || 0;
     return Math.max(0, basePositionMs + ((getServerNowMs() - serverUpdatedAtMs) * playbackRate) - followDelayMs);
   }
 

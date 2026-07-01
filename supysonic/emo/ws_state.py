@@ -3,7 +3,7 @@ import time
 
 
 DEFAULT_CLIENT_STALE_SECONDS = 90
-DEFAULT_FOLLOW_DELAY_MS = 700
+DEFAULT_FOLLOW_DELAY_MS = 0
 
 
 def _timestamp_ms(now=None):
@@ -89,6 +89,8 @@ class WebSocketState:
         self._client_active_broadcast = {}
         # follower clientId -> server-owned follow relationship
         self._follow_relationships = {}
+        # prepareId -> pending two-phase playback control state
+        self._pending_prepares = {}
 
     def register_session(self, sid, now=None):
         now = time.time() if now is None else now
@@ -322,9 +324,20 @@ class WebSocketState:
             "updatedAt": (timeline.get("serverUpdatedAtMs", 0) or 0) / 1000,
             "playbackRate": timeline.get("playbackRate", 1.0),
         }
+        effective_at_server_ms = timeline.get("effectiveAtServerMs")
+        if effective_at_server_ms is not None:
+            fields["effectiveAtServerMs"] = effective_at_server_ms
         if server_time_ms is not None:
             fields["serverTimeMs"] = server_time_ms
         return fields
+
+    def _strip_expired_effective_at_locked(self, payload, now=None):
+        effective_at_server_ms = payload.get("effectiveAtServerMs")
+        if not isinstance(effective_at_server_ms, (int, float)):
+            payload.pop("effectiveAtServerMs", None)
+            return
+        if effective_at_server_ms <= _timestamp_ms(now):
+            payload.pop("effectiveAtServerMs", None)
 
     def update_queue(
         self,
@@ -619,6 +632,8 @@ class WebSocketState:
                     timeline["epoch"] = timeline.get("epoch", 0) + 1
             timeline["mediaIdentity"] = media_identity
             timeline["serverUpdatedAtMs"] = server_updated_at_ms
+            timeline.pop("effectiveAtServerMs", None)
+            playback_state.pop("effectiveAtServerMs", None)
 
             playback_state.update(
                 self._copy_playback_timeline_fields(
@@ -632,6 +647,106 @@ class WebSocketState:
             playback_state.setdefault("followDelayMs", DEFAULT_FOLLOW_DELAY_MS)
             self._playback_states[(session_id, client_id)] = playback_state
         return dict(playback_state)
+
+    def update_playback_control(
+        self,
+        session_id,
+        client_id,
+        state_name=None,
+        track_id=None,
+        position_ms=None,
+        queue_song_ids=None,
+        current_index=None,
+        updated_by_client_id=None,
+        effective_at_server_ms=None,
+        control_version=None,
+        now=None,
+    ):
+        if not session_id or not client_id:
+            return None
+        server_updated_at_ms = _timestamp_ms(now)
+        with self._lock:
+            previous_state = self._playback_states.get((session_id, client_id)) or {}
+            queue_state = self._queues.get(session_id)
+            local_queue_state = self._local_queues.get((session_id, client_id))
+            timeline = self._get_or_create_playback_timeline_locked(session_id, client_id)
+
+            if queue_song_ids is None:
+                if local_queue_state is not None:
+                    queue_song_ids = local_queue_state.get("queueSongIds")
+                elif queue_state is not None:
+                    queue_song_ids = queue_state.get("queueSongIds")
+            queue_song_ids = list(queue_song_ids or previous_state.get("queueSongIds") or [])
+
+            if not isinstance(current_index, int):
+                if local_queue_state is not None:
+                    current_index = local_queue_state.get("currentIndex", 0)
+                elif queue_state is not None:
+                    current_index = queue_state.get("currentIndex", 0)
+                else:
+                    current_index = previous_state.get("currentIndex", 0)
+            if not isinstance(current_index, int):
+                current_index = 0
+
+            if track_id is None:
+                if queue_song_ids and 0 <= current_index < len(queue_song_ids):
+                    track_id = queue_song_ids[current_index]
+                else:
+                    track_id = previous_state.get("trackId")
+
+            if position_ms is None:
+                position_ms = previous_state.get("positionMs", 0)
+            position_ms = _int_or_default(position_ms, 0)
+
+            if state_name is None:
+                state_name = previous_state.get("state") or "stopped"
+
+            queue_revision = timeline.get("queueRevision", 0)
+            if queue_state is not None and queue_state.get("sourceClientId") == client_id:
+                queue_revision = queue_state.get("queueRevision", queue_revision)
+
+            previous_media_identity = timeline.get("mediaIdentity")
+            media_identity = (track_id, current_index, queue_revision, client_id)
+
+            timeline["originClientId"] = updated_by_client_id or client_id
+            timeline["trackId"] = track_id
+            timeline["state"] = state_name
+            timeline["positionMs"] = position_ms
+            timeline["playbackRate"] = previous_state.get("playbackRate", timeline.get("playbackRate", 1.0))
+            timeline["queueRevision"] = queue_revision
+            timeline["version"] = timeline.get("version", 0) + 1
+            if type(control_version) is int:
+                timeline["controlVersion"] = control_version
+            else:
+                timeline["controlVersion"] = timeline.get("controlVersion", 0) + 1
+            if timeline.get("epoch", 0) == 0:
+                timeline["epoch"] = 1
+            elif previous_media_identity is not None and previous_media_identity != media_identity:
+                timeline["epoch"] = timeline.get("epoch", 0) + 1
+            timeline["mediaIdentity"] = media_identity
+            timeline["serverUpdatedAtMs"] = server_updated_at_ms
+            if effective_at_server_ms is not None and state_name == "playing":
+                timeline["effectiveAtServerMs"] = effective_at_server_ms
+            else:
+                timeline.pop("effectiveAtServerMs", None)
+
+            playback_state = dict(previous_state)
+            playback_state.update(
+                {
+                    "sessionId": session_id,
+                    "sourceClientId": client_id,
+                    "state": state_name,
+                    "trackId": track_id,
+                    "positionMs": position_ms,
+                    "queueSongIds": queue_song_ids,
+                    "currentIndex": current_index,
+                    "queueType": playback_state.get("queueType") or "session",
+                }
+            )
+            playback_state.update(self._copy_playback_timeline_fields(timeline))
+            playback_state.setdefault("followDelayMs", DEFAULT_FOLLOW_DELAY_MS)
+            self._playback_states[(session_id, client_id)] = playback_state
+            return dict(playback_state)
 
     def restore_playback_state(self, session_id, client_id, state, now=None):
         if not session_id or not client_id or state is None:
@@ -669,6 +784,7 @@ class WebSocketState:
 
             playback_state = dict(state)
             playback_state.pop("serverTimeMs", None)
+            self._strip_expired_effective_at_locked(playback_state, now=now)
             playback_state["sessionId"] = session_id
             playback_state["sourceClientId"] = client_id
             playback_state["updatedAt"] = server_updated_at_ms / 1000
@@ -703,6 +819,10 @@ class WebSocketState:
             timeline["controlVersion"] = control_version
             timeline["mediaIdentity"] = media_identity
             timeline["serverUpdatedAtMs"] = server_updated_at_ms
+            if "effectiveAtServerMs" in playback_state:
+                timeline["effectiveAtServerMs"] = playback_state["effectiveAtServerMs"]
+            else:
+                timeline.pop("effectiveAtServerMs", None)
 
             client_instance_id = playback_state.get("clientInstanceId")
             client_seq = playback_state.get("clientSeq")
@@ -742,6 +862,7 @@ class WebSocketState:
         state_name="stopped",
         control_policy="participants_and_controllers_can_control",
         updated_by_client_id=None,
+        effective_at_server_ms=None,
         now=None,
     ):
         now = time.time() if now is None else now
@@ -773,6 +894,8 @@ class WebSocketState:
             "followDelayMs": DEFAULT_FOLLOW_DELAY_MS,
             "controlPolicy": control_policy,
         }
+        if effective_at_server_ms is not None and state_name == "playing":
+            broadcast["effectiveAtServerMs"] = effective_at_server_ms
         with self._lock:
             self._broadcasts[broadcast_id] = broadcast
             self._broadcast_participants[broadcast_id] = set(participant_ids)
@@ -843,6 +966,7 @@ class WebSocketState:
         increment_queue_revision=False,
         increment_control_version=True,
         require_active=False,
+        effective_at_server_ms=None,
         now=None,
     ):
         now = time.time() if now is None else now
@@ -895,6 +1019,10 @@ class WebSocketState:
             broadcast["updatedByClientId"] = updated_by_client_id
             broadcast["serverUpdatedAtMs"] = server_updated_at_ms
             broadcast["updatedAt"] = server_updated_at_ms / 1000
+            if effective_at_server_ms is not None and broadcast.get("state") == "playing":
+                broadcast["effectiveAtServerMs"] = effective_at_server_ms
+            elif state_name is not None and state_name != "playing":
+                broadcast.pop("effectiveAtServerMs", None)
             if increment_version:
                 broadcast["version"] = broadcast.get("version", 0) + 1
             return dict(broadcast)
@@ -929,6 +1057,7 @@ class WebSocketState:
             ) + 1
             broadcast["serverUpdatedAtMs"] = server_updated_at_ms
             broadcast["updatedAt"] = server_updated_at_ms / 1000
+            broadcast.pop("effectiveAtServerMs", None)
             broadcast["version"] = broadcast.get("version", 0) + 1
 
             for client_id in self._broadcast_participants.get(broadcast_id, set()):
@@ -1030,6 +1159,97 @@ class WebSocketState:
             relationship["updatedAtMs"] = now_ms
             return dict(relationship)
 
+    def create_prepare(
+        self,
+        prepare_id,
+        action,
+        timeline_id,
+        target_client_ids,
+        required_client_ids,
+        control_version,
+        commit_payload,
+        created_at_ms,
+        expires_at_ms,
+        request_sid=None,
+        request_id=None,
+    ):
+        prepare = {
+            "prepareId": prepare_id,
+            "action": action,
+            "timelineId": timeline_id,
+            "targetClientIds": list(target_client_ids),
+            "requiredClientIds": list(required_client_ids),
+            "readyClientIds": set(),
+            "failedClientIds": set(),
+            "controlVersion": control_version,
+            "commitPayload": dict(commit_payload),
+            "createdAtMs": created_at_ms,
+            "expiresAtMs": expires_at_ms,
+            "status": "preparing",
+            "requestSid": request_sid,
+            "requestId": request_id,
+        }
+        with self._lock:
+            self.supersede_prepares_for_timeline(timeline_id)
+            self._pending_prepares[prepare_id] = prepare
+            return self._copy_prepare_locked(prepare)
+
+    def _copy_prepare_locked(self, prepare):
+        copied = dict(prepare)
+        copied["targetClientIds"] = list(prepare.get("targetClientIds") or [])
+        copied["requiredClientIds"] = list(prepare.get("requiredClientIds") or [])
+        copied["readyClientIds"] = set(prepare.get("readyClientIds") or set())
+        copied["failedClientIds"] = set(prepare.get("failedClientIds") or set())
+        copied["commitPayload"] = dict(prepare.get("commitPayload") or {})
+        return copied
+
+    def get_prepare(self, prepare_id):
+        with self._lock:
+            prepare = self._pending_prepares.get(prepare_id)
+            return None if prepare is None else self._copy_prepare_locked(prepare)
+
+    def update_prepare_ready(self, prepare_id, client_id, ready):
+        with self._lock:
+            prepare = self._pending_prepares.get(prepare_id)
+            if prepare is None:
+                return None
+            if prepare.get("status") != "preparing":
+                return self._copy_prepare_locked(prepare)
+            if client_id not in set(prepare.get("targetClientIds") or []):
+                return None
+            if ready:
+                prepare["readyClientIds"].add(client_id)
+                prepare["failedClientIds"].discard(client_id)
+            else:
+                prepare["failedClientIds"].add(client_id)
+                prepare["readyClientIds"].discard(client_id)
+            return self._copy_prepare_locked(prepare)
+
+    def finish_prepare(self, prepare_id, status):
+        with self._lock:
+            prepare = self._pending_prepares.get(prepare_id)
+            if prepare is None:
+                return None
+            prepare["status"] = status
+            return self._copy_prepare_locked(prepare)
+
+    def finish_prepare_if_preparing(self, prepare_id, status):
+        with self._lock:
+            prepare = self._pending_prepares.get(prepare_id)
+            if prepare is None or prepare.get("status") != "preparing":
+                return None
+            prepare["status"] = status
+            return self._copy_prepare_locked(prepare)
+
+    def supersede_prepares_for_timeline(self, timeline_id):
+        with self._lock:
+            for prepare in self._pending_prepares.values():
+                if (
+                    prepare.get("timelineId") == timeline_id
+                    and prepare.get("status") == "preparing"
+                ):
+                    prepare["status"] = "superseded"
+
     def get_follow_relationship(self, follower_client_id, active_only=True):
         with self._lock:
             relationship = self._follow_relationships.get(follower_client_id)
@@ -1038,6 +1258,20 @@ class WebSocketState:
             if active_only and not relationship.get("active"):
                 return None
             return dict(relationship)
+
+    def list_followers_for_source(self, source_client_id, active_only=True):
+        with self._lock:
+            followers = []
+            for relationship in self._follow_relationships.values():
+                if relationship.get("sourceClientId") != source_client_id:
+                    continue
+                if active_only and not relationship.get("active"):
+                    continue
+                followers.append(dict(relationship))
+            return sorted(
+                followers,
+                key=lambda relationship: relationship.get("followerClientId") or "",
+            )
 
     def _deactivate_follow_relationships_for_client_locked(self, client_id, now=None):
         now_ms = _timestamp_ms(now)
