@@ -40,9 +40,9 @@
    - 纯 `seek/play/pause` 不递增 `epoch`。
    - 客户端不能用旧 `epoch` 的进度覆盖新 `epoch` 的歌曲。
 
-5. **跟随端永远保留安全延迟**
-   - 推荐 `followDelayMs = 500` 到 `800`。
-   - 客户端计算目标进度时必须减去这个延迟，避免跑到源头前面。
+5. **跟随端默认不保留人为安全延迟**
+   - `followDelayMs` 缺省为 `0`。
+   - 如果服务端显式下发非零 `followDelayMs`，客户端计算目标进度时再减去这个延迟。
 
 ## 3. 新增字段
 
@@ -62,7 +62,7 @@
   "clientInstanceId": "phone-1:boot-20260629-001",
   "clientSeq": 118,
   "playbackRate": 1.0,
-  "followDelayMs": 700
+  "followDelayMs": 0
 }
 ```
 
@@ -82,7 +82,7 @@
 | `clientInstanceId` | string | 建议 | 客户端进程实例 ID。App 重启或播放器进程重建时变化，用于限定 `clientSeq` 的作用域。 |
 | `clientSeq` | int | 建议 | 同一 `clientInstanceId` 内单调递增序号，用于服务端丢弃同一设备的乱序旧状态。 |
 | `playbackRate` | number | 建议 | 播放速率，默认 `1.0`。 |
-| `followDelayMs` | int | 建议 | 服务端建议跟随延迟，默认可用 `700`。 |
+| `followDelayMs` | int | 建议 | 服务端建议跟随延迟，缺省为 `0`。 |
 
 版本字段规则：
 
@@ -200,7 +200,7 @@
     "serverUpdatedAtMs": 1782730001000,
     "serverTimeMs": 1782730001020,
     "updatedAt": 1782730001.0,
-    "followDelayMs": 700
+    "followDelayMs": 0
   }
 }
 ```
@@ -460,7 +460,7 @@ targetPositionMs = clamp(targetPositionMs, 0, durationMs)
 推荐默认：
 
 ```text
-followDelayMs = 700
+followDelayMs = 0
 ```
 
 客户端 drift 修正建议：
@@ -532,7 +532,7 @@ followDelayMs = 700
 - 使用 `serverUpdatedAtMs` 推算进度。
 - 按 `timelineId/version/epoch` 丢弃旧播放消息。
 - 队列控制使用 `baseQueueRevision`，broadcast 控制使用 `baseControlVersion`；兼容旧 `baseVersion`。
-- 固定减去 `followDelayMs`。
+- 如服务端显式下发 `followDelayMs`，按该值扣减；缺省按 `0` 处理。
 - 跟随端的 `playback.update` 只作为反馈，不作为源头状态。
 
 ### Phase 3：服务端启用严格乱序保护
@@ -548,12 +548,12 @@ followDelayMs = 700
 - 源头上报 `positionMs = 60000`
 - 服务端盖章 `serverUpdatedAtMs = 100000`
 - 跟随端在 `serverNowMs = 101000` 收到
-- `followDelayMs = 700`
+- `followDelayMs = 0`
 
 期望：
 
 ```text
-target = 60000 + 1000 - 700 = 60300
+target = 60000 + 1000 - 0 = 61000
 ```
 
 跟随端目标位置应落后源头约 `700ms`，不能是 `61000` 或更大。

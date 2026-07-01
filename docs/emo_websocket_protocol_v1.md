@@ -258,7 +258,8 @@ Server broadcast note:
 - Server rebroadcasts are authoritative and include additive timeline fields:
   `timelineId`, `authorityClientId`, `originClientId`, `version`, `epoch`,
   `queueRevision`, `controlVersion`, `serverUpdatedAtMs`, `serverTimeMs`,
-  `playbackRate`, and `followDelayMs`.
+  `playbackRate`, and `followDelayMs`. If `followDelayMs` is absent, clients
+  should treat it as `0`.
 - New clients should order playback state by `timelineId + version` and reject
   older `epoch` values so old track progress cannot overwrite a newer track.
 

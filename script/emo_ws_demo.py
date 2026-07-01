@@ -28,6 +28,16 @@ def send_message(sio, message):
     sio.emit("message", message, namespace="/emo")
 
 
+def current_time_ms():
+    return int(time.time() * 1000)
+
+
+def delay_until_server_time_ms(server_time_ms):
+    if not isinstance(server_time_ms, (int, float)):
+        return 0
+    return max(0, (server_time_ms - current_time_ms()) / 1000)
+
+
 def authenticate(sio, args):
     send_message(
         sio,
@@ -49,6 +59,14 @@ def register_device(sio, args):
     }
     if args.alias:
         payload["alias"] = args.alias
+
+    capabilities = {}
+    if args.effective_at_playback:
+        capabilities["effectiveAtPlayback"] = True
+    if args.playback_prepare:
+        capabilities["playbackPrepare"] = True
+    if capabilities:
+        payload["capabilities"] = capabilities
 
     send_message(
         sio,
@@ -125,32 +143,98 @@ def run_player(args):
         "volume": 70,
     }
 
-    def on_message(sio, message):
-        action = message.get("action")
-        if action == "player.play":
-            playback_state["state"] = "playing"
-        elif action == "player.pause":
-            playback_state["state"] = "paused"
-        elif action == "player.next":
-            playback_state["state"] = "playing"
-        elif action == "player.prev":
-            playback_state["state"] = "playing"
-        elif action == "player.seek":
-            playback_state["positionMs"] = message.get("payload", {}).get(
-                "positionMs", playback_state["positionMs"]
-            )
-        else:
-            return
+    def apply_playback_payload(payload):
+        for key in (
+            "sessionId",
+            "broadcastId",
+            "state",
+            "trackId",
+            "positionMs",
+            "queueSongIds",
+            "currentIndex",
+            "timelineId",
+            "version",
+            "epoch",
+            "queueRevision",
+            "controlVersion",
+        ):
+            if key in payload:
+                playback_state[key] = payload[key]
 
+    def send_playback_feedback(sio, request_prefix="playback"):
         send_message(
             sio,
             build_message(
                 "event",
                 "playback.update",
                 playback_state,
-                request_id=f"playback-{int(time.time())}",
+                request_id=f"{request_prefix}-{int(time.time())}",
             ),
         )
+
+    def schedule_feedback(sio, payload, request_prefix="playback"):
+        delay = delay_until_server_time_ms(payload.get("effectiveAtServerMs"))
+        if delay > 0:
+            print(f"waiting {delay:.3f}s for effectiveAtServerMs")
+            timer = threading.Timer(
+                delay,
+                lambda: send_playback_feedback(sio, request_prefix=request_prefix),
+            )
+            timer.daemon = True
+            timer.start()
+            return
+        send_playback_feedback(sio, request_prefix=request_prefix)
+
+    def on_message(sio, message):
+        action = message.get("action")
+        payload = message.get("payload") or {}
+
+        if action == "playback.prepare":
+            apply_playback_payload(payload)
+            playback_state["state"] = "paused"
+            send_message(
+                sio,
+                build_message(
+                    "event",
+                    "playback.ready",
+                    {
+                        "prepareId": payload.get("prepareId"),
+                        "clientId": args.client_id,
+                        "ready": True,
+                        "positionMs": playback_state.get("positionMs", 0),
+                        "controlVersion": payload.get("controlVersion"),
+                    },
+                    request_id=f"ready-{payload.get('prepareId')}",
+                ),
+            )
+            return
+
+        if action in {"playback.update", "broadcast.start", "broadcast.play", "broadcast.playItem"}:
+            apply_playback_payload(payload)
+            schedule_feedback(sio, payload, request_prefix=action.replace(".", "-"))
+            return
+
+        if action == "player.play":
+            apply_playback_payload(payload)
+            playback_state["state"] = "playing"
+        elif action == "player.pause":
+            apply_playback_payload(payload)
+            playback_state["state"] = "paused"
+        elif action == "player.next":
+            playback_state["state"] = "playing"
+        elif action == "player.prev":
+            playback_state["state"] = "playing"
+        elif action == "player.seek":
+            apply_playback_payload(payload)
+            playback_state["positionMs"] = payload.get(
+                "positionMs", playback_state["positionMs"]
+            )
+        elif action in {"broadcast.pause", "broadcast.seek", "broadcast.stop"}:
+            apply_playback_payload(payload)
+        else:
+            return
+
+        schedule_feedback(sio, payload)
 
     def on_ready(sio, state):
         print("player registered and ready")
@@ -294,6 +378,8 @@ def parse_args(argv):
     parser.add_argument("--track-id", default="demo-track")
     parser.add_argument("--target-client-id")
     parser.add_argument("--queue-json")
+    parser.add_argument("--effective-at-playback", action="store_true")
+    parser.add_argument("--playback-prepare", action="store_true")
     return parser.parse_args(argv)
 
 

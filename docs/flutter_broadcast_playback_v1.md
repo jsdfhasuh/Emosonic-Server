@@ -2,6 +2,9 @@
 
 本文档给 Flutter / player 客户端工程师使用，说明如何按 `docs/goal/broadcast.md` 实现第一版群播执行端。
 
+新客户端如果要启用 `effectiveAtPlayback` / `playbackPrepare`，还必须实现
+`docs/flutter_effective_at_playback_v2.md` 里的 timing contract。
+
 ## 1. 定义
 
 群播是多台 player 设备共同播放同一个 `broadcastId` 下的共享队列。`broadcastId` 是群播权威，设备自己的 `sessionId` 不切换。
@@ -35,7 +38,7 @@ class BroadcastPlaybackState {
   int epoch = 0;
   int queueRevision = 0;
   int controlVersion = 0;
-  int followDelayMs = 700;
+  int followDelayMs = 0;
   double serverClockOffsetMs = 0;
 }
 ```
@@ -82,7 +85,7 @@ class BroadcastPlaybackState {
     "serverUpdatedAtMs": 1770000000123,
     "serverTimeMs": 1770000000140,
     "updatedAt": 1770000000.123,
-    "followDelayMs": 700,
+    "followDelayMs": 0,
     "autoPlay": true,
     "serverStartAt": null
   }
@@ -258,7 +261,7 @@ final serverUpdatedAtMs =
 final playbackRate =
     (payload['playbackRate'] as num?)?.toDouble() ?? 1.0;
 final followDelayMs =
-    (payload['followDelayMs'] as num?)?.toDouble() ?? 700;
+    (payload['followDelayMs'] as num?)?.toDouble() ?? 0;
 final targetPositionMs = max(
   0,
   payloadPositionMs +

@@ -2,6 +2,9 @@
 
 本文档给 Flutter 播放器工程师使用，说明如何基于现有 Emosonic Socket.IO 协议实现第一版跟播。
 
+新客户端如果要启用 `effectiveAtPlayback` / `playbackPrepare`，还必须实现
+`docs/flutter_effective_at_playback_v2.md` 里的 timing contract。
+
 ## 1. 定义
 
 跟播是设备 A 跟随设备 B 播放。设备 B 是权威播放源，设备 A 不切换自己的 `sessionId`，只订阅 B 所在的 `sessionId`，并复制 B 的队列、当前歌曲、播放状态和播放进度。
@@ -197,7 +200,7 @@ final serverUpdatedAtMs =
 final playbackRate =
     (payload['playbackRate'] as num?)?.toDouble() ?? 1.0;
 final followDelayMs =
-    (payload['followDelayMs'] as num?)?.toDouble() ?? 700;
+    (payload['followDelayMs'] as num?)?.toDouble() ?? 0;
 final targetPositionMs = max(
   0,
   sourcePositionMs +
@@ -310,5 +313,5 @@ abs(driftMs) >= 1000:
 - session queue 按 `followSessionId` 接收。
 - local queue 和 playback 按 `followSourceClientId` 执行。
 - `playing/paused/stopped`、切歌和 seek 能同步执行。
-- 进度使用 `serverUpdatedAtMs/serverTimeMs` 和服务端时间偏移计算，并减去 `followDelayMs`。
+- 进度使用 `serverUpdatedAtMs/serverTimeMs` 和服务端时间偏移计算；如 payload 带 `followDelayMs`，按该值扣减，缺省为 `0`。
 - 停止跟播后不再执行源设备状态。
