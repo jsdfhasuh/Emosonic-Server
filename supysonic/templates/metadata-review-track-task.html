@@ -1,0 +1,135 @@
+{% extends "layout.html" %}
+{% block title %}Track Review Task - Emosonic Server{% endblock %}
+{% block document_title_en %}Track Review Task - Emosonic Server{% endblock %}
+{% block document_title_zh %}曲目审核任务 - Emosonic Server{% endblock %}
+{% block page_title %}<span data-i18n-en="Track Review Task" data-i18n-zh="曲目审核任务">Track Review Task</span>{% endblock %}
+{% block page_subtitle %}<span data-i18n-en="Review one track metadata result at a time." data-i18n-zh="一次审核一条曲目元数据结果。">Review one track metadata result at a time.</span>{% endblock %}
+{% block body %}
+<link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='css/metadata.css') }}">
+<div class="console-section-spacer">
+  <div class="metadata-review-return-bar">
+    <a href="{{ url_for('frontend.metadata', tab='inbox') }}" class="btn btn-primary metadata-review-back-link">
+      <span data-i18n-en="Back to Metadata Inbox" data-i18n-zh="返回元数据收件箱">Back to Metadata Inbox</span>
+    </a>
+    <span class="text-body-secondary" data-i18n-en="Return to the metadata inbox and review queue." data-i18n-zh="返回元数据收件箱和审核队列。">Return to the metadata inbox and review queue.</span>
+  </div>
+
+  <div class="card mb-4 metadata-review-hero-card">
+    <div class="card-body">
+      <p class="console-eyebrow mb-2" data-i18n-en="Metadata / Inbox / Track Review Task" data-i18n-zh="元数据 / 收件箱 / 曲目审核任务">Metadata / Inbox / Track Review Task</p>
+      <div class="d-flex flex-wrap gap-4 align-items-start justify-content-between metadata-review-hero">
+        <div class="d-flex gap-3 align-items-start metadata-review-hero-main">
+          <img src="{{ reviewSummary.cover_art_url }}" alt="{{ reviewTrack.title }} cover" class="metadata-review-cover">
+          <div>
+            <h2 class="h3 mb-1">{{ reviewTrack.title }}</h2>
+            <p class="mb-2 text-body-secondary">{{ reviewTrack.artist.get_artist_name() }}{% if reviewTrack.album %} · {{ reviewTrack.album.name }}{% endif %}</p>
+            <div class="d-flex flex-wrap gap-2 mb-3">
+              <span class="console-chip text-uppercase">{{ reviewTask.status }}</span>
+              <span class="console-chip">{{ reviewTask.reason.replace('_', ' ') }}</span>
+            </div>
+            <div class="d-flex flex-wrap gap-2 metadata-review-issue-list">
+              {% for issue in reviewSummary.issues %}
+                <span class="console-chip metadata-review-issue-chip">{{ issue }}</span>
+              {% endfor %}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  {% if not reviewIsEditable %}
+    <div class="alert alert-info mb-4 metadata-review-scope-alert" data-i18n-en="This review task is resolved and now read-only." data-i18n-zh="此审核任务已解决，现在为只读状态。">This review task is resolved and now read-only.</div>
+  {% endif %}
+
+  <div class="row g-4 align-items-start">
+    <div class="col-xl-8">
+      <div class="card">
+        <div class="card-header"><span data-i18n-en="Track metadata" data-i18n-zh="曲目元数据">Track metadata</span></div>
+        <div class="card-body">
+          {% if reviewSummary.track_metadata.summary %}
+            <p class="mb-4">{{ reviewSummary.track_metadata.summary }}</p>
+          {% endif %}
+          <ul class="console-info-list mb-4">
+            {% if reviewSummary.track_metadata.tags_label %}
+              <li><span data-i18n-en="Tags" data-i18n-zh="标签">Tags</span><strong>{{ reviewSummary.track_metadata.tags_label }}</strong></li>
+            {% endif %}
+            {% if reviewSummary.track_metadata.moods_label %}
+              <li><span data-i18n-en="Mood" data-i18n-zh="情绪">Mood</span><strong>{{ reviewSummary.track_metadata.moods_label }}</strong></li>
+            {% endif %}
+            {% if reviewSummary.track_metadata.scenes_label %}
+              <li><span data-i18n-en="Scene" data-i18n-zh="场景">Scene</span><strong>{{ reviewSummary.track_metadata.scenes_label }}</strong></li>
+            {% endif %}
+            {% if reviewSummary.track_metadata.energy is not none %}
+              <li><span data-i18n-en="Energy" data-i18n-zh="能量">Energy</span><strong>{{ reviewSummary.track_metadata.energy }}</strong></li>
+            {% endif %}
+            {% if reviewSummary.track_metadata.valence is not none %}
+              <li><span data-i18n-en="Valence" data-i18n-zh="情绪正向度">Valence</span><strong>{{ reviewSummary.track_metadata.valence }}</strong></li>
+            {% endif %}
+            {% if reviewSummary.track_metadata.danceability is not none %}
+              <li><span data-i18n-en="Danceability" data-i18n-zh="舞曲感">Danceability</span><strong>{{ reviewSummary.track_metadata.danceability }}</strong></li>
+            {% endif %}
+          </ul>
+          {% if not reviewSummary.track_metadata.has_metadata %}
+            <p class="mb-0 text-body-secondary" data-i18n-en="No track metadata snapshot is available." data-i18n-zh="没有可用的曲目元数据快照。">No track metadata snapshot is available.</p>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+    <div class="col-xl-4">
+      <div class="card metadata-review-summary-card">
+        <div class="card-header"><span data-i18n-en="Review summary" data-i18n-zh="审核摘要">Review summary</span></div>
+        <div class="card-body">
+          <ul class="console-info-list mb-4">
+            <li><span data-i18n-en="Status" data-i18n-zh="状态">Status</span><strong>{{ reviewTask.status }}</strong></li>
+            <li><span data-i18n-en="Created" data-i18n-zh="创建时间">Created</span><strong>{{ reviewTask.created.strftime('%Y-%m-%d %H:%M:%S') }}</strong></li>
+            <li><span data-i18n-en="Expires" data-i18n-zh="过期时间">Expires</span><strong>{% if reviewSummary.expires_at %}{{ reviewSummary.expires_at.strftime('%Y-%m-%d %H:%M:%S') }}{% else %}<span data-i18n-en="No expiry" data-i18n-zh="无过期时间">No expiry</span>{% endif %}</strong></li>
+            <li><span data-i18n-en="Duration" data-i18n-zh="时长">Duration</span><strong>{{ reviewSummary.duration }}</strong></li>
+            {% if reviewSummary.track_metadata.confidence is not none %}
+              <li><span data-i18n-en="Confidence" data-i18n-zh="置信度">Confidence</span><strong>{{ "%.2f"|format(reviewSummary.track_metadata.confidence) }}</strong></li>
+            {% endif %}
+            {% if reviewSummary.track_metadata.provider %}
+              <li><span data-i18n-en="Provider" data-i18n-zh="来源">Provider</span><strong>{{ reviewSummary.track_metadata.provider }}</strong></li>
+            {% endif %}
+            {% if reviewSummary.track_metadata.model %}
+              <li><span data-i18n-en="Model" data-i18n-zh="模型">Model</span><strong>{{ reviewSummary.track_metadata.model }}</strong></li>
+            {% endif %}
+          </ul>
+          <div class="mb-4">
+            <h3 class="h6 mb-2" data-i18n-en="Detected issues" data-i18n-zh="检测到的问题">Detected issues</h3>
+            <ul class="metadata-review-summary-issues mb-0">
+              {% for issue in reviewSummary.issues %}
+                <li>{{ issue }}</li>
+              {% endfor %}
+            </ul>
+          </div>
+          <div class="mb-4">
+            <h3 class="h6 mb-2" data-i18n-en="Issue status" data-i18n-zh="问题状态">Issue status</h3>
+            <ul class="metadata-review-summary-issues mb-3">
+              {% for issue in reviewSummary.issue_status %}
+                <li>{{ issue.label }}: {% if issue.resolved %}<span data-i18n-en="Resolved" data-i18n-zh="已解决">Resolved</span>{% else %}<span data-i18n-en="Waiting for changes" data-i18n-zh="等待修改">Waiting for changes</span>{% endif %}</li>
+              {% endfor %}
+            </ul>
+            <div class="alert alert-success{% if not reviewSummary.ready_to_confirm %} d-none{% endif %} mb-0" data-i18n-en="Ready to confirm" data-i18n-zh="可以确认">Ready to confirm</div>
+          </div>
+          <div class="d-flex flex-wrap gap-2">
+            {% if reviewIsEditable %}
+              <form method="post" action="{{ url_for('frontend.confirm_metadata_review_task', task_id=reviewTask.id) }}">
+                <button type="submit" class="btn btn-primary"><span data-i18n-en="Confirm Task" data-i18n-zh="确认任务">Confirm Task</span></button>
+              </form>
+              <form method="post" action="{{ url_for('frontend.dismiss_metadata_review_task', task_id=reviewTask.id) }}">
+                <button type="submit" class="btn btn-outline-secondary"><span data-i18n-en="Dismiss Task" data-i18n-zh="忽略任务">Dismiss Task</span></button>
+              </form>
+            {% else %}
+              <form method="post" action="{{ url_for('frontend.reopen_metadata_review_task', task_id=reviewTask.id) }}">
+                <button type="submit" class="btn btn-warning"><span data-i18n-en="Reopen Task" data-i18n-zh="重新打开任务">Reopen Task</span></button>
+              </form>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

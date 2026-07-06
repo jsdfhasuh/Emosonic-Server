@@ -1,19 +1,44 @@
-import logging
 import json
-
-from flask import flash, g, redirect, render_template, request, session, url_for
-from flask import current_app
+import logging
 from functools import wraps
+
+from flask import (
+    current_app,
+    flash,
+    g,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 from peewee import fn
 
 from ..config import get_current_config
 from ..daemon.client import DaemonClient
 from ..daemon.exceptions import DaemonUnavailableError
-from ..db import AlbumArtist, ClientPrefs, User, Artist, Album, Track, TrackArtist, db
+from ..db import (
+    Album,
+    AlbumArtist,
+    Artist,
+    ClientPrefs,
+    Track,
+    TrackArtist,
+    TrackMetadata,
+    User,
+    db,
+)
 from ..lastfm import LastFm
 from ..listenbrainz import ListenBrainz
 from ..logging_utils import format_log_event
 from ..managers.user import UserManager
+from ..scanner_func.scanner_review_tasks import (
+    ABNORMAL_TRACK_METADATA_REASON,
+    CONFLICTING_TRACK_METADATA_REASON,
+    DEFAULT_TRACK_METADATA_CONFIDENCE_THRESHOLD,
+    LOW_CONFIDENCE_TRACK_METADATA_REASON,
+    getTrackMetadataReviewIssues,
+)
 from .metadata_actions import assignPrimaryArtist, resolvePrimaryArtist, updateArtistMetadata
 from .metadata_nfo import writeReviewAlbumNfo
 from .metadata_review import (
@@ -28,6 +53,13 @@ from .metadata_review import (
 from . import admin_only, frontend
 
 logger = logging.getLogger(__name__)
+
+TRACK_METADATA_CONFIDENCE_THRESHOLD = DEFAULT_TRACK_METADATA_CONFIDENCE_THRESHOLD
+TRACK_METADATA_REVIEW_REASONS = {
+    LOW_CONFIDENCE_TRACK_METADATA_REASON,
+    ABNORMAL_TRACK_METADATA_REASON,
+    CONFLICTING_TRACK_METADATA_REASON,
+}
 
 
 def logMetadataEvent(level, event, **fields):
@@ -93,7 +125,13 @@ def getReviewSection(defaultSection="album"):
 def getReviewRedirectResponse(task):
     if request.args.get("redirect") != "1":
         return None
-    return redirect(url_for("frontend.metadata_review_task", task_id=task.id, section=getReviewSection()))
+    return redirect(
+        url_for(
+            "frontend.metadata_review_task",
+            task_id=task.id,
+            section=getReviewSection(),
+        )
+    )
 
 
 def getMetadataCoverArtUrl(entityId):
@@ -201,6 +239,99 @@ def buildAlbumEnrichmentData(album=None, snapshot=None):
     }
 
 
+def buildTrackMetadataReviewData(track=None, snapshot=None):
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    snapshot_metadata = snapshot.get("metadata") or {}
+    if not isinstance(snapshot_metadata, dict):
+        snapshot_metadata = {}
+
+    metadata = None
+    if track is not None:
+        metadata = TrackMetadata.get_or_none(TrackMetadata.track == track)
+
+    moods = (
+        metadata.get_moods()
+        if metadata is not None
+        else normalizeStringList(snapshot_metadata.get("mood"))
+    )
+    scenes = (
+        metadata.get_scenes()
+        if metadata is not None
+        else normalizeStringList(snapshot_metadata.get("scene"))
+    )
+    tags = (
+        metadata.get_tags()
+        if metadata is not None
+        else normalizeStringList(snapshot_metadata.get("tags"))
+    )
+    confidence = (
+        metadata.confidence
+        if metadata is not None
+        else snapshot_metadata.get("confidence")
+    )
+    try:
+        confidence_value = float(confidence) if confidence is not None else None
+    except (TypeError, ValueError):
+        confidence_value = None
+
+    provider = getOptionalText(
+        getattr(metadata, "provider", None) or snapshot_metadata.get("provider")
+    )
+    model = getOptionalText(
+        getattr(metadata, "model", None) or snapshot_metadata.get("model")
+    )
+    language = getOptionalText(
+        getattr(metadata, "language", None) or snapshot_metadata.get("language")
+    )
+    summary = getOptionalText(
+        getattr(metadata, "summary", None) or snapshot_metadata.get("summary")
+    )
+    energy = (
+        getattr(metadata, "energy", None)
+        if metadata is not None
+        else snapshot_metadata.get("energy")
+    )
+    valence = (
+        getattr(metadata, "valence", None)
+        if metadata is not None
+        else snapshot_metadata.get("valence")
+    )
+    danceability = (
+        getattr(metadata, "danceability", None)
+        if metadata is not None
+        else snapshot_metadata.get("danceability")
+    )
+
+    inbox_lines = []
+    if confidence_value is not None:
+        inbox_lines.append(f"Confidence: {confidence_value:.2f}")
+    if tags:
+        inbox_lines.append(f"Tags: {', '.join(tags[:5])}")
+    if moods:
+        inbox_lines.append(f"Mood: {', '.join(moods[:5])}")
+    if scenes:
+        inbox_lines.append(f"Scene: {', '.join(scenes[:5])}")
+
+    return {
+        "has_metadata": metadata is not None or bool(snapshot_metadata),
+        "language": language,
+        "moods": moods,
+        "moods_label": ", ".join(moods),
+        "scenes": scenes,
+        "scenes_label": ", ".join(scenes),
+        "tags": tags,
+        "tags_label": ", ".join(tags),
+        "summary": summary,
+        "energy": energy,
+        "valence": valence,
+        "danceability": danceability,
+        "confidence": confidence_value,
+        "provider": provider,
+        "model": model,
+        "inbox_lines": inbox_lines,
+    }
+
+
 def getReviewArtistImageUrl(artist, artistInfo):
     for key in ("largeImageUrl", "mediumImageUrl", "smallImageUrl"):
         imageUrl = artistInfo.get(key) or ""
@@ -210,7 +341,10 @@ def getReviewArtistImageUrl(artist, artistInfo):
 
 
 def hasDedicatedArtistImage(artistInfo):
-    return any(artistInfo.get(key) for key in ("largeImageUrl", "mediumImageUrl", "smallImageUrl"))
+    return any(
+        artistInfo.get(key)
+        for key in ("largeImageUrl", "mediumImageUrl", "smallImageUrl")
+    )
 
 
 def hasAlbumCoverFallback(artist):
@@ -227,6 +361,13 @@ def buildMetadataArtistCardData(artist):
     }
 
 
+def getCurrentTrackMetadataIssueCodes(track):
+    if track is None:
+        return []
+    metadata = TrackMetadata.get_or_none(TrackMetadata.track == track)
+    return getTrackMetadataReviewIssues(metadata, TRACK_METADATA_CONFIDENCE_THRESHOLD)
+
+
 def getTaskIssueCodes(task):
     snapshot = json.loads(task.snapshot_json or "{}")
     issue_codes = snapshot.get("issues") or []
@@ -236,6 +377,14 @@ def getTaskIssueCodes(task):
     if task.is_artist_task():
         if task.reason == "missing_image":
             return ["missing_image"]
+        return []
+
+    if task.is_track_task():
+        issue_codes = getCurrentTrackMetadataIssueCodes(task.track)
+        if issue_codes:
+            return issue_codes
+        if task.reason == LOW_CONFIDENCE_TRACK_METADATA_REASON:
+            return [task.reason]
         return []
 
     issue_codes = []
@@ -257,6 +406,8 @@ def getTaskIssueCodes(task):
 def getInboxTaskPrefix(task):
     if task.is_artist_task():
         return "Artist metadata review"
+    if task.is_track_task():
+        return "Track metadata review"
     album_reason_map = {
         "new_album": "New album metadata review",
     }
@@ -284,6 +435,9 @@ def getIssueLabel(issueCode):
         "missing_year": "Missing release year",
         "track_artist_mapping_needs_review": "Track artist mapping needs review",
         "missing_image": "Missing artist image",
+        LOW_CONFIDENCE_TRACK_METADATA_REASON: "Low metadata confidence",
+        ABNORMAL_TRACK_METADATA_REASON: "Abnormal metadata result",
+        CONFLICTING_TRACK_METADATA_REASON: "Conflicting metadata result",
     }
     return issue_map.get(issueCode, issueCode.replace("_", " "))
 
@@ -297,6 +451,9 @@ def getCurrentTaskIssueCodes(task):
         if not hasDedicatedArtistImage(artist_info):
             return ["missing_image"]
         return []
+
+    if task.is_track_task():
+        return getCurrentTrackMetadataIssueCodes(task.track)
 
     issue_codes = []
     album = task.album
@@ -318,6 +475,11 @@ def getTrackedTaskIssueCodes(task):
     if task.is_artist_task():
         if task.reason == "missing_image":
             return ["missing_image"]
+        return getCurrentTaskIssueCodes(task)
+
+    if task.is_track_task():
+        if task.reason in TRACK_METADATA_REVIEW_REASONS:
+            return [task.reason]
         return getCurrentTaskIssueCodes(task)
 
     if task.reason == "missing_year":
@@ -361,6 +523,8 @@ def getTaskDisplayIssues(task, tracks=None):
         return issues
     if task.is_artist_task():
         return ["Artist metadata review requested"]
+    if task.is_track_task():
+        return ["Track metadata review requested"]
     return ["Metadata review requested for new album"]
 
 
@@ -368,10 +532,14 @@ def buildInboxTaskData(task):
     snapshot = json.loads(task.snapshot_json or "{}")
     if task.is_artist_task():
         artist = task.artist
-        artist_name = snapshot.get("artist_name") or (artist.get_artist_name() if artist is not None else "Unknown artist")
+        artist_name = snapshot.get("artist_name") or (
+            artist.get_artist_name() if artist is not None else "Unknown artist"
+        )
         artist_id = getattr(artist, "id", task.entity_id)
         artist_info = artist.get_info() if artist is not None else {}
-        is_cover_art_fallback = (not hasDedicatedArtistImage(artist_info)) and hasAlbumCoverFallback(artist)
+        is_cover_art_fallback = (
+            not hasDedicatedArtistImage(artist_info)
+        ) and hasAlbumCoverFallback(artist)
         issue_codes = getTaskIssueCodes(task)
         return {
             "id": str(task.id),
@@ -385,6 +553,48 @@ def buildInboxTaskData(task):
             "issue_codes": issue_codes,
             "cover_art_url": getMetadataCoverArtUrl(f"ar-{artist_id}"),
             "is_cover_art_fallback": is_cover_art_fallback,
+        }
+
+    if task.is_track_task():
+        track = task.track
+        issue_codes = getTaskIssueCodes(task)
+        track_title = snapshot.get("track_title") or (
+            track.title if track is not None else "Unknown track"
+        )
+        artist_name = snapshot.get("artist_name") or (
+            track.artist.get_artist_name()
+            if track is not None and track.artist is not None
+            else ""
+        )
+        album_name = snapshot.get("album_name") or (
+            track.album.name if track is not None and track.album is not None else ""
+        )
+        subtitle_parts = [value for value in (artist_name, album_name) if value]
+        track_metadata = buildTrackMetadataReviewData(track=track, snapshot=snapshot)
+        if track_metadata["confidence"] is not None:
+            subtitle_parts.append(f"confidence {track_metadata['confidence']:.2f}")
+
+        cover_art_id = str(task.entity_id)
+        if track is not None:
+            if track.has_art:
+                cover_art_id = str(track.id)
+            elif track.album_id is not None:
+                cover_art_id = f"al-{track.album_id}"
+        elif snapshot.get("album_id"):
+            cover_art_id = f"al-{snapshot['album_id']}"
+
+        return {
+            "id": str(task.id),
+            "entity_type": "track",
+            "title": track_title,
+            "subtitle": " · ".join(subtitle_parts) or task.reason.replace("_", " "),
+            "description": getInboxTaskDescription(task),
+            "status": task.status,
+            "created": task.created,
+            "expires_at": task.expires_at,
+            "issue_codes": issue_codes,
+            "cover_art_url": getMetadataCoverArtUrl(cover_art_id),
+            "track_metadata": track_metadata,
         }
 
     album = task.album
@@ -432,7 +642,9 @@ def buildArtistReviewCard(artist):
         "name": artist.name,
         "biography": artist_info.get("biography", ""),
         "image_url": getReviewArtistImageUrl(artist, artist_info),
-        "is_cover_art_fallback": (not hasDedicatedArtistImage(artist_info)) and hasAlbumCoverFallback(artist),
+        "is_cover_art_fallback": (
+            not hasDedicatedArtistImage(artist_info)
+        ) and hasAlbumCoverFallback(artist),
         "can_remove": False,
     }
 
@@ -497,6 +709,7 @@ def metadata():
 
     inbox_tasks = []
     album_inbox_tasks = []
+    track_inbox_tasks = []
     artist_inbox_tasks = []
     inbox_summary = None
     selected_status = request.args.get("status", "pending")
@@ -507,8 +720,10 @@ def metadata():
             inbox_tasks.append(buildInboxTaskData(task))
 
         album_inbox_tasks = [task for task in inbox_tasks if task["entity_type"] == "album"]
+        track_inbox_tasks = [task for task in inbox_tasks if task["entity_type"] == "track"]
         artist_inbox_tasks = [task for task in inbox_tasks if task["entity_type"] == "artist"]
         album_inbox_tasks.sort(key=lambda task: (getAlbumInboxTaskPriority(task), task["created"]))
+        track_inbox_tasks.sort(key=lambda task: task["created"])
         artist_inbox_tasks.sort(key=lambda task: task["created"])
 
         inbox_summary = {
@@ -523,6 +738,7 @@ def metadata():
         activeTab=activeTab,
         inboxTasks=inbox_tasks,
         albumInboxTasks=album_inbox_tasks,
+        trackInboxTasks=track_inbox_tasks,
         artistInboxTasks=artist_inbox_tasks,
         inboxSummary=inbox_summary,
         selectedInboxStatus=selected_status,
@@ -566,6 +782,34 @@ def metadata_review_task(task_id):
             reviewArtist=artist,
             reviewArtists=[artist],
             reviewArtistCards=review_artist_cards,
+            reviewSummary=review_summary,
+            reviewIsEditable=(task.status == "pending"),
+        )
+
+    if task.is_track_task():
+        track = task.track
+        if track is None:
+            return {"status": "error", "message": "Review task track not found"}, 404
+
+        snapshot = json.loads(task.snapshot_json or "{}")
+        issue_summary = buildTaskIssueStatus(task)
+        track_metadata = buildTrackMetadataReviewData(track=track, snapshot=snapshot)
+        cover_art_id = str(track.id) if track.has_art else f"al-{track.album_id}"
+        review_summary = {
+            "status": task.status,
+            "created": task.created,
+            "expires_at": task.expires_at,
+            "duration": formatDurationLabel(track.duration),
+            "cover_art_url": getMetadataCoverArtUrl(cover_art_id),
+            "issues": getTaskDisplayIssues(task),
+            "issue_status": issue_summary["issue_status"],
+            "ready_to_confirm": issue_summary["ready_to_confirm"],
+            "track_metadata": track_metadata,
+        }
+        return render_template(
+            "metadata-review-track-task.html",
+            reviewTask=task,
+            reviewTrack=track,
             reviewSummary=review_summary,
             reviewIsEditable=(task.status == "pending"),
         )
@@ -637,6 +881,8 @@ def update_metadata_review_task_album(task_id):
     try:
         task = getMetadataReviewTask(task_id)
         ensurePendingReviewTask(task)
+        if not task.is_album_task():
+            raise ValueError("Album updates are only available for album review tasks")
     except ValueError as exc:
         logMetadataEvent(logging.WARNING, "review_album_update", result="bad_request", task_id=task_id)
         return {"status": "error", "message": str(exc)}, 400
@@ -687,6 +933,8 @@ def update_metadata_review_task_tracks(task_id):
     try:
         task = getMetadataReviewTask(task_id)
         ensurePendingReviewTask(task)
+        if not task.is_album_task():
+            raise ValueError("Track list updates are only available for album review tasks")
     except ValueError as exc:
         logMetadataEvent(logging.WARNING, "review_tracks_update", result="bad_request", task_id=task_id)
         return {"status": "error", "message": str(exc)}, 400
@@ -756,6 +1004,8 @@ def update_metadata_review_task_artist(task_id, artist_id):
     try:
         task = getMetadataReviewTask(task_id)
         ensurePendingReviewTask(task)
+        if task.is_track_task():
+            raise ValueError("Artist updates are not available for track review tasks")
     except ValueError as exc:
         logMetadataEvent(
             logging.WARNING,
@@ -1203,7 +1453,6 @@ def metadata_artists():
             responsePayload["message"] = "artist metadata updated"
             return responsePayload
         return {"status": "success", "message": "artist metadata updated"}
-        pass
 
     elif request.method == "GET":
         if request.args.get("embed"):

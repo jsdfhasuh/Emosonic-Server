@@ -1,13 +1,25 @@
-import unittest
-import tempfile
 import os
+import tempfile
+import unittest
 from datetime import timedelta
-
-from flask import current_app
 from uuid import uuid4
 
+from flask import current_app
+
+from supysonic.db import (
+    Album,
+    AlbumArtist,
+    AlbumReviewTask,
+    Artist,
+    Folder,
+    ReviewTask,
+    Track,
+    TrackArtist,
+    TrackMetadata,
+    User,
+    now,
+)
 from supysonic.tool import write_dict_to_json
-from supysonic.db import Album, AlbumArtist, AlbumReviewTask, Artist, Folder, ReviewTask, Track, TrackArtist, User, now
 
 from .frontendtestbase import FrontendTestBase
 from ..testbase import TestConfig
@@ -28,17 +40,29 @@ class MetadataReviewWorkspaceTestCase(FrontendTestBase):
         with self.app_context():
             view_functions = current_app.view_functions
             if "emo.list_logs" not in view_functions:
-                current_app.add_url_rule("/emo/test-logs", endpoint="emo.list_logs", view_func=lambda: "")
+                current_app.add_url_rule(
+                    "/emo/test-logs",
+                    endpoint="emo.list_logs",
+                    view_func=lambda: "",
+                )
 
         self.artist = Artist.create(name="Review Artist")
         imagePath = os.path.join(tempfile.gettempdir(), "review-artist-image.png")
-        write_dict_to_json({"biography": "", "image": {"large": imagePath}}, imagePath + ".json")
+        write_dict_to_json(
+            {"biography": "", "image": {"large": imagePath}},
+            imagePath + ".json",
+        )
         self.artist.artist_info_json = imagePath + ".json"
         self.artist.save()
         self.album = Album.create(name="Review Album", artist=self.artist, year="2024")
         self.root = Folder.create(root=True, name="Root", path="/tmp/root")
-        self.folder = Folder.create(root=False, name="Album", path="/tmp/root/album", parent=self.root)
-        Track.create(
+        self.folder = Folder.create(
+            root=False,
+            name="Album",
+            path="/tmp/root/album",
+            parent=self.root,
+        )
+        self.track = Track.create(
             disc=1,
             number=1,
             title="First Track",
@@ -53,7 +77,7 @@ class MetadataReviewWorkspaceTestCase(FrontendTestBase):
             folder=self.folder,
         )
         AlbumArtist.create(album_id=self.album, artist_id=self.artist, position=1)
-        TrackArtist.create(track_id=self.album.tracks.get(), artist_id=self.artist, position=1)
+        TrackArtist.create(track_id=self.track, artist_id=self.artist, position=1)
         self.task = AlbumReviewTask.create(
             album=self.album,
             task_type="metadata_review",
@@ -249,6 +273,40 @@ class MetadataReviewWorkspaceTestCase(FrontendTestBase):
         self.assertIn("data-review-artist-image-preview", rv.data)
         self.assertIn("URL.createObjectURL", rv.data)
         self.assertIn("new FormData(artistForm)", rv.data)
+
+    def test_review_workspace_renders_track_review_task(self):
+        from supysonic.scanner_func.scanner_review_tasks import buildTrackReviewSnapshot
+
+        metadata = TrackMetadata.create(
+            track=self.track,
+            track_last_modification=self.track.last_modification,
+            confidence=0.2,
+            provider="local",
+            summary="Low confidence semantic summary.",
+        )
+        metadata.set_tags(["dream pop"])
+        metadata.save()
+        track_task = ReviewTask.create(
+            entity_type="track",
+            entity_id=str(self.track.id),
+            task_type="metadata_review",
+            status="pending",
+            reason="low_confidence",
+            snapshot_json=buildTrackReviewSnapshot(self.track, metadata),
+        )
+
+        rv = self.client.get(f"/metadata/review-tasks/{track_task.id}")
+
+        self.assertEqual(rv.status_code, 200)
+        self.assertIn("Track Review Task", rv.data)
+        self.assertIn("First Track", rv.data)
+        self.assertIn("Low metadata confidence", rv.data)
+        self.assertIn("Low confidence semantic summary.", rv.data)
+        self.assertIn("dream pop", rv.data)
+        self.assertIn("0.20", rv.data)
+        self.assertIn("Confirm Task", rv.data)
+        self.assertIn("Dismiss Task", rv.data)
+        self.assertIn(f"/rest/getCoverArt?id=al-{self.album.id}&amp;v=1.15.0&amp;c=web", rv.data)
 
     def test_artist_review_workspace_enables_artist_suggestions_for_primary_artist_mapping(self):
         artist_task = ReviewTask.create(

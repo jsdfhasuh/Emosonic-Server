@@ -16,6 +16,13 @@
             {% endfor %}
           </div>
         {% endif %}
+        {% if task.track_metadata and task.track_metadata.has_metadata %}
+          <div class="mb-3 text-body-secondary">
+            {% for line in task.track_metadata.inbox_lines %}
+              <div>{{ line }}</div>
+            {% endfor %}
+          </div>
+        {% endif %}
         {% if task.entity_type == 'artist' and task.is_cover_art_fallback %}
           <p class="mb-3 text-warning-emphasis" data-i18n-en="Showing album cover fallback. Artist image is still missing." data-i18n-zh="当前显示专辑封面兜底图，艺人图片仍缺失。">Showing album cover fallback. Artist image is still missing.</p>
         {% endif %}
@@ -59,6 +66,19 @@
           </div>
           <div class="d-grid gap-3">
             {% for task in albumInboxTasks %}
+              {{ render_inbox_task(task) }}
+            {% endfor %}
+          </div>
+        </section>
+      {% endif %}
+
+      {% if trackInboxTasks %}
+        <section class="mb-4">
+          <div class="d-flex justify-content-between align-items-center mb-3 px-1">
+            <h3 class="h5 mb-0" data-i18n-en="Track tasks ({{ trackInboxTasks|length }})" data-i18n-zh="曲目任务 ({{ trackInboxTasks|length }})">Track tasks ({{ trackInboxTasks|length }})</h3>
+          </div>
+          <div class="d-grid gap-3">
+            {% for task in trackInboxTasks %}
               {{ render_inbox_task(task) }}
             {% endfor %}
           </div>

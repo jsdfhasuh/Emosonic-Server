@@ -56,6 +56,18 @@ def getTaskRelatedArtists(task):
     if task.is_artist_task():
         artist = task.artist
         return [artist] if artist is not None else []
+    if task.is_track_task():
+        track = task.track
+        if track is None:
+            return []
+        artists = []
+        seen_artist_ids = set()
+        for artist in [track.artist, track.album.artist if track.album is not None else None]:
+            if artist is None or artist.id in seen_artist_ids:
+                continue
+            seen_artist_ids.add(artist.id)
+            artists.append(artist)
+        return artists
 
     artists = []
     seen_artist_ids = set()

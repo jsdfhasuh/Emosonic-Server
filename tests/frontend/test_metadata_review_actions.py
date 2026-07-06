@@ -9,7 +9,18 @@ from unittest.mock import patch
 from PIL import Image
 
 from supysonic.daemon.exceptions import DaemonUnavailableError
-from supysonic.db import Album, AlbumArtist, AlbumReviewTask, Artist, Folder, ReviewTask, Track, TrackArtist, User, now
+from supysonic.db import (
+    Album,
+    AlbumArtist,
+    AlbumReviewTask,
+    Artist,
+    Folder,
+    ReviewTask,
+    Track,
+    TrackArtist,
+    User,
+    now,
+)
 from supysonic.nfo.nfo import NfoHandler
 from supysonic.tool import read_dict_from_json
 
@@ -231,6 +242,27 @@ class MetadataReviewActionsTestCase(FrontendTestBase):
 
         self.assertEqual(rv.status_code, 400)
         self.assertEqual(rv.json["status"], "error")
+
+    def test_track_review_task_artist_update_is_rejected(self):
+        track_task = ReviewTask.create(
+            entity_type="track",
+            entity_id=str(self.track.id),
+            task_type="metadata_review",
+            status="pending",
+            reason="low_confidence",
+            snapshot_json='{"track_title": "First Track", "issues": ["low_confidence"]}',
+        )
+        original_info = Artist.get_by_id(self.artist.id).artist_info_json
+
+        rv = self.client.post(
+            f"/metadata/review-tasks/{track_task.id}/artists/{self.artist.id}",
+            json={"biography": "Should not update"},
+        )
+
+        self.assertEqual(rv.status_code, 400)
+        self.assertEqual(rv.json["status"], "error")
+        self.assertIn("Artist updates are not available", rv.json["message"])
+        self.assertEqual(Artist.get_by_id(self.artist.id).artist_info_json, original_info)
 
     def test_review_task_artist_update_persists_biography(self):
         rv = self.client.post(

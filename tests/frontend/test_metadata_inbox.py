@@ -3,7 +3,18 @@ from datetime import timedelta
 
 from flask import current_app
 
-from supysonic.db import Album, AlbumReviewTask, Artist, ReviewTask, User, db, now
+from supysonic.db import (
+    Album,
+    AlbumReviewTask,
+    Artist,
+    Folder,
+    ReviewTask,
+    Track,
+    TrackMetadata,
+    User,
+    db,
+    now,
+)
 
 from .frontendtestbase import FrontendTestBase
 from ..testbase import TestConfig
@@ -24,7 +35,36 @@ class MetadataInboxTestCase(FrontendTestBase):
         with self.app_context():
             view_functions = current_app.view_functions
             if "emo.list_logs" not in view_functions:
-                current_app.add_url_rule("/emo/test-logs", endpoint="emo.list_logs", view_func=lambda: "")
+                current_app.add_url_rule(
+                    "/emo/test-logs",
+                    endpoint="emo.list_logs",
+                    view_func=lambda: "",
+                )
+
+    def _create_track(self, title="Inbox Track"):
+        artist = Artist.create(name=f"{title} Artist")
+        album = Album.create(name=f"{title} Album", artist=artist, year="2024")
+        root = Folder.create(root=True, name=f"{title} Root", path=f"/tmp/{title}/root")
+        folder = Folder.create(
+            root=False,
+            name=f"{title} Folder",
+            path=f"/tmp/{title}/root/album",
+            parent=root,
+        )
+        return Track.create(
+            disc=1,
+            number=1,
+            title=title,
+            duration=180,
+            has_art=False,
+            album=album,
+            artist=artist,
+            bitrate=320,
+            path=f"/tmp/{title}/track.flac",
+            last_modification=1,
+            root_folder=root,
+            folder=folder,
+        )
 
     def test_metadata_inbox_renders_pending_review_task(self):
         artist = Artist.create(name="Review Artist")
@@ -99,6 +139,38 @@ class MetadataInboxTestCase(FrontendTestBase):
         self.assertIn("Expires", rv.data)
         self.assertIn("No expiry", rv.data)
         self.assertNotIn("Expires:", rv.data)
+
+    def test_metadata_inbox_renders_pending_track_review_task(self):
+        from supysonic.scanner_func.scanner_review_tasks import buildTrackReviewSnapshot
+
+        track = self._create_track("Low Confidence Track")
+        metadata = TrackMetadata.create(
+            track=track,
+            track_last_modification=track.last_modification,
+            confidence=0.2,
+            provider="local",
+        )
+        metadata.set_tags(["dream pop"])
+        metadata.save()
+        task = ReviewTask.create(
+            entity_type="track",
+            entity_id=str(track.id),
+            task_type="metadata_review",
+            status="pending",
+            reason="low_confidence",
+            snapshot_json=buildTrackReviewSnapshot(track, metadata),
+        )
+
+        rv = self.client.get("/metadata?tab=inbox")
+
+        self.assertEqual(rv.status_code, 200)
+        self.assertIn("Track tasks (1)", rv.data)
+        self.assertIn("Low Confidence Track", rv.data)
+        self.assertIn("Low metadata confidence", rv.data)
+        self.assertIn("Confidence: 0.20", rv.data)
+        self.assertIn("Tags: dream pop", rv.data)
+        self.assertIn(f"/metadata/review-tasks/{task.id}", rv.data)
+        self.assertIn(f"/rest/getCoverArt?id=al-{track.album_id}&amp;v=1.15.0&amp;c=web", rv.data)
 
     def test_metadata_inbox_shows_album_cover_fallback_notice_for_artist_task(self):
         artist = Artist.create(name="Fallback Artist")
