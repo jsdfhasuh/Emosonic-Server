@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from ..db import Track
+from ..db import Track, delete_track_metadata_for_tracks
 from ..tool import get_file_md5
 from .scanner_lookup import findFolder, findRootFolder
 
@@ -18,7 +18,9 @@ def removeFile(scanner: Scanner, path: str) -> None:
         raise TypeError("Expecting string, got " + str(type(path)))
 
     try:
-        Track.get(path=path).delete_instance(recursive=True)
+        track = Track.get(path=path)
+        delete_track_metadata_for_tracks([track.id])
+        track.delete_instance(recursive=True)
         scanner.stats().deleted.tracks += 1
     except Track.DoesNotExist:
         pass

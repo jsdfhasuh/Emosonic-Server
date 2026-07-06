@@ -47,6 +47,9 @@ class DbLayerContractTestCase(unittest.TestCase):
             "AlbumArtist",
             "Track",
             "TrackArtist",
+            "TrackMetadata",
+            "TrackMetadataEnrichmentTask",
+            "delete_track_metadata_for_tracks",
             "User",
             "User_Play_Activity",
             "UserRecommendationFeedback",
@@ -181,6 +184,7 @@ class DbLayerContractTestCase(unittest.TestCase):
         users = importlib.import_module("supysonic.db_layer.users")
         annotations = importlib.import_module("supysonic.db_layer.annotations")
         review_tasks = importlib.import_module("supysonic.db_layer.review_tasks")
+        track_metadata = importlib.import_module("supysonic.db_layer.track_metadata")
         music_requests = importlib.import_module("supysonic.db_layer.music_requests")
         playlists = importlib.import_module("supysonic.db_layer.playlists")
         misc = importlib.import_module("supysonic.db_layer.misc")
@@ -222,6 +226,15 @@ class DbLayerContractTestCase(unittest.TestCase):
         self.assertIs(db_module.ReviewTask, review_tasks.ReviewTask)
         self.assertIs(db_module.AlbumReviewTask, review_tasks.AlbumReviewTask)
         self.assertIs(review_tasks.AlbumReviewTask, review_tasks.ReviewTask)
+        self.assertIs(db_module.TrackMetadata, track_metadata.TrackMetadata)
+        self.assertIs(
+            db_module.TrackMetadataEnrichmentTask,
+            track_metadata.TrackMetadataEnrichmentTask,
+        )
+        self.assertIs(
+            db_module.delete_track_metadata_for_tracks,
+            track_metadata.delete_track_metadata_for_tracks,
+        )
         self.assertIs(db_module.MusicRequest, music_requests.MusicRequest)
         self.assertIs(db_module.Playlist, playlists.Playlist)
         self.assertIs(db_module.SharedTrackLink, playlists.SharedTrackLink)

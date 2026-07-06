@@ -36,6 +36,11 @@ from .db_layer.runtime import (
     release_database,
 )
 from .db_layer.schema import SCHEMA_VERSION, execute_sql_resource_script
+from .db_layer.track_metadata import (
+    TrackMetadata,
+    TrackMetadataEnrichmentTask,
+    delete_track_metadata_for_tracks,
+)
 from .db_layer.users import (
     ClientPrefs,
     RecommendationAgentCache,

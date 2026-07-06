@@ -112,6 +112,7 @@ class Folder(PathMixin, _Model):
             delete_folder_annotations,
             delete_track_annotations,
         )
+        from .track_metadata import delete_track_metadata_for_tracks
         from .users import clear_last_play_for_tracks
 
         clear_last_play_for_tracks(cond)
@@ -123,12 +124,23 @@ class Folder(PathMixin, _Model):
         folders = Folder.select(Folder.id).where(path_cond)
         delete_folder_annotations(folders)
 
+        folder_ids = [f.id for f in Folder.select(Folder.id).where(path_cond)]
+        metadata_track_ids = [
+            track_id for (track_id,) in Track.select(Track.id).where(cond).tuples()
+        ]
+        if folder_ids:
+            metadata_track_ids.extend(
+                track_id
+                for (track_id,) in Track.select(Track.id)
+                .where(Track.folder_id.in_(folder_ids))
+                .tuples()
+                if track_id not in metadata_track_ids
+            )
+        delete_track_metadata_for_tracks(metadata_track_ids)
+
         deleted_tracks = Track.delete().where(cond).execute()
 
         # Ensure tracks in all child folders are deleted.
-        # Collect all related folder IDs.
-        folder_ids = [f.id for f in Folder.select(Folder.id).where(path_cond)]
-
         # Delete all tracks in the related folders.
         Track.delete().where(Track.folder_id.in_(folder_ids)).execute()
 
