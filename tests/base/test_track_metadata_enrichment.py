@@ -598,7 +598,7 @@ class TrackMetadataEnrichmentTestCase(unittest.TestCase):
         )
         runner = CliRunner()
 
-        with patch(
+        with patch("supysonic.llm_client.time.sleep") as sleep, patch(
             "supysonic.llm_client.requests.post",
             side_effect=[rate_limited, recovered],
         ) as post:
@@ -610,7 +610,81 @@ class TrackMetadataEnrichmentTestCase(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(post.call_count, 2)
+        sleep.assert_called_once_with(5.0)
         self.assertIn("enriched: 1", result.output)
+
+    def test_cli_metadata_enrich_llm_rate_limit_aborts_batch_after_retry(self):
+        root = db.Folder.create(root=True, name="Root", path="music")
+        folder = db.Folder.create(
+            root=False,
+            name="Album",
+            path="music/album",
+            parent=root,
+        )
+        first_track = self._create_track(
+            path="music/album/rate-limit-1.flac",
+            root=root,
+            folder=folder,
+        )
+        second_track = self._create_track(
+            path="music/album/rate-limit-2.flac",
+            root=root,
+            folder=folder,
+        )
+        self.config.RECOMMENDATION_AGENT.update(
+            {
+                "api_base_url": "https://llm.example/v1",
+                "api_key": "secret",
+                "model": "metadata-model",
+            }
+        )
+        rate_limited = SimpleNamespace(
+            status_code=429,
+            json=lambda: {
+                "error": {
+                    "message": "Too many requests",
+                    "code": "429",
+                }
+            },
+        )
+        runner = CliRunner()
+
+        with patch("supysonic.llm_client.time.sleep") as sleep, patch(
+            "supysonic.llm_client.requests.post",
+            return_value=rate_limited,
+        ) as post:
+            result = runner.invoke(
+                cli,
+                ["metadata", "enrich", "--provider", "llm", "--limit", "2"],
+                obj=self.config,
+            )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(post.call_count, 2)
+        sleep.assert_called_once_with(5.0)
+        self.assertIn("failed: 1", result.output)
+        self.assertIn("stopped: rate_limited", result.output)
+        self.assertIn("provider_error", result.output)
+        self.assertNotIn("Traceback", result.output)
+        tasks = list(db.TrackMetadataEnrichmentTask.select())
+        self.assertEqual(len(tasks), 1)
+        task = tasks[0]
+        self.assertIn(task.track_id, {first_track.id, second_track.id})
+        unprocessed_track = (
+            second_track if task.track_id == first_track.id else first_track
+        )
+        self.assertEqual(task.status, db.TrackMetadataEnrichmentTask.STATUS_RETRY)
+        self.assertEqual(
+            task.reason,
+            db.TrackMetadataEnrichmentTask.REASON_PROVIDER_ERROR,
+        )
+        self.assertIsNotNone(task.next_retry_at)
+        self.assertIn("Too many requests", task.last_error)
+        self.assertIsNone(
+            db.TrackMetadataEnrichmentTask.get_or_none(
+                db.TrackMetadataEnrichmentTask.track == unprocessed_track
+            )
+        )
 
     def test_cli_metadata_enrich_llm_quota_failure_aborts_batch(self):
         root = db.Folder.create(root=True, name="Root", path="music")

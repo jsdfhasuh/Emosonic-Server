@@ -291,12 +291,15 @@ def metadata_enrich(config, limit, track_ids, force, failed_only, dry_run, provi
             config.DAEMON.get("track_metadata_enrichment_send_path_hints", False)
         ),
     )
-    click.echo(
+    summary_line = (
         "Selected: {selected}, enriched: {enriched}, failed: {failed}, "
         "skipped: {skipped}, provider: {provider}, dry-run: {dry_run}".format(
             **summary
         )
     )
+    if summary.get("rate_limited"):
+        summary_line += ", stopped: rate_limited"
+    click.echo(summary_line)
     for track in summary["tracks"]:
         line = "{status}\t{id}\t{reason}\t{title}".format(
             status=track.get("status", ""),

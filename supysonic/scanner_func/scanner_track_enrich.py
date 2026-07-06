@@ -487,6 +487,7 @@ def runTrackMetadataEnrichmentPass(
         "provider": provider_name,
         "tracks": [],
         "quota_exhausted": False,
+        "rate_limited": False,
         "error": None,
     }
 
@@ -578,6 +579,44 @@ def runTrackMetadataEnrichmentPass(
                     provider=provider_name,
                 )
             )
+        except TrackMetadataProviderError as exc:
+            retry_delay_seconds = _providerRetryDelaySeconds(exc)
+            recordTrackEnrichmentAttempt(
+                track,
+                provider,
+                TrackMetadataEnrichmentTask.STATUS_RETRY,
+                reason=TrackMetadataEnrichmentTask.REASON_PROVIDER_ERROR,
+                error=str(exc),
+                next_retry_at=now() + timedelta(seconds=retry_delay_seconds),
+            )
+            track_info["status"] = "retry"
+            track_info["reason"] = TrackMetadataEnrichmentTask.REASON_PROVIDER_ERROR
+            track_info["error"] = str(exc)
+            summary["failed"] += 1
+            if _isRateLimitedProviderError(exc):
+                summary["rate_limited"] = True
+                summary["error"] = str(exc)
+                stop_after_current = True
+                logger.warning(
+                    format_log_event(
+                        "track_metadata_enrichment",
+                        "track_metadata_enrichment_rate_limited",
+                        track_id=str(track.id),
+                        provider=provider_name,
+                        retry_after_seconds=retry_delay_seconds,
+                    )
+                )
+            else:
+                logger.warning(
+                    format_log_event(
+                        "track_metadata_enrichment",
+                        "track_metadata_enrichment_provider_retry",
+                        track_id=str(track.id),
+                        provider=provider_name,
+                        error_type=exc.__class__.__name__,
+                        retry_after_seconds=retry_delay_seconds,
+                    )
+                )
         except Exception as exc:
             recordTrackEnrichmentAttempt(
                 track,
@@ -616,6 +655,18 @@ def runTrackMetadataEnrichmentPass(
         )
     )
     return summary
+
+
+def _isRateLimitedProviderError(exc: TrackMetadataProviderError) -> bool:
+    return bool(exc.details.get("rateLimited")) or exc.details.get("upstreamStatus") == 429
+
+
+def _providerRetryDelaySeconds(exc: TrackMetadataProviderError) -> int:
+    try:
+        retry_after = int(float(exc.details.get("retryAfterSeconds")))
+    except (TypeError, ValueError):
+        retry_after = DEFAULT_RETRY_DELAY_SECONDS
+    return retry_after if retry_after > 0 else DEFAULT_RETRY_DELAY_SECONDS
 
 
 def buildTrackMetadataInput(

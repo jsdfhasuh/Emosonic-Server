@@ -1,7 +1,12 @@
 import json
+import time
 from typing import Dict, Mapping, Optional, Sequence
 
 import requests
+
+
+DEFAULT_RATE_LIMIT_RETRY_DELAY_SECONDS = 5.0
+MAX_RATE_LIMIT_RETRY_DELAY_SECONDS = 60.0
 
 
 class LlmClientError(Exception):
@@ -93,6 +98,7 @@ def post_chat_completion(
                 timeout_seconds=timeout_seconds,
             )
         if first_error.details.get("retryable"):
+            _sleep_before_retry(first_error.details)
             return _post_chat_completion_once(
                 endpoint,
                 api_key,
@@ -204,8 +210,47 @@ def _extract_upstream_error(response: object) -> Dict[str, object]:
         details["quotaExhausted"] = True
         details["retryable"] = False
     elif status_code == 429:
+        details["rateLimited"] = True
         details["retryable"] = True
+        retry_after = _retry_after_seconds(response)
+        if retry_after is not None:
+            details["retryAfterSeconds"] = retry_after
     return details
+
+
+def _sleep_before_retry(details: Mapping[str, object]) -> None:
+    if details.get("upstreamStatus") != 429:
+        return
+    time.sleep(_bounded_retry_delay(details.get("retryAfterSeconds")))
+
+
+def _bounded_retry_delay(value: object) -> float:
+    try:
+        retry_after = float(value)
+    except (TypeError, ValueError):
+        retry_after = DEFAULT_RATE_LIMIT_RETRY_DELAY_SECONDS
+    if retry_after <= 0:
+        retry_after = DEFAULT_RATE_LIMIT_RETRY_DELAY_SECONDS
+    return min(retry_after, MAX_RATE_LIMIT_RETRY_DELAY_SECONDS)
+
+
+def _retry_after_seconds(response: object) -> Optional[float]:
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    raw_value = None
+    for name in ("Retry-After", "retry-after"):
+        try:
+            raw_value = headers.get(name)
+        except AttributeError:
+            raw_value = None
+        if raw_value:
+            break
+    try:
+        retry_after = float(raw_value)
+    except (TypeError, ValueError):
+        return None
+    return retry_after if retry_after > 0 else None
 
 
 def _is_quota_exhausted_error(
