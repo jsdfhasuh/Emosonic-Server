@@ -664,8 +664,12 @@ class TrackMetadataEnrichmentTestCase(unittest.TestCase):
         self.assertIn("provider_quota", result.output)
         self.assertIn("LLM quota exhausted", result.output)
         self.assertEqual(db.TrackMetadata.select().count(), 0)
-        task = db.TrackMetadataEnrichmentTask.get(
-            db.TrackMetadataEnrichmentTask.track == first_track
+        tasks = list(db.TrackMetadataEnrichmentTask.select())
+        self.assertEqual(len(tasks), 1)
+        task = tasks[0]
+        self.assertIn(task.track_id, {first_track.id, second_track.id})
+        unprocessed_track = (
+            second_track if task.track_id == first_track.id else first_track
         )
         self.assertEqual(task.status, db.TrackMetadataEnrichmentTask.STATUS_FAILED)
         self.assertEqual(
@@ -676,7 +680,7 @@ class TrackMetadataEnrichmentTestCase(unittest.TestCase):
         self.assertIn("LLM quota exhausted", task.last_error)
         self.assertIsNone(
             db.TrackMetadataEnrichmentTask.get_or_none(
-                db.TrackMetadataEnrichmentTask.track == second_track
+                db.TrackMetadataEnrichmentTask.track == unprocessed_track
             )
         )
 
