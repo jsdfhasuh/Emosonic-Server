@@ -25,6 +25,9 @@ class ReviewTask(_Model):
     def is_artist_task(self):
         return self.entity_type == "artist"
 
+    def is_track_task(self):
+        return self.entity_type == "track"
+
     def get_album(self):
         from .library import Album
 
@@ -38,6 +41,13 @@ class ReviewTask(_Model):
         if not self.is_artist_task():
             return None
         return Artist.get_or_none(Artist.id == self.entity_id)
+
+    def get_track(self):
+        from .library import Track
+
+        if not self.is_track_task():
+            return None
+        return Track.get_or_none(Track.id == self.entity_id)
 
     @property
     def album(self):
@@ -58,6 +68,15 @@ class ReviewTask(_Model):
         self.entity_id = str(getattr(value, "id", value))
 
     @property
+    def track(self):
+        return self.get_track()
+
+    @track.setter
+    def track(self, value):
+        self.entity_type = "track"
+        self.entity_id = str(getattr(value, "id", value))
+
+    @property
     def album_id(self):
         if not self.is_album_task():
             return None
@@ -69,10 +88,18 @@ class ReviewTask(_Model):
             return None
         return UUID(self.entity_id)
 
+    @property
+    def track_id(self):
+        if not self.is_track_task():
+            return None
+        return UUID(self.entity_id)
+
     def save(self, *args, **kwargs):
         if self.status == "pending" and self.entity_type and self.entity_id:
             if self.entity_type == "artist":
                 self.pending_key = f"artist:{self.entity_id}:pending:{self.reason}"
+            elif self.entity_type == "track":
+                self.pending_key = f"track:{self.entity_id}:pending:{self.reason}"
             elif self.reason == "external_enrichment":
                 self.pending_key = f"{self.entity_type}:{self.entity_id}:pending:{self.reason}"
             else:

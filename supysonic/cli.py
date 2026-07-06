@@ -19,6 +19,12 @@ from .logging_manager import build_web_logging_config, configure_web_logging
 from .managers.folder import FolderManager
 from .managers.user import UserManager
 from .scanner import Scanner
+from .scanner_func.scanner_track_enrich import (
+    LLMMetadataProvider,
+    LocalMetadataProvider,
+    TrackMetadataProviderError,
+    runTrackMetadataEnrichmentPass,
+)
 
 
 logger = logging.getLogger(__package__)
@@ -231,6 +237,79 @@ def _folder_scan_foreground(config, daemon, folders, force):
         click.echo("Errors in:")
         for err in stats.errors:
             click.echo("- " + err)
+
+
+@cli.group("metadata")
+def metadata():
+    """Metadata maintenance commands"""
+    pass
+
+
+@metadata.command("enrich")
+@click.option("--limit", type=int, default=10, show_default=True)
+@click.option("--track-id", "track_ids", multiple=True, help="Only enrich this track ID")
+@click.option("--force", is_flag=True, default=False, help="Force selected tracks")
+@click.option(
+    "--failed-only",
+    is_flag=True,
+    default=False,
+    help="Only select failed or retryable enrichment tasks",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Show candidate tracks without writing metadata",
+)
+@click.option(
+    "--provider",
+    type=click.Choice(("local", "llm")),
+    default="local",
+    show_default=True,
+)
+@click.pass_obj
+def metadata_enrich(config, limit, track_ids, force, failed_only, dry_run, provider):
+    """Enrich track recommendation metadata."""
+
+    try:
+        provider_instance = (
+            LLMMetadataProvider(config.RECOMMENDATION_AGENT)
+            if provider == "llm"
+            else LocalMetadataProvider()
+        )
+    except TrackMetadataProviderError as e:
+        raise ClickException(str(e)) from e
+
+    summary = runTrackMetadataEnrichmentPass(
+        limit=limit,
+        force=force,
+        track_ids=track_ids or None,
+        provider=provider_instance,
+        failed_only=failed_only,
+        dry_run=dry_run,
+        include_path_hints=bool(
+            config.DAEMON.get("track_metadata_enrichment_send_path_hints", False)
+        ),
+    )
+    click.echo(
+        "Selected: {selected}, enriched: {enriched}, failed: {failed}, "
+        "skipped: {skipped}, provider: {provider}, dry-run: {dry_run}".format(
+            **summary
+        )
+    )
+    for track in summary["tracks"]:
+        line = "{status}\t{id}\t{reason}\t{title}".format(
+            status=track.get("status", ""),
+            id=track.get("id", ""),
+            reason=track.get("reason", ""),
+            title=track.get("title", ""),
+        )
+        if track.get("error"):
+            line += "\t{}".format(track["error"])
+        click.echo(line)
+
+    if summary.get("quota_exhausted"):
+        raise ClickException(str(summary.get("error") or "LLM quota exhausted."))
 
 
 @cli.group("user")

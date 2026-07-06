@@ -109,6 +109,26 @@ log_backup_count = 7
 log_level = INFO
 log_rotate = yes
 
+; Enable daemon-driven track recommendation metadata enrichment. Default: off
+track_metadata_enrichment = off
+
+; Provider for daemon-driven track metadata enrichment. "local" does not call
+; external services. "llm" uses [recommendation_agent] api_base_url, api_key,
+; model, timeout_seconds, max_output_tokens and temperature. Default: local
+track_metadata_enrichment_provider = local
+
+; Poll interval in seconds for track metadata enrichment. Default: 300
+track_metadata_enrichment_interval = 300
+
+; Maximum tracks enriched per daemon pass. Default: 10
+track_metadata_enrichment_batch_size = 10
+
+; Seconds before a running enrichment task is considered stale. Default: 900
+track_metadata_enrichment_stale_lock_seconds = 900
+
+; Allow full path hints to be sent to an enrichment provider. Default: off
+track_metadata_enrichment_send_path_hints = off
+
 [musicbrainz]
 ; MusicBrainz is the default structured album enrichment source.
 ; Enrichment only fills empty album/track metadata and may create an
@@ -160,6 +180,8 @@ log_rotate = yes
 [recommendation_agent]
 ; OpenAI-compatible model endpoint for the recommendation page Agent.
 ; Disabled unless enabled, api_key, and model are set.
+; Track metadata LLM enrichment reuses this endpoint/key/model when explicitly
+; selected, but does not require recommendation_agent.enabled.
 enabled = off
 
 ; Defaults: https://api.openai.com/v1

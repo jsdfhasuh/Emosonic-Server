@@ -5,9 +5,18 @@ from __future__ import annotations
 import json
 import logging
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Optional
 
-from ..db import Album, Artist, ReviewTask, close_connection, open_connection, now
+from ..db import (
+    Album,
+    Artist,
+    ReviewTask,
+    Track,
+    TrackMetadata,
+    close_connection,
+    open_connection,
+    now,
+)
 from ..logging_utils import format_log_event
 
 if TYPE_CHECKING:
@@ -23,6 +32,10 @@ MISSING_YEAR_REVIEW_REASON = "missing_year"
 EXTERNAL_ENRICHMENT_REVIEW_REASON = "external_enrichment"
 NEW_ARTIST_REVIEW_REASON = "new_artist"
 MISSING_IMAGE_REVIEW_REASON = "missing_image"
+LOW_CONFIDENCE_TRACK_METADATA_REASON = "low_confidence"
+ABNORMAL_TRACK_METADATA_REASON = "abnormal_result"
+CONFLICTING_TRACK_METADATA_REASON = "conflict"
+DEFAULT_TRACK_METADATA_CONFIDENCE_THRESHOLD = 0.5
 NEW_ARTIST_REVIEW_TTL_DAYS = 7
 NEW_ALBUM_REVIEW_TTL_DAYS = 3
 AUTO_CONFIRM_ALBUM_REVIEW_REASONS = (
@@ -99,11 +112,51 @@ def buildArtistReviewSnapshot(artist) -> str:
     return json.dumps(snapshot, ensure_ascii=False)
 
 
+def buildTrackReviewSnapshot(
+    track: Track,
+    metadata: Optional[TrackMetadata] = None,
+    confidence_threshold: float = DEFAULT_TRACK_METADATA_CONFIDENCE_THRESHOLD,
+) -> str:
+    metadata = metadata or TrackMetadata.get_or_none(TrackMetadata.track == track)
+    artist_name = track.artist.get_artist_name() if track.artist is not None else ""
+    album_name = track.album.name if track.album is not None else ""
+    snapshot = {
+        "track_id": str(track.id),
+        "track_title": track.title,
+        "artist_name": artist_name,
+        "album_id": str(track.album_id) if track.album_id is not None else None,
+        "album_name": album_name,
+        "disc": track.disc,
+        "number": track.number,
+        "genre": track.genre,
+        "year": track.year,
+        "issues": getTrackMetadataReviewIssues(metadata, confidence_threshold),
+        "confidence_threshold": confidence_threshold,
+    }
+    if metadata is not None:
+        snapshot["metadata"] = {
+            "language": metadata.language,
+            "mood": metadata.get_moods(),
+            "scene": metadata.get_scenes(),
+            "tags": metadata.get_tags(),
+            "summary": metadata.summary,
+            "energy": metadata.energy,
+            "valence": metadata.valence,
+            "danceability": metadata.danceability,
+            "confidence": metadata.confidence,
+            "provider": metadata.provider,
+            "model": metadata.model,
+            "source": metadata.source,
+            "updated_at": metadata.updated_at.isoformat() if metadata.updated_at else None,
+        }
+    return json.dumps(snapshot, ensure_ascii=False)
+
+
 def getAlbumReviewReason(album: Album) -> str:
     return MISSING_YEAR_REVIEW_REASON if not album.year else NEW_ALBUM_REVIEW_REASON
 
 
-def getAlbumReviewIssues(album: Album) -> list[str]:
+def getAlbumReviewIssues(album: Album) -> List[str]:
     issues = []
     if not album.year:
         issues.append(MISSING_YEAR_REVIEW_REASON)
@@ -112,11 +165,22 @@ def getAlbumReviewIssues(album: Album) -> list[str]:
     return issues
 
 
-def getArtistReviewIssues(artist) -> list[str]:
+def getArtistReviewIssues(artist) -> List[str]:
     artist_info = artist.get_info()
     if any(artist_info.get(key) for key in ("largeImageUrl", "mediumImageUrl", "smallImageUrl")):
         return []
     return [MISSING_IMAGE_REVIEW_REASON]
+
+
+def getTrackMetadataReviewIssues(
+    metadata: Optional[TrackMetadata],
+    confidence_threshold: float = DEFAULT_TRACK_METADATA_CONFIDENCE_THRESHOLD,
+) -> List[str]:
+    if metadata is None:
+        return []
+    if metadata.confidence is None or metadata.confidence < confidence_threshold:
+        return [LOW_CONFIDENCE_TRACK_METADATA_REASON]
+    return []
 
 
 def _getTaskExpiry(task) -> object:
@@ -164,12 +228,60 @@ def _upsertArtistTask(artist, reason, snapshot_json, expires_at=None):
     return 0
 
 
+def _upsertTrackTask(track, reason, snapshot_json, expires_at=None):
+    task, was_created = ReviewTask.get_or_create(
+        pending_key=f"track:{track.id}:pending:{reason}",
+        defaults={
+            "entity_type": "track",
+            "entity_id": str(track.id),
+            "task_type": METADATA_REVIEW_TASK_TYPE,
+            "status": PENDING_REVIEW_TASK_STATUS,
+            "reason": reason,
+            "snapshot_json": snapshot_json,
+            "expires_at": expires_at,
+        },
+    )
+    if was_created:
+        task.expires_at = expires_at
+        task.updated = now()
+        task.save()
+        return 1
+
+    if task.snapshot_json == snapshot_json and task.expires_at == expires_at:
+        return 0
+
+    task.snapshot_json = snapshot_json
+    task.expires_at = expires_at
+    task.updated = now()
+    task.save()
+    return 0
+
+
 def _confirmPendingArtistTasks(artist, reason, snapshot_json):
     updated = 0
     current_time = now()
     query = ReviewTask.select().where(
         ReviewTask.entity_type == "artist",
         ReviewTask.entity_id == str(artist.id),
+        ReviewTask.status == PENDING_REVIEW_TASK_STATUS,
+        ReviewTask.reason == reason,
+    )
+    for task in query:
+        task.snapshot_json = snapshot_json
+        task.status = "confirmed"
+        task.resolved_at = current_time
+        task.updated = current_time
+        task.save()
+        updated += 1
+    return updated
+
+
+def _confirmPendingTrackTasks(track, reason, snapshot_json):
+    updated = 0
+    current_time = now()
+    query = ReviewTask.select().where(
+        ReviewTask.entity_type == "track",
+        ReviewTask.entity_id == str(track.id),
         ReviewTask.status == PENDING_REVIEW_TASK_STATUS,
         ReviewTask.reason == reason,
     )
@@ -201,6 +313,8 @@ def _getPendingTaskTitle(task: ReviewTask) -> str:
     snapshot = json.loads(task.snapshot_json or "{}")
     if task.is_artist_task():
         return snapshot.get("artist_name") or "Unknown artist"
+    if task.is_track_task():
+        return snapshot.get("track_title") or "Unknown track"
     return snapshot.get("album_name") or "Unknown album"
 
 
@@ -211,6 +325,8 @@ def _getPendingTaskExpiryPolicy(task: ReviewTask) -> str:
         return "awaiting_artist_image"
     if task.reason == MISSING_YEAR_REVIEW_REASON:
         return "awaiting_album_year"
+    if task.reason == LOW_CONFIDENCE_TRACK_METADATA_REASON:
+        return "awaiting_track_metadata_review"
     return "no_expiry_policy"
 
 
@@ -475,6 +591,54 @@ def createArtistReviewTasks(scanner: Scanner) -> int:
                 MISSING_IMAGE_REVIEW_REASON,
                 snapshot_json,
             )
+    return created
+
+
+def createLowConfidenceTrackMetadataReviewTask(
+    track: Track,
+    metadata: Optional[TrackMetadata] = None,
+    confidence_threshold: float = DEFAULT_TRACK_METADATA_CONFIDENCE_THRESHOLD,
+) -> int:
+    metadata = metadata or TrackMetadata.get_or_none(TrackMetadata.track == track)
+    snapshot_json = buildTrackReviewSnapshot(track, metadata, confidence_threshold)
+    issues = getTrackMetadataReviewIssues(metadata, confidence_threshold)
+    if LOW_CONFIDENCE_TRACK_METADATA_REASON not in issues:
+        return _confirmPendingTrackTasks(
+            track,
+            LOW_CONFIDENCE_TRACK_METADATA_REASON,
+            snapshot_json,
+        )
+    return _upsertTrackTask(
+        track,
+        LOW_CONFIDENCE_TRACK_METADATA_REASON,
+        snapshot_json,
+        None,
+    )
+
+
+def createLowConfidenceTrackMetadataReviewTasks(
+    confidence_threshold: float = DEFAULT_TRACK_METADATA_CONFIDENCE_THRESHOLD,
+    limit: Optional[int] = None,
+) -> int:
+    query = (
+        TrackMetadata.select(TrackMetadata, Track)
+        .join(Track)
+        .where(
+            (TrackMetadata.confidence.is_null(True))
+            | (TrackMetadata.confidence < confidence_threshold)
+        )
+        .order_by(TrackMetadata.updated_at.asc())
+    )
+    if limit is not None:
+        query = query.limit(limit)
+
+    created = 0
+    for metadata in query:
+        created += createLowConfidenceTrackMetadataReviewTask(
+            metadata.track,
+            metadata,
+            confidence_threshold,
+        )
     return created
 
 

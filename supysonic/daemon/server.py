@@ -19,6 +19,12 @@ from ..recommend import getRecommendationDay, refreshDailyRecommendPlaylists
 from ..scheduler import IntervalScheduler
 from ..scanner import Scanner
 from ..scanner_func.scanner_review_tasks import runReviewTaskMaintenance
+from ..scanner_func.scanner_track_enrich import (
+    LLMMetadataProvider,
+    LocalMetadataProvider,
+    TrackMetadataProviderError,
+    runTrackMetadataEnrichmentPass,
+)
 from ..utils import get_secret_key
 from ..watcher import SupysonicWatcher
 
@@ -105,6 +111,18 @@ class Daemon:
     def __get_review_task_maintenance_interval(self):
         return max(60, int(self.__config.DAEMON.get("review_task_maintenance_interval", 300)))
 
+    def __get_track_metadata_enrichment_interval(self):
+        return max(60, int(self.__config.DAEMON.get("track_metadata_enrichment_interval", 300)))
+
+    def __get_track_metadata_enrichment_batch_size(self):
+        return max(1, int(self.__config.DAEMON.get("track_metadata_enrichment_batch_size", 10)))
+
+    def __get_track_metadata_enrichment_stale_lock_seconds(self):
+        return max(
+            60,
+            int(self.__config.DAEMON.get("track_metadata_enrichment_stale_lock_seconds", 900)),
+        )
+
     def __configure_scheduler(self):
         self.__scheduler.register(
             "review-task-maintenance",
@@ -118,9 +136,107 @@ class Daemon:
             self.__get_recommend_refresh_interval(),
             enabled=self.__config.DAEMON.get("recommend_daily_refresh", True),
         )
+        self.__scheduler.register(
+            "track-metadata-enrichment",
+            self.__run_track_metadata_enrichment,
+            self.__get_track_metadata_enrichment_interval(),
+            enabled=self.__config.DAEMON.get("track_metadata_enrichment", False),
+        )
 
     def __run_review_task_maintenance(self):
         return runReviewTaskMaintenance()
+
+    def __run_track_metadata_enrichment(self):
+        provider_name = str(
+            self.__config.DAEMON.get("track_metadata_enrichment_provider", "local")
+        ).strip().lower()
+
+        if provider_name == "local":
+            provider = LocalMetadataProvider()
+        elif provider_name == "llm":
+            try:
+                provider = LLMMetadataProvider(
+                    getattr(self.__config, "RECOMMENDATION_AGENT", {})
+                )
+            except TrackMetadataProviderError as exc:
+                logger.warning(
+                    format_log_event(
+                        "daemon",
+                        "track_metadata_enrichment_provider_unavailable",
+                        provider=provider_name,
+                        error_type=exc.__class__.__name__,
+                    )
+                )
+                return False
+        else:
+            logger.warning(
+                format_log_event(
+                    "daemon",
+                    "track_metadata_enrichment_provider_unavailable",
+                    provider=provider_name,
+                )
+            )
+            return False
+
+        opened = False
+        try:
+            opened = open_connection(True)
+            logger.info(
+                format_log_event(
+                    "daemon",
+                    "track_metadata_enrichment_started",
+                    provider=provider_name,
+                )
+            )
+            summary = runTrackMetadataEnrichmentPass(
+                limit=self.__get_track_metadata_enrichment_batch_size(),
+                provider=provider,
+                stale_lock_seconds=self.__get_track_metadata_enrichment_stale_lock_seconds(),
+                include_path_hints=bool(
+                    self.__config.DAEMON.get(
+                        "track_metadata_enrichment_send_path_hints",
+                        False,
+                    )
+                ),
+            )
+            if summary.get("quota_exhausted"):
+                logger.warning(
+                    format_log_event(
+                        "daemon",
+                        "track_metadata_enrichment_quota_exhausted",
+                        provider=provider_name,
+                        selected=summary["selected"],
+                        enriched=summary["enriched"],
+                        failed=summary["failed"],
+                        skipped=summary["skipped"],
+                    )
+                )
+                return False
+            logger.info(
+                format_log_event(
+                    "daemon",
+                    "track_metadata_enrichment_completed",
+                    provider=provider_name,
+                    selected=summary["selected"],
+                    enriched=summary["enriched"],
+                    failed=summary["failed"],
+                    skipped=summary["skipped"],
+                )
+            )
+            return True
+        except Exception as exc:
+            logger.exception(
+                format_log_event(
+                    "daemon",
+                    "track_metadata_enrichment_failed",
+                    provider=provider_name,
+                    error_type=exc.__class__.__name__,
+                )
+            )
+            return False
+        finally:
+            if opened:
+                close_connection()
 
     def __refresh_recommend_playlists_if_needed(self, current_day=None):
         recommendationDay = getRecommendationDay() if current_day is None else current_day

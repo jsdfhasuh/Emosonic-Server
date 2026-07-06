@@ -287,6 +287,33 @@ library folders and providing the jukebox feature.
    recommended playlists are archived under
    :file:`<webapp.cache_dir>/recommend-playlists/<user>/`. Defaults to ``5``.
 
+``track_metadata_enrichment``
+   Whether the daemon should enrich track recommendation metadata automatically.
+   Defaults to ``no`` so upgrades never trigger external metadata work by
+   surprise.
+
+``track_metadata_enrichment_provider``
+   Provider used by daemon-driven track metadata enrichment. ``local`` uses only
+   existing library metadata and does not call external services. ``llm`` uses
+   the OpenAI-compatible endpoint, API key, model, timeout, token limit and
+   temperature from the ``[recommendation_agent]`` section. Defaults to
+   ``local``.
+
+``track_metadata_enrichment_interval``
+   Poll interval, in seconds, for daemon-driven track metadata enrichment.
+   Defaults to ``300``.
+
+``track_metadata_enrichment_batch_size``
+   Maximum tracks to enrich in one daemon pass. Defaults to ``10``.
+
+``track_metadata_enrichment_stale_lock_seconds``
+   Seconds before a running enrichment task is considered stale and can be
+   retried. Defaults to ``900``.
+
+``track_metadata_enrichment_send_path_hints``
+   Whether enrichment providers may receive full local path hints. Defaults to
+   ``no``. Keep this disabled unless the configured provider is trusted.
+
 Sample configuration::
 
    [daemon]
@@ -339,6 +366,26 @@ Sample configuration::
    ; ones are archived to JSON when the recommendation creation task runs.
    ; Default: 5
    recommend_playlist_retention_days = 5
+
+   ; Enrich track recommendation metadata automatically from the daemon.
+   ; Default: no
+   track_metadata_enrichment = no
+
+   ; Provider for daemon-driven track metadata enrichment. "llm" reuses
+   ; [recommendation_agent] endpoint/key/model settings. Default: local
+   track_metadata_enrichment_provider = local
+
+   ; Poll interval in seconds for track metadata enrichment. Default: 300
+   track_metadata_enrichment_interval = 300
+
+   ; Maximum tracks enriched per daemon pass. Default: 10
+   track_metadata_enrichment_batch_size = 10
+
+   ; Seconds before a running enrichment task is considered stale. Default: 900
+   track_metadata_enrichment_stale_lock_seconds = 900
+
+   ; Allow full path hints to be sent to an enrichment provider. Default: no
+   track_metadata_enrichment_send_path_hints = no
 
 .. _conf-musicbrainz:
 

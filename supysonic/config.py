@@ -74,6 +74,12 @@ class DefaultConfig:
         "recommend_playlist_retention_days": 5,
         "review_task_maintenance": True,
         "review_task_maintenance_interval": 300,
+        "track_metadata_enrichment": False,
+        "track_metadata_enrichment_provider": "local",
+        "track_metadata_enrichment_interval": 300,
+        "track_metadata_enrichment_batch_size": 10,
+        "track_metadata_enrichment_stale_lock_seconds": 900,
+        "track_metadata_enrichment_send_path_hints": False,
     }
     MUSICBRAINZ = {
         "api_url": "https://musicbrainz.org/ws/2",
