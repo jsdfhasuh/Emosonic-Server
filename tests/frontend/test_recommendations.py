@@ -17,6 +17,7 @@ from supysonic.db import (
     RecommendationAgentCache,
     RecommendationAgentSession,
     Track,
+    TrackMetadata,
     User,
     User_Play_Activity,
     UserRecommendationFeedback,
@@ -704,6 +705,32 @@ class RecommendationsTestCase(FrontendTestBase):
         Artist.create(name="G.E.M.")
         User_Play_Activity.create(track=self.track, user=self.user)
         User_Play_Activity.create(track=self.track, user=self.user)
+        TrackMetadata.create(
+            track=self.track,
+            track_last_modification=self.track.last_modification,
+            mood_json='["bright"]',
+            scene_json='["commute"]',
+            tags_json='["alt-pop"]',
+            summary="A bright local favorite.",
+            energy=70,
+            valence=80,
+            danceability=60,
+            confidence=0.9,
+            provider="test",
+        )
+        TrackMetadata.create(
+            track=self.other_track,
+            track_last_modification=self.other_track.last_modification,
+            mood_json='["focused"]',
+            scene_json='["work"]',
+            tags_json='["jazz"]',
+            summary="A focused current recommendation.",
+            energy=55,
+            valence=65,
+            danceability=50,
+            confidence=0.8,
+            provider="test",
+        )
 
         self._login("alice", "Alic3")
         with patch("supysonic.recommendation_agent.requests.post") as post:
@@ -767,6 +794,16 @@ class RecommendationsTestCase(FrontendTestBase):
             "Recommended One",
             json.dumps(prompt_payload["context"]["playHistory"], ensure_ascii=False),
         )
+        play_history_metadata = prompt_payload["context"]["playHistory"][0][
+            "semanticMetadata"
+        ]
+        self.assertEqual(play_history_metadata["mood"], ["bright"])
+        self.assertEqual(play_history_metadata["scene"], ["commute"])
+        self.assertEqual(play_history_metadata["tags"], ["alt-pop"])
+        current_track_metadata = prompt_payload["context"][
+            "currentRecommendationTracks"
+        ][0]["semanticMetadata"]
+        self.assertIn("summary", current_track_metadata)
         self.assertIn("Artist!", prompt_payload["context"]["libraryArtists"])
         self.assertIn("G.E.M.", prompt_payload["context"]["libraryArtists"])
 

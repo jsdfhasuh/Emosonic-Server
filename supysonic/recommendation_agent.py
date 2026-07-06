@@ -9,7 +9,7 @@ from typing import Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 import requests
 from peewee import OperationalError
 
-from .db import Artist, Track, User, User_Play_Activity, now
+from .db import Artist, Track, TrackMetadata, User, User_Play_Activity, now
 from .recommendation_agent_cache import (
     DEFAULT_AGENT_CACHE_TTL_SECONDS,
     build_recommendation_agent_context_hash,
@@ -421,8 +421,25 @@ def _serialize_datetime(value) -> str:
     return value.isoformat()
 
 
-def _serialize_track(track: Track, played_at=None) -> Dict[str, object]:
+def _serialize_track_metadata(metadata) -> Dict[str, object]:
+    if not metadata:
+        return {}
     return {
+        "language": metadata.language or "",
+        "mood": metadata.get_moods(),
+        "scene": metadata.get_scenes(),
+        "tags": metadata.get_tags(),
+        "summary": metadata.summary or "",
+        "energy": metadata.energy,
+        "valence": metadata.valence,
+        "danceability": metadata.danceability,
+        "confidence": metadata.confidence,
+        "provider": metadata.provider or "",
+    }
+
+
+def _serialize_track(track: Track, played_at=None, metadata=None) -> Dict[str, object]:
+    data = {
         "id": str(track.id),
         "title": track.title,
         "artist": track.artist.get_artist_name() if track.artist else "",
@@ -432,6 +449,10 @@ def _serialize_track(track: Track, played_at=None) -> Dict[str, object]:
         "playCount": track.play_count,
         "playedAt": _serialize_datetime(played_at),
     }
+    semantic_metadata = _serialize_track_metadata(metadata)
+    if semantic_metadata:
+        data["semanticMetadata"] = semantic_metadata
+    return data
 
 
 def _normalize_artist_name(name: object) -> str:
@@ -559,21 +580,47 @@ def _collect_play_history(user: User, history_limit: int) -> List[Dict[str, obje
     play_history: List[Dict[str, object]] = []
 
     try:
-        activities = (
+        activities = list(
             User_Play_Activity.select()
             .where(User_Play_Activity.user == user)
             .order_by(User_Play_Activity.time.desc())
             .limit(history_limit)
         )
+        metadata_by_track = _load_track_metadata(
+            [activity.track_id for activity in activities]
+        )
         for activity in activities:
-            play_history.append(_serialize_track(activity.track, activity.time))
+            play_history.append(
+                _serialize_track(
+                    activity.track,
+                    activity.time,
+                    metadata_by_track.get(activity.track_id),
+                )
+            )
     except OperationalError:
         logger.debug("User play activity table is unavailable for recommendation agent")
 
     if not play_history and getattr(user, "last_play", None):
-        play_history.append(_serialize_track(user.last_play, user.last_play_date))
+        metadata_by_track = _load_track_metadata([user.last_play_id])
+        play_history.append(
+            _serialize_track(
+                user.last_play,
+                user.last_play_date,
+                metadata_by_track.get(user.last_play_id),
+            )
+        )
 
     return play_history
+
+
+def _load_track_metadata(track_ids: Sequence[object]) -> Dict[object, TrackMetadata]:
+    ids = [track_id for track_id in track_ids if track_id]
+    if not ids:
+        return {}
+    return {
+        metadata.track_id: metadata
+        for metadata in TrackMetadata.select().where(TrackMetadata.track.in_(ids))
+    }
 
 
 def build_recommendation_agent_context(
@@ -587,6 +634,9 @@ def build_recommendation_agent_context(
     history_summary = _summarize_play_history(play_history)
     feedback_preferences = get_recommendation_feedback_preferences(user)
     hidden_artist_names = _hidden_feedback_artist_names(feedback_preferences)
+    recommendation_metadata = _load_track_metadata(
+        [track.id for track in recommendation_tracks]
+    )
 
     return {
         "user": user.name,
@@ -596,7 +646,8 @@ def build_recommendation_agent_context(
             **history_summary,
         },
         "currentRecommendationTracks": [
-            _serialize_track(track) for track in recommendation_tracks
+            _serialize_track(track, metadata=recommendation_metadata.get(track.id))
+            for track in recommendation_tracks
         ],
         "recommendationSummary": dict(recommendation_summary),
         "libraryArtists": _collect_library_artist_names(),
@@ -1009,8 +1060,39 @@ def _safe_int(value: object) -> int:
         return 0
 
 
-def _compact_agent_track_summary(track: Mapping[str, object]) -> Dict[str, object]:
+def _safe_optional_number(value: object):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _compact_semantic_metadata(value: object) -> Dict[str, object]:
+    if not isinstance(value, Mapping):
+        return {}
+    compact = {
+        "language": _safe_text(value.get("language"), 16),
+        "mood": _sanitize_string_list(value.get("mood"), 6, 80),
+        "scene": _sanitize_string_list(value.get("scene"), 6, 80),
+        "tags": _sanitize_string_list(value.get("tags"), 8, 80),
+        "summary": _safe_text(value.get("summary"), 240),
+        "energy": _safe_optional_number(value.get("energy")),
+        "valence": _safe_optional_number(value.get("valence")),
+        "danceability": _safe_optional_number(value.get("danceability")),
+        "confidence": _safe_optional_number(value.get("confidence")),
+        "provider": _safe_text(value.get("provider"), 64),
+    }
     return {
+        key: val
+        for key, val in compact.items()
+        if val not in ("", [], None)
+    }
+
+
+def _compact_agent_track_summary(track: Mapping[str, object]) -> Dict[str, object]:
+    summary = {
         "id": _safe_text(track.get("id"), 64),
         "title": _safe_text(track.get("title"), 160),
         "artist": _safe_text(track.get("artist"), 160),
@@ -1018,6 +1100,10 @@ def _compact_agent_track_summary(track: Mapping[str, object]) -> Dict[str, objec
         "genre": _safe_text(track.get("genre"), 80),
         "playCount": _safe_int(track.get("playCount")),
     }
+    semantic_metadata = _compact_semantic_metadata(track.get("semanticMetadata"))
+    if semantic_metadata:
+        summary["semanticMetadata"] = semantic_metadata
+    return summary
 
 
 def _compact_agent_play_history_summary(

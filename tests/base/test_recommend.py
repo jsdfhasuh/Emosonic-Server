@@ -6,10 +6,21 @@ import unittest
 from datetime import datetime
 from unittest.mock import patch
 
-from supysonic.db import Album, Artist, Folder, Playlist, Track, User, User_Play_Activity, db
+from supysonic.db import (
+    Album,
+    Artist,
+    Folder,
+    Playlist,
+    Track,
+    TrackMetadata,
+    User,
+    User_Play_Activity,
+    db,
+)
 from supysonic.recommend import (
     RECOMMENDED_PLAYLIST_COMMENT,
     _buildRecommendedTracks,
+    buildRecommendationReasonMap,
     create_recommend_playlist,
 )
 from supysonic.recommendation_feedback import set_recommendation_feedback
@@ -380,6 +391,66 @@ class RecommendTestCase(TestBase):
         self.assertEqual([track.id for track in tracks], [similar_track.id])
         self.assertNotEqual(tracks[0].id, other_track.id)
 
+    def test_build_recommended_tracks_scores_track_metadata_affinity(self):
+        seed_track = self.listened_tracks[0]
+        TrackMetadata.create(
+            track=seed_track,
+            track_last_modification=seed_track.last_modification,
+            mood_json='["calm"]',
+            scene_json='["late night"]',
+            tags_json='["dreamy"]',
+            energy=35,
+            provider="test",
+        )
+        metadata_artist = Artist.create(name="Metadata Candidate Artist")
+        metadata_album = Album.create(name="Metadata Candidate Album", artist=metadata_artist)
+        other_artist = Artist.create(name="Other Metadata Artist")
+        other_album = Album.create(name="Other Metadata Album", artist=other_artist)
+        metadata_candidate = self._create_track(
+            "Metadata Candidate",
+            30,
+            genre="ambient",
+            artist=metadata_artist,
+            album=metadata_album,
+        )
+        other_candidate = self._create_track(
+            "Other Metadata Candidate",
+            31,
+            genre="ambient",
+            artist=other_artist,
+            album=other_album,
+        )
+        TrackMetadata.create(
+            track=metadata_candidate,
+            track_last_modification=metadata_candidate.last_modification,
+            mood_json='["calm"]',
+            scene_json='["late night"]',
+            tags_json='["dreamy"]',
+            energy=40,
+            provider="test",
+        )
+        TrackMetadata.create(
+            track=other_candidate,
+            track_last_modification=other_candidate.last_modification,
+            mood_json='["aggressive"]',
+            scene_json='["workout"]',
+            tags_json='["harsh"]',
+            energy=95,
+            provider="test",
+        )
+
+        tracks = _buildRecommendedTracks(
+            {seed_track.id: 3},
+            1,
+            excludedTrackIds={
+                self.listened_tracks[1].id,
+                *[track.id for track in self.candidate_tracks],
+            },
+        )
+
+        self.assertEqual([track.id for track in tracks], [metadata_candidate.id])
+        self.assertNotEqual(tracks[0].id, other_candidate.id)
+
     def test_build_recommended_tracks_rotates_equal_candidates_by_day(self):
         existing_ids = {
             track.id
@@ -476,6 +547,21 @@ class RecommendTestCase(TestBase):
         self.assertEqual(payload["track_ids"], [str(self.candidate_tracks[0].id)])
         self.assertEqual(payload["tracks"][0]["title"], self.candidate_tracks[0].title)
         self.assertIn("rock", payload["tracks"][0]["recommend_reason"])
+
+    def test_recommendation_reason_uses_track_metadata_when_available(self):
+        track = self.candidate_tracks[0]
+        TrackMetadata.create(
+            track=track,
+            track_last_modification=track.last_modification,
+            mood_json='["calm", "warm"]',
+            scene_json='["late night"]',
+            provider="test",
+        )
+
+        reasons = buildRecommendationReasonMap(self.user, [track])
+
+        self.assertIn("calm / warm", reasons[str(track.id)])
+        self.assertIn("late night", reasons[str(track.id)])
 
     def test_create_recommend_playlist_sanitizes_archive_user_directory(self):
         self._record_play(self.listened_tracks[0], 2)

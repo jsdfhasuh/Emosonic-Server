@@ -9,7 +9,7 @@ from peewee import fn
 from typing import Dict, Mapping, Optional, Sequence
 
 from .config import DefaultConfig
-from .db import Playlist, Track, User, User_Play_Activity
+from .db import Playlist, Track, TrackMetadata, User, User_Play_Activity
 from .recommendation_feedback import (
     get_recommendation_feedback_preferences,
     track_matches_negative_recommendation_feedback,
@@ -29,13 +29,17 @@ RECOMMENDED_PLAYLIST_DAY_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 SAFE_ARCHIVE_SEGMENT_RE = re.compile(r"[^A-Za-z0-9._@-]+")
 DEFAULT_RECOMMEND_PLAYLIST_RETENTION_DAYS = 5
 RECOMMENDATION_SCORE_WEIGHTS = {
-    "genre_match": 0.30,
-    "artist_affinity": 0.25,
-    "album_affinity": 0.10,
-    "freshness": 0.10,
-    "popularity": 0.10,
-    "not_played": 0.10,
-    "feedback": 0.05,
+    "genre_match": 0.24,
+    "artist_affinity": 0.20,
+    "album_affinity": 0.08,
+    "freshness": 0.08,
+    "popularity": 0.08,
+    "not_played": 0.08,
+    "feedback": 0.04,
+    "mood_match": 0.08,
+    "scene_match": 0.05,
+    "tag_match": 0.05,
+    "energy_match": 0.02,
 }
 
 
@@ -149,6 +153,34 @@ def _buildRecommendationReasonProfile(user) -> Dict[str, object]:
     }
 
 
+def _buildTrackMetadataReason(metadata) -> str:
+    if not metadata:
+        return ""
+
+    moods = metadata.get_moods()
+    scenes = metadata.get_scenes()
+    tags = metadata.get_tags()
+    if moods and scenes:
+        return (
+            "Because it matches a "
+            + " / ".join(moods[:2])
+            + " mood and suits "
+            + " / ".join(scenes[:2])
+            + " listening."
+        )
+    if moods:
+        return "Because it carries a " + " / ".join(moods[:2]) + " mood."
+    if scenes:
+        return "Because it suits " + " / ".join(scenes[:2]) + " listening."
+    if metadata.summary:
+        summary = str(metadata.summary).strip()
+        if summary:
+            return f"Because {summary[0].lower()}{summary[1:]}"
+    if tags:
+        return "Because its tags add " + " / ".join(tags[:3]) + " variety."
+    return ""
+
+
 def getRecommendationReason(
     user,
     track,
@@ -160,6 +192,7 @@ def getRecommendationReason(
     topArtistIds = profile.get("topArtistIds") or set()
     likedMoreGenres = profile.get("likedMoreGenres") or set()
     likedMoreArtistIds = profile.get("likedMoreArtistIds") or set()
+    metadataByTrackId = profile.get("trackMetadataById")
 
     trackId = str(track.id)
     genre = str(track.genre or "").strip()
@@ -170,6 +203,14 @@ def getRecommendationReason(
         or (track.artist_id and track.artist_id in likedMoreArtistIds)
     ):
         return "Because you asked for more songs like a previous recommendation."
+
+    if metadataByTrackId is None:
+        metadata = TrackMetadata.get_or_none(TrackMetadata.track == track)
+    else:
+        metadata = metadataByTrackId.get(trackId)
+    metadataReason = _buildTrackMetadataReason(metadata)
+    if metadataReason:
+        return metadataReason
 
     if genre and genre in topGenres:
         return f"Because you often listen to {genre}, and this track matches that style."
@@ -194,6 +235,11 @@ def buildRecommendationReasonMap(
     tracks: Sequence[object],
 ) -> Dict[str, str]:
     profile = _buildRecommendationReasonProfile(user)
+    trackIds = [track.id for track in tracks]
+    profile["trackMetadataById"] = {
+        str(metadata.track_id): metadata
+        for metadata in TrackMetadata.select().where(TrackMetadata.track.in_(trackIds))
+    } if trackIds else {}
     return {
         str(track.id): getRecommendationReason(user, track, profile)
         for track in tracks
@@ -252,6 +298,88 @@ def _recommendationFeedbackScore(track, likedMoreProfile: Mapping[str, set]) -> 
     return 0.0
 
 
+def _buildMetadataPreferenceProfile(trackPlayCounts) -> Dict[str, object]:
+    profile = {
+        "mood_counts": {},
+        "scene_counts": {},
+        "tag_counts": {},
+        "average_energy": None,
+    }
+    if not trackPlayCounts:
+        return profile
+
+    totalEnergyWeight = 0
+    weightedEnergy = 0
+    for metadata in TrackMetadata.select().where(
+        TrackMetadata.track.in_(list(trackPlayCounts.keys()))
+    ):
+        playCount = int(trackPlayCounts.get(metadata.track_id, 0) or 0)
+        if playCount <= 0:
+            continue
+        _incrementMetadataCounts(profile["mood_counts"], metadata.get_moods(), playCount)
+        _incrementMetadataCounts(profile["scene_counts"], metadata.get_scenes(), playCount)
+        _incrementMetadataCounts(profile["tag_counts"], metadata.get_tags(), playCount)
+        if metadata.energy is not None:
+            weightedEnergy += int(metadata.energy) * playCount
+            totalEnergyWeight += playCount
+
+    if totalEnergyWeight:
+        profile["average_energy"] = weightedEnergy / totalEnergyWeight
+    return profile
+
+
+def _incrementMetadataCounts(counts: Dict[str, int], values, amount: int) -> None:
+    for value in values:
+        key = str(value).strip().casefold()
+        if key:
+            counts[key] = counts.get(key, 0) + amount
+
+
+def _metadataListScore(values, counts: Mapping[str, int]) -> float:
+    if not values or not counts:
+        return 0.0
+    maxCount = max(counts.values()) if counts else 0
+    if maxCount <= 0:
+        return 0.0
+    matched = sum(counts.get(str(value).strip().casefold(), 0) for value in values)
+    return min(1.0, float(matched) / float(maxCount))
+
+
+def _metadataEnergyScore(metadata, averageEnergy) -> float:
+    if not metadata or metadata.energy is None or averageEnergy is None:
+        return 0.0
+    distance = abs(float(metadata.energy) - float(averageEnergy))
+    return max(0.0, 1.0 - min(1.0, distance / 100.0))
+
+
+def _trackMetadataScore(metadata, metadataProfile: Mapping[str, object]) -> Dict[str, float]:
+    if not metadata:
+        return {
+            "mood_match": 0.0,
+            "scene_match": 0.0,
+            "tag_match": 0.0,
+            "energy_match": 0.0,
+        }
+    return {
+        "mood_match": _metadataListScore(
+            metadata.get_moods(),
+            metadataProfile.get("mood_counts", {}),
+        ),
+        "scene_match": _metadataListScore(
+            metadata.get_scenes(),
+            metadataProfile.get("scene_counts", {}),
+        ),
+        "tag_match": _metadataListScore(
+            metadata.get_tags(),
+            metadataProfile.get("tag_counts", {}),
+        ),
+        "energy_match": _metadataEnergyScore(
+            metadata,
+            metadataProfile.get("average_energy"),
+        ),
+    }
+
+
 def _scoreRecommendationCandidate(
     track,
     listenedTrackIds,
@@ -260,6 +388,8 @@ def _scoreRecommendationCandidate(
     albumCounts,
     maxPopularity: int,
     likedMoreProfile: Mapping[str, set],
+    metadata=None,
+    metadataProfile: Optional[Mapping[str, object]] = None,
 ) -> float:
     maxGenreCount = max(genreCounts.values()) if genreCounts else 0
     maxArtistCount = max(artistCounts.values()) if artistCounts else 0
@@ -275,6 +405,7 @@ def _scoreRecommendationCandidate(
     popularityScore = _normalized_count(int(track.play_count or 0), maxPopularity)
     notPlayedScore = 1.0 if track.id not in listenedTrackIds else 0.0
     feedbackScore = _recommendationFeedbackScore(track, likedMoreProfile)
+    metadataScores = _trackMetadataScore(metadata, metadataProfile or {})
 
     return (
         genreScore * RECOMMENDATION_SCORE_WEIGHTS["genre_match"]
@@ -284,6 +415,10 @@ def _scoreRecommendationCandidate(
         + popularityScore * RECOMMENDATION_SCORE_WEIGHTS["popularity"]
         + notPlayedScore * RECOMMENDATION_SCORE_WEIGHTS["not_played"]
         + feedbackScore * RECOMMENDATION_SCORE_WEIGHTS["feedback"]
+        + metadataScores["mood_match"] * RECOMMENDATION_SCORE_WEIGHTS["mood_match"]
+        + metadataScores["scene_match"] * RECOMMENDATION_SCORE_WEIGHTS["scene_match"]
+        + metadataScores["tag_match"] * RECOMMENDATION_SCORE_WEIGHTS["tag_match"]
+        + metadataScores["energy_match"] * RECOMMENDATION_SCORE_WEIGHTS["energy_match"]
     )
 
 
@@ -314,6 +449,7 @@ def _buildRecommendedTracks(
     preferences = preferences or {}
     genreCounts, artistCounts, albumCounts = _getPreferenceCounts(trackPlayCounts)
     likedMoreProfile = _buildLikedMoreProfile(preferences)
+    metadataProfile = _buildMetadataPreferenceProfile(trackPlayCounts)
 
     candidateQuery = Track.select()
     if listenedTrackIds:
@@ -329,6 +465,12 @@ def _buildRecommendedTracks(
         candidates.append(track)
 
     maxPopularity = max((int(track.play_count or 0) for track in candidates), default=0)
+    candidateMetadata = {
+        metadata.track_id: metadata
+        for metadata in TrackMetadata.select().where(
+            TrackMetadata.track.in_([track.id for track in candidates])
+        )
+    } if candidates else {}
     scoredCandidates = [
         (
             _scoreRecommendationCandidate(
@@ -339,6 +481,8 @@ def _buildRecommendedTracks(
                 albumCounts,
                 maxPopularity,
                 likedMoreProfile,
+                metadata=candidateMetadata.get(track.id),
+                metadataProfile=metadataProfile,
             ),
             int(track.play_count or 0),
             _dailyRecommendationJitter(track, recommendationDay),
