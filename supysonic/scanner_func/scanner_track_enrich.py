@@ -9,6 +9,8 @@ import re
 from datetime import timedelta
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 
+from peewee import IntegrityError
+
 from ..db import (
     Track,
     TrackMetadata,
@@ -816,15 +818,9 @@ def _claimTrackMetadataEnrichmentTask(
     force: bool = False,
 ) -> Optional[TrackMetadataEnrichmentTask]:
     current_time = now()
+    task = _get_or_create_track_metadata_enrichment_task(track, reason, force)
     with db.atomic():
-        task, _ = TrackMetadataEnrichmentTask.get_or_create(
-            track=track,
-            defaults={
-                "status": TrackMetadataEnrichmentTask.STATUS_PENDING,
-                "reason": reason,
-                "force": force,
-            },
-        )
+        task = TrackMetadataEnrichmentTask.get_by_id(task.id)
         if task.status == TrackMetadataEnrichmentTask.STATUS_RUNNING:
             return None
 
@@ -850,6 +846,31 @@ def _claimTrackMetadataEnrichmentTask(
         if not updated:
             return None
         return TrackMetadataEnrichmentTask.get_by_id(task.id)
+
+
+def _get_or_create_track_metadata_enrichment_task(
+    track: Track,
+    reason: str,
+    force: bool = False,
+) -> TrackMetadataEnrichmentTask:
+    try:
+        with db.atomic():
+            task, _ = TrackMetadataEnrichmentTask.get_or_create(
+                track=track,
+                defaults={
+                    "status": TrackMetadataEnrichmentTask.STATUS_PENDING,
+                    "reason": reason,
+                    "force": force,
+                },
+            )
+            return task
+    except IntegrityError:
+        task = TrackMetadataEnrichmentTask.get_or_none(
+            TrackMetadataEnrichmentTask.track == track
+        )
+        if task is None:
+            raise
+        return task
 
 
 def _validateEnrichment(enrichment: Mapping[str, object]) -> Dict[str, object]:

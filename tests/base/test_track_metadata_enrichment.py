@@ -11,7 +11,14 @@ from peewee import IntegrityError
 
 from supysonic import db
 from supysonic.cli import cli
+from supysonic.llm_client import parse_json_object_response
 from supysonic.scanner_func.scanner_records import removeFile
+from supysonic.scanner_func.scanner_review_tasks import (
+    createLowConfidenceTrackMetadataReviewTask,
+    createLowConfidenceTrackMetadataReviewTasks,
+    getTrackMetadataReviewIssues,
+)
+from supysonic.scanner_func import scanner_track_enrich
 from supysonic.scanner_func.scanner_track_enrich import (
     LLMMetadataProvider,
     LocalMetadataProvider,
@@ -21,6 +28,32 @@ from supysonic.scanner_func.scanner_track_enrich import (
 )
 
 from ..testbase import TestConfig
+
+
+class StaticLLMMetadataProvider:
+    name = "llm"
+    model = "test-model"
+    source = "llm"
+
+    def __init__(self, confidence=0.8):
+        self.confidence = confidence
+
+    def enrich(self, track_input):
+        return {
+            "language": "en",
+            "mood": ["calm"],
+            "scene": ["late night"],
+            "tags": ["dreamy"],
+            "summary": "A calm late night track.",
+            "energy": 30,
+            "valence": 60,
+            "danceability": 40,
+            "confidence": self.confidence,
+            "provider": self.name,
+            "model": self.model,
+            "source": self.source,
+            "raw": {"provider": self.name},
+        }
 
 
 class TrackMetadataEnrichmentTestCase(unittest.TestCase):
@@ -181,10 +214,28 @@ class TrackMetadataEnrichmentTestCase(unittest.TestCase):
         self.assertEqual(task.status, db.TrackMetadataEnrichmentTask.STATUS_COMPLETED)
         self.assertEqual(task.attempt_count, 1)
 
-    def test_low_confidence_enrichment_creates_track_review_task(self):
+    def test_local_provider_does_not_create_track_review_task(self):
         track = self._create_track()
 
         runTrackMetadataEnrichmentPass(provider=LocalMetadataProvider())
+
+        metadata = db.TrackMetadata.get(db.TrackMetadata.track == track)
+        self.assertEqual(metadata.provider, "local")
+        self.assertEqual(getTrackMetadataReviewIssues(metadata), [])
+        self.assertIsNone(
+            db.ReviewTask.get_or_none(
+                db.ReviewTask.entity_type == "track",
+                db.ReviewTask.entity_id == str(track.id),
+                db.ReviewTask.reason == "low_confidence",
+            )
+        )
+
+    def test_low_confidence_llm_enrichment_creates_track_review_task(self):
+        track = self._create_track()
+
+        runTrackMetadataEnrichmentPass(
+            provider=StaticLLMMetadataProvider(confidence=0.2)
+        )
 
         task = db.ReviewTask.get(
             db.ReviewTask.entity_type == "track",
@@ -196,18 +247,16 @@ class TrackMetadataEnrichmentTestCase(unittest.TestCase):
         snapshot = json.loads(task.snapshot_json)
         self.assertEqual(snapshot["track_title"], "Track Metadata Song")
         self.assertEqual(snapshot["issues"], ["low_confidence"])
-        self.assertEqual(snapshot["metadata"]["confidence"], 0.25)
+        self.assertEqual(snapshot["metadata"]["confidence"], 0.2)
 
     def test_high_confidence_track_metadata_confirms_pending_review_task(self):
-        from supysonic.scanner_func.scanner_review_tasks import (
-            createLowConfidenceTrackMetadataReviewTask,
-        )
-
         track = self._create_track()
         metadata = db.TrackMetadata.create(
             track=track,
             track_last_modification=track.last_modification,
             confidence=0.2,
+            provider="llm",
+            source="llm",
         )
         task = db.ReviewTask.create(
             entity_type="track",
@@ -226,6 +275,82 @@ class TrackMetadataEnrichmentTestCase(unittest.TestCase):
         refreshed_task = db.ReviewTask.get_by_id(task.id)
         self.assertEqual(refreshed_task.status, "confirmed")
         self.assertIsNotNone(refreshed_task.resolved_at)
+
+    def test_local_track_metadata_confirms_existing_pending_review_task(self):
+        track = self._create_track()
+        metadata = db.TrackMetadata.create(
+            track=track,
+            track_last_modification=track.last_modification,
+            confidence=0.2,
+            provider="local",
+            source="local",
+        )
+        task = db.ReviewTask.create(
+            entity_type="track",
+            entity_id=str(track.id),
+            task_type="metadata_review",
+            status="pending",
+            reason="low_confidence",
+            snapshot_json="{}",
+        )
+
+        updated_count = createLowConfidenceTrackMetadataReviewTask(track, metadata)
+
+        self.assertEqual(updated_count, 1)
+        refreshed_task = db.ReviewTask.get_by_id(task.id)
+        self.assertEqual(refreshed_task.status, "confirmed")
+        snapshot = json.loads(refreshed_task.snapshot_json)
+        self.assertEqual(snapshot["issues"], [])
+
+    def test_bulk_low_confidence_track_review_skips_local_metadata(self):
+        root = db.Folder.create(root=True, name="Root", path="music")
+        folder = db.Folder.create(
+            root=False,
+            name="Album",
+            path="music/album",
+            parent=root,
+        )
+        local_track = self._create_track(
+            path="music/album/local.flac",
+            root=root,
+            folder=folder,
+        )
+        llm_track = self._create_track(
+            path="music/album/llm.flac",
+            root=root,
+            folder=folder,
+        )
+        db.TrackMetadata.create(
+            track=local_track,
+            track_last_modification=local_track.last_modification,
+            confidence=0.1,
+            provider="local",
+            source="local",
+        )
+        db.TrackMetadata.create(
+            track=llm_track,
+            track_last_modification=llm_track.last_modification,
+            confidence=0.1,
+            provider="llm",
+            source="llm",
+        )
+
+        created = createLowConfidenceTrackMetadataReviewTasks()
+
+        self.assertEqual(created, 1)
+        self.assertIsNone(
+            db.ReviewTask.get_or_none(
+                db.ReviewTask.entity_type == "track",
+                db.ReviewTask.entity_id == str(local_track.id),
+            )
+        )
+        self.assertIsNotNone(
+            db.ReviewTask.get_or_none(
+                db.ReviewTask.entity_type == "track",
+                db.ReviewTask.entity_id == str(llm_track.id),
+                db.ReviewTask.reason == "low_confidence",
+            )
+        )
 
     def test_build_track_metadata_input_does_not_include_absolute_path(self):
         track = self._create_track(path="/private/music/Album Name/Track Name.flac")
@@ -565,6 +690,72 @@ class TrackMetadataEnrichmentTestCase(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertIn("response_format", post.call_args_list[0].kwargs["json"])
         self.assertNotIn("response_format", post.call_args_list[1].kwargs["json"])
+
+    def test_parse_json_object_response_accepts_fenced_json(self):
+        parsed = parse_json_object_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "```json\n"
+                                '{"tags":["dreamy"],"confidence":0.7}'
+                                "\n```"
+                            )
+                        }
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(parsed["tags"], ["dreamy"])
+        self.assertEqual(parsed["confidence"], 0.7)
+
+    def test_parse_json_object_response_accepts_text_wrapped_json(self):
+        parsed = parse_json_object_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "Here is the metadata: "
+                                '{"summary":"Uses {braces} in text","confidence":0.8}'
+                                " Done."
+                            )
+                        }
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(parsed["summary"], "Uses {braces} in text")
+        self.assertEqual(parsed["confidence"], 0.8)
+
+    def test_track_metadata_task_claim_recovers_from_unique_key_race(self):
+        track = self._create_track()
+        existing_task = db.TrackMetadataEnrichmentTask.create(
+            track=track,
+            status=db.TrackMetadataEnrichmentTask.STATUS_PENDING,
+            reason=db.TrackMetadataEnrichmentTask.REASON_METADATA_MISSING,
+        )
+
+        with patch.object(
+            scanner_track_enrich.TrackMetadataEnrichmentTask,
+            "get_or_create",
+            side_effect=IntegrityError("duplicate track task"),
+        ):
+            claimed = scanner_track_enrich._claimTrackMetadataEnrichmentTask(
+                track,
+                db.TrackMetadataEnrichmentTask.REASON_METADATA_MISSING,
+            )
+
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.id, existing_task.id)
+        self.assertEqual(
+            claimed.status,
+            db.TrackMetadataEnrichmentTask.STATUS_RUNNING,
+        )
+        self.assertEqual(claimed.attempt_count, 1)
 
     def test_cli_metadata_enrich_llm_retries_rate_limit_once(self):
         self._create_track()

@@ -24,7 +24,10 @@ from supysonic.db import (
     now,
 )
 from supysonic.recommend import RECOMMENDED_PLAYLIST_COMMENT, getRecommendationDay
-from supysonic.recommendation_agent import reset_recommendation_agent_health_state
+from supysonic.recommendation_agent import (
+    build_recommendation_agent_context,
+    reset_recommendation_agent_health_state,
+)
 from supysonic.recommendation_feedback import set_recommendation_feedback
 
 from .frontendtestbase import FrontendTestBase
@@ -716,7 +719,8 @@ class RecommendationsTestCase(FrontendTestBase):
             valence=80,
             danceability=60,
             confidence=0.9,
-            provider="test",
+            provider="llm",
+            source="llm",
         )
         TrackMetadata.create(
             track=self.other_track,
@@ -729,7 +733,8 @@ class RecommendationsTestCase(FrontendTestBase):
             valence=65,
             danceability=50,
             confidence=0.8,
-            provider="test",
+            provider="llm",
+            source="llm",
         )
 
         self._login("alice", "Alic3")
@@ -800,6 +805,13 @@ class RecommendationsTestCase(FrontendTestBase):
         self.assertEqual(play_history_metadata["mood"], ["bright"])
         self.assertEqual(play_history_metadata["scene"], ["commute"])
         self.assertEqual(play_history_metadata["tags"], ["alt-pop"])
+        listening_profile = prompt_payload["context"]["listeningProfile"]
+        self.assertEqual(listening_profile["playCount"], 2)
+        self.assertEqual(
+            listening_profile["topMoods"],
+            [{"value": "bright", "playCount": 2}],
+        )
+        self.assertEqual(listening_profile["averageEnergy"], 70.0)
         current_track_metadata = prompt_payload["context"][
             "currentRecommendationTracks"
         ][0]["semanticMetadata"]
@@ -823,6 +835,48 @@ class RecommendationsTestCase(FrontendTestBase):
         self.assertEqual(
             payload["agentSession"]["recommendedArtists"][0]["similarTo"],
             ["Artist!"],
+        )
+
+    def test_recommendation_agent_context_omits_low_quality_semantic_metadata(self):
+        User_Play_Activity.create(track=self.track, user=self.user)
+        TrackMetadata.create(
+            track=self.track,
+            track_last_modification=self.track.last_modification,
+            mood_json='["local-mood"]',
+            scene_json='["local-scene"]',
+            tags_json='["local-tag"]',
+            energy=30,
+            valence=40,
+            danceability=50,
+            confidence=0.25,
+            provider="local",
+            source="local",
+        )
+        TrackMetadata.create(
+            track=self.other_track,
+            track_last_modification=self.other_track.last_modification,
+            mood_json='["low-confidence"]',
+            scene_json='["work"]',
+            tags_json='["jazz"]',
+            energy=55,
+            valence=65,
+            danceability=50,
+            confidence=0.2,
+            provider="llm",
+            source="llm",
+        )
+
+        context = build_recommendation_agent_context(
+            self.user,
+            [self.other_track],
+            {},
+            history_limit=10,
+        )
+
+        self.assertNotIn("semanticMetadata", context["playHistory"][0])
+        self.assertNotIn(
+            "semanticMetadata",
+            context["currentRecommendationTracks"][0],
         )
 
     def test_recommendation_agent_suggested_prompts_include_style_and_obscure_followups(self):

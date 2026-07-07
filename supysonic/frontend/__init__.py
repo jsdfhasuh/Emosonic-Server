@@ -52,6 +52,7 @@ from ..db import (
 )
 from ..api.media import _get_cover_path
 from ..emo.ws_state import DEFAULT_CLIENT_STALE_SECONDS, get_state
+from ..home_smart_cards import build_home_smart_cards
 from ..managers.user import UserManager
 from ..api.media import __new_get_cover_path
 from ..cache import CacheMiss
@@ -169,9 +170,11 @@ def index():
         "albums": Album.select().count(),
         "tracks": Track.select().count(),
     }
+    smart_cards = build_home_smart_cards(request.user)
     return render_template(
         "home.html",
         stats=stats,
+        smart_cards=smart_cards,
         device_summary=device_summary,
         recent_devices=device_rows[:5],
         client_release_downloads=client_release_downloads,
