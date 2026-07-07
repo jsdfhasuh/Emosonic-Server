@@ -11,6 +11,7 @@ import logging
 import os
 import time
 import uuid
+from datetime import datetime
 from typing import Dict, List, Optional, Sequence
 
 from flask import (
@@ -92,6 +93,10 @@ AGENT_STARTER_TRACK_LIMIT = 12
 AGENT_STARTER_PLAYLIST_COMMENT = "Recommendation Agent starter playlist"
 AGENT_STARTER_MUSIC_REQUEST_NOTE = (
     "Created from Recommendation Agent starter playlist action."
+)
+SCHEDULER_LOG_CAPTURE_NOTE = (
+    "Run logs follow daemon log level and include only records emitted by the "
+    "scheduled job thread."
 )
 ANONYMOUS_FRONTEND_ENDPOINTS = {
     "frontend.login",
@@ -1155,37 +1160,172 @@ def device_data():
     return jsonify({"devices": rows, "summary": getDeviceMonitorSummary(rows)})
 
 
-@frontend.route("/admin/tasks")
-@admin_only
-def admin_tasks():
-    tasks = list_task_results()
+def _format_epoch_seconds(value):
+    if value is None:
+        return "—"
+    try:
+        timestamp = float(value)
+        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "—"
+
+
+def _format_duration(value):
+    if value is None:
+        return "—"
+    try:
+        duration = max(0.0, float(value))
+    except (TypeError, ValueError):
+        return "—"
+    if duration < 1:
+        return f"{round(duration * 1000)}ms"
+    return f"{duration:.3f}s"
+
+
+def _format_task_rows(tasks):
+    rows = []
+    for task in tasks:
+        row = dict(task)
+        row["timestamp_display"] = _format_epoch_seconds(row.get("timestamp"))
+        rows.append(row)
+    return rows
+
+
+def _format_scheduler_log(log):
+    if not isinstance(log, dict):
+        raise TypeError("Invalid scheduler log entry")
+    item = dict(log)
+    item["timestamp_display"] = _format_epoch_seconds(item.get("timestamp"))
+    return item
+
+
+def _format_scheduler_run(run):
+    if not isinstance(run, dict):
+        raise TypeError("Invalid scheduler run entry")
+    item = dict(run)
+    item["started_at_display"] = _format_epoch_seconds(item.get("started_at"))
+    item["finished_at_display"] = _format_epoch_seconds(item.get("finished_at"))
+    item["duration_display"] = _format_duration(item.get("duration"))
+    logs = item.get("logs", [])
+    if logs is None:
+        logs = []
+    if not isinstance(logs, (list, tuple)):
+        raise TypeError("Invalid scheduler run logs")
+    item["logs"] = [_format_scheduler_log(log) for log in logs]
+    return item
+
+
+def _format_scheduler_jobs(jobs):
+    if jobs is None:
+        return []
+    if not isinstance(jobs, (list, tuple)):
+        raise TypeError("Invalid scheduler jobs payload")
+    rows = []
+    for job in jobs:
+        if not isinstance(job, dict):
+            raise TypeError("Invalid scheduler job entry")
+        row = dict(job)
+        row["name"] = str(row.get("name") or "unknown")
+        row["next_run_at_display"] = _format_epoch_seconds(row.get("next_run_at"))
+        row["last_started_at_display"] = _format_epoch_seconds(row.get("last_started_at"))
+        row["last_finished_at_display"] = _format_epoch_seconds(row.get("last_finished_at"))
+        row["last_duration_display"] = _format_duration(row.get("last_duration"))
+        row["current_duration_display"] = _format_duration(row.get("current_duration"))
+        last_logs = row.get("last_logs", [])
+        history = row.get("history", [])
+        if last_logs is None:
+            last_logs = []
+        if history is None:
+            history = []
+        if not isinstance(last_logs, (list, tuple)):
+            raise TypeError("Invalid scheduler job logs")
+        if not isinstance(history, (list, tuple)):
+            raise TypeError("Invalid scheduler job history")
+        row["last_logs"] = [_format_scheduler_log(log) for log in last_logs]
+        row["history"] = [_format_scheduler_run(run) for run in history]
+        rows.append(row)
+    return rows
+
+
+def _summarize_task_results(tasks):
     status_counts = {"pending": 0, "completed": 0, "failed": 0}
-    for t in tasks:
-        status_counts[t["status"]] = status_counts.get(t["status"], 0) + 1
-    summary = {
+    for task in tasks:
+        status = task["status"]
+        status_counts[status] = status_counts.get(status, 0) + 1
+    return {
         "pending": status_counts["pending"],
         "completed": status_counts["completed"],
         "failed": status_counts["failed"],
         "total": len(tasks),
     }
-    return render_template("admin-tasks.html", tasks=tasks, summary=summary)
+
+
+def _get_scheduler_jobs():
+    try:
+        return (
+            DaemonClient(current_app.config["DAEMON"]["socket"]).get_scheduler_jobs(),
+            None,
+        )
+    except (DaemonUnavailableError, EOFError, OSError, AttributeError, TypeError) as exc:
+        return [], str(exc)
+
+
+def _flatten_scheduler_runs(jobs):
+    runs = []
+    for job in jobs:
+        for run in job.get("history", []):
+            item = dict(run)
+            item["job_name"] = job.get("name") or "unknown"
+            runs.append(item)
+    runs.sort(key=lambda item: _epoch_sort_key(item.get("started_at")), reverse=True)
+    return runs
+
+
+def _epoch_sort_key(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def _get_formatted_scheduler_jobs():
+    scheduler_jobs, scheduler_error = _get_scheduler_jobs()
+    try:
+        return _format_scheduler_jobs(scheduler_jobs), scheduler_error
+    except (TypeError, ValueError) as exc:
+        return [], str(exc)
+
+
+@frontend.route("/admin/tasks")
+@admin_only
+def admin_tasks():
+    tasks = list_task_results()
+    scheduler_jobs, scheduler_error = _get_formatted_scheduler_jobs()
+    return render_template(
+        "admin-tasks.html",
+        tasks=_format_task_rows(tasks),
+        summary=_summarize_task_results(tasks),
+        scheduler_jobs=scheduler_jobs,
+        scheduler_error=scheduler_error,
+        scheduler_log_capture_note=SCHEDULER_LOG_CAPTURE_NOTE,
+        scheduler_runs=_flatten_scheduler_runs(scheduler_jobs),
+    )
 
 
 @frontend.route("/admin/tasks/data")
 @admin_only
 def admin_tasks_data():
     tasks = list_task_results()
-    status_counts = {"pending": 0, "completed": 0, "failed": 0}
-    for t in tasks:
-        status_counts[t["status"]] = status_counts.get(t["status"], 0) + 1
+    scheduler_jobs, scheduler_error = _get_formatted_scheduler_jobs()
     return jsonify(
         {
-            "tasks": tasks,
-            "summary": {
-                "pending": status_counts["pending"],
-                "completed": status_counts["completed"],
-                "failed": status_counts["failed"],
-                "total": len(tasks),
+            "tasks": _format_task_rows(tasks),
+            "summary": _summarize_task_results(tasks),
+            "scheduler": {
+                "jobs": scheduler_jobs,
+                "runs": _flatten_scheduler_runs(scheduler_jobs),
+                "error": scheduler_error,
+                "log_note": SCHEDULER_LOG_CAPTURE_NOTE,
             },
         }
     )

@@ -12,8 +12,115 @@
 <a class="nav-link active" aria-current="page" href="{{ url_for('frontend.admin_tasks') }}"><span data-i18n-en="Tasks" data-i18n-zh="任务">Tasks</span></a>
 {% endblock %}
 {% block page_title %}<span data-i18n-en="Background tasks" data-i18n-zh="后台任务">Background tasks</span>{% endblock %}
-{% block page_subtitle %}<span data-i18n-en="Current process only. Results are in-memory and not persisted. Restarting the web process clears this history." data-i18n-zh="仅当前进程。结果存于内存，不持久化。重启 Web 进程后历史会清除。">Current process only. Results are in-memory and not persisted. Restarting the web process clears this history.</span>{% endblock %}
+{% block page_subtitle %}<span data-i18n-en="Daemon scheduler state is kept since daemon start. Web task results are in-memory for the current web process." data-i18n-zh="Daemon 定时任务状态自 daemon 启动后保留。Web 任务结果仅保存在当前 Web 进程内存中。">Daemon scheduler state is kept since daemon start. Web task results are in-memory for the current web process.</span>{% endblock %}
 {% block body %}
+<div class="d-flex justify-content-between align-items-center mb-2">
+  <h2 class="h5 mb-0" data-i18n-en="Daemon scheduled jobs" data-i18n-zh="Daemon 定时任务">Daemon scheduled jobs</h2>
+  <small class="text-body-secondary"><span data-i18n-en="Auto-refresh every" data-i18n-zh="每">Auto-refresh every</span> <span id="refresh-countdown">5</span><span data-i18n-en="s" data-i18n-zh=" 秒自动刷新">s</span></small>
+</div>
+<div class="alert alert-warning py-2{% if not scheduler_error %} d-none{% endif %}" id="scheduler-error">
+  <span data-i18n-en="Daemon scheduler unavailable:" data-i18n-zh="Daemon 定时任务不可用：">Daemon scheduler unavailable:</span>
+  <span class="scheduler-error-text">{{ scheduler_error or "" }}</span>
+</div>
+<div class="card mb-3">
+  <div class="card-body p-0">
+    <div class="table-responsive">
+      <table class="table table-hover mb-0">
+        <thead class="table-light">
+          <tr>
+            <th data-i18n-en="Job" data-i18n-zh="任务">Job</th>
+            <th data-i18n-en="State" data-i18n-zh="状态">State</th>
+            <th data-i18n-en="Interval" data-i18n-zh="间隔">Interval</th>
+            <th data-i18n-en="Next Run" data-i18n-zh="下次运行">Next Run</th>
+            <th data-i18n-en="Last Started" data-i18n-zh="上次开始">Last Started</th>
+            <th data-i18n-en="Duration" data-i18n-zh="耗时">Duration</th>
+            <th data-i18n-en="Last Result" data-i18n-zh="上次结果">Last Result</th>
+            <th data-i18n-en="Runs" data-i18n-zh="运行次数">Runs</th>
+          </tr>
+        </thead>
+        <tbody id="scheduler-jobs-tbody">
+          {% for job in scheduler_jobs %}
+          <tr>
+            <td><code>{{ job.name }}</code></td>
+            <td><span class="console-chip text-uppercase">{% if not job.enabled %}disabled{% elif job.running %}running{% elif job.thread_alive %}waiting{% else %}stopped{% endif %}</span></td>
+            <td class="text-nowrap">{{ job.interval }}s</td>
+            <td class="text-nowrap">{{ job.next_run_at_display }}</td>
+            <td class="text-nowrap">{{ job.last_started_at_display }}</td>
+            <td class="text-nowrap">{% if job.running %}{{ job.current_duration_display }}{% else %}{{ job.last_duration_display }}{% endif %}</td>
+            <td class="text-break">
+              {% if job.last_success is sameas true %}ok{% elif job.last_success is sameas false %}failed{% else %}—{% endif %}
+              {% if job.last_result %}<span class="text-body-secondary"> · {{ job.last_result }}</span>{% endif %}
+              {% if job.last_error %}<span class="text-danger"> · {{ job.last_error }}</span>{% endif %}
+            </td>
+            <td class="text-nowrap">{{ job.run_count }} / {{ job.failure_count }}</td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="8" class="text-center text-body-secondary py-4" data-i18n-en="No daemon scheduled jobs reported." data-i18n-zh="暂无 daemon 定时任务状态。">No daemon scheduled jobs reported.</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="card mb-4">
+  <div class="card-header">
+    <span data-i18n-en="Recent scheduled runs" data-i18n-zh="最近定时运行记录">Recent scheduled runs</span>
+  </div>
+  <div class="px-3 py-2 small text-body-secondary">
+    <span data-i18n-en="{{ scheduler_log_capture_note }}" data-i18n-zh="运行日志遵循 daemon 日志级别，并且只包含定时任务线程发出的记录。">{{ scheduler_log_capture_note }}</span>
+  </div>
+  <div class="card-body p-0">
+    <div class="table-responsive">
+      <table class="table table-hover mb-0">
+        <thead class="table-light">
+          <tr>
+            <th data-i18n-en="Job" data-i18n-zh="任务">Job</th>
+            <th data-i18n-en="Started" data-i18n-zh="开始时间">Started</th>
+            <th data-i18n-en="Finished" data-i18n-zh="结束时间">Finished</th>
+            <th data-i18n-en="Duration" data-i18n-zh="耗时">Duration</th>
+            <th data-i18n-en="Status" data-i18n-zh="状态">Status</th>
+            <th data-i18n-en="Result" data-i18n-zh="结果">Result</th>
+            <th data-i18n-en="Error" data-i18n-zh="错误">Error</th>
+            <th data-i18n-en="Logs" data-i18n-zh="日志">Logs</th>
+          </tr>
+        </thead>
+        <tbody id="scheduler-runs-tbody">
+          {% for run in scheduler_runs %}
+          <tr>
+            <td><code>{{ run.job_name }}</code></td>
+            <td class="text-nowrap">{{ run.started_at_display }}</td>
+            <td class="text-nowrap">{{ run.finished_at_display }}</td>
+            <td class="text-nowrap">{{ run.duration_display }}</td>
+            <td><span class="console-chip text-uppercase">{{ "ok" if run.success else "failed" }}</span></td>
+            <td class="text-break">{{ run.result if run.result else "—" }}</td>
+            <td class="text-break text-danger small">{{ run.error if run.error else "—" }}</td>
+            <td class="text-break small">
+              {% if run.logs %}
+              <details>
+                <summary>{{ run.logs|length }} <span data-i18n-en="lines" data-i18n-zh="行">lines</span></summary>
+                <pre class="small mb-0">{% for log in run.logs %}[{{ log.timestamp_display }}] {{ log.level }} {{ log.logger }} {{ log.message }}
+{% endfor %}</pre>
+              </details>
+              {% else %}
+              —
+              {% endif %}
+            </td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="8" class="text-center text-body-secondary py-4" data-i18n-en="No scheduled runs recorded yet." data-i18n-zh="暂无定时运行记录。">No scheduled runs recorded yet.</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<h2 class="h5 mb-2" data-i18n-en="Web background tasks" data-i18n-zh="Web 后台任务">Web background tasks</h2>
 <div class="row row-cols-1 row-cols-md-4 g-3 mb-3">
   <div class="col">
     <div class="card text-center h-100 console-metric-card">
@@ -58,7 +165,7 @@
 <div class="card">
   <div class="card-header d-flex justify-content-between align-items-center">
     <span data-i18n-en="Tasks" data-i18n-zh="任务">Tasks</span>
-    <small class="text-body-secondary"><span data-i18n-en="Auto-refresh every" data-i18n-zh="每">Auto-refresh every</span> <span id="refresh-countdown">5</span><span data-i18n-en="s" data-i18n-zh=" 秒自动刷新">s</span></small>
+    <small class="text-body-secondary"><span data-i18n-en="Current web process" data-i18n-zh="当前 Web 进程">Current web process</span></small>
   </div>
   <div class="card-body p-0">
     <div class="table-responsive">
@@ -77,7 +184,7 @@
           <tr>
             <td><code>{{ task.task_id }}</code></td>
             <td><span class="console-chip text-uppercase">{{ task.status }}</span></td>
-            <td class="text-nowrap">{{ task.timestamp | float | round(0) | int if task.timestamp else "—" }}</td>
+            <td class="text-nowrap">{{ task.timestamp_display }}</td>
             <td class="text-break">{{ task.result if task.result is not none else "—" }}</td>
             <td class="text-break text-danger small">{{ task.error if task.error else "—" }}</td>
           </tr>
@@ -98,19 +205,83 @@
     var countdownEl = document.getElementById("refresh-countdown");
     var lastRefreshEl = document.getElementById("last-refresh");
     var tbody = document.getElementById("tasks-tbody");
+    var schedulerJobsTbody = document.getElementById("scheduler-jobs-tbody");
+    var schedulerRunsTbody = document.getElementById("scheduler-runs-tbody");
+    var schedulerErrorEl = document.getElementById("scheduler-error");
+    var schedulerErrorTextEl = schedulerErrorEl ? schedulerErrorEl.querySelector(".scheduler-error-text") : null;
     var refreshSeconds = 5;
     var countdown = refreshSeconds;
     var timer = null;
 
+    function escapeHtml(val) {
+      return String(val).replace(/[&<>"']/g, function (c) {
+        return {
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;"
+        }[c];
+      });
+    }
+
     function formatTimestamp(ts) {
       if (!ts) return "\u2014";
       var d = new Date(ts * 1000);
-      return d.toISOString().replace("T", " ").replace(/\.[0-9]+Z$/, "");
+      function pad(n) {
+        return String(n).padStart(2, "0");
+      }
+      return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " +
+        pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+    }
+
+    function formatDuration(seconds) {
+      if (seconds === null || seconds === undefined) return "\u2014";
+      var n = Number(seconds);
+      if (!isFinite(n)) return "\u2014";
+      if (n < 1) return Math.round(n * 1000) + "ms";
+      return n.toFixed(3) + "s";
     }
 
     function fmtCell(val) {
       if (val === null || val === undefined) return "\u2014";
-      return String(val);
+      return escapeHtml(val);
+    }
+
+    function schedulerState(job) {
+      if (!job.enabled) return "disabled";
+      if (job.running) return "running";
+      if (job.thread_alive) return "waiting";
+      return "stopped";
+    }
+
+    function schedulerResult(job) {
+      var status = "\u2014";
+      var extra = "";
+      if (job.last_success === true) status = "ok";
+      if (job.last_success === false) status = "failed";
+      if (job.last_result) extra += ' <span class="text-body-secondary">&middot; ' + fmtCell(job.last_result) + "</span>";
+      if (job.last_error) extra += ' <span class="text-danger">&middot; ' + fmtCell(job.last_error) + "</span>";
+      return escapeHtml(status) + extra;
+    }
+
+    function displayTimestamp(item, key) {
+      return fmtCell(item[key + "_display"] || formatTimestamp(item[key]));
+    }
+
+    function displayDuration(item, key) {
+      return fmtCell(item[key + "_display"] || formatDuration(item[key]));
+    }
+
+    function formatRunLogs(logs) {
+      if (!logs || !logs.length) return "\u2014";
+      var lines = "";
+      for (var i = 0; i < logs.length; i++) {
+        var log = logs[i];
+        lines += "[" + fmtCell(log.timestamp_display || formatTimestamp(log.timestamp)) + "] " +
+          fmtCell(log.level) + " " + fmtCell(log.logger) + " " + fmtCell(log.message) + "\n";
+      }
+      return "<details><summary>" + logs.length + " " + i18nText("lines", "行") + "</summary><pre class=\"small mb-0\">" + lines + "</pre></details>";
     }
 
     function updateSummary(summary) {
@@ -130,14 +301,75 @@
         var t = tasks[i];
         rows +=
           "<tr>" +
-          "<td><code>" + t.task_id + "</code></td>" +
-          "<td><span class=\"console-chip text-uppercase\">" + t.status + "</span></td>" +
-          "<td class=\"text-nowrap\">" + formatTimestamp(t.timestamp) + "</td>" +
+          "<td><code>" + fmtCell(t.task_id) + "</code></td>" +
+          "<td><span class=\"console-chip text-uppercase\">" + fmtCell(t.status) + "</span></td>" +
+          "<td class=\"text-nowrap\">" + displayTimestamp(t, "timestamp") + "</td>" +
           "<td class=\"text-break\">" + fmtCell(t.result) + "</td>" +
           "<td class=\"text-break text-danger small\">" + fmtCell(t.error) + "</td>" +
           "</tr>";
       }
       tbody.innerHTML = rows;
+    }
+
+    function updateSchedulerJobs(jobs) {
+      if (!jobs.length) {
+        schedulerJobsTbody.innerHTML = '<tr><td colspan="8" class="text-center text-body-secondary py-4">' + i18nText('No daemon scheduled jobs reported.', '暂无 daemon 定时任务状态。') + '</td></tr>';
+        return;
+      }
+
+      var rows = "";
+      for (var i = 0; i < jobs.length; i++) {
+        var job = jobs[i];
+        rows +=
+          "<tr>" +
+          "<td><code>" + fmtCell(job.name) + "</code></td>" +
+          "<td><span class=\"console-chip text-uppercase\">" + fmtCell(schedulerState(job)) + "</span></td>" +
+          "<td class=\"text-nowrap\">" + fmtCell(job.interval) + "s</td>" +
+          "<td class=\"text-nowrap\">" + displayTimestamp(job, "next_run_at") + "</td>" +
+          "<td class=\"text-nowrap\">" + displayTimestamp(job, "last_started_at") + "</td>" +
+          "<td class=\"text-nowrap\">" + (job.running ? displayDuration(job, "current_duration") : displayDuration(job, "last_duration")) + "</td>" +
+          "<td class=\"text-break\">" + schedulerResult(job) + "</td>" +
+          "<td class=\"text-nowrap\">" + fmtCell(job.run_count || 0) + " / " + fmtCell(job.failure_count || 0) + "</td>" +
+          "</tr>";
+      }
+      schedulerJobsTbody.innerHTML = rows;
+    }
+
+    function updateSchedulerRuns(runs) {
+      if (!runs.length) {
+        schedulerRunsTbody.innerHTML = '<tr><td colspan="8" class="text-center text-body-secondary py-4">' + i18nText('No scheduled runs recorded yet.', '暂无定时运行记录。') + '</td></tr>';
+        return;
+      }
+
+      var rows = "";
+      for (var i = 0; i < runs.length; i++) {
+        var run = runs[i];
+        rows +=
+          "<tr>" +
+          "<td><code>" + fmtCell(run.job_name) + "</code></td>" +
+          "<td class=\"text-nowrap\">" + displayTimestamp(run, "started_at") + "</td>" +
+          "<td class=\"text-nowrap\">" + displayTimestamp(run, "finished_at") + "</td>" +
+          "<td class=\"text-nowrap\">" + displayDuration(run, "duration") + "</td>" +
+          "<td><span class=\"console-chip text-uppercase\">" + (run.success ? "ok" : "failed") + "</span></td>" +
+          "<td class=\"text-break\">" + fmtCell(run.result) + "</td>" +
+          "<td class=\"text-break text-danger small\">" + fmtCell(run.error) + "</td>" +
+          "<td class=\"text-break small\">" + formatRunLogs(run.logs) + "</td>" +
+          "</tr>";
+      }
+      schedulerRunsTbody.innerHTML = rows;
+    }
+
+    function updateScheduler(scheduler) {
+      scheduler = scheduler || {};
+      if (scheduler.error) {
+        schedulerErrorEl.classList.remove("d-none");
+        if (schedulerErrorTextEl) schedulerErrorTextEl.textContent = scheduler.error;
+      } else {
+        schedulerErrorEl.classList.add("d-none");
+        if (schedulerErrorTextEl) schedulerErrorTextEl.textContent = "";
+      }
+      updateSchedulerJobs(scheduler.jobs || []);
+      updateSchedulerRuns(scheduler.runs || []);
     }
 
     function fetchData() {
@@ -149,6 +381,7 @@
         .then(function (data) {
           updateSummary(data.summary);
           updateTable(data.tasks);
+          updateScheduler(data.scheduler);
           lastRefreshEl.textContent = i18nText("just now", "刚刚");
         })
         .catch(function () {
@@ -170,6 +403,8 @@
     document.getElementById("refresh-now").addEventListener("click", function () {
       fetchData();
     });
+
+    fetchData();
   })();
 </script>
 {% endblock %}
