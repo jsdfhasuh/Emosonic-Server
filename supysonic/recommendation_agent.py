@@ -23,6 +23,8 @@ from .recommendation_agent_session import (
     save_recommendation_agent_session,
 )
 from .recommendation_feedback import get_recommendation_feedback_preferences
+from .track_metadata_quality import is_high_quality_track_metadata
+from .user_listening_profile import build_user_listening_profile
 
 
 logger = logging.getLogger(__name__)
@@ -422,7 +424,7 @@ def _serialize_datetime(value) -> str:
 
 
 def _serialize_track_metadata(metadata) -> Dict[str, object]:
-    if not metadata:
+    if not is_high_quality_track_metadata(metadata):
         return {}
     return {
         "language": metadata.language or "",
@@ -632,6 +634,7 @@ def build_recommendation_agent_context(
 ) -> Dict[str, object]:
     play_history = _collect_play_history(user, history_limit)
     history_summary = _summarize_play_history(play_history)
+    listening_profile = build_user_listening_profile(user)
     feedback_preferences = get_recommendation_feedback_preferences(user)
     hidden_artist_names = _hidden_feedback_artist_names(feedback_preferences)
     recommendation_metadata = _load_track_metadata(
@@ -645,6 +648,7 @@ def build_recommendation_agent_context(
             "activityCount": len(play_history),
             **history_summary,
         },
+        "listeningProfile": listening_profile,
         "currentRecommendationTracks": [
             _serialize_track(track, metadata=recommendation_metadata.get(track.id))
             for track in recommendation_tracks
@@ -707,7 +711,8 @@ def _build_system_prompt(language: str) -> str:
         "or capitalization variants. Do not recommend artists listed in "
         "context.recommendationFeedback.hiddenArtistNames; those artists were "
         "hidden by the user. Use the user's full playHistory as the main "
-        "signal, then topArtists, favoriteGenres, and currentRecommendationTracks. "
+        "signal, then listeningProfile, topArtists, favoriteGenres, and "
+        "currentRecommendationTracks. "
         "If context.previousRecommendedArtists is present and the user asks a "
         "follow-up such as starter songs, starter tracks, reasons, comparisons, "
         "or why these artists were recommended, answer about those previous "
@@ -1428,6 +1433,11 @@ def _build_context_stats(
         ),
         "recommendationTrackCount": len(recommendation_tracks),
         "agentSessionCount": len(agent_context.get("recentAgentSessions") or []),
+        "listeningProfilePlayCount": int(
+            (agent_context.get("listeningProfile") or {}).get("playCount", 0)
+            if isinstance(agent_context.get("listeningProfile"), Mapping)
+            else 0
+        ),
         "requestPayloadBytes": _payload_size_bytes(request_payload),
     }
 
@@ -1535,6 +1545,7 @@ def _build_agent_cache_context_hash(
             "language": language,
             "model": model,
             "history": agent_context.get("history") or {},
+            "listeningProfile": agent_context.get("listeningProfile") or {},
             "playHistory": [
                 _compact_agent_play_history_summary(track)
                 for track in play_history[:AGENT_CACHE_PLAY_HISTORY_LIMIT]

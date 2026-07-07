@@ -18,6 +18,10 @@ from ..db import (
     now,
 )
 from ..logging_utils import format_log_event
+from ..track_metadata_quality import (
+    MIN_HIGH_QUALITY_TRACK_METADATA_CONFIDENCE,
+    should_review_track_metadata_confidence,
+)
 
 if TYPE_CHECKING:
     from ..scanner import Scanner
@@ -35,7 +39,9 @@ MISSING_IMAGE_REVIEW_REASON = "missing_image"
 LOW_CONFIDENCE_TRACK_METADATA_REASON = "low_confidence"
 ABNORMAL_TRACK_METADATA_REASON = "abnormal_result"
 CONFLICTING_TRACK_METADATA_REASON = "conflict"
-DEFAULT_TRACK_METADATA_CONFIDENCE_THRESHOLD = 0.5
+DEFAULT_TRACK_METADATA_CONFIDENCE_THRESHOLD = (
+    MIN_HIGH_QUALITY_TRACK_METADATA_CONFIDENCE
+)
 NEW_ARTIST_REVIEW_TTL_DAYS = 7
 NEW_ALBUM_REVIEW_TTL_DAYS = 3
 AUTO_CONFIRM_ALBUM_REVIEW_REASONS = (
@@ -176,9 +182,7 @@ def getTrackMetadataReviewIssues(
     metadata: Optional[TrackMetadata],
     confidence_threshold: float = DEFAULT_TRACK_METADATA_CONFIDENCE_THRESHOLD,
 ) -> List[str]:
-    if metadata is None:
-        return []
-    if metadata.confidence is None or metadata.confidence < confidence_threshold:
+    if should_review_track_metadata_confidence(metadata, confidence_threshold):
         return [LOW_CONFIDENCE_TRACK_METADATA_REASON]
     return []
 
@@ -624,6 +628,7 @@ def createLowConfidenceTrackMetadataReviewTasks(
         TrackMetadata.select(TrackMetadata, Track)
         .join(Track)
         .where(
+            (TrackMetadata.provider == "llm") | (TrackMetadata.source == "llm"),
             (TrackMetadata.confidence.is_null(True))
             | (TrackMetadata.confidence < confidence_threshold)
         )
@@ -634,6 +639,11 @@ def createLowConfidenceTrackMetadataReviewTasks(
 
     created = 0
     for metadata in query:
+        if not should_review_track_metadata_confidence(
+            metadata,
+            confidence_threshold,
+        ):
+            continue
         created += createLowConfidenceTrackMetadataReviewTask(
             metadata.track,
             metadata,

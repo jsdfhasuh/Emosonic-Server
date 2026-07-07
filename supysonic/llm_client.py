@@ -1,4 +1,5 @@
 import json
+import re
 import time
 from typing import Dict, Mapping, Optional, Sequence
 
@@ -7,6 +8,7 @@ import requests
 
 DEFAULT_RATE_LIMIT_RETRY_DELAY_SECONDS = 5.0
 MAX_RATE_LIMIT_RETRY_DELAY_SECONDS = 60.0
+FENCED_JSON_RE = re.compile(r"```\s*(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 
 
 class LlmClientError(Exception):
@@ -116,13 +118,69 @@ def parse_json_object_response(response_json: Mapping[str, object]) -> Dict[str,
     except (KeyError, IndexError, TypeError) as exc:
         raise LlmInvalidResponseError("LLM response did not include message content.") from exc
 
-    try:
-        parsed = json.loads(content)
-    except (TypeError, ValueError) as exc:
-        raise LlmInvalidResponseError("LLM response content was not valid JSON.") from exc
+    parsed = _parse_json_object_content(content)
     if not isinstance(parsed, dict):
         raise LlmInvalidResponseError("LLM JSON response must be an object.")
     return parsed
+
+
+def _parse_json_object_content(content: object) -> object:
+    for candidate in _json_content_candidates(content):
+        try:
+            return json.loads(candidate)
+        except (TypeError, ValueError):
+            continue
+    raise LlmInvalidResponseError("LLM response content was not valid JSON.")
+
+
+def _json_content_candidates(content: object) -> Sequence[object]:
+    candidates = [content]
+    if not isinstance(content, str):
+        return candidates
+
+    for match in FENCED_JSON_RE.finditer(content):
+        candidate = match.group(1).strip()
+        if candidate:
+            candidates.append(candidate)
+    candidates.extend(_json_object_candidates(content))
+    return candidates
+
+
+def _json_object_candidates(content: str) -> Sequence[str]:
+    candidates = []
+    for index, char in enumerate(content):
+        if char != "{":
+            continue
+        candidate = _balanced_json_object_from(content, index)
+        if candidate:
+            candidates.append(candidate)
+    return candidates
+
+
+def _balanced_json_object_from(content: str, start: int) -> Optional[str]:
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(content)):
+        char = content[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return content[start : index + 1]
+    return None
 
 
 def _post_chat_completion_once(

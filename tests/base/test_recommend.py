@@ -19,7 +19,9 @@ from supysonic.db import (
 )
 from supysonic.recommend import (
     RECOMMENDED_PLAYLIST_COMMENT,
+    _buildMetadataPreferenceProfile,
     _buildRecommendedTracks,
+    _trackMetadataScore,
     buildRecommendationReasonMap,
     create_recommend_playlist,
 )
@@ -400,7 +402,9 @@ class RecommendTestCase(TestBase):
             scene_json='["late night"]',
             tags_json='["dreamy"]',
             energy=35,
-            provider="test",
+            confidence=0.9,
+            provider="llm",
+            source="llm",
         )
         metadata_artist = Artist.create(name="Metadata Candidate Artist")
         metadata_album = Album.create(name="Metadata Candidate Album", artist=metadata_artist)
@@ -427,7 +431,9 @@ class RecommendTestCase(TestBase):
             scene_json='["late night"]',
             tags_json='["dreamy"]',
             energy=40,
-            provider="test",
+            confidence=0.9,
+            provider="llm",
+            source="llm",
         )
         TrackMetadata.create(
             track=other_candidate,
@@ -436,7 +442,9 @@ class RecommendTestCase(TestBase):
             scene_json='["workout"]',
             tags_json='["harsh"]',
             energy=95,
-            provider="test",
+            confidence=0.9,
+            provider="llm",
+            source="llm",
         )
 
         tracks = _buildRecommendedTracks(
@@ -548,20 +556,147 @@ class RecommendTestCase(TestBase):
         self.assertEqual(payload["tracks"][0]["title"], self.candidate_tracks[0].title)
         self.assertIn("rock", payload["tracks"][0]["recommend_reason"])
 
-    def test_recommendation_reason_uses_track_metadata_when_available(self):
+    def test_recommendation_reason_uses_high_quality_track_metadata_when_available(self):
         track = self.candidate_tracks[0]
         TrackMetadata.create(
             track=track,
             track_last_modification=track.last_modification,
             mood_json='["calm", "warm"]',
             scene_json='["late night"]',
-            provider="test",
+            confidence=0.9,
+            provider="llm",
+            source="llm",
         )
 
         reasons = buildRecommendationReasonMap(self.user, [track])
 
         self.assertIn("calm / warm", reasons[str(track.id)])
         self.assertIn("late night", reasons[str(track.id)])
+
+    def test_local_metadata_summary_does_not_override_top_genre_reason(self):
+        self._record_play(self.listened_tracks[0], 3)
+        track = self.candidate_tracks[0]
+        TrackMetadata.create(
+            track=track,
+            track_last_modification=track.last_modification,
+            summary="Candidate Rock by Artist from Album",
+            confidence=0.25,
+            provider="local",
+            source="local",
+        )
+
+        reasons = buildRecommendationReasonMap(self.user, [track])
+
+        self.assertIn("often listen to rock", reasons[str(track.id)])
+        self.assertNotIn("Candidate Rock by Artist", reasons[str(track.id)])
+
+    def test_local_metadata_summary_does_not_override_top_artist_reason(self):
+        self._record_play(self.listened_tracks[0], 3)
+        track = self.candidate_tracks[1]
+        TrackMetadata.create(
+            track=track,
+            track_last_modification=track.last_modification,
+            summary="Candidate Artist by Artist from Album",
+            confidence=0.25,
+            provider="local",
+            source="local",
+        )
+
+        reasons = buildRecommendationReasonMap(self.user, [track])
+
+        self.assertIn("often listen to Artist", reasons[str(track.id)])
+        self.assertNotIn("Candidate Artist by Artist", reasons[str(track.id)])
+
+    def test_low_confidence_llm_metadata_does_not_build_recommendation_reason(self):
+        track = self.candidate_tracks[1]
+        TrackMetadata.create(
+            track=track,
+            track_last_modification=track.last_modification,
+            mood_json='["calm"]',
+            scene_json='["late night"]',
+            confidence=0.2,
+            provider="llm",
+            source="llm",
+        )
+
+        reasons = buildRecommendationReasonMap(self.user, [track])
+
+        self.assertNotIn("calm", reasons[str(track.id)])
+        self.assertNotIn("late night", reasons[str(track.id)])
+        self.assertIn("pop", reasons[str(track.id)])
+
+    def test_metadata_preference_profile_excludes_local_metadata(self):
+        seed_track = self.listened_tracks[0]
+        metadata = TrackMetadata.create(
+            track=seed_track,
+            track_last_modification=seed_track.last_modification,
+            mood_json='["calm"]',
+            scene_json='["late night"]',
+            tags_json='["dreamy"]',
+            energy=35,
+            confidence=0.25,
+            provider="local",
+            source="local",
+        )
+
+        profile = _buildMetadataPreferenceProfile({seed_track.id: 3})
+        score = _trackMetadataScore(
+            metadata,
+            {
+                "mood_counts": {"calm": 3},
+                "scene_counts": {"late night": 3},
+                "tag_counts": {"dreamy": 3},
+                "average_energy": 35,
+            },
+        )
+
+        self.assertEqual(profile["mood_counts"], {})
+        self.assertEqual(profile["scene_counts"], {})
+        self.assertEqual(profile["tag_counts"], {})
+        self.assertIsNone(profile["average_energy"])
+        self.assertEqual(
+            score,
+            {
+                "mood_match": 0.0,
+                "scene_match": 0.0,
+                "tag_match": 0.0,
+                "energy_match": 0.0,
+            },
+        )
+
+    def test_track_metadata_score_excludes_low_confidence_llm_metadata(self):
+        track = self.candidate_tracks[0]
+        metadata = TrackMetadata.create(
+            track=track,
+            track_last_modification=track.last_modification,
+            mood_json='["calm"]',
+            scene_json='["late night"]',
+            tags_json='["dreamy"]',
+            energy=35,
+            confidence=0.2,
+            provider="llm",
+            source="llm",
+        )
+
+        score = _trackMetadataScore(
+            metadata,
+            {
+                "mood_counts": {"calm": 3},
+                "scene_counts": {"late night": 3},
+                "tag_counts": {"dreamy": 3},
+                "average_energy": 35,
+            },
+        )
+
+        self.assertEqual(
+            score,
+            {
+                "mood_match": 0.0,
+                "scene_match": 0.0,
+                "tag_match": 0.0,
+                "energy_match": 0.0,
+            },
+        )
 
     def test_create_recommend_playlist_sanitizes_archive_user_directory(self):
         self._record_play(self.listened_tracks[0], 2)

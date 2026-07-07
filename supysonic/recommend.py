@@ -14,6 +14,8 @@ from .recommendation_feedback import (
     get_recommendation_feedback_preferences,
     track_matches_negative_recommendation_feedback,
 )
+from .track_metadata_quality import is_high_quality_track_metadata
+from .user_listening_profile import build_metadata_preference_profile_from_track_counts
 from .tool import write_dict_to_json
 
 
@@ -204,19 +206,20 @@ def getRecommendationReason(
     ):
         return "Because you asked for more songs like a previous recommendation."
 
-    if metadataByTrackId is None:
-        metadata = TrackMetadata.get_or_none(TrackMetadata.track == track)
-    else:
-        metadata = metadataByTrackId.get(trackId)
-    metadataReason = _buildTrackMetadataReason(metadata)
-    if metadataReason:
-        return metadataReason
-
     if genre and genre in topGenres:
         return f"Because you often listen to {genre}, and this track matches that style."
 
     if track.artist_id and track.artist_id in topArtistIds and artistName:
         return f"Because you often listen to {artistName}, and this is another track from that artist."
+
+    if metadataByTrackId is None:
+        metadata = TrackMetadata.get_or_none(TrackMetadata.track == track)
+    else:
+        metadata = metadataByTrackId.get(trackId)
+    if is_high_quality_track_metadata(metadata):
+        metadataReason = _buildTrackMetadataReason(metadata)
+        if metadataReason:
+            return metadataReason
 
     if trackId not in listenedTrackIds and int(track.play_count or 0) > 0:
         return "Because it is a popular library track you have not played yet."
@@ -299,40 +302,7 @@ def _recommendationFeedbackScore(track, likedMoreProfile: Mapping[str, set]) -> 
 
 
 def _buildMetadataPreferenceProfile(trackPlayCounts) -> Dict[str, object]:
-    profile = {
-        "mood_counts": {},
-        "scene_counts": {},
-        "tag_counts": {},
-        "average_energy": None,
-    }
-    if not trackPlayCounts:
-        return profile
-
-    totalEnergyWeight = 0
-    weightedEnergy = 0
-    for metadata in TrackMetadata.select().where(
-        TrackMetadata.track.in_(list(trackPlayCounts.keys()))
-    ):
-        playCount = int(trackPlayCounts.get(metadata.track_id, 0) or 0)
-        if playCount <= 0:
-            continue
-        _incrementMetadataCounts(profile["mood_counts"], metadata.get_moods(), playCount)
-        _incrementMetadataCounts(profile["scene_counts"], metadata.get_scenes(), playCount)
-        _incrementMetadataCounts(profile["tag_counts"], metadata.get_tags(), playCount)
-        if metadata.energy is not None:
-            weightedEnergy += int(metadata.energy) * playCount
-            totalEnergyWeight += playCount
-
-    if totalEnergyWeight:
-        profile["average_energy"] = weightedEnergy / totalEnergyWeight
-    return profile
-
-
-def _incrementMetadataCounts(counts: Dict[str, int], values, amount: int) -> None:
-    for value in values:
-        key = str(value).strip().casefold()
-        if key:
-            counts[key] = counts.get(key, 0) + amount
+    return build_metadata_preference_profile_from_track_counts(trackPlayCounts)
 
 
 def _metadataListScore(values, counts: Mapping[str, int]) -> float:
@@ -353,7 +323,7 @@ def _metadataEnergyScore(metadata, averageEnergy) -> float:
 
 
 def _trackMetadataScore(metadata, metadataProfile: Mapping[str, object]) -> Dict[str, float]:
-    if not metadata:
+    if not is_high_quality_track_metadata(metadata):
         return {
             "mood_match": 0.0,
             "scene_match": 0.0,
