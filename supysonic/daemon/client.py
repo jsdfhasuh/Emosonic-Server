@@ -69,6 +69,11 @@ class ScannerStartCommand(ScannerCommand):
         daemon.start_scan(self.__folders, self.__force)
 
 
+class SchedulerStatusCommand(DaemonCommand):
+    def apply(self, connection, daemon):
+        connection.send(SchedulerStatusResult(daemon.scheduler.list_jobs()))
+
+
 class JukeboxCommand(DaemonCommand):
     def __init__(self, action, args):
         self.__action = action
@@ -139,6 +144,11 @@ class JukeboxResult(DaemonCommandResult):
         self.playlist = ()
 
 
+class SchedulerStatusResult(DaemonCommandResult):
+    def __init__(self, jobs):
+        self.jobs = jobs
+
+
 class DaemonClient:
     def __init__(self, address=None):
         self.__address = address or get_current_config().DAEMON["socket"]
@@ -183,6 +193,11 @@ class DaemonClient:
             raise TypeError("Expecting list, got " + str(type(folders)))
         with self.__get_connection() as c:
             c.send(ScannerStartCommand(folders, force))
+
+    def get_scheduler_jobs(self):
+        with self.__get_connection() as c:
+            c.send(SchedulerStatusCommand())
+            return c.recv().jobs
 
     def jukebox_control(self, action, *args):
         if not isinstance(action, str):
