@@ -85,6 +85,7 @@ class DefaultConfig:
         "track_metadata_enrichment_batch_size": 10,
         "track_metadata_enrichment_stale_lock_seconds": 900,
         "track_metadata_enrichment_send_path_hints": False,
+        "track_metadata_enrichment_log_payload": False,
     }
     MUSICBRAINZ = {
         "api_url": "https://musicbrainz.org/ws/2",

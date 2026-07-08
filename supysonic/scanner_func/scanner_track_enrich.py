@@ -436,6 +436,80 @@ def collectTracksNeedingEnrichment(
     return candidates
 
 
+def countTracksNeedingEnrichment(
+    force: bool = False,
+    track_ids: Optional[Sequence[object]] = None,
+    failed_only: bool = False,
+    stale_lock_seconds: int = DEFAULT_STALE_LOCK_SECONDS,
+) -> int:
+    current_time = now()
+    _recoverStaleTrackMetadataTasks(current_time, stale_lock_seconds)
+
+    track_query = Track.select().order_by(Track.created, Track.id)
+    if track_ids:
+        track_query = track_query.where(Track.id.in_(list(track_ids)))
+
+    count = 0
+    offset = 0
+    batch_size = MIN_ENRICHMENT_SCAN_BATCH_SIZE
+    while True:
+        tracks = list(track_query.limit(batch_size).offset(offset))
+        if not tracks:
+            break
+        offset += len(tracks)
+
+        page_track_ids = [track.id for track in tracks]
+        metadata_by_track = _loadTrackMetadataByTrack(page_track_ids)
+        task_by_track = _loadTrackMetadataTaskByTrack(page_track_ids)
+
+        for track in tracks:
+            if _getCandidateReason(
+                track,
+                metadata_by_track.get(track.id),
+                task_by_track.get(track.id),
+                force=force,
+                failed_only=failed_only,
+                current_time=current_time,
+            ):
+                count += 1
+
+        if len(tracks) < batch_size:
+            break
+
+    return count
+
+
+def countTracksMissingCurrentMetadata(
+    track_ids: Optional[Sequence[object]] = None,
+) -> int:
+    track_query = Track.select().order_by(Track.created, Track.id)
+    if track_ids:
+        track_query = track_query.where(Track.id.in_(list(track_ids)))
+
+    count = 0
+    offset = 0
+    batch_size = MIN_ENRICHMENT_SCAN_BATCH_SIZE
+    while True:
+        tracks = list(track_query.limit(batch_size).offset(offset))
+        if not tracks:
+            break
+        offset += len(tracks)
+
+        metadata_by_track = _loadTrackMetadataByTrack([track.id for track in tracks])
+        for track in tracks:
+            metadata = metadata_by_track.get(track.id)
+            if (
+                metadata is None
+                or metadata.track_last_modification != track.last_modification
+            ):
+                count += 1
+
+        if len(tracks) < batch_size:
+            break
+
+    return count
+
+
 def _loadTrackMetadataByTrack(
     track_ids: Sequence[object],
 ) -> Dict[object, TrackMetadata]:
@@ -469,6 +543,7 @@ def runTrackMetadataEnrichmentPass(
     dry_run: bool = False,
     stale_lock_seconds: int = DEFAULT_STALE_LOCK_SECONDS,
     include_path_hints: bool = False,
+    log_payload: bool = False,
 ) -> Dict[str, object]:
     provider = provider or LocalMetadataProvider()
     provider_name = getattr(provider, "name", provider.__class__.__name__)
@@ -480,8 +555,18 @@ def runTrackMetadataEnrichmentPass(
         stale_lock_seconds=stale_lock_seconds,
         include_reasons=True,
     )
+    pending_total = countTracksNeedingEnrichment(
+        force=force,
+        track_ids=track_ids,
+        failed_only=failed_only,
+        stale_lock_seconds=stale_lock_seconds,
+    )
+    unenriched_total = countTracksMissingCurrentMetadata(track_ids=track_ids)
     summary = {
         "selected": len(candidates),
+        "pending": pending_total,
+        "remaining": pending_total,
+        "unenriched": unenriched_total,
         "enriched": 0,
         "failed": 0,
         "skipped": 0,
@@ -498,6 +583,8 @@ def runTrackMetadataEnrichmentPass(
             "track_metadata_enrichment",
             "track_metadata_enrichment_pass_start",
             selected=len(candidates),
+            pending=pending_total,
+            unenriched=unenriched_total,
             dry_run=dry_run,
             provider=provider_name,
         )
@@ -538,12 +625,17 @@ def runTrackMetadataEnrichmentPass(
             )
             track_info["status"] = "completed"
             summary["enriched"] += 1
+            log_fields = {
+                "track_id": str(track.id),
+                "provider": provider_name,
+            }
+            if log_payload:
+                log_fields.update(_metadataLogPayload(metadata))
             logger.info(
                 format_log_event(
                     "track_metadata_enrichment",
                     "track_metadata_enrichment_applied",
-                    track_id=str(track.id),
-                    provider=provider_name,
+                    **log_fields,
                 )
             )
         except TrackMetadataInvalidResponseError as exc:
@@ -644,11 +736,21 @@ def runTrackMetadataEnrichmentPass(
         if stop_after_current:
             break
 
+    summary["remaining"] = countTracksNeedingEnrichment(
+        force=force,
+        track_ids=track_ids,
+        failed_only=failed_only,
+        stale_lock_seconds=stale_lock_seconds,
+    )
+    summary["unenriched"] = countTracksMissingCurrentMetadata(track_ids=track_ids)
     logger.info(
         format_log_event(
             "track_metadata_enrichment",
             "track_metadata_enrichment_pass_end",
             selected=summary["selected"],
+            pending=summary["pending"],
+            remaining=summary["remaining"],
+            unenriched=summary["unenriched"],
             enriched=summary["enriched"],
             failed=summary["failed"],
             skipped=summary["skipped"],
@@ -669,6 +771,30 @@ def _providerRetryDelaySeconds(exc: TrackMetadataProviderError) -> int:
     except (TypeError, ValueError):
         retry_after = DEFAULT_RETRY_DELAY_SECONDS
     return retry_after if retry_after > 0 else DEFAULT_RETRY_DELAY_SECONDS
+
+
+def _metadataLogPayload(metadata: TrackMetadata) -> Dict[str, object]:
+    return {
+        "language": metadata.language,
+        "moods": metadata.get_moods(),
+        "scenes": metadata.get_scenes(),
+        "tags": metadata.get_tags(),
+        "summary": _truncateLogText(metadata.summary),
+        "energy": metadata.energy,
+        "valence": metadata.valence,
+        "danceability": metadata.danceability,
+        "confidence": metadata.confidence,
+        "model": metadata.model,
+    }
+
+
+def _truncateLogText(value: Optional[object], max_length: int = 240) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value)
+    if len(text) <= max_length:
+        return text
+    return text[: max_length - 3] + "..."
 
 
 def buildTrackMetadataInput(

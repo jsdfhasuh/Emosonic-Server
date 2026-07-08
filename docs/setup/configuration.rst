@@ -337,6 +337,11 @@ library folders and providing the jukebox feature.
    Whether enrichment providers may receive full local path hints. Defaults to
    ``no``. Keep this disabled unless the configured provider is trusted.
 
+``track_metadata_enrichment_log_payload``
+   Whether successful enrichment logs should include generated mood, scene,
+   tag and summary fields. Defaults to ``no`` because it can be noisy and may
+   expose generated semantic text in logs.
+
 Sample configuration::
 
    [daemon]
@@ -426,6 +431,10 @@ Sample configuration::
 
    ; Allow full path hints to be sent to an enrichment provider. Default: no
    track_metadata_enrichment_send_path_hints = no
+
+   ; Log generated mood/scene/tag/summary fields after each enriched track.
+   ; Default: no
+   track_metadata_enrichment_log_payload = no
 
 .. _conf-musicbrainz:
 

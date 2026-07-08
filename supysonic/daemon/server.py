@@ -243,6 +243,12 @@ class Daemon:
                         False,
                     )
                 ),
+                log_payload=bool(
+                    self.__config.DAEMON.get(
+                        "track_metadata_enrichment_log_payload",
+                        False,
+                    )
+                ),
             )
             if summary.get("quota_exhausted"):
                 logger.warning(
@@ -254,6 +260,8 @@ class Daemon:
                         enriched=summary["enriched"],
                         failed=summary["failed"],
                         skipped=summary["skipped"],
+                        remaining=summary.get("remaining", 0),
+                        unenriched=summary.get("unenriched", 0),
                     )
                 )
                 return False
@@ -266,6 +274,8 @@ class Daemon:
                     enriched=summary["enriched"],
                     failed=summary["failed"],
                     skipped=summary["skipped"],
+                    remaining=summary.get("remaining", 0),
+                    unenriched=summary.get("unenriched", 0),
                 )
             )
             return True

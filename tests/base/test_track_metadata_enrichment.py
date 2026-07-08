@@ -23,6 +23,8 @@ from supysonic.scanner_func.scanner_track_enrich import (
     LLMMetadataProvider,
     LocalMetadataProvider,
     buildTrackMetadataInput,
+    countTracksMissingCurrentMetadata,
+    countTracksNeedingEnrichment,
     collectTracksNeedingEnrichment,
     runTrackMetadataEnrichmentPass,
 )
@@ -213,6 +215,57 @@ class TrackMetadataEnrichmentTestCase(unittest.TestCase):
         )
         self.assertEqual(task.status, db.TrackMetadataEnrichmentTask.STATUS_COMPLETED)
         self.assertEqual(task.attempt_count, 1)
+
+    def test_run_track_metadata_enrichment_reports_remaining_counts(self):
+        first = self._create_track(path="music/album/first.flac")
+        second = self._create_track(
+            path="music/album/second.flac",
+            folder=first.folder,
+            root=first.root_folder,
+        )
+
+        summary = runTrackMetadataEnrichmentPass(
+            limit=1,
+            provider=LocalMetadataProvider(),
+        )
+
+        self.assertEqual(summary["selected"], 1)
+        self.assertEqual(summary["pending"], 2)
+        self.assertEqual(summary["enriched"], 1)
+        self.assertEqual(summary["remaining"], 1)
+        self.assertEqual(summary["unenriched"], 1)
+        self.assertEqual(countTracksNeedingEnrichment(), 1)
+        self.assertEqual(countTracksMissingCurrentMetadata(), 1)
+        metadata_by_track = {
+            track.id: db.TrackMetadata.get_or_none(db.TrackMetadata.track == track)
+            for track in (first, second)
+        }
+        enriched_tracks = [
+            track
+            for track in (first, second)
+            if metadata_by_track[track.id] is not None
+        ]
+        self.assertEqual(len(enriched_tracks), 1)
+
+    def test_run_track_metadata_enrichment_can_log_payload(self):
+        self._create_track()
+
+        with self.assertLogs(
+            "supysonic.scanner_func.scanner_track_enrich",
+            level="INFO",
+        ) as logs:
+            runTrackMetadataEnrichmentPass(
+                provider=StaticLLMMetadataProvider(),
+                log_payload=True,
+            )
+
+        output = "\n".join(logs.output)
+        self.assertIn("event=track_metadata_enrichment_applied", output)
+        self.assertIn('moods="平静"', output)
+        self.assertIn('scenes="深夜"', output)
+        self.assertIn('tags="梦幻"', output)
+        self.assertIn('summary="A calm late night track."', output)
+        self.assertIn("model=test-model", output)
 
     def test_local_provider_does_not_create_track_review_task(self):
         track = self._create_track()

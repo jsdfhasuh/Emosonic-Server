@@ -260,6 +260,7 @@ class DaemonRecommendRefreshTestCase(unittest.TestCase):
             track_metadata_enrichment_provider="local",
             track_metadata_enrichment_batch_size=7,
             track_metadata_enrichment_stale_lock_seconds=1200,
+            track_metadata_enrichment_log_payload=True,
         )
 
         with patch("supysonic.daemon.server.open_connection", return_value=True), patch(
@@ -273,6 +274,7 @@ class DaemonRecommendRefreshTestCase(unittest.TestCase):
         run_pass.assert_called_once()
         self.assertEqual(run_pass.call_args.kwargs["limit"], 7)
         self.assertEqual(run_pass.call_args.kwargs["stale_lock_seconds"], 1200)
+        self.assertTrue(run_pass.call_args.kwargs["log_payload"])
         self.assertEqual(run_pass.call_args.kwargs["provider"].name, "local")
 
     def test_track_metadata_enrichment_runs_llm_provider(self):
@@ -295,6 +297,7 @@ class DaemonRecommendRefreshTestCase(unittest.TestCase):
 
         run_pass.assert_called_once()
         self.assertEqual(run_pass.call_args.kwargs["limit"], 3)
+        self.assertFalse(run_pass.call_args.kwargs["log_payload"])
         self.assertEqual(run_pass.call_args.kwargs["provider"].name, "llm")
 
     def test_track_metadata_enrichment_skips_unconfigured_llm_provider(self):

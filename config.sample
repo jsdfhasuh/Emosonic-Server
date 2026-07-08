@@ -148,6 +148,10 @@ track_metadata_enrichment_stale_lock_seconds = 900
 ; Allow full path hints to be sent to an enrichment provider. Default: off
 track_metadata_enrichment_send_path_hints = off
 
+; Log generated mood/scene/tag/summary fields for each enriched track.
+; This can be noisy and may expose semantic summaries in logs. Default: off
+track_metadata_enrichment_log_payload = off
+
 ; Example for scheduled LLM enrichment:
 ;   track_metadata_enrichment = yes
 ;   track_metadata_enrichment_provider = llm
