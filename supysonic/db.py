@@ -15,7 +15,14 @@ from .db_layer.annotations import (
 )
 from .db_layer.client_releases import ClientRelease
 from .db_layer.core import Meta, PathMixin, PrimaryKeyField, db, now, random
-from .db_layer.emo import EmoLocalQueue, EmoPlaybackState, EmoSessionQueue
+from .db_layer.emo import (
+    EmoDevicePlaybackState,
+    EmoLocalQueue,
+    EmoPlaybackContext,
+    EmoPlaybackHandoff,
+    EmoPlaybackState,
+    EmoSessionQueue,
+)
 from .db_layer.library import (
     Album,
     AlbumArtist,

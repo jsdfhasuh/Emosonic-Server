@@ -13,6 +13,7 @@ MODULE_SPEC.loader.exec_module(MODULE)
 WebSocketState = MODULE.WebSocketState
 ClientSeqStaleError = MODULE.ClientSeqStaleError
 QueueRevisionMismatchError = MODULE.QueueRevisionMismatchError
+PlaybackAuthorityMismatchError = MODULE.PlaybackAuthorityMismatchError
 
 
 class EmoWebSocketStateTestCase(unittest.TestCase):
@@ -159,6 +160,119 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
 
         self.assertEqual(restarted["version"], 2)
         self.assertEqual(restarted["epoch"], 1)
+
+    def test_playback_context_authority_and_device_feedback_are_separate(self):
+        context = self.state.update_playback_context_queue(
+            "playback:alice:main",
+            "root:phone",
+            ["song-1"],
+            source_client_id="phone-1",
+            user_name="alice",
+            now=10,
+        )
+        self.assertEqual(context["authorityClientId"], "phone-1")
+
+        updated_context, authoritative = self.state.apply_authority_playback_update(
+            "playback:alice:main",
+            "root:phone",
+            "phone-1",
+            "alice",
+            {"state": "playing", "trackId": "song-1", "positionMs": 100},
+            now=11,
+        )
+        self.assertTrue(authoritative)
+        self.assertEqual(updated_context["positionMs"], 100)
+
+        pc_feedback = self.state.record_device_playback_state(
+            "playback:alice:main",
+            "root:pc",
+            "pc-1",
+            "alice",
+            {"state": "playing", "trackId": "song-1", "positionMs": 999},
+            is_authority=False,
+            now=12,
+        )
+        unchanged_context, authoritative = self.state.apply_authority_playback_update(
+            "playback:alice:main",
+            "root:pc",
+            "pc-1",
+            "alice",
+            {"state": "playing", "trackId": "song-1", "positionMs": 999},
+            now=12,
+        )
+
+        self.assertFalse(authoritative)
+        self.assertEqual(unchanged_context["authorityClientId"], "phone-1")
+        self.assertEqual(unchanged_context["positionMs"], 100)
+        self.assertEqual(pc_feedback["positionMs"], 999)
+
+    def test_transfer_playback_authority_keeps_playback_context_id(self):
+        self.state.update_playback_context_queue(
+            "playback:alice:main",
+            "root:phone",
+            ["song-1"],
+            source_client_id="phone-1",
+            user_name="alice",
+            now=10,
+        )
+
+        transferred = self.state.transfer_playback_authority(
+            "playback:alice:main",
+            "phone-1",
+            "pc-1",
+            expected_control_version=1,
+            playback_state={"state": "playing", "trackId": "song-1", "positionMs": 200},
+            now=11,
+        )
+
+        self.assertEqual(transferred["playbackContextId"], "playback:alice:main")
+        self.assertEqual(transferred["authorityClientId"], "pc-1")
+        self.assertEqual(transferred["controlVersion"], 2)
+        self.assertEqual(transferred["positionMs"], 200)
+
+        with self.assertRaises(PlaybackAuthorityMismatchError):
+            self.state.transfer_playback_authority(
+                "playback:alice:main",
+                "phone-1",
+                "tablet-1",
+            )
+
+    def test_handoff_request_id_is_scoped_by_user(self):
+        alice_handoff = self.state.create_playback_handoff(
+            "handoff-alice",
+            "request-1",
+            "playback:alice:main",
+            "alice",
+            "alice-phone",
+            "alice-pc",
+            1,
+            2,
+            {},
+            now=10,
+        )
+        bob_handoff = self.state.create_playback_handoff(
+            "handoff-bob",
+            "request-1",
+            "playback:bob:main",
+            "bob",
+            "bob-phone",
+            "bob-pc",
+            1,
+            2,
+            {},
+            now=11,
+        )
+
+        self.assertEqual(alice_handoff["handoffId"], "handoff-alice")
+        self.assertEqual(bob_handoff["handoffId"], "handoff-bob")
+        self.assertEqual(
+            self.state.get_playback_handoff_by_request("alice", "request-1")["handoffId"],
+            "handoff-alice",
+        )
+        self.assertEqual(
+            self.state.get_playback_handoff_by_request("bob", "request-1")["handoffId"],
+            "handoff-bob",
+        )
 
     def test_queue_revision_conflict_is_independent_from_playback_version(self):
         queue = self.state.update_queue(

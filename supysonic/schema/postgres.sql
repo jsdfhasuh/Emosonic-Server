@@ -337,6 +337,63 @@ CREATE TABLE IF NOT EXISTS emo_playback_state (
     UNIQUE(session_id, owner_client_id)
 );
 
+CREATE TABLE IF NOT EXISTS emo_playback_context (
+    id UUID PRIMARY KEY,
+    playback_context_id VARCHAR(128) NOT NULL UNIQUE,
+    user_name VARCHAR(64) NOT NULL,
+    authority_client_id VARCHAR(128),
+    origin_client_id VARCHAR(128),
+    queue_json TEXT NOT NULL,
+    current_index INTEGER NOT NULL DEFAULT 0,
+    track_id VARCHAR(128),
+    state VARCHAR(32) NOT NULL DEFAULT 'stopped',
+    position_ms INTEGER NOT NULL DEFAULT 0,
+    volume INTEGER,
+    queue_revision INTEGER NOT NULL DEFAULT 1,
+    control_version INTEGER NOT NULL DEFAULT 1,
+    version INTEGER NOT NULL DEFAULT 1,
+    epoch INTEGER NOT NULL DEFAULT 1,
+    playback_json TEXT,
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS emo_device_playback_state (
+    id UUID PRIMARY KEY,
+    playback_context_id VARCHAR(128) NOT NULL,
+    device_session_id VARCHAR(128) NOT NULL,
+    owner_client_id VARCHAR(128) NOT NULL,
+    user_name VARCHAR(64) NOT NULL,
+    state VARCHAR(32) NOT NULL,
+    track_id VARCHAR(128),
+    position_ms INTEGER NOT NULL DEFAULT 0,
+    volume INTEGER,
+    is_authority INTEGER NOT NULL DEFAULT 0,
+    mode VARCHAR(32) NOT NULL DEFAULT 'normal',
+    playback_json TEXT,
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
+    UNIQUE(playback_context_id, owner_client_id)
+);
+
+CREATE TABLE IF NOT EXISTS emo_playback_handoff (
+    id UUID PRIMARY KEY,
+    handoff_id VARCHAR(128) NOT NULL UNIQUE,
+    request_id VARCHAR(128),
+    playback_context_id VARCHAR(128) NOT NULL,
+    user_name VARCHAR(64) NOT NULL,
+    source_client_id VARCHAR(128) NOT NULL,
+    target_client_id VARCHAR(128) NOT NULL,
+    origin_client_id VARCHAR(128),
+    status VARCHAR(32) NOT NULL,
+    base_control_version INTEGER NOT NULL DEFAULT 0,
+    snapshot_json TEXT,
+    error_code VARCHAR(64),
+    error_message TEXT,
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS shared_track_link (
     id UUID PRIMARY KEY,
     token VARCHAR(96) NOT NULL UNIQUE,
