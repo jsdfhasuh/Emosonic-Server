@@ -156,7 +156,7 @@ class MoodPlaylistsFrontendTestCase(FrontendTestBase):
         self.assertIn("Saved Frontend", rv.data)
         self.assertFalse(saved.comment.startswith(MOOD_SCENE_PLAYLIST_COMMENT_PREFIX))
 
-    def test_playlist_index_hides_system_mood_playlists_but_shows_saved_copies(self):
+    def test_playlist_index_shows_system_mood_playlists_and_saved_copies(self):
         track = self._create_track("Visible Saved")
         system = Playlist.create(
             name="alice's 2026-07-07 night mood playlist",
@@ -177,7 +177,7 @@ class MoodPlaylistsFrontendTestCase(FrontendTestBase):
         rv = self.client.get("/playlist")
 
         self.assertEqual(rv.status_code, 200)
-        self.assertNotIn("2026-07-07 night mood playlist", rv.data)
+        self.assertIn("2026-07-07 night mood playlist", rv.data)
         self.assertIn("Saved mood copy", rv.data)
 
 

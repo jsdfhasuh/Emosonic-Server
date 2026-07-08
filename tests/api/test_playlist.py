@@ -112,7 +112,7 @@ class PlaylistTestCase(ApiTestBase):
             self._find(child, "./playlist[@name=\"alice's 2026-05-01 recommend playlist\"]")
         )
 
-    def test_get_playlists_excludes_system_mood_playlists_but_keeps_saved_copies(self):
+    def test_get_playlists_includes_system_mood_playlists_and_saved_copies(self):
         user = User.get(User.name == "alice")
         track = Track.select().first()
         system = Playlist.create(
@@ -132,8 +132,8 @@ class PlaylistTestCase(ApiTestBase):
 
         rv, child = self._make_request("getPlaylists", tag="playlists")
 
-        self.assertEqual(len(child), 3)
-        self.assertIsNone(
+        self.assertEqual(len(child), 4)
+        self.assertIsNotNone(
             self._find(child, "./playlist[@name=\"alice's 2026-07-07 night mood playlist\"]")
         )
         self.assertIsNotNone(self._find(child, "./playlist[@name='Saved mood copy']"))

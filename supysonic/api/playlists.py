@@ -23,7 +23,6 @@ from ..db import (
     random,
 )
 from ..logging_utils import format_log_event
-from ..mood_scene_playlist_service import non_system_mood_scene_playlist_where
 from ..recommend import (
     buildRecommendationReasonMap,
     getLatestRecommendedPlaylist,
@@ -340,7 +339,6 @@ def list_playlists():
         .where(
             (Playlist.user == request.user) | Playlist.public,
             non_recommended_playlist_where(),
-            non_system_mood_scene_playlist_where(),
         )
         .order_by(Playlist.name)
     )
@@ -358,7 +356,6 @@ def list_playlists():
             .where(
                 Playlist.user == user,
                 non_recommended_playlist_where(),
-                non_system_mood_scene_playlist_where(),
             )
             .order_by(Playlist.name)
         )
