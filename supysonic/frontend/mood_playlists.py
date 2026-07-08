@@ -99,15 +99,6 @@ def _build_mood_playlist_cards(user, day: str, limit: int) -> list:
     for scene_key in list_mood_scene_playlist_keys():
         scene = SCENE_PLAYLISTS[scene_key]
         playlist = get_daily_mood_scene_playlist_for_user(user, scene_key, day=day)
-        preview_results = get_mood_scene_playlist(
-            scene_key,
-            limit=preview_limit,
-            user=user,
-        )
-        reasons_by_track_id = {
-            str(result["track"].id): result.get("reasons") or []
-            for result in preview_results
-        }
         if playlist is not None:
             tracks = playlist.get_tracks()
             status = "ready"
@@ -115,7 +106,17 @@ def _build_mood_playlist_cards(user, day: str, limit: int) -> list:
             status_zh = "已生成"
             display_tracks = tracks[:preview_limit]
             track_count = len(tracks)
+            reasons_by_track_id = {}
         else:
+            preview_results = get_mood_scene_playlist(
+                scene_key,
+                limit=preview_limit,
+                user=user,
+            )
+            reasons_by_track_id = {
+                str(result["track"].id): result.get("reasons") or []
+                for result in preview_results
+            }
             status = "preview" if preview_results else "empty"
             status_en = "preview" if preview_results else "empty"
             status_zh = "预览" if preview_results else "暂无"

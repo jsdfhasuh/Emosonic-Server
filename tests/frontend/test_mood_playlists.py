@@ -10,6 +10,7 @@ from supysonic.mood_scene_playlist_service import (
     SAVED_MOOD_SCENE_PLAYLIST_COMMENT_PREFIX,
     get_mood_scene_playlist_comment,
 )
+from supysonic.mood_scene_playlists import list_mood_scene_playlist_keys
 
 from .frontendtestbase import FrontendTestBase
 
@@ -108,6 +109,30 @@ class MoodPlaylistsFrontendTestCase(FrontendTestBase):
         self.assertIsNotNone(playlist)
         self.assertEqual(playlist.get_tracks(), [track])
         self.assertIn("Mood playlist created.", rv.data)
+
+    def test_mood_playlists_page_uses_stored_playlists_without_preview_generation(self):
+        track = self._create_track("Stored Frontend")
+        for scene_key in list_mood_scene_playlist_keys():
+            playlist = Playlist.create(
+                name=f"alice's 2026-07-07 {scene_key} mood playlist",
+                user=self.user,
+                comment=get_mood_scene_playlist_comment(scene_key, "2026-07-07"),
+            )
+            playlist.add(track)
+            playlist.save()
+
+        self._login("alice", "Alic3")
+        with patch(
+            "supysonic.frontend.mood_playlists.getRecommendationDay",
+            return_value="2026-07-07",
+        ), patch(
+            "supysonic.frontend.mood_playlists.get_mood_scene_playlist"
+        ) as get_preview:
+            rv = self.client.get("/mood-playlists")
+
+        self.assertEqual(rv.status_code, 200)
+        get_preview.assert_not_called()
+        self.assertIn("Stored Frontend", rv.data)
 
     def test_refresh_all_reports_partial_failures(self):
         self._login("alice", "Alic3")
