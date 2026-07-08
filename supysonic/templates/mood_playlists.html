@@ -1,0 +1,115 @@
+{#-
+ This file is part of Supysonic.
+ Supysonic is a Python implementation of the Subsonic server API.
+
+ Distributed under terms of the GNU AGPLv3 license.
+-#}
+{% extends "layout.html" %}
+{% block title %}Mood Playlists · Emosonic Server{% endblock %}
+{% block document_title_en %}Mood Playlists · Emosonic Server{% endblock %}
+{% block document_title_zh %}情绪歌单 · Emosonic Server{% endblock %}
+{% block navbar_playlists %}
+<a class="nav-link active" aria-current="page" href="{{ url_for('frontend.mood_playlists_index') }}"><span data-i18n-en="Mood Playlists" data-i18n-zh="情绪歌单">Mood Playlists</span></a>
+{% endblock %}
+{% block page_title %}<span data-i18n-en="Mood Playlists" data-i18n-zh="情绪歌单">Mood Playlists</span>{% endblock %}
+{% block page_subtitle %}<span data-i18n-en="Daily system playlists generated from high-quality semantic metadata and your listening feedback." data-i18n-zh="根据高质量语义元数据和你的听歌反馈生成的每日系统歌单。">Daily system playlists generated from high-quality semantic metadata and your listening feedback.</span>{% endblock %}
+{% block body %}
+<div class="row row-cols-1 row-cols-md-3 g-3 console-section-spacer">
+  <div class="col">
+    <div class="card console-metric-card">
+      <div class="card-header"><span data-i18n-en="Playlist day" data-i18n-zh="歌单日期">Playlist day</span></div>
+      <div class="card-body">
+        <div class="console-metric-value">{{ day }}</div>
+        <div class="console-metric-caption" data-i18n-en="System playlists are regenerated once per day." data-i18n-zh="系统歌单每天生成或刷新一次。">System playlists are regenerated once per day.</div>
+      </div>
+    </div>
+  </div>
+  <div class="col">
+    <div class="card console-metric-card">
+      <div class="card-header"><span data-i18n-en="Scenes" data-i18n-zh="场景">Scenes</span></div>
+      <div class="card-body">
+        <div class="console-metric-value">{{ cards|length }}</div>
+        <div class="console-metric-caption" data-i18n-en="Mood and scene sets available for the current user." data-i18n-zh="当前用户可用的情绪与场景集合。">Mood and scene sets available for the current user.</div>
+      </div>
+    </div>
+  </div>
+  <div class="col">
+    <div class="card console-metric-card">
+      <div class="card-header"><span data-i18n-en="Refresh" data-i18n-zh="刷新">Refresh</span></div>
+      <div class="card-body d-flex flex-column justify-content-between gap-3">
+        <div class="console-metric-caption" data-i18n-en="Create or update every scene for today." data-i18n-zh="创建或更新今天的所有场景歌单。">Create or update every scene for today.</div>
+        <form method="post" action="{{ url_for('frontend.mood_playlists_refresh_all') }}">
+          <button class="btn btn-dark btn-sm" type="submit"><span data-i18n-en="Refresh all" data-i18n-zh="刷新全部">Refresh all</span></button>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-3 console-section-spacer">
+  {% for card in cards %}
+  <div class="col-xl-4 col-md-6">
+    <div class="card h-100">
+      <div class="card-header d-flex justify-content-between align-items-center gap-2">
+        <div>
+          <span data-i18n-en="{{ card.key }} mood playlist" data-i18n-zh="{{ card.label }}情绪歌单">{{ card.label }}情绪歌单</span>
+          <small class="d-block console-muted">{{ card.display_name }}</small>
+        </div>
+        <span class="console-status status-{{ 'playing' if card.status == 'ready' else 'unknown' }}" data-i18n-en="{{ card.status_en }}" data-i18n-zh="{{ card.status_zh }}">{{ card.status_en }}</span>
+      </div>
+      <div class="card-body d-flex flex-column gap-3">
+        <ul class="console-info-list">
+          <li>
+            <span data-i18n-en="Scene key" data-i18n-zh="场景 key">Scene key</span>
+            <strong>{{ card.key }}</strong>
+          </li>
+          <li>
+            <span data-i18n-en="Tracks" data-i18n-zh="曲目数">Tracks</span>
+            <strong>{{ card.track_count }}</strong>
+          </li>
+          <li>
+            <span data-i18n-en="Playlist" data-i18n-zh="播放列表">Playlist</span>
+            {% if card.playlist %}
+            <a href="{{ url_for('frontend.playlist_details', uid=card.playlist.id) }}"><span data-i18n-en="Open" data-i18n-zh="打开">Open</span></a>
+            {% else %}
+            <strong>-</strong>
+            {% endif %}
+          </li>
+        </ul>
+
+        {% if card.tracks %}
+        <div>
+          <h3 class="h6 mb-2" data-i18n-en="Preview tracks" data-i18n-zh="预览曲目">Preview tracks</h3>
+          <ol class="ps-3 mb-0">
+            {% for item in card.tracks %}
+            <li class="mb-2">
+              <strong>{{ item.track.title }}</strong>
+              {% if item.track.artist %}
+              <small class="d-block console-muted">{{ item.track.artist.name }}</small>
+              {% endif %}
+              <small class="console-muted">{{ item.reason }}</small>
+            </li>
+            {% endfor %}
+          </ol>
+        </div>
+        {% else %}
+        <div class="console-muted" data-i18n-en="No high-quality semantic matches are available yet." data-i18n-zh="暂无可用的高质量语义匹配。">No high-quality semantic matches are available yet.</div>
+        {% endif %}
+
+        <div class="d-flex flex-wrap gap-2 mt-auto">
+          <form method="post" action="{{ url_for('frontend.mood_playlists_refresh_scene', scene_key=card.key) }}">
+            <button class="btn btn-outline-dark btn-sm" type="submit"><span data-i18n-en="Refresh today" data-i18n-zh="刷新今日歌单">Refresh today</span></button>
+          </form>
+          {% if card.playlist %}
+          <a class="btn btn-outline-dark btn-sm" href="{{ url_for('frontend.playlist_details', uid=card.playlist.id) }}"><span data-i18n-en="Open playlist" data-i18n-zh="打开播放列表">Open playlist</span></a>
+          {% endif %}
+          <form method="post" action="{{ url_for('frontend.mood_playlists_save_scene', scene_key=card.key) }}">
+            <button class="btn btn-dark btn-sm" type="submit" {% if not card.track_count %}disabled{% endif %}><span data-i18n-en="Save copy" data-i18n-zh="保存为我的歌单">Save copy</span></button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}

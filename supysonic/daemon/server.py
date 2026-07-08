@@ -15,6 +15,12 @@ from .client import DaemonCommand
 from ..db import Folder, open_connection, close_connection
 from ..jukebox import Jukebox
 from ..logging_utils import format_log_event
+from ..mood_scene_playlist_service import (
+    DEFAULT_MOOD_SCENE_DAILY_PLAYLIST_LIMIT,
+    DEFAULT_MOOD_SCENE_PLAYLIST_RETENTION_DAYS,
+    cleanup_old_mood_scene_playlists,
+    refresh_daily_mood_scene_playlists,
+)
 from ..recommend import getRecommendationDay, refreshDailyRecommendPlaylists
 from ..scheduler import IntervalScheduler
 from ..scanner import Scanner
@@ -42,6 +48,7 @@ class Daemon:
         self.__jukebox = None
         self.__scheduler = IntervalScheduler()
         self.__lastRecommendRefreshDay = None
+        self.__lastMoodSceneRefreshDay = None
         self.__stopped = Event()
 
     watcher = property(lambda self: self.__watcher)
@@ -109,6 +116,34 @@ class Daemon:
     def __get_recommend_playlist_size(self):
         return max(1, int(self.__config.DAEMON.get("recommend_playlist_size", 50)))
 
+    def __get_mood_scene_playlists_refresh_interval(self):
+        return max(
+            60,
+            int(self.__config.DAEMON.get("mood_scene_playlists_refresh_interval", 300)),
+        )
+
+    def __get_mood_scene_playlist_size(self):
+        return max(
+            1,
+            int(
+                self.__config.DAEMON.get(
+                    "mood_scene_playlist_size",
+                    DEFAULT_MOOD_SCENE_DAILY_PLAYLIST_LIMIT,
+                )
+            ),
+        )
+
+    def __get_mood_scene_playlist_retention_days(self):
+        return max(
+            1,
+            int(
+                self.__config.DAEMON.get(
+                    "mood_scene_playlist_retention_days",
+                    DEFAULT_MOOD_SCENE_PLAYLIST_RETENTION_DAYS,
+                )
+            ),
+        )
+
     def __get_review_task_maintenance_interval(self):
         return max(60, int(self.__config.DAEMON.get("review_task_maintenance_interval", 300)))
 
@@ -136,6 +171,15 @@ class Daemon:
             self.__refresh_recommend_playlists_if_needed,
             self.__get_recommend_refresh_interval(),
             enabled=self.__config.DAEMON.get("recommend_daily_refresh", True),
+        )
+        self.__scheduler.register(
+            "daily-mood-scene-playlists",
+            self.__refresh_mood_scene_playlists_if_needed,
+            self.__get_mood_scene_playlists_refresh_interval(),
+            enabled=self.__config.DAEMON.get(
+                "mood_scene_playlists_daily_refresh",
+                True,
+            ),
         )
         self.__scheduler.register(
             "track-metadata-enrichment",
@@ -275,6 +319,79 @@ class Daemon:
                     "daemon",
                     "recommend_refresh_failed",
                     day=recommendationDay,
+                    error_type=exc.__class__.__name__,
+                )
+            )
+            return False
+        finally:
+            if opened:
+                close_connection()
+
+    def __refresh_mood_scene_playlists_if_needed(self, current_day=None):
+        playlistDay = getRecommendationDay() if current_day is None else current_day
+        if playlistDay == self.__lastMoodSceneRefreshDay:
+            return False
+
+        opened = False
+        try:
+            opened = open_connection(True)
+            logger.info(
+                format_log_event(
+                    "daemon",
+                    "mood_scene_playlist_refresh_started",
+                    day=playlistDay,
+                )
+            )
+            refreshSummary = refresh_daily_mood_scene_playlists(
+                limit=self.__get_mood_scene_playlist_size(),
+                day=playlistDay,
+                active_users_only=bool(
+                    self.__config.DAEMON.get(
+                        "mood_scene_playlists_active_users_only",
+                        True,
+                    )
+                ),
+            )
+            failedCount = int(refreshSummary.get("failed", 0) or 0)
+            if failedCount:
+                logger.warning(
+                    format_log_event(
+                        "daemon",
+                        "mood_scene_playlist_refresh_incomplete",
+                        day=playlistDay,
+                        created=refreshSummary.get("created", 0),
+                        updated=refreshSummary.get("updated", 0),
+                        skipped=refreshSummary.get("skipped", 0),
+                        failed=failedCount,
+                    )
+                )
+                return False
+
+            cleanupSummary = cleanup_old_mood_scene_playlists(
+                retention_days=self.__get_mood_scene_playlist_retention_days(),
+                current_day=playlistDay,
+            )
+            self.__lastMoodSceneRefreshDay = playlistDay
+            logger.info(
+                format_log_event(
+                    "daemon",
+                    "mood_scene_playlist_refresh_completed",
+                    day=playlistDay,
+                    created=refreshSummary.get("created", 0),
+                    updated=refreshSummary.get("updated", 0),
+                    skipped=refreshSummary.get("skipped", 0),
+                    failed=refreshSummary.get("failed", 0),
+                    deleted=cleanupSummary.get("deleted", 0),
+                    cleanup_skipped=cleanupSummary.get("skipped", 0),
+                )
+            )
+            return True
+        except Exception as exc:
+            logger.exception(
+                format_log_event(
+                    "daemon",
+                    "mood_scene_playlist_refresh_failed",
+                    day=playlistDay,
                     error_type=exc.__class__.__name__,
                 )
             )

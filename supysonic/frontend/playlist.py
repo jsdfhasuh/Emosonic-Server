@@ -11,6 +11,7 @@ from flask import Response, flash, redirect, render_template, request, url_for
 from functools import wraps
 
 from ..db import Playlist
+from ..mood_scene_playlist_service import non_system_mood_scene_playlist_where
 from ..recommend import non_recommended_playlist_where
 
 from . import frontend
@@ -23,11 +24,13 @@ def playlist_index():
         mine=Playlist.select().where(
             Playlist.user == request.user,
             non_recommended_playlist_where(),
+            non_system_mood_scene_playlist_where(),
         ),
         others=Playlist.select().where(
             Playlist.user != request.user,
             Playlist.public,
             non_recommended_playlist_where(),
+            non_system_mood_scene_playlist_where(),
         ),
     )
 

@@ -49,7 +49,10 @@ Distributed under terms of the GNU AGPLv3 license.
   <div class="col-12">
     <div class="d-flex justify-content-between align-items-center mb-2">
       <h2 class="h5 mb-0" data-i18n-en="Smart picks" data-i18n-zh="智能推荐">Smart picks</h2>
-      <span class="console-density-note text-body-secondary" data-i18n-en="Metadata driven" data-i18n-zh="语义元数据驱动">Metadata driven</span>
+      <div class="d-flex align-items-center gap-2">
+        <span class="console-density-note text-body-secondary" data-i18n-en="Metadata driven" data-i18n-zh="语义元数据驱动">Metadata driven</span>
+        <a class="btn btn-outline-dark btn-sm" href="{{ url_for('frontend.mood_playlists_index') }}"><span data-i18n-en="Open mood playlists" data-i18n-zh="打开情绪歌单">Open mood playlists</span></a>
+      </div>
     </div>
   </div>
   {% for card in smart_cards %}

@@ -287,6 +287,29 @@ library folders and providing the jukebox feature.
    recommended playlists are archived under
    :file:`<webapp.cache_dir>/recommend-playlists/<user>/`. Defaults to ``5``.
 
+``mood_scene_playlists_daily_refresh``
+   Whether the daemon should create or update system mood/scene playlists
+   automatically each day. This uses existing semantic metadata and does not
+   call an LLM. Defaults to ``yes``.
+
+``mood_scene_playlists_refresh_interval``
+   Poll interval, in seconds, for the daily mood/scene playlist refresh check.
+   The scheduler still refreshes at most once per natural day. Defaults to
+   ``300``.
+
+``mood_scene_playlist_size``
+   Number of tracks to include in each generated mood/scene playlist. Defaults
+   to ``30``.
+
+``mood_scene_playlist_retention_days``
+   Number of system mood/scene playlist days to keep in the playlist table.
+   Older system mood/scene playlists are removed during the refresh task.
+   Defaults to ``1``.
+
+``mood_scene_playlists_active_users_only``
+   Whether automatic mood/scene playlist generation should be limited to users
+   with play activity or a last-play track. Defaults to ``yes``.
+
 ``track_metadata_enrichment``
    Whether the daemon should enrich track recommendation metadata automatically.
    Defaults to ``no`` so upgrades never trigger external metadata work by
@@ -366,6 +389,23 @@ Sample configuration::
    ; ones are archived to JSON when the recommendation creation task runs.
    ; Default: 5
    recommend_playlist_retention_days = 5
+
+   ; Create or update system mood/scene playlists automatically each day.
+   ; Default: yes
+   mood_scene_playlists_daily_refresh = yes
+
+   ; Poll interval in seconds for the daily mood/scene playlist refresh check.
+   ; Default: 300
+   mood_scene_playlists_refresh_interval = 300
+
+   ; Number of tracks in each generated mood/scene playlist. Default: 30
+   mood_scene_playlist_size = 30
+
+   ; Keep only this many system mood/scene playlist days. Default: 1
+   mood_scene_playlist_retention_days = 1
+
+   ; Generate automatically only for active users. Default: yes
+   mood_scene_playlists_active_users_only = yes
 
    ; Enrich track recommendation metadata automatically from the daemon.
    ; Default: no

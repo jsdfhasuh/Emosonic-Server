@@ -135,6 +135,75 @@
   </div>
 </div>
 
+<div class="card console-section-spacer">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <span data-i18n-en="Listening Profile" data-i18n-zh="听歌画像">Listening Profile</span>
+    <span class="console-chip">{{ listening_profile.playCount if listening_profile else 0 }} <span data-i18n-en="plays" data-i18n-zh="次播放">plays</span></span>
+  </div>
+  <div class="card-body">
+    {% if listening_profile and listening_profile.playCount %}
+    <div class="row g-3">
+      <div class="col-xl-8">
+        <div class="row g-3">
+          <div class="col-md-6">
+            <h3 class="h6" data-i18n-en="Top moods" data-i18n-zh="常听情绪">Top moods</h3>
+            <div class="d-flex flex-wrap gap-2">
+              {% for item in listening_profile.topMoods %}
+              <span class="console-chip">{{ item.value }} · {{ item.playCount }}</span>
+              {% else %}
+              <span class="console-muted">-</span>
+              {% endfor %}
+            </div>
+          </div>
+          <div class="col-md-6">
+            <h3 class="h6" data-i18n-en="Top scenes" data-i18n-zh="常听场景">Top scenes</h3>
+            <div class="d-flex flex-wrap gap-2">
+              {% for item in listening_profile.topScenes %}
+              <span class="console-chip">{{ item.value }} · {{ item.playCount }}</span>
+              {% else %}
+              <span class="console-muted">-</span>
+              {% endfor %}
+            </div>
+          </div>
+          <div class="col-md-6">
+            <h3 class="h6" data-i18n-en="Top tags" data-i18n-zh="常听标签">Top tags</h3>
+            <div class="d-flex flex-wrap gap-2">
+              {% for item in listening_profile.topTags %}
+              <span class="console-chip">{{ item.value }} · {{ item.playCount }}</span>
+              {% else %}
+              <span class="console-muted">-</span>
+              {% endfor %}
+            </div>
+          </div>
+          <div class="col-md-6">
+            <h3 class="h6" data-i18n-en="Top languages" data-i18n-zh="常听语言">Top languages</h3>
+            <div class="d-flex flex-wrap gap-2">
+              {% for item in listening_profile.topLanguages %}
+              <span class="console-chip">{{ item.value }} · {{ item.playCount }}</span>
+              {% else %}
+              <span class="console-muted">-</span>
+              {% endfor %}
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="col-xl-4">
+        <ul class="console-info-list">
+          <li><span data-i18n-en="Track count" data-i18n-zh="曲目数">Track count</span><strong>{{ listening_profile.trackCount }}</strong></li>
+          <li><span data-i18n-en="Average energy" data-i18n-zh="平均能量">Average energy</span><strong>{{ listening_profile.averageEnergy if listening_profile.averageEnergy is not none else '-' }}</strong></li>
+          <li><span data-i18n-en="Average valence" data-i18n-zh="平均情绪值">Average valence</span><strong>{{ listening_profile.averageValence if listening_profile.averageValence is not none else '-' }}</strong></li>
+          <li><span data-i18n-en="Average danceability" data-i18n-zh="平均舞动性">Average danceability</span><strong>{{ listening_profile.averageDanceability if listening_profile.averageDanceability is not none else '-' }}</strong></li>
+          <li><span data-i18n-en="Recent 7 days" data-i18n-zh="近 7 天">Recent 7 days</span><strong>{{ listening_profile.recent7Days.playCount }}</strong></li>
+          <li><span data-i18n-en="Recent 30 days" data-i18n-zh="近 30 天">Recent 30 days</span><strong>{{ listening_profile.recent30Days.playCount }}</strong></li>
+        </ul>
+      </div>
+    </div>
+    {% else %}
+    <div class="console-muted" data-i18n-en="Not enough listening data yet." data-i18n-zh="暂无足够听歌数据">Not enough listening data yet.</div>
+    {% endif %}
+  </div>
+</div>
+
 {% if clients.count() %}
 <div class="card console-section-spacer">
   <div class="card-header"><span data-i18n-en="Client preferences" data-i18n-zh="客户端偏好">Client preferences</span></div>

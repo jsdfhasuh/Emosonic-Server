@@ -109,7 +109,26 @@ log_backup_count = 7
 log_level = INFO
 log_rotate = yes
 
-; Enable daemon-driven track recommendation metadata enrichment. Default: off
+; Enable daemon-driven daily mood/scene playlist refresh. Default: on.
+; This does not call an LLM; it uses existing high-quality semantic metadata.
+mood_scene_playlists_daily_refresh = on
+
+; Poll interval in seconds for the mood/scene playlist scheduler. The scheduler
+; still refreshes at most once per natural day. Default: 300
+mood_scene_playlists_refresh_interval = 300
+
+; Maximum tracks per generated mood/scene playlist. Default: 30
+mood_scene_playlist_size = 30
+
+; Number of days of system mood/scene playlists to keep. Default: 1
+mood_scene_playlist_retention_days = 1
+
+; Only auto-generate for users with play activity or a last-play track. Default: on
+mood_scene_playlists_active_users_only = on
+
+; Enable daemon-driven track recommendation metadata enrichment. Default: off.
+; Keep this disabled unless you explicitly want the daemon to enrich tracks
+; on a timer.
 track_metadata_enrichment = off
 
 ; Provider for daemon-driven track metadata enrichment. "local" does not call
@@ -128,6 +147,14 @@ track_metadata_enrichment_stale_lock_seconds = 900
 
 ; Allow full path hints to be sent to an enrichment provider. Default: off
 track_metadata_enrichment_send_path_hints = off
+
+; Example for scheduled LLM enrichment:
+;   track_metadata_enrichment = yes
+;   track_metadata_enrichment_provider = llm
+;   track_metadata_enrichment_interval = 300
+;   track_metadata_enrichment_batch_size = 10
+; The interval is 5 minutes in this example. Increase batch size cautiously to
+; avoid provider rate limits and quota usage.
 
 [musicbrainz]
 ; MusicBrainz is the default structured album enrichment source.

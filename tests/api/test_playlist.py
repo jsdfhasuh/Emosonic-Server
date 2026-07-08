@@ -9,6 +9,10 @@ import unittest
 import uuid
 
 from supysonic.db import Folder, Artist, Album, Track, Playlist, User
+from supysonic.mood_scene_playlist_service import (
+    SAVED_MOOD_SCENE_PLAYLIST_COMMENT_PREFIX,
+    get_mood_scene_playlist_comment,
+)
 from supysonic.recommend import RECOMMENDED_PLAYLIST_COMMENT
 
 from .apitestbase import ApiTestBase
@@ -107,6 +111,32 @@ class PlaylistTestCase(ApiTestBase):
         self.assertIsNone(
             self._find(child, "./playlist[@name=\"alice's 2026-05-01 recommend playlist\"]")
         )
+
+    def test_get_playlists_excludes_system_mood_playlists_but_keeps_saved_copies(self):
+        user = User.get(User.name == "alice")
+        track = Track.select().first()
+        system = Playlist.create(
+            user=user,
+            name="alice's 2026-07-07 night mood playlist",
+            comment=get_mood_scene_playlist_comment("night", "2026-07-07"),
+        )
+        system.add(track)
+        system.save()
+        saved = Playlist.create(
+            user=user,
+            name="Saved mood copy",
+            comment=f"{SAVED_MOOD_SCENE_PLAYLIST_COMMENT_PREFIX}night:2026-07-07",
+        )
+        saved.add(track)
+        saved.save()
+
+        rv, child = self._make_request("getPlaylists", tag="playlists")
+
+        self.assertEqual(len(child), 3)
+        self.assertIsNone(
+            self._find(child, "./playlist[@name=\"alice's 2026-07-07 night mood playlist\"]")
+        )
+        self.assertIsNotNone(self._find(child, "./playlist[@name='Saved mood copy']"))
 
     def test_get_playlist(self):
         # missing param

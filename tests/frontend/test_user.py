@@ -5,12 +5,23 @@
 #
 # Distributed under terms of the GNU AGPLv3 license.
 
+import json
+import os
 import unittest
 import uuid
 
 from markupsafe import escape
 
-from supysonic.db import User, ClientPrefs
+from supysonic.db import (
+    Album,
+    Artist,
+    ClientPrefs,
+    Folder,
+    Track,
+    TrackMetadata,
+    User,
+    User_Play_Activity,
+)
 
 from .frontendtestbase import FrontendTestBase
 
@@ -51,6 +62,56 @@ class UserTestCase(FrontendTestBase):
         rv = self.client.get("/user/me")
         self.assertIn('<h1 class="console-title">bob</h1>', rv.data)
         self.assertIn("tests", rv.data)
+
+    def test_profile_shows_listening_profile_and_api_returns_json(self):
+        user = User[self.users["alice"]]
+        folder = Folder.create(root=True, name="Profile Root", path="/music")
+        artist = Artist.create(name="Profile Artist")
+        album = Album.create(name="Profile Album", artist=artist)
+        track = Track.create(
+            disc=1,
+            number=1,
+            title="Profile Song",
+            duration=180,
+            has_art=False,
+            album=album,
+            artist=artist,
+            genre="pop",
+            bitrate=320,
+            path=os.path.join("/music", "profile.flac"),
+            last_modification=1,
+            root_folder=folder,
+            folder=folder,
+        )
+        TrackMetadata.create(
+            track=track,
+            track_last_modification=track.last_modification,
+            mood_json=json.dumps(["bright"]),
+            scene_json=json.dumps(["commute"]),
+            tags_json=json.dumps(["alt-pop"]),
+            language="en",
+            energy=70,
+            valence=60,
+            danceability=55,
+            confidence=0.9,
+            provider="llm",
+            source="llm",
+        )
+        User_Play_Activity.create(track=track, user=user)
+        User_Play_Activity.create(track=track, user=user)
+
+        self._login("alice", "Alic3")
+        page = self.client.get("/user/me")
+        api = self.client.get("/api/me/listening-profile")
+
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("Listening Profile", page.data)
+        self.assertIn("bright", page.data)
+        self.assertIn("commute", page.data)
+        self.assertEqual(api.status_code, 200)
+        self.assertEqual(api.json["playCount"], 2)
+        self.assertEqual(api.json["topMoods"], [{"value": "bright", "playCount": 2}])
+        self.assertEqual(api.json["averageEnergy"], 70.0)
 
     def test_update_client_prefs(self):
         self._login("alice", "Alic3")

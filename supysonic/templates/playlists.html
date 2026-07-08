@@ -14,6 +14,10 @@
 {% block page_title %}<span data-i18n-en="Playlists" data-i18n-zh="播放列表">Playlists</span>{% endblock %}
 {% block page_subtitle %}<span data-i18n-en="Manage your own collections, inspect shared playlists, and export curated M3U sets from the Emosonic Server library." data-i18n-zh="管理自己的收藏，查看共享播放列表，并导出 Emosonic Server 曲库中的 M3U 集合。">Manage your own collections, inspect shared playlists, and export curated M3U sets from the Emosonic Server library.</span>{% endblock %}
 {% block body %}
+<div class="d-flex justify-content-end console-section-spacer">
+  <a class="btn btn-outline-dark btn-sm" href="{{ url_for('frontend.mood_playlists_index') }}"><span data-i18n-en="Mood playlists" data-i18n-zh="情绪歌单">Mood playlists</span></a>
+</div>
+
 <div class="row row-cols-1 row-cols-md-3 g-3 console-section-spacer">
   <div class="col">
     <div class="card console-metric-card">

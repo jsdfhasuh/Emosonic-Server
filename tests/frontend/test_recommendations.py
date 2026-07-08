@@ -220,6 +220,35 @@ class RecommendationsTestCase(FrontendTestBase):
         self.assertIn("listenLater", rv.data)
         self.assertIn("nextActions", rv.data)
 
+    def test_recommendations_page_shows_agent_listening_profile_summary(self):
+        self._create_recommended_playlist(self.track)
+        User_Play_Activity.create(track=self.track, user=self.user)
+        User_Play_Activity.create(track=self.track, user=self.user)
+        TrackMetadata.create(
+            track=self.track,
+            track_last_modification=self.track.last_modification,
+            mood_json=json.dumps(["bright"]),
+            scene_json=json.dumps(["commute"]),
+            tags_json=json.dumps(["alt-pop"]),
+            language="en",
+            energy=70,
+            valence=60,
+            danceability=55,
+            confidence=0.9,
+            provider="llm",
+            source="llm",
+        )
+
+        self._login("alice", "Alic3")
+        rv = self.client.get("/recommendations")
+
+        self.assertEqual(rv.status_code, 200)
+        self.assertIn("Agent context", rv.data)
+        self.assertIn("bright", rv.data)
+        self.assertIn("commute", rv.data)
+        self.assertIn("alt-pop", rv.data)
+        self.assertIn("average energy", rv.data)
+
     def test_recommendations_page_embeds_recent_agent_sessions(self):
         RecommendationAgentSession.create(
             user=self.user,
@@ -788,6 +817,16 @@ class RecommendationsTestCase(FrontendTestBase):
         self.assertEqual(request_payload["max_tokens"], 900)
         self.assertIn(
             "outside the user's local music library",
+            request_payload["messages"][0]["content"],
+        )
+        self.assertIn("context.listeningProfile", request_payload["messages"][0]["content"])
+        self.assertIn("topMoods", request_payload["messages"][0]["content"])
+        self.assertIn("topScenes", request_payload["messages"][0]["content"])
+        self.assertIn("topTags", request_payload["messages"][0]["content"])
+        self.assertIn("topLanguages", request_payload["messages"][0]["content"])
+        self.assertIn("averageEnergy", request_payload["messages"][0]["content"])
+        self.assertIn(
+            "do not invent semantic metadata",
             request_payload["messages"][0]["content"],
         )
         self.assertIn("similarTo", request_payload["messages"][0]["content"])

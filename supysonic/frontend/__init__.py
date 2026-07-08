@@ -82,6 +82,7 @@ from ..recommendation_agent_session import (
     clear_recommendation_agent_sessions,
     list_recommendation_agent_sessions,
 )
+from ..user_listening_profile import build_user_listening_profile
 
 logger = logging.getLogger(__name__)
 
@@ -661,6 +662,7 @@ def recommendation_index():
         _get_recommendation_count(),
     )
     context["agentSessions"] = list_recommendation_agent_sessions(request.user)
+    context["listeningProfile"] = build_user_listening_profile(request.user)
     return render_template("recommendations.html", **context)
 
 
@@ -1545,6 +1547,7 @@ def device_cover(eid):
 from .user import *
 from .folder import *
 from .playlist import *
+from .mood_playlists import *
 from .music_requests import *
 from .metadata import *
 from .share import *

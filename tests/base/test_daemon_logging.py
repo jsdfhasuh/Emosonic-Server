@@ -181,6 +181,7 @@ class DaemonLoggingTestCase(unittest.TestCase):
                 "run_watcher": True,
                 "jukebox_command": None,
                 "recommend_daily_refresh": False,
+                "mood_scene_playlists_daily_refresh": False,
                 "review_task_maintenance": False,
             },
             BASE={},

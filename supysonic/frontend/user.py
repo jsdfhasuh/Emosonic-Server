@@ -14,6 +14,7 @@ from ..db import ClientPrefs, User
 from ..lastfm import LastFm, is_configured
 from ..listenbrainz import ListenBrainz
 from ..managers.user import UserManager
+from ..user_listening_profile import build_user_listening_profile
 
 from . import admin_only, frontend
 
@@ -146,12 +147,19 @@ def user_index():
 @frontend.route("/user/<uid>")
 @me_or_uuid
 def user_profile(uid, user):
+    listening_profile = build_user_listening_profile(user)
     return render_template(
         "profile.html",
         user=user,
         api_key=_get_lastfm_api_key(),
         clients=user.clients,
+        listening_profile=listening_profile,
     )
+
+
+@frontend.route("/api/me/listening-profile")
+def user_listening_profile_api():
+    return jsonify(build_user_listening_profile(request.user))
 
 
 @frontend.route("/user/<uid>", methods=["POST"])

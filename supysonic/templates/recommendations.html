@@ -83,6 +83,28 @@
               <span class="recommendation-agent-label" data-i18n-en="Outside-library artists" data-i18n-zh="曲库外歌手">Outside-library artists</span>
               <div class="recommendation-agent-chips" data-agent-recommended-artists></div>
             </section>
+            <section class="recommendation-agent-insight">
+              <span class="recommendation-agent-label" data-i18n-en="Agent context" data-i18n-zh="Agent 参考画像">Agent context</span>
+              <div class="recommendation-agent-chips">
+                {% if listeningProfile and listeningProfile.playCount %}
+                  {% for item in listeningProfile.topMoods[:3] %}
+                  <span class="recommendation-agent-chip"><strong>{{ item.value }}</strong><span data-i18n-en="mood · {{ item.playCount }}" data-i18n-zh="情绪 · {{ item.playCount }}">mood · {{ item.playCount }}</span></span>
+                  {% endfor %}
+                  {% for item in listeningProfile.topScenes[:3] %}
+                  <span class="recommendation-agent-chip"><strong>{{ item.value }}</strong><span data-i18n-en="scene · {{ item.playCount }}" data-i18n-zh="场景 · {{ item.playCount }}">scene · {{ item.playCount }}</span></span>
+                  {% endfor %}
+                  {% for item in listeningProfile.topTags[:3] %}
+                  <span class="recommendation-agent-chip"><strong>{{ item.value }}</strong><span data-i18n-en="tag · {{ item.playCount }}" data-i18n-zh="标签 · {{ item.playCount }}">tag · {{ item.playCount }}</span></span>
+                  {% endfor %}
+                  {% for item in listeningProfile.topLanguages[:3] %}
+                  <span class="recommendation-agent-chip"><strong>{{ item.value }}</strong><span data-i18n-en="language · {{ item.playCount }}" data-i18n-zh="语言 · {{ item.playCount }}">language · {{ item.playCount }}</span></span>
+                  {% endfor %}
+                  <span class="recommendation-agent-chip"><strong>{{ listeningProfile.averageEnergy if listeningProfile.averageEnergy is not none else '-' }}</strong><span data-i18n-en="average energy" data-i18n-zh="平均能量">average energy</span></span>
+                {% else %}
+                  <span class="recommendation-agent-chip is-muted" data-i18n-en="Not enough data yet" data-i18n-zh="暂无足够数据">Not enough data yet</span>
+                {% endif %}
+              </div>
+            </section>
           </div>
           <section class="recommendation-agent-health" data-agent-health>
             <div>

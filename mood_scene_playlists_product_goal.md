@@ -19,7 +19,7 @@ agent/track-metadata-goal-v2
 | 情绪/场景歌单内存结果 | `supysonic/mood_scene_playlists.py` | 已有 `get_mood_scene_playlist()`，支持 night / study / commute / relax / high_energy / low_energy / cantonese / nostalgic / emo |
 | 首页智能卡片 | `supysonic/home_smart_cards.py` + `supysonic/templates/home.html` | 已接入首页 `Smart picks`，但不是完整情绪歌单页面 |
 | 用户画像聚合 | `supysonic/user_listening_profile.py` | 已能根据 high-quality `TrackMetadata` 聚合 mood / scene / tags / language / energy 等 |
-| Agent 上下文 | `supysonic/recommendation_agent.py` | `build_recommendation_agent_context()` 已包含 `listeningProfile`，但 prompt 和页面展示还可加强 |
+| Agent 上下文 | `supysonic/recommendation_agent.py` | `build_recommendation_agent_context()` 已包含 `listeningProfile`，prompt 已弱引用该字段，但还需要明确 mood / scene / tags / language / energy 的使用和解释规则 |
 | Playlist 数据结构 | `supysonic/db_layer/playlists.py` | `Playlist.comment` 可用于标记系统生成来源，`Playlist.tracks` 存储 track id 列表 |
 | 播放列表页面 | `supysonic/frontend/playlist.py` + `supysonic/templates/playlists.html` | 普通 Playlist 管理已存在，系统情绪歌单需要纳入展示/跳转策略 |
 | daemon 定时任务 | `supysonic/daemon/server.py` | 已有 `recommend-refresh` 和 `track-metadata-enrichment` 的 scheduler 模式，可复用 |
@@ -31,7 +31,7 @@ agent/track-metadata-goal-v2
 - 还没有独立 `/mood-playlists` 页面。
 - 情绪歌单没有每日自动刷新和过期自动删除机制。
 - 用户画像还没有展示到 `/user/me` 或 Agent 页面。
-- Agent 虽然已有 `listeningProfile`，但 prompt 还没有明确要求用画像解释推荐歌手。
+- Agent 虽然已有 `listeningProfile`，但 prompt 目前只是弱信号引用，还没有明确要求用画像解释推荐歌手。
 
 ---
 
@@ -64,6 +64,15 @@ agent/track-metadata-goal-v2
 - low-confidence LLM metadata 不进入画像和 Agent 判断。
 - 结果不足时可以 fallback 到 genre / popularity / recommendation，但必须标注 reason。
 
+### 1.4 普通 Playlist 可见性
+
+系统每日情绪歌单是系统托管对象，默认不应该混入普通 Playlist 列表：
+
+- `/playlist` 普通列表默认隐藏 `comment.startswith("mood_scene_playlist:")` 的系统歌单。
+- `/rest/getPlaylists` 也默认隐藏系统情绪歌单，避免 Subsonic 客户端看到内部每日对象。
+- `/mood-playlists` 页面和“打开播放列表”按钮仍然可以跳转到真实 Playlist 详情页。
+- 用户保存副本 `saved_mood_scene_playlist:*` 是普通用户歌单，应保留在普通列表和 API 列表中。
+
 ---
 
 ## 2. Phase 1: Daily Mood Scene Playlist Service
@@ -93,6 +102,14 @@ def get_mood_scene_playlist_comment(scene_key: str, day: str) -> str:
 
 
 def is_system_mood_scene_playlist(playlist) -> bool:
+    ...
+
+
+def system_mood_scene_playlist_where():
+    ...
+
+
+def non_system_mood_scene_playlist_where():
     ...
 
 
@@ -192,6 +209,18 @@ Playlist.comment == f"mood_scene_playlist:{scene_key}:{day}"
 }
 ```
 
+实现注意：
+
+- `Playlist.tracks` 是逗号分隔的 UUID `TextField`，不是关联表。
+- 写入 tracks 时必须保持 `get_mood_scene_playlist()` 返回顺序。
+- 可以复用 `Playlist.clear()` + `Playlist.add(track)`，也可以集中写入：
+
+```python
+playlist.tracks = ",".join(str(result["track"].id) for result in results)
+```
+
+- 不要把 `result["reasons"]` 存入 `Playlist.tracks`；reason 只用于页面/API 展示时重新从服务层或预览结果中读取。
+
 ### Task 1.4: 歌单命名规则
 
 建议内部名：
@@ -219,10 +248,17 @@ Playlist.comment == f"mood_scene_playlist:{scene_key}:{day}"
   - comment 中日期早于保留窗口。
 - 日期解析失败的系统情绪歌单不要直接删除，先跳过并记录 warning。
 - 返回结构包含删除数量和跳过数量。
+- 清理函数只处理 `mood_scene_playlist:*`，不要复用或修改推荐系统 `recommended` / `recommend` 的归档清理逻辑。
 
 ---
 
 ## 3. Phase 2: Daemon Daily Refresh And Cleanup
+
+落地顺序建议：
+
+- 先完成 Phase 1 服务层和 base tests。
+- 再完成 `/mood-playlists` 手动刷新页面，确认真实 Playlist 创建/更新路径稳定。
+- 最后接入 daemon 自动刷新，避免在服务层尚未稳定时扩大调度和数据库写入面。
 
 ### Task 2.1: 新增 daemon 配置
 
@@ -246,7 +282,7 @@ DAEMON = {
 
 说明：
 
-- 该任务不调用 LLM，只使用已有 metadata，因此默认开启是可以接受的。
+- 该任务不调用 LLM，只使用已有 metadata；在服务层和页面测试稳定后，默认开启是可以接受的。
 - 如部署方担心自动创建 Playlist，可通过配置关闭。
 
 ### Task 2.2: 注册 scheduler job
@@ -271,6 +307,8 @@ daily-mood-scene-playlists
   1. `refresh_daily_mood_scene_playlists(...)`
   2. `cleanup_old_mood_scene_playlists(...)`
 - 日志记录：day、created、updated、skipped、deleted。
+- 只有 refresh 和 cleanup 都执行完成后，才更新 `self.__lastMoodSceneRefreshDay`。
+- 如果 refresh 或 cleanup 抛错，同一天下次 scheduler tick 应允许重试。
 
 建议方法：
 
@@ -287,6 +325,11 @@ def __refresh_mood_scene_playlists_if_needed(self, current_day=None):
 - 或存在 `user.last_play_id` 的用户。
 
 如果当前用户主动打开 `/mood-playlists` 并点击刷新，则无论是否活跃都可以为自己生成。
+
+实现建议：
+
+- 新增独立 `_get_active_mood_scene_playlist_users()` 或等价 helper。
+- 不要直接复用推荐系统私有函数 `_getUsersWithPlayActivity()`，避免跨模块依赖私有实现。
 
 ---
 
@@ -311,6 +354,15 @@ POST /mood-playlists/<scene_key>/save
 ```
 
 如果项目路由加载需要显式 import，需要在现有前端初始化位置补充导入。
+
+当前仓库需要显式注册路由：
+
+```python
+# supysonic/frontend/__init__.py
+from .mood_playlists import *
+```
+
+否则 `supysonic/frontend/mood_playlists.py` 中挂到 `frontend` blueprint 的路由不会生效。
 
 ### Task 3.2: 页面展示
 
@@ -353,6 +405,7 @@ emo
 - 今日系统 Playlist，如果已存在。
 - 如果今日系统 Playlist 不存在，则临时调用 `get_mood_scene_playlist()` 预览结果。
 - 点击刷新后创建/更新真实 Playlist。
+- 已存在 Playlist 的 tracks 来自 `Playlist.get_tracks()`；reason 可以通过同日同 scene 的服务层结果映射补充，缺失时显示通用 fallback reason。
 
 ### Task 3.4: 保存为我的歌单
 
@@ -376,6 +429,24 @@ saved_mood_scene_playlist:{scene_key}:{YYYY-MM-DD}
 - 首页 `Smart picks` 标题右侧增加 `Open mood playlists / 打开情绪歌单`。
 - `/playlist` 页面顶部增加 `Mood playlists / 情绪歌单` 按钮。
 - 顶部导航如有空间，可新增二级入口。
+
+### Task 3.6: 普通列表和 API 过滤
+
+系统情绪歌单应该由 `/mood-playlists` 管理，不应默认出现在普通 Playlist 列表里。
+
+修改：
+
+```text
+supysonic/frontend/playlist.py
+supysonic/api/playlists.py
+```
+
+要求：
+
+- `/playlist` 的 `mine` / `others` 查询过滤 `mood_scene_playlist:*` 系统歌单。
+- `/rest/getPlaylists` 过滤 `mood_scene_playlist:*` 系统歌单。
+- 不过滤 `saved_mood_scene_playlist:*`，保存副本仍然是用户普通歌单。
+- 保留现有 `recommended` / `recommend` 过滤行为。
 
 ---
 
@@ -455,13 +526,13 @@ supysonic/recommendation_agent.py
 "listeningProfile": listening_profile
 ```
 
-需要强化 `_build_system_prompt()`：
+当前 `_build_system_prompt()` 已经把 `listeningProfile` 列为次级信号，但还不够明确。需要强化 `_build_system_prompt()`：
 
 - 推荐歌手时必须参考 `context.listeningProfile`。
 - 结合用户常听 mood / scene / tags / language / averageEnergy。
 - 用户问“为什么推荐”时，解释推荐和画像之间的关系。
 - 画像不是唯一依据，还要结合 `playHistory`、`history.topArtists`、`history.favoriteGenres`、`currentRecommendationTracks` 和 feedback。
-- 不要使用 low-quality semantic metadata。
+- 不要声称使用 low-quality semantic metadata；画像来源已经由 `build_user_listening_profile()` 过滤 high-quality metadata，prompt 只需要要求不要基于不可信 semantic metadata 下结论。
 
 建议增加类似说明：
 
@@ -470,6 +541,7 @@ When recommending artists, use context.listeningProfile as an explicit signal.
 If the user asks why, explain how the recommendation relates to their top moods,
 scenes, tags, languages, and energy profile. Do not overfit to one field; combine
 profile, play history, current recommendations, and feedback.
+Do not invent semantic metadata that is not present in context.
 ```
 
 中文交互时，最终 reply 仍由现有 language 规则控制。
@@ -497,11 +569,16 @@ Agent context / Agent 参考画像
 
 ### Task 5.3: 用户画像 API
 
-新增 JSON endpoint：
+新增 Web JSON endpoint：
 
 ```text
 GET /api/me/listening-profile
 ```
+
+实现位置建议：
+
+- 放在 `frontend` blueprint 侧，例如 `supysonic/frontend/user.py` 或独立前端模块。
+- 不要放进 Subsonic `/rest` API 路由，避免改变兼容 API 表面。
 
 返回：
 
@@ -558,8 +635,8 @@ tests/base/test_user_listening_profile.py
 
 ```text
 tests/frontend/test_mood_playlists.py
-tests/frontend/test_user_profile.py
-tests/frontend/test_recommendation_agent.py
+tests/frontend/test_user.py
+tests/frontend/test_recommendations.py
 ```
 
 覆盖：
@@ -577,7 +654,14 @@ tests/frontend/test_recommendation_agent.py
 
 ### Task 6.3: Daemon tests
 
-新增或更新 daemon/scheduler 相关测试，覆盖：
+更新现有 daemon/scheduler 相关测试，优先放在：
+
+```text
+tests/base/test_daemon_recommend_refresh.py
+tests/base/test_scheduler.py
+```
+
+覆盖：
 
 - `daily-mood-scene-playlists` job 注册。
 - 同一天只执行一次刷新。
@@ -592,14 +676,14 @@ python -m unittest tests.base.test_mood_scene_playlists
 python -m unittest tests.base.test_daily_mood_scene_playlists
 python -m unittest tests.base.test_user_listening_profile
 python -m unittest tests.frontend.test_mood_playlists
-python -m unittest tests.frontend.test_user_profile
-python -m unittest tests.frontend.test_recommendation_agent
+python -m unittest tests.frontend.test_user
+python -m unittest tests.frontend.test_recommendations
 ```
 
 如果 daemon 改动较多，追加：
 
 ```bash
-python -m unittest tests.base.test_daemon
+python -m unittest tests.base.test_daemon_recommend_refresh
 python -m unittest tests.base.test_scheduler
 ```
 
@@ -630,7 +714,9 @@ python -m unittest tests.base.test_scheduler
 - 同一天重复刷新只更新，不创建重复 Playlist。
 - 第二天能生成新的每日系统 Playlist。
 - 旧系统情绪歌单会按 retention 自动删除。
+- 系统情绪歌单默认不出现在普通 `/playlist` 和 `/rest/getPlaylists` 中。
 - 普通用户 Playlist 和用户保存副本不会被自动删除。
+- 用户保存副本会出现在普通 Playlist 列表中。
 - 情绪歌单每首歌有推荐原因。
 - 情绪歌单主结果只使用 high-quality LLM metadata。
 - local provider 和 low-confidence metadata 不污染歌单、画像和 Agent 判断。
@@ -643,13 +729,13 @@ python -m unittest tests.base.test_scheduler
 
 ## 10. Suggested Commit Order
 
-1. Add daily mood scene playlist service helpers.
-2. Add Playlist comment naming, create/update, cleanup, and save-copy logic.
-3. Add daemon config and scheduler job.
-4. Add `/mood-playlists` frontend page and refresh/save actions.
-5. Add listening profile display on user profile page.
+1. Add daily mood scene playlist service helpers, comment predicates, create/update, cleanup, save-copy logic, and base tests.
+2. Hide system mood playlists from ordinary playlist list/API while preserving saved copies.
+3. Add `/mood-playlists` frontend page, explicit route import, refresh/save actions, and frontend tests.
+4. Add daemon config and scheduler job with once-per-day retry-safe refresh/cleanup tests.
+5. Add listening profile display on user profile page and `/api/me/listening-profile`.
 6. Strengthen Recommendation Agent prompt and Agent profile summary UI.
-7. Add tests for service, frontend, daemon, and Agent/profile integration.
+7. Run targeted base/frontend/daemon tests, then widen only if the touched surface requires it.
 
 ---
 
@@ -667,6 +753,8 @@ Scope:
 - Refresh daily mood playlists automatically through a daemon scheduler job.
 - Automatically delete expired system mood playlists while preserving normal user
   playlists and saved copies.
+- Hide system mood playlists from ordinary /playlist and /rest/getPlaylists
+  results while keeping saved copies visible.
 - Add a /mood-playlists page with scene cards, reasons, refresh actions, open
   Playlist actions, and save-as-my-playlist behavior.
 - Display user listening profile on /user/me.

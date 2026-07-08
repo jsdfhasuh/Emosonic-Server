@@ -90,6 +90,7 @@ class UserListeningProfileTestCase(TestBase):
         calm = self._create_track("Calm")
         energetic = self._create_track("Energetic")
         local = self._create_track("Local")
+        low_confidence = self._create_track("Low Confidence")
         self._metadata(
             calm,
             mood=["calm"],
@@ -118,9 +119,20 @@ class UserListeningProfileTestCase(TestBase):
             provider="local",
             source="local",
         )
+        self._metadata(
+            low_confidence,
+            mood=["low-confidence"],
+            scene=["late night"],
+            tags=["ignored"],
+            energy=10,
+            confidence=0.2,
+            provider="llm",
+            source="llm",
+        )
         self._play(calm, 3, reference_time - timedelta(days=1))
         self._play(energetic, 1, reference_time - timedelta(days=10))
         self._play(local, 5, reference_time - timedelta(days=1))
+        self._play(low_confidence, 2, reference_time - timedelta(days=1))
 
         profile = build_user_listening_profile(
             self.user,
@@ -145,6 +157,10 @@ class UserListeningProfileTestCase(TestBase):
         self.assertEqual(profile["recent7Days"]["playCount"], 3)
         self.assertEqual(profile["recent7Days"]["topMoods"][0]["value"], "calm")
         self.assertEqual(profile["recent30Days"]["playCount"], 4)
+        self.assertNotIn(
+            "low-confidence",
+            [item["value"] for item in profile["topMoods"]],
+        )
 
     def test_recommendation_metadata_profile_reuses_listening_profile_counts(self):
         calm = self._create_track("Calm")

@@ -91,10 +91,139 @@ class DaemonRecommendRefreshTestCase(unittest.TestCase):
             config=daemon._Daemon__config,
         )
 
+    def test_refresh_mood_scene_playlists_runs_once_per_day(self):
+        daemon = self.createDaemon(
+            mood_scene_playlist_size=12,
+            mood_scene_playlist_retention_days=2,
+            mood_scene_playlists_active_users_only=False,
+        )
+
+        with patch("supysonic.daemon.server.open_connection", return_value=True), patch(
+            "supysonic.daemon.server.close_connection"
+        ), patch(
+            "supysonic.daemon.server.refresh_daily_mood_scene_playlists",
+            return_value={"created": 3, "updated": 2, "skipped": 1, "failed": 0},
+        ) as refresh_daily, patch(
+            "supysonic.daemon.server.cleanup_old_mood_scene_playlists",
+            return_value={"deleted": 4, "skipped": 0},
+        ) as cleanup_old, self.assertLogs(
+            "supysonic.daemon.server",
+            level="INFO",
+        ) as logs:
+            self.assertTrue(
+                daemon._Daemon__refresh_mood_scene_playlists_if_needed(
+                    current_day="2026-05-02"
+                )
+            )
+            self.assertFalse(
+                daemon._Daemon__refresh_mood_scene_playlists_if_needed(
+                    current_day="2026-05-02"
+                )
+            )
+            self.assertTrue(
+                daemon._Daemon__refresh_mood_scene_playlists_if_needed(
+                    current_day="2026-05-03"
+                )
+            )
+
+        self.assertEqual(refresh_daily.call_count, 2)
+        refresh_daily.assert_any_call(
+            limit=12,
+            day="2026-05-02",
+            active_users_only=False,
+        )
+        refresh_daily.assert_any_call(
+            limit=12,
+            day="2026-05-03",
+            active_users_only=False,
+        )
+        self.assertEqual(cleanup_old.call_count, 2)
+        cleanup_old.assert_any_call(
+            retention_days=2,
+            current_day="2026-05-02",
+        )
+        cleanup_old.assert_any_call(
+            retention_days=2,
+            current_day="2026-05-03",
+        )
+        completed_logs = "\n".join(logs.output)
+        self.assertIn("mood_scene_playlist_refresh_completed", completed_logs)
+        self.assertIn("created=3", completed_logs)
+        self.assertIn("updated=2", completed_logs)
+        self.assertIn("skipped=1", completed_logs)
+        self.assertIn("deleted=4", completed_logs)
+
+    def test_refresh_mood_scene_playlists_retries_same_day_after_failure(self):
+        daemon = self.createDaemon(mood_scene_playlist_size=8)
+
+        with patch("supysonic.daemon.server.open_connection", return_value=True), patch(
+            "supysonic.daemon.server.close_connection"
+        ), patch(
+            "supysonic.daemon.server.refresh_daily_mood_scene_playlists",
+            return_value={"created": 1, "updated": 0, "skipped": 0, "failed": 0},
+        ) as refresh_daily, patch(
+            "supysonic.daemon.server.cleanup_old_mood_scene_playlists",
+            side_effect=[RuntimeError("boom"), {"deleted": 0, "skipped": 0}],
+        ) as cleanup_old:
+            self.assertFalse(
+                daemon._Daemon__refresh_mood_scene_playlists_if_needed(
+                    current_day="2026-05-02"
+                )
+            )
+            self.assertTrue(
+                daemon._Daemon__refresh_mood_scene_playlists_if_needed(
+                    current_day="2026-05-02"
+                )
+            )
+
+        self.assertEqual(refresh_daily.call_count, 2)
+        self.assertEqual(cleanup_old.call_count, 2)
+
+    def test_refresh_mood_scene_playlists_retries_when_summary_has_failures(self):
+        daemon = self.createDaemon(mood_scene_playlist_size=8)
+
+        with patch("supysonic.daemon.server.open_connection", return_value=True), patch(
+            "supysonic.daemon.server.close_connection"
+        ), patch(
+            "supysonic.daemon.server.refresh_daily_mood_scene_playlists",
+            side_effect=[
+                {"created": 1, "updated": 0, "skipped": 0, "failed": 1},
+                {"created": 1, "updated": 0, "skipped": 0, "failed": 0},
+            ],
+        ) as refresh_daily, patch(
+            "supysonic.daemon.server.cleanup_old_mood_scene_playlists",
+            return_value={"deleted": 0, "skipped": 0},
+        ) as cleanup_old, self.assertLogs(
+            "supysonic.daemon.server",
+            level="WARNING",
+        ) as logs:
+            self.assertFalse(
+                daemon._Daemon__refresh_mood_scene_playlists_if_needed(
+                    current_day="2026-05-02"
+                )
+            )
+            self.assertTrue(
+                daemon._Daemon__refresh_mood_scene_playlists_if_needed(
+                    current_day="2026-05-02"
+                )
+            )
+
+        self.assertEqual(refresh_daily.call_count, 2)
+        cleanup_old.assert_called_once_with(
+            retention_days=1,
+            current_day="2026-05-02",
+        )
+        self.assertIn(
+            "mood_scene_playlist_refresh_incomplete",
+            "\n".join(logs.output),
+        )
+
     def test_configure_scheduler_registers_maintenance_and_recommend_jobs(self):
         daemon = self.createDaemon(
             recommend_daily_refresh=True,
             recommend_refresh_interval=120,
+            mood_scene_playlists_daily_refresh=True,
+            mood_scene_playlists_refresh_interval=240,
             review_task_maintenance=True,
             review_task_maintenance_interval=900,
             track_metadata_enrichment=False,
@@ -108,6 +237,7 @@ class DaemonRecommendRefreshTestCase(unittest.TestCase):
         first_call = scheduler.register.call_args_list[0]
         second_call = scheduler.register.call_args_list[1]
         third_call = scheduler.register.call_args_list[2]
+        fourth_call = scheduler.register.call_args_list[3]
 
         self.assertEqual(first_call.args[0], "review-task-maintenance")
         self.assertEqual(first_call.args[2], 900)
@@ -117,9 +247,13 @@ class DaemonRecommendRefreshTestCase(unittest.TestCase):
         self.assertEqual(second_call.args[2], 120)
         self.assertTrue(second_call.kwargs["enabled"])
 
-        self.assertEqual(third_call.args[0], "track-metadata-enrichment")
-        self.assertEqual(third_call.args[2], 180)
-        self.assertFalse(third_call.kwargs["enabled"])
+        self.assertEqual(third_call.args[0], "daily-mood-scene-playlists")
+        self.assertEqual(third_call.args[2], 240)
+        self.assertTrue(third_call.kwargs["enabled"])
+
+        self.assertEqual(fourth_call.args[0], "track-metadata-enrichment")
+        self.assertEqual(fourth_call.args[2], 180)
+        self.assertFalse(fourth_call.kwargs["enabled"])
 
     def test_track_metadata_enrichment_runs_local_provider(self):
         daemon = self.createDaemon(
