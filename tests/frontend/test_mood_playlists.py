@@ -177,6 +177,7 @@ class MoodPlaylistsFrontendTestCase(FrontendTestBase):
         )
         self.assertEqual(rv.status_code, 200)
         self.assertIsNotNone(saved)
+        self.assertEqual(saved.name, "2026-07-07 夜晚 情绪歌单（我的副本）")
         self.assertEqual(saved.get_tracks(), [track])
         self.assertIn("Saved Frontend", rv.data)
         self.assertFalse(saved.comment.startswith(MOOD_SCENE_PLAYLIST_COMMENT_PREFIX))

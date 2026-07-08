@@ -134,9 +134,18 @@ class PlaylistTestCase(ApiTestBase):
 
         self.assertEqual(len(child), 4)
         self.assertIsNotNone(
+            self._find(child, "./playlist[@name='2026-07-07 夜晚 情绪歌单']")
+        )
+        self.assertIsNone(
             self._find(child, "./playlist[@name=\"alice's 2026-07-07 night mood playlist\"]")
         )
         self.assertIsNotNone(self._find(child, "./playlist[@name='Saved mood copy']"))
+        rv, playlist = self._make_request(
+            "getPlaylist",
+            {"id": str(system.id)},
+            tag="playlist",
+        )
+        self.assertEqual(playlist.get("name"), "2026-07-07 夜晚 情绪歌单")
 
     def test_get_playlist(self):
         # missing param

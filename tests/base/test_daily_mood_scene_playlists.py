@@ -129,6 +129,8 @@ class DailyMoodScenePlaylistsTestCase(TestBase):
         self.assertEqual(created["status"], "created")
         self.assertEqual(updated["status"], "updated")
         self.assertEqual(next_day["status"], "created")
+        self.assertEqual(created["playlist"].name, "2026-07-07 夜晚 情绪歌单")
+        self.assertEqual(next_day["playlist"].name, "2026-07-08 夜晚 情绪歌单")
         self.assertEqual(created["playlist"].id, updated["playlist"].id)
         self.assertNotEqual(created["playlist"].id, next_day["playlist"].id)
         self.assertEqual(updated["playlist"].get_tracks(), [night])
@@ -236,6 +238,7 @@ class DailyMoodScenePlaylistsTestCase(TestBase):
 
         self.assertIsNotNone(saved)
         self.assertFalse(is_system_mood_scene_playlist(saved))
+        self.assertEqual(saved.name, "2026-07-07 夜晚 情绪歌单（我的副本）")
         self.assertEqual(saved.comment, "saved_mood_scene_playlist:night:2026-07-07")
         self.assertEqual(saved.get_tracks(), [first, second])
 

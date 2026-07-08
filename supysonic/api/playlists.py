@@ -23,6 +23,7 @@ from ..db import (
     random,
 )
 from ..logging_utils import format_log_event
+from ..mood_scene_playlist_service import get_system_mood_scene_playlist_display_name
 from ..recommend import (
     buildRecommendationReasonMap,
     getLatestRecommendedPlaylist,
@@ -40,6 +41,18 @@ from . import get_entity, api_routing
 from .exceptions import Forbidden, GenericError, MissingParameter
 
 logger = logging.getLogger(__name__)
+
+
+def _as_subsonic_playlist(playlist: object, user: object, tracks=None) -> dict:
+    info = playlist.as_subsonic_playlist(user, tracks=tracks)
+    mood_name = get_system_mood_scene_playlist_display_name(playlist)
+    if mood_name:
+        info["name"] = (
+            mood_name
+            if playlist.user.id == user.id
+            else f"[{playlist.user.name}] {mood_name}"
+        )
+    return info
 
 
 def _feedback_preference_log_counts(preferences: dict) -> dict:
@@ -359,7 +372,7 @@ def list_playlists():
             )
             .order_by(Playlist.name)
         )
-    temp = [p.as_subsonic_playlist(request.user) for p in query]
+    temp = [_as_subsonic_playlist(p, request.user) for p in query]
     return request.formatter(
         "playlists",
         {"playlist": temp},
@@ -401,7 +414,7 @@ def show_playlist():
         ]
         info["entry"] = entry
         return request.formatter("playlist", info)
-    info = res.as_subsonic_playlist(request.user)
+    info = _as_subsonic_playlist(res, request.user)
     info["entry"] = [
         t.as_subsonic_child(request.user, request.client) for t in res.get_tracks()
     ]

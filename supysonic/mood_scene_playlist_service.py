@@ -53,14 +53,27 @@ def non_system_mood_scene_playlist_where():
     )
 
 
-def get_daily_mood_scene_playlist_name(user, scene_key: str, day: str) -> str:
-    return f"{user.name}'s {day} {scene_key} mood playlist"
+def get_daily_mood_scene_playlist_name(user: object, scene_key: str, day: str) -> str:
+    return get_mood_scene_playlist_display_name(scene_key, day)
 
 
 def get_mood_scene_playlist_display_name(scene_key: str, day: str) -> str:
     scene = SCENE_PLAYLISTS.get(scene_key, {})
     label = scene.get("label") or scene_key
     return f"{day} {label} 情绪歌单"
+
+
+def get_saved_mood_scene_playlist_name(user: object, scene_key: str, day: str) -> str:
+    return f"{get_mood_scene_playlist_display_name(scene_key, day)}（我的副本）"
+
+
+def get_system_mood_scene_playlist_display_name(playlist: object) -> Optional[str]:
+    scene_key, day = parse_mood_scene_playlist_comment(
+        getattr(playlist, "comment", None)
+    )
+    if scene_key is None or day is None:
+        return None
+    return get_mood_scene_playlist_display_name(scene_key, day)
 
 
 def get_daily_mood_scene_playlist_for_user(user, scene_key: str, day: Optional[str] = None):
@@ -257,7 +270,7 @@ def save_mood_scene_playlist_copy_for_user(user, source_playlist):
 
     playlist = Playlist.create(
         user=user,
-        name=f"{user.name}'s saved {day} {scene_key} mood playlist",
+        name=get_saved_mood_scene_playlist_name(user, scene_key, day),
         comment=get_saved_mood_scene_playlist_comment(scene_key, day),
         public=False,
     )
