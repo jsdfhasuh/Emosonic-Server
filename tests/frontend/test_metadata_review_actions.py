@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import unittest
 
+from importlib import import_module
 from unittest.mock import patch
 
 from PIL import Image
@@ -26,6 +27,8 @@ from supysonic.tool import read_dict_from_json
 
 from .frontendtestbase import FrontendTestBase
 from ..testbase import TestConfig
+
+metadata_module = import_module("supysonic.frontend.metadata")
 
 
 class MetadataReviewActionsTestCase(FrontendTestBase):
@@ -422,7 +425,7 @@ class MetadataReviewActionsTestCase(FrontendTestBase):
         self.assertEqual(rv.json["status"], "error")
 
     def test_review_task_confirm_logs_success(self):
-        with patch("supysonic.frontend.metadata.DaemonClient", return_value=FakeDaemonClient(), create=True):
+        with patch.object(metadata_module, "DaemonClient", return_value=FakeDaemonClient()):
             rv = self.client.post(f"/metadata/review-tasks/{self.task.id}/confirm")
 
         self.assertEqual(rv.status_code, 200)
@@ -437,7 +440,7 @@ class MetadataReviewActionsTestCase(FrontendTestBase):
         self.assertIn(f"nfo_path={os.path.join(self.albumDir, 'album.nfo')}", log_content)
 
     def test_review_task_confirm_writes_album_nfo_before_confirming(self):
-        with patch("supysonic.frontend.metadata.DaemonClient", return_value=FakeDaemonClient(), create=True):
+        with patch.object(metadata_module, "DaemonClient", return_value=FakeDaemonClient()):
             rv = self.client.post(f"/metadata/review-tasks/{self.task.id}/confirm")
 
         self.assertEqual(rv.status_code, 200)
@@ -451,7 +454,7 @@ class MetadataReviewActionsTestCase(FrontendTestBase):
         self.assertEqual(writtenData["album"]["track"]["title"], "First Track")
 
     def test_review_task_confirm_keeps_task_pending_when_nfo_write_fails(self):
-        with patch("supysonic.frontend.metadata.DaemonClient", return_value=FailingDaemonClient(), create=True):
+        with patch.object(metadata_module, "DaemonClient", return_value=FailingDaemonClient()):
             rv = self.client.post(f"/metadata/review-tasks/{self.task.id}/confirm")
 
         self.assertEqual(rv.status_code, 500)
@@ -464,7 +467,7 @@ class MetadataReviewActionsTestCase(FrontendTestBase):
         self.assertIn('failure_reason="suppress failed"', log_content)
 
     def test_review_task_confirm_succeeds_when_daemon_is_unavailable(self):
-        with patch("supysonic.frontend.metadata.DaemonClient", return_value=UnavailableDaemonClient(), create=True):
+        with patch.object(metadata_module, "DaemonClient", return_value=UnavailableDaemonClient()):
             rv = self.client.post(f"/metadata/review-tasks/{self.task.id}/confirm")
 
         self.assertEqual(rv.status_code, 200)
@@ -486,7 +489,7 @@ class MetadataReviewActionsTestCase(FrontendTestBase):
             snapshot_json='{"artist_name": "Review Artist", "issues": ["missing_image"]}',
         )
 
-        with patch("supysonic.frontend.metadata.writeReviewAlbumNfo") as write_review_album_nfo:
+        with patch.object(metadata_module, "writeReviewAlbumNfo") as write_review_album_nfo:
             rv = self.client.post(f"/metadata/review-tasks/{artist_task.id}/confirm")
 
         self.assertEqual(rv.status_code, 200)
