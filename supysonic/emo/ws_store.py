@@ -24,6 +24,44 @@ def _strip_transient_playback_fields(payload):
         payload.pop("effectiveAtServerMs", None)
 
 
+def _payload_value_or_default(payload, key, default):
+    value = payload.get(key)
+    return default if value is None else value
+
+
+def serializePlaybackContextV2(playback_context):
+    if playback_context is None:
+        return None
+    payload = dict(playback_context)
+    payload["queueSongIds"] = list(payload.get("queueSongIds") or [])
+    logical_volume = payload.pop("logicalVolume", None)
+    stored_volume = payload.pop("volume", None)
+    if logical_volume is None:
+        logical_volume = stored_volume
+    if logical_volume is not None:
+        payload["logicalVolume"] = logical_volume
+    payload.pop("sessionId", None)
+    payload.pop("sourceClientId", None)
+    return payload
+
+
+def serializeDevicePlaybackStateV2(device_state):
+    if device_state is None:
+        return None
+    payload = dict(device_state)
+    client_id = (
+        payload.get("clientId")
+        or payload.get("ownerClientId")
+        or payload.get("sourceClientId")
+    )
+    if client_id is not None:
+        payload["clientId"] = client_id
+    payload.pop("sessionId", None)
+    payload.pop("sourceClientId", None)
+    payload.pop("ownerClientId", None)
+    return payload
+
+
 def getQueueState(session_id):
     open_connection(reuse=True)
     try:
@@ -286,7 +324,13 @@ def getPlaybackContextState(playback_context_id):
         close_connection()
 
 
-def savePlaybackContextState(playback_context_id, user_name, playback_context):
+def _writePlaybackContextState(
+    playback_context_id,
+    user_name,
+    playback_context,
+    create_missing=True,
+    update_existing=True,
+):
     payload = dict(playback_context)
     queue_song_ids = list(payload.get("queueSongIds") or [])
     queue_json = json.dumps(queue_song_ids, ensure_ascii=True)
@@ -299,6 +343,8 @@ def savePlaybackContextState(playback_context_id, user_name, playback_context):
             EmoPlaybackContext.playback_context_id == playback_context_id
         )
         if record is None:
+            if not create_missing:
+                return False
             EmoPlaybackContext.create(
                 playback_context_id=playback_context_id,
                 user_name=user_name,
@@ -310,14 +356,18 @@ def savePlaybackContextState(playback_context_id, user_name, playback_context):
                 state=payload.get("state") or "stopped",
                 position_ms=payload.get("positionMs") or 0,
                 volume=payload.get("volume"),
-                queue_revision=payload.get("queueRevision") or 1,
-                control_version=payload.get("controlVersion") or 1,
-                version=payload.get("version") or 1,
-                epoch=payload.get("epoch") or 1,
+                queue_revision=_payload_value_or_default(payload, "queueRevision", 1),
+                control_version=_payload_value_or_default(payload, "controlVersion", 1),
+                version=_payload_value_or_default(payload, "version", 1),
+                epoch=_payload_value_or_default(payload, "epoch", 1),
                 playback_json=json.dumps(payload, ensure_ascii=True),
             )
-            return
+            return True
 
+        if not update_existing:
+            return False
+        if record.user_name != user_name:
+            raise PermissionError("Playback context belongs to another user")
         record.user_name = user_name
         record.authority_client_id = payload.get("authorityClientId")
         record.origin_client_id = payload.get("originClientId")
@@ -327,13 +377,57 @@ def savePlaybackContextState(playback_context_id, user_name, playback_context):
         record.state = payload.get("state") or "stopped"
         record.position_ms = payload.get("positionMs") or 0
         record.volume = payload.get("volume")
-        record.queue_revision = payload.get("queueRevision") or 1
-        record.control_version = payload.get("controlVersion") or 1
-        record.version = payload.get("version") or 1
-        record.epoch = payload.get("epoch") or 1
+        record.queue_revision = _payload_value_or_default(payload, "queueRevision", 1)
+        record.control_version = _payload_value_or_default(payload, "controlVersion", 1)
+        record.version = _payload_value_or_default(payload, "version", 1)
+        record.epoch = _payload_value_or_default(payload, "epoch", 1)
         record.playback_json = json.dumps(payload, ensure_ascii=True)
         record.updated_at = now()
         record.save()
+        return True
+    finally:
+        close_connection()
+
+
+def savePlaybackContextState(playback_context_id, user_name, playback_context):
+    _writePlaybackContextState(
+        playback_context_id,
+        user_name,
+        playback_context,
+        create_missing=True,
+        update_existing=True,
+    )
+
+
+def createPlaybackContextState(playback_context_id, user_name, playback_context):
+    return _writePlaybackContextState(
+        playback_context_id,
+        user_name,
+        playback_context,
+        create_missing=True,
+        update_existing=False,
+    )
+
+
+def updatePlaybackContextState(playback_context_id, user_name, playback_context):
+    return _writePlaybackContextState(
+        playback_context_id,
+        user_name,
+        playback_context,
+        create_missing=False,
+        update_existing=True,
+    )
+
+
+def listUserPlaybackContexts(user_name):
+    open_connection(reuse=True)
+    try:
+        query = (
+            EmoPlaybackContext.select()
+            .where(EmoPlaybackContext.user_name == user_name)
+            .order_by(EmoPlaybackContext.updated_at.desc())
+        )
+        return [_playback_context_payload(record) for record in query]
     finally:
         close_connection()
 
@@ -385,6 +479,28 @@ def getDevicePlaybackStates(playback_context_id):
         for record in query:
             payloads.append(_device_playback_state_payload(record))
         return payloads
+    finally:
+        close_connection()
+
+
+def getPlaybackContextWithDeviceStates(playback_context_id):
+    open_connection(reuse=True)
+    try:
+        context_record = EmoPlaybackContext.get_or_none(
+            EmoPlaybackContext.playback_context_id == playback_context_id
+        )
+        if context_record is None:
+            return None
+        device_records = EmoDevicePlaybackState.select().where(
+            EmoDevicePlaybackState.playback_context_id == playback_context_id
+        )
+        return {
+            "playbackContext": _playback_context_payload(context_record),
+            "deviceStates": [
+                _device_playback_state_payload(record)
+                for record in device_records
+            ],
+        }
     finally:
         close_connection()
 
@@ -453,6 +569,48 @@ def saveDevicePlaybackState(
         close_connection()
 
 
+def deletePlaybackContext(playback_context_id):
+    open_connection(reuse=True)
+    try:
+        deleted = (
+            EmoPlaybackContext.delete()
+            .where(EmoPlaybackContext.playback_context_id == playback_context_id)
+            .execute()
+        )
+        if deleted:
+            (
+                EmoDevicePlaybackState.delete()
+                .where(
+                    EmoDevicePlaybackState.playback_context_id == playback_context_id
+                )
+                .execute()
+            )
+        return bool(deleted)
+    finally:
+        close_connection()
+
+
+def expirePlaybackContext(playback_context_id, state_name="expired"):
+    open_connection(reuse=True)
+    try:
+        record = EmoPlaybackContext.get_or_none(
+            EmoPlaybackContext.playback_context_id == playback_context_id
+        )
+        if record is None:
+            return None
+        payload = json.loads(record.playback_json) if record.playback_json else {}
+        record.state = state_name
+        record.version += 1
+        record.updated_at = now()
+        payload["state"] = state_name
+        payload["version"] = record.version
+        record.playback_json = json.dumps(payload, ensure_ascii=True)
+        record.save()
+        return _playback_context_payload(record)
+    finally:
+        close_connection()
+
+
 def getPlaybackHandoff(handoff_id):
     open_connection(reuse=True)
     try:
@@ -485,8 +643,8 @@ def getPlaybackHandoff(handoff_id):
         close_connection()
 
 
-def getPlaybackHandoffByRequest(user_name, request_id):
-    if not request_id:
+def getPlaybackHandoffByRequest(user_name, origin_client_id, request_id):
+    if not user_name or not origin_client_id or not request_id:
         return None
     open_connection(reuse=True)
     try:
@@ -494,6 +652,7 @@ def getPlaybackHandoffByRequest(user_name, request_id):
             EmoPlaybackHandoff.select()
             .where(
                 (EmoPlaybackHandoff.user_name == user_name)
+                & (EmoPlaybackHandoff.origin_client_id == origin_client_id)
                 & (EmoPlaybackHandoff.request_id == request_id)
             )
             .order_by(EmoPlaybackHandoff.created_at.desc())
@@ -521,6 +680,49 @@ def getPlaybackHandoffByRequest(user_name, request_id):
             "createdAt": record.created_at.timestamp(),
             "updatedAt": record.updated_at.timestamp(),
         }
+    finally:
+        close_connection()
+
+
+def getActivePlaybackHandoffs(playback_context_id):
+    if not playback_context_id:
+        return []
+    open_connection(reuse=True)
+    try:
+        query = (
+            EmoPlaybackHandoff.select()
+            .where(
+                (EmoPlaybackHandoff.playback_context_id == playback_context_id)
+                & EmoPlaybackHandoff.status.in_(("preparing", "ready", "committed"))
+            )
+            .order_by(EmoPlaybackHandoff.created_at.asc())
+        )
+        handoffs = []
+        for record in query:
+            payload = json.loads(record.snapshot_json) if record.snapshot_json else {}
+            handoffs.append(
+                {
+                    "handoffId": record.handoff_id,
+                    "requestId": record.request_id,
+                    "playbackContextId": record.playback_context_id,
+                    "userName": record.user_name,
+                    "sourceClientId": record.source_client_id,
+                    "targetClientId": record.target_client_id,
+                    "originClientId": record.origin_client_id,
+                    "status": record.status,
+                    "baseControlVersion": record.base_control_version,
+                    "controlVersion": payload.get("handoffControlVersion"),
+                    "prepareId": payload.get("prepareId"),
+                    "prepareExpiresAtMs": payload.get("prepareExpiresAtMs"),
+                    "completeExpiresAtMs": payload.get("completeExpiresAtMs"),
+                    "snapshot": payload,
+                    "errorCode": record.error_code,
+                    "errorMessage": record.error_message,
+                    "createdAt": record.created_at.timestamp(),
+                    "updatedAt": record.updated_at.timestamp(),
+                }
+            )
+        return handoffs
     finally:
         close_connection()
 

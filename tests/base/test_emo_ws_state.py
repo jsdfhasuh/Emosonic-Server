@@ -14,6 +14,7 @@ WebSocketState = MODULE.WebSocketState
 ClientSeqStaleError = MODULE.ClientSeqStaleError
 QueueRevisionMismatchError = MODULE.QueueRevisionMismatchError
 PlaybackAuthorityMismatchError = MODULE.PlaybackAuthorityMismatchError
+PlaybackContextConflictError = MODULE.PlaybackContextConflictError
 
 
 class EmoWebSocketStateTestCase(unittest.TestCase):
@@ -206,6 +207,89 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
         self.assertEqual(unchanged_context["positionMs"], 100)
         self.assertEqual(pc_feedback["positionMs"], 999)
 
+    def test_authority_device_volume_does_not_update_playback_context_volume(self):
+        self.state.update_playback_context_queue(
+            "playback:alice:main",
+            "root:phone",
+            ["song-1"],
+            source_client_id="phone-1",
+            user_name="alice",
+            now=10,
+        )
+
+        updated_context, authoritative = self.state.apply_authority_playback_update(
+            "playback:alice:main",
+            "root:phone",
+            "phone-1",
+            "alice",
+            {
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 100,
+                "volume": 65,
+            },
+            now=11,
+        )
+        device_state = self.state.record_device_playback_state(
+            "playback:alice:main",
+            "root:phone",
+            "phone-1",
+            "alice",
+            {
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 100,
+                "volume": 65,
+                "muted": True,
+                "outputDeviceId": "dac-1",
+                "audioDeviceName": "USB DAC",
+            },
+            is_authority=True,
+            now=11,
+        )
+
+        self.assertTrue(authoritative)
+        self.assertIsNone(updated_context["volume"])
+        self.assertNotIn("muted", updated_context)
+        self.assertNotIn("outputDeviceId", updated_context)
+        self.assertNotIn("audioDeviceName", updated_context)
+        self.assertEqual(device_state["volume"], 65)
+        self.assertTrue(device_state["muted"])
+        self.assertEqual(device_state["outputDeviceId"], "dac-1")
+        self.assertEqual(device_state["audioDeviceName"], "USB DAC")
+
+        logical_context, authoritative = self.state.apply_authority_playback_update(
+            "playback:alice:main",
+            "root:phone",
+            "phone-1",
+            "alice",
+            {
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 100,
+                "logicalVolume": 40,
+            },
+            now=12,
+        )
+
+        self.assertTrue(authoritative)
+        self.assertEqual(logical_context["volume"], 40)
+
+    def test_authority_playback_update_can_require_existing_context(self):
+        context, authoritative = self.state.apply_authority_playback_update(
+            "playback:alice:missing",
+            "root:phone",
+            "phone-1",
+            "alice",
+            {"state": "playing", "trackId": "song-1", "positionMs": 100},
+            create_if_missing=False,
+            now=11,
+        )
+
+        self.assertIsNone(context)
+        self.assertFalse(authoritative)
+        self.assertIsNone(self.state.get_playback_context("playback:alice:missing"))
+
     def test_transfer_playback_authority_keeps_playback_context_id(self):
         self.state.update_playback_context_queue(
             "playback:alice:main",
@@ -221,14 +305,22 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
             "phone-1",
             "pc-1",
             expected_control_version=1,
-            playback_state={"state": "playing", "trackId": "song-1", "positionMs": 200},
+            playback_state={
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 200,
+                "volume": 70,
+            },
+            origin_client_id="controller-1",
             now=11,
         )
 
         self.assertEqual(transferred["playbackContextId"], "playback:alice:main")
         self.assertEqual(transferred["authorityClientId"], "pc-1")
+        self.assertEqual(transferred["originClientId"], "controller-1")
         self.assertEqual(transferred["controlVersion"], 2)
         self.assertEqual(transferred["positionMs"], 200)
+        self.assertIsNone(transferred["volume"])
 
         with self.assertRaises(PlaybackAuthorityMismatchError):
             self.state.transfer_playback_authority(
@@ -266,12 +358,67 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
         self.assertEqual(alice_handoff["handoffId"], "handoff-alice")
         self.assertEqual(bob_handoff["handoffId"], "handoff-bob")
         self.assertEqual(
-            self.state.get_playback_handoff_by_request("alice", "request-1")["handoffId"],
+            self.state.get_playback_handoff_by_request(
+                "alice",
+                "alice-phone",
+                "request-1",
+            )["handoffId"],
             "handoff-alice",
         )
         self.assertEqual(
-            self.state.get_playback_handoff_by_request("bob", "request-1")["handoffId"],
+            self.state.get_playback_handoff_by_request(
+                "bob",
+                "bob-phone",
+                "request-1",
+            )["handoffId"],
             "handoff-bob",
+        )
+
+    def test_handoff_request_id_is_scoped_by_origin_client(self):
+        first_handoff = self.state.create_playback_handoff(
+            "handoff-controller-1",
+            "request-1",
+            "playback:alice:main",
+            "alice",
+            "alice-phone",
+            "alice-pc",
+            1,
+            2,
+            {},
+            origin_client_id="controller-1",
+            now=10,
+        )
+        second_handoff = self.state.create_playback_handoff(
+            "handoff-controller-2",
+            "request-1",
+            "playback:alice:other",
+            "alice",
+            "alice-tablet",
+            "alice-speaker",
+            1,
+            2,
+            {},
+            origin_client_id="controller-2",
+            now=11,
+        )
+
+        self.assertEqual(first_handoff["originClientId"], "controller-1")
+        self.assertEqual(second_handoff["originClientId"], "controller-2")
+        self.assertEqual(
+            self.state.get_playback_handoff_by_request(
+                "alice",
+                "controller-1",
+                "request-1",
+            )["handoffId"],
+            "handoff-controller-1",
+        )
+        self.assertEqual(
+            self.state.get_playback_handoff_by_request(
+                "alice",
+                "controller-2",
+                "request-1",
+            )["handoffId"],
+            "handoff-controller-2",
         )
 
     def test_queue_revision_conflict_is_independent_from_playback_version(self):
@@ -555,6 +702,144 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
         self.assertEqual(queue["queueRevision"], 2)
         self.assertEqual(queue["epoch"], 3)
 
+    def test_broadcast_playback_context_upsert_tracks_broadcast_state(self):
+        context = self.state.upsert_broadcast_playback_context(
+            "broadcast:alice:main",
+            "broadcast-1",
+            "alice",
+            "server",
+            "phone-1",
+            ["phone-1", "pc-1"],
+            ["song-1", "song-2"],
+            current_index=1,
+            position_ms=5000,
+            state_name="playing",
+            queue_revision=2,
+            control_version=3,
+            version=4,
+            epoch=5,
+            timeline_id="broadcast:broadcast-1",
+            now=10,
+        )
+
+        self.assertEqual(context["contextType"], "broadcast")
+        self.assertEqual(context["broadcastId"], "broadcast-1")
+        self.assertEqual(context["authorityClientId"], "server")
+        self.assertEqual(context["originClientId"], "phone-1")
+        self.assertEqual(context["participants"], ["phone-1", "pc-1"])
+        self.assertEqual(context["queueSongIds"], ["song-1", "song-2"])
+        self.assertEqual(context["currentIndex"], 1)
+        self.assertEqual(context["trackId"], "song-2")
+        self.assertEqual(context["positionMs"], 5000)
+        self.assertEqual(context["queueRevision"], 2)
+        self.assertEqual(context["controlVersion"], 3)
+        self.assertEqual(context["version"], 4)
+        self.assertEqual(context["epoch"], 5)
+
+        stopped = self.state.upsert_broadcast_playback_context(
+            "broadcast:alice:main",
+            "broadcast-1",
+            "alice",
+            "server",
+            "phone-1",
+            ["phone-1", "pc-1"],
+            ["song-1", "song-2"],
+            current_index=1,
+            position_ms=7000,
+            state_name="stopped",
+            queue_revision=2,
+            control_version=4,
+            version=5,
+            epoch=5,
+            timeline_id="broadcast:broadcast-1",
+            now=11,
+        )
+
+        self.assertEqual(stopped["state"], "stopped")
+        self.assertEqual(stopped["positionMs"], 7000)
+        self.assertEqual(stopped["controlVersion"], 4)
+        self.assertEqual(stopped["version"], 5)
+
+    def test_broadcast_playback_context_upsert_rejects_existing_normal_context(self):
+        self.state.create_playback_context(
+            "playback:alice:main",
+            "root:phone",
+            "alice",
+            "phone-1",
+            queue_song_ids=["song-1"],
+            now=10,
+        )
+
+        with self.assertRaises(PlaybackContextConflictError):
+            self.state.upsert_broadcast_playback_context(
+                "playback:alice:main",
+                "broadcast-1",
+                "alice",
+                "server",
+                "phone-1",
+                ["phone-1"],
+                ["song-1"],
+                now=11,
+            )
+
+    def test_restore_broadcast_playback_context_rebuilds_active_mappings(self):
+        broadcast = self.state.restore_broadcast_playback_context(
+            {
+                "playbackContextId": "broadcast:alice:main",
+                "contextType": "broadcast",
+                "broadcastId": "broadcast-1",
+                "userName": "alice",
+                "ownerClientId": "phone-1",
+                "authorityClientId": "server",
+                "originClientId": "phone-1",
+                "participants": ["phone-1", "pc-1"],
+                "queueSongIds": ["song-1"],
+                "currentIndex": 0,
+                "trackId": "song-1",
+                "positionMs": 500,
+                "state": "playing",
+                "queueRevision": 2,
+                "controlVersion": 3,
+                "version": 4,
+                "epoch": 5,
+                "serverUpdatedAtMs": 10000,
+            }
+        )
+
+        self.assertEqual(broadcast["broadcastId"], "broadcast-1")
+        self.assertEqual(broadcast["ownerClientId"], "phone-1")
+        self.assertTrue(self.state.is_broadcast_participant("broadcast-1", "pc-1"))
+        self.assertEqual(
+            self.state.get_active_broadcast_for_client("phone-1"),
+            "broadcast-1",
+        )
+
+    def test_create_prepare_rejects_duplicate_broadcast_context_reservation(self):
+        self.state.create_prepare(
+            "prepare-1",
+            "broadcast.start",
+            "broadcast:broadcast-1",
+            ["phone-1"],
+            ["phone-1"],
+            1,
+            {"playbackContextId": "broadcast:alice:main"},
+            1000,
+            2000,
+        )
+
+        with self.assertRaises(PlaybackContextConflictError):
+            self.state.create_prepare(
+                "prepare-2",
+                "broadcast.start",
+                "broadcast:broadcast-2",
+                ["phone-1"],
+                ["phone-1"],
+                1,
+                {"playbackContextId": "broadcast:alice:main"},
+                1100,
+                2100,
+            )
+
     def test_re_registering_same_client_id_keeps_latest_session_mapping(self):
         self.state.register_session("sid-1")
         self.state.authenticate_session("sid-1", "root")
@@ -603,3 +888,72 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
 
         self.state.unregister_session("sid-1")
         self.assertEqual(self.state.list_subscribers("root:bedroom", user_name="root"), [])
+
+    def test_playback_context_subscriptions_are_tracked_and_cleared(self):
+        self.state.register_session("sid-1")
+        self.state.authenticate_session("sid-1", "root")
+        self.state.subscribe_playback_context("sid-1", "playback:root:main")
+        self.state.subscribe_playback_context("sid-1", "playback:root:bedroom")
+
+        subscribers = self.state.list_playback_context_subscribers(
+            "playback:root:main",
+            user_name="root",
+        )
+        self.assertEqual(subscribers, ["sid-1"])
+
+        remaining = self.state.unsubscribe_playback_context("sid-1", "playback:root:main")
+        self.assertEqual(remaining, ["playback:root:bedroom"])
+        self.assertEqual(
+            self.state.list_playback_context_subscribers(
+                "playback:root:main",
+                user_name="root",
+            ),
+            [],
+        )
+
+        self.state.unregister_session("sid-1")
+        self.assertEqual(
+            self.state.list_playback_context_subscribers(
+                "playback:root:bedroom",
+                user_name="root",
+            ),
+            [],
+        )
+
+    def test_close_playback_context_updates_state_and_clears_subscriptions(self):
+        context, created = self.state.create_playback_context(
+            "playback:root:main",
+            "root:phone",
+            "root",
+            "phone-1",
+            queue_song_ids=["song-1"],
+            current_index=0,
+            position_ms=1000,
+            now=10,
+        )
+        self.assertTrue(created)
+        self.assertEqual(context["state"], "stopped")
+
+        self.state.register_session("sid-1")
+        self.state.authenticate_session("sid-1", "root")
+        self.state.subscribe_playback_context("sid-1", "playback:root:main")
+
+        closed = self.state.close_playback_context(
+            "playback:root:main",
+            updated_by_client_id="phone-1",
+            now=11,
+        )
+        cleared = self.state.clear_playback_context_subscriptions("playback:root:main")
+
+        self.assertEqual(closed["state"], "closed")
+        self.assertEqual(closed["originClientId"], "phone-1")
+        self.assertEqual(closed["controlVersion"], 1)
+        self.assertEqual(closed["version"], 1)
+        self.assertEqual(cleared, 1)
+        self.assertEqual(
+            self.state.list_playback_context_subscribers(
+                "playback:root:main",
+                user_name="root",
+            ),
+            [],
+        )
