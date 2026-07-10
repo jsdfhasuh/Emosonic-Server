@@ -5,6 +5,7 @@ import unittest
 
 from supysonic.db import release_database
 from supysonic.emo.ws import (
+  CAPABILITY_PLAYBACK_CONTEXT_V2,
   _build_message,
   _commit_prepare,
   _expire_handoff_complete,
@@ -16,7 +17,9 @@ from supysonic.emo.ws_store import (
   getLocalQueueState,
   getPlaybackContextState,
   getPlaybackState,
+  getQueueState,
   saveLocalQueueState,
+  saveQueueState,
 )
 from supysonic.emo.ws_state import get_state
 from supysonic.managers.user import UserManager
@@ -121,19 +124,24 @@ class EmoWebSocketTestCase(unittest.TestCase):
     auth_messages = client.get_received("/emo")
     self.assertTrue(any(item["name"] == "message" for item in auth_messages))
 
+    register_payload = {
+      "clientId": client_id,
+      "deviceName": client_id,
+      "roles": roles,
+      "capabilities": capabilities or {},
+    }
+    if register_payload["capabilities"].get(CAPABILITY_PLAYBACK_CONTEXT_V2) is True:
+      register_payload["deviceSessionId"] = session_id
+    else:
+      register_payload["sessionId"] = session_id
+
     client.emit(
       "message",
       {
         "type": "device",
         "action": "device.register",
         "requestId": f"register-{client_id}",
-        "payload": {
-          "clientId": client_id,
-          "deviceName": client_id,
-          "roles": roles,
-          "sessionId": session_id,
-          "capabilities": capabilities or {},
-        },
+        "payload": register_payload,
       },
       namespace="/emo",
     )
@@ -229,6 +237,35 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     return self.get_ack(self.get_messages(client), request_id)
 
+  def create_playback_context(
+    self,
+    client,
+    request_id,
+    playback_context_id="playback:alice:main",
+    device_session_id="root:phone",
+    queue_song_ids=None,
+    current_index=0,
+    position_ms=0,
+  ):
+    payload = {
+      "playbackContextId": playback_context_id,
+      "deviceSessionId": device_session_id,
+      "queueSongIds": queue_song_ids or ["song-1"],
+      "currentIndex": current_index,
+      "positionMs": position_ms,
+    }
+    client.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "playback.context.create",
+        "requestId": request_id,
+        "payload": payload,
+      },
+      namespace="/emo",
+    )
+    return self.get_ack(self.get_messages(client), request_id)
+
   def test_build_message_stamps_server_time_without_mutating_payload(self):
     payload = {"serverUpdatedAtMs": 1000, "positionMs": 10}
 
@@ -260,6 +297,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     device_list = next(message for message in messages if message["action"] == "device.list")
     device = next(device for device in device_list["payload"]["devices"] if device["clientId"] == "player-1")
     self.assertEqual(device["alias"], alias)
+    self.assertEqual(device["sessionId"], "sess-main")
 
   def test_device_register_accepts_device_session_id(self):
     client = self.connect_authenticated_client("alice", "Alic3", "auth-player-1")
@@ -279,6 +317,125 @@ class EmoWebSocketTestCase(unittest.TestCase):
     registered = ack["payload"]["client"]
     self.assertEqual(registered["deviceSessionId"], "root:pc")
     self.assertEqual(registered["sessionId"], "root:pc")
+
+  def test_v2_device_register_requires_device_session_id(self):
+    client = self.connect_authenticated_client("alice", "Alic3", "auth-player-v2")
+
+    messages = self.register_device(
+      client,
+      "register-player-v2",
+      {
+        "clientId": "player-v2",
+        "deviceName": "V2 Player",
+        "roles": ["player"],
+        "capabilities": {CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+      },
+    )
+
+    error = self.get_error(messages, "register-player-v2")
+    self.assertEqual(error["payload"]["code"], "bad_request")
+
+  def test_v2_device_register_rejects_session_id(self):
+    client = self.connect_authenticated_client("alice", "Alic3", "auth-player-v2")
+
+    messages = self.register_device(
+      client,
+      "register-player-v2",
+      {
+        "clientId": "player-v2",
+        "deviceName": "V2 Player",
+        "roles": ["player"],
+        "deviceSessionId": "device:player-v2",
+        "sessionId": "legacy-room",
+        "capabilities": {CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+      },
+    )
+
+    error = self.get_error(messages, "register-player-v2")
+    self.assertEqual(error["payload"]["code"], "bad_request")
+
+  def test_v2_device_register_does_not_return_session_id(self):
+    client = self.connect_authenticated_client("alice", "Alic3", "auth-player-v2")
+
+    messages = self.register_device(
+      client,
+      "register-player-v2",
+      {
+        "clientId": "player-v2",
+        "deviceName": "V2 Player",
+        "roles": ["player"],
+        "deviceSessionId": "device:player-v2",
+        "capabilities": {CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+      },
+    )
+
+    ack = self.get_ack(messages, "register-player-v2")
+    registered = ack["payload"]["client"]
+    self.assertEqual(registered["deviceSessionId"], "device:player-v2")
+    self.assertNotIn("sessionId", registered)
+
+  def test_v2_device_list_omits_session_id_aliases(self):
+    legacy = self.connect_device("alice", "Alic3", "legacy-player-1", "legacy-room", ["player"])
+    v2 = self.connect_device(
+      "alice",
+      "Alic3",
+      "v2-player-1",
+      "device:v2-player-1",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(legacy)
+    self.get_messages(v2)
+
+    v2.emit(
+      "message",
+      {
+        "type": "device",
+        "action": "device.list",
+        "requestId": "v2-device-list-1",
+        "payload": {},
+      },
+      namespace="/emo",
+    )
+
+    device_list = next(message for message in self.get_messages(v2) if message["action"] == "device.list")
+    self.assertEqual(
+      {device["clientId"] for device in device_list["payload"]["devices"]},
+      {"legacy-player-1", "v2-player-1"},
+    )
+    for device in device_list["payload"]["devices"]:
+      self.assertNotIn("sessionId", device)
+      self.assertIn("deviceSessionId", device)
+
+  def test_v2_device_list_broadcast_omits_session_id_aliases(self):
+    v2 = self.connect_device(
+      "alice",
+      "Alic3",
+      "v2-player-1",
+      "device:v2-player-1",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(v2)
+    legacy = self.connect_authenticated_client("alice", "Alic3", "auth-legacy-player-1")
+
+    self.register_device(
+      legacy,
+      "register-legacy-player-1",
+      {
+        "clientId": "legacy-player-1",
+        "deviceName": "Legacy Player",
+        "roles": ["player"],
+        "sessionId": "legacy-room",
+      },
+    )
+
+    device_list = next(message for message in self.get_messages(v2) if message["action"] == "device.list")
+    legacy_device = next(
+      device for device in device_list["payload"]["devices"] if device["clientId"] == "legacy-player-1"
+    )
+    self.assertEqual(legacy_device["deviceSessionId"], "legacy-room")
+    self.assertNotIn("sessionId", legacy_device)
 
   def test_device_register_alias_strips_whitespace(self):
     client = self.connect_authenticated_client("alice", "Alic3", "auth-player-1")
@@ -1972,6 +2129,1112 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertEqual(queue["timelineId"], "session:sess-1:client:player-1")
     self.assertEqual(get_state().get_queue("sess-1")["sourceClientId"], "player-1")
 
+  def test_v2_playback_context_create_sets_current_client_as_authority(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+
+    phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "playback.context.create",
+        "requestId": "context-create-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:phone",
+          "queueSongIds": ["song-1"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+
+    ack = self.get_ack(self.get_messages(phone), "context-create-1")
+    context = ack["payload"]["playbackContext"]
+    self.assertTrue(ack["payload"]["created"])
+    self.assertEqual(context["playbackContextId"], "playback:alice:main")
+    self.assertEqual(context["authorityClientId"], "phone-1")
+    self.assertNotIn("sessionId", context)
+    self.assertNotIn("sourceClientId", context)
+    self.assertIsNone(getQueueState("playback:alice:main"))
+    persisted_context = getPlaybackContextState("playback:alice:main")
+    for counter_name in ("queueRevision", "controlVersion", "version", "epoch"):
+      self.assertEqual(persisted_context[counter_name], context[counter_name])
+
+  def test_v2_playback_context_queue_payload_rejects_invalid_values(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+
+    phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "playback.context.create",
+        "requestId": "context-create-invalid-queue-1",
+        "payload": {
+          "playbackContextId": "playback:alice:invalid",
+          "deviceSessionId": "root:phone",
+          "queueSongIds": "",
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    invalid_queue = self.get_error(
+      self.get_messages(phone),
+      "context-create-invalid-queue-1",
+    )
+    self.assertEqual(invalid_queue["payload"]["code"], "bad_request")
+    self.assertIsNone(getPlaybackContextState("playback:alice:invalid"))
+
+    self.create_playback_context(phone, "context-create-valid-1")
+    phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.context.sync",
+        "requestId": "context-sync-negative-position-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:phone",
+          "queueSongIds": ["song-1"],
+          "currentIndex": 0,
+          "positionMs": -1,
+        },
+      },
+      namespace="/emo",
+    )
+    negative_position = self.get_error(
+      self.get_messages(phone),
+      "context-sync-negative-position-1",
+    )
+    self.assertEqual(negative_position["payload"]["code"], "bad_request")
+    self.assertEqual(getPlaybackContextState("playback:alice:main")["positionMs"], 0)
+
+  def test_v2_playback_update_rejects_invalid_shared_state(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+    self.create_playback_context(phone, "context-create-1")
+
+    invalid_payloads = (
+      ("invalid-queue", {"queueSongIds": "bad", "currentIndex": 0}),
+      ("invalid-index", {"queueSongIds": ["song-1"], "currentIndex": True}),
+      ("invalid-position", {"positionMs": -1}),
+    )
+    for suffix, invalid_fields in invalid_payloads:
+      payload = {
+        "playbackContextId": "playback:alice:main",
+        "deviceSessionId": "root:phone",
+        "state": "playing",
+        "trackId": "song-1",
+        "positionMs": 0,
+      }
+      payload.update(invalid_fields)
+      request_id = f"playback-update-{suffix}-1"
+      phone.emit(
+        "message",
+        {
+          "type": "event",
+          "action": "playback.update",
+          "requestId": request_id,
+          "payload": payload,
+        },
+        namespace="/emo",
+      )
+      error = self.get_error(self.get_messages(phone), request_id)
+      self.assertEqual(error["payload"]["code"], "bad_request")
+
+    persisted = getPlaybackContextState("playback:alice:main")
+    self.assertEqual(persisted["queueSongIds"], ["song-1"])
+    self.assertEqual(persisted["currentIndex"], 0)
+    self.assertEqual(persisted["positionMs"], 0)
+    self.assertEqual(persisted["trackId"], "song-1")
+
+  def test_v2_playback_context_create_restores_existing_persisted_context(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+
+    first_ack = self.create_playback_context(
+      phone,
+      "context-create-1",
+      queue_song_ids=["song-1", "song-2"],
+      current_index=1,
+      position_ms=1200,
+    )
+    persisted_context = getPlaybackContextState("playback:alice:main")
+    get_state()._playback_contexts.clear()
+
+    second_ack = self.create_playback_context(
+      phone,
+      "context-create-2",
+      queue_song_ids=["song-1"],
+      current_index=0,
+      position_ms=0,
+    )
+    restored_context = second_ack["payload"]["playbackContext"]
+
+    self.assertTrue(first_ack["payload"]["created"])
+    self.assertFalse(second_ack["payload"]["created"])
+    self.assertEqual(restored_context["queueSongIds"], ["song-1", "song-2"])
+    self.assertEqual(restored_context["currentIndex"], 1)
+    self.assertEqual(restored_context["positionMs"], 1200)
+    for counter_name in ("queueRevision", "controlVersion", "version", "epoch"):
+      self.assertEqual(restored_context[counter_name], persisted_context[counter_name])
+
+  def test_v2_playback_context_status_uses_v2_serializer_without_session_id(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+
+    phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "playback.context.create",
+        "requestId": "context-create-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:phone",
+          "queueSongIds": ["song-1"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(phone)
+
+    phone.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "context-playback-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:phone",
+          "state": "playing",
+          "trackId": "song-1",
+          "positionMs": 500,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(phone)
+
+    phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "playback.context.status",
+        "requestId": "context-status-1",
+        "payload": {"playbackContextId": "playback:alice:main"},
+      },
+      namespace="/emo",
+    )
+
+    ack = self.get_ack(self.get_messages(phone), "context-status-1")
+    context = ack["payload"]["playbackContext"]
+    device_state = ack["payload"]["deviceStates"][0]
+    self.assertEqual(context["playbackContextId"], "playback:alice:main")
+    self.assertNotIn("sessionId", context)
+    self.assertNotIn("sourceClientId", context)
+    self.assertEqual(device_state["clientId"], "phone-1")
+    self.assertEqual(device_state["deviceSessionId"], "root:phone")
+    self.assertNotIn("sessionId", device_state)
+    self.assertNotIn("sourceClientId", device_state)
+
+  def test_v2_playback_context_subscribe_pushes_snapshot(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    observer = self.connect_device(
+      "alice",
+      "Alic3",
+      "observer-1",
+      "root:observer",
+      ["controller"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+    self.get_messages(observer)
+    self.create_playback_context(phone, "context-create-1")
+
+    observer.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "playback.context.subscribe",
+        "requestId": "context-subscribe-1",
+        "payload": {"playbackContextId": "playback:alice:main"},
+      },
+      namespace="/emo",
+    )
+
+    messages = self.get_messages(observer)
+    ack = self.get_ack(messages, "context-subscribe-1")
+    snapshot = next(
+      message for message in messages if message["action"] == "playback.context.status"
+    )
+    self.assertEqual(ack["payload"]["subscriptions"], ["playback:alice:main"])
+    self.assertEqual(
+      snapshot["payload"]["playbackContext"]["playbackContextId"],
+      "playback:alice:main",
+    )
+    self.assertNotIn("sessionId", snapshot["payload"]["playbackContext"])
+
+  def test_v2_playback_context_subscriber_receives_queue_context_sync(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    observer = self.connect_device(
+      "alice",
+      "Alic3",
+      "observer-1",
+      "root:observer",
+      ["controller"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    bystander = self.connect_device(
+      "alice",
+      "Alic3",
+      "bystander-1",
+      "root:bystander",
+      ["controller"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+    self.get_messages(observer)
+    self.get_messages(bystander)
+    self.create_playback_context(phone, "context-create-1")
+    self.get_messages(observer)
+    self.get_messages(bystander)
+
+    observer.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "playback.context.subscribe",
+        "requestId": "context-subscribe-1",
+        "payload": {"playbackContextId": "playback:alice:main"},
+      },
+      namespace="/emo",
+    )
+    self.get_messages(observer)
+
+    phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.context.sync",
+        "requestId": "queue-context-sync-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:phone",
+          "queueSongIds": ["song-1", "song-2"],
+          "currentIndex": 1,
+          "positionMs": 250,
+          "baseQueueRevision": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(phone)
+    observer_messages = self.get_messages(observer)
+    bystander_messages = self.get_messages(bystander)
+
+    queue_update = next(
+      message for message in observer_messages if message["action"] == "queue.context.sync"
+    )
+    self.assertEqual(queue_update["payload"]["currentIndex"], 1)
+    self.assertNotIn("sessionId", queue_update["payload"])
+    self.assertFalse(
+      any(message["action"] == "queue.context.sync" for message in bystander_messages)
+    )
+
+  def test_v2_playback_context_unsubscribe_stops_queue_updates(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    observer = self.connect_device(
+      "alice",
+      "Alic3",
+      "observer-1",
+      "root:observer",
+      ["controller"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+    self.get_messages(observer)
+    self.create_playback_context(phone, "context-create-1")
+    self.get_messages(observer)
+
+    observer.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "playback.context.subscribe",
+        "requestId": "context-subscribe-1",
+        "payload": {"playbackContextId": "playback:alice:main"},
+      },
+      namespace="/emo",
+    )
+    self.get_messages(observer)
+    observer.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "playback.context.unsubscribe",
+        "requestId": "context-unsubscribe-1",
+        "payload": {"playbackContextId": "playback:alice:main"},
+      },
+      namespace="/emo",
+    )
+    unsubscribe_ack = self.get_ack(self.get_messages(observer), "context-unsubscribe-1")
+    self.assertEqual(unsubscribe_ack["payload"]["subscriptions"], [])
+
+    phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.context.sync",
+        "requestId": "queue-context-sync-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:phone",
+          "queueSongIds": ["song-1", "song-2"],
+          "currentIndex": 1,
+          "positionMs": 250,
+          "baseQueueRevision": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(phone)
+    observer_messages = self.get_messages(observer)
+    self.assertFalse(
+      any(message["action"] == "queue.context.sync" for message in observer_messages)
+    )
+
+  def test_v2_playback_context_close_closes_context_and_clears_subscribers(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    observer = self.connect_device(
+      "alice",
+      "Alic3",
+      "observer-1",
+      "root:observer",
+      ["controller"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+    self.get_messages(observer)
+    self.create_playback_context(phone, "context-create-1")
+    self.get_messages(observer)
+
+    observer.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "playback.context.subscribe",
+        "requestId": "context-subscribe-1",
+        "payload": {"playbackContextId": "playback:alice:main"},
+      },
+      namespace="/emo",
+    )
+    self.get_messages(observer)
+
+    phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "playback.context.close",
+        "requestId": "context-close-1",
+        "payload": {"playbackContextId": "playback:alice:main"},
+      },
+      namespace="/emo",
+    )
+
+    close_ack = self.get_ack(self.get_messages(phone), "context-close-1")
+    observer_messages = self.get_messages(observer)
+    update = next(message for message in observer_messages if message["action"] == "playback.update")
+    runtime_context = get_state().get_playback_context("playback:alice:main")
+    persisted_context = getPlaybackContextState("playback:alice:main")
+
+    self.assertTrue(close_ack["payload"]["closed"])
+    self.assertEqual(close_ack["payload"]["playbackContext"]["state"], "closed")
+    self.assertNotIn("sessionId", close_ack["payload"]["playbackContext"])
+    self.assertEqual(update["payload"]["state"], "closed")
+    self.assertNotIn("sessionId", update["payload"])
+    self.assertEqual(runtime_context["state"], "closed")
+    self.assertEqual(persisted_context["state"], "closed")
+    self.assertEqual(
+      get_state().list_playback_context_subscribers(
+        "playback:alice:main",
+        user_name="alice",
+      ),
+      [],
+    )
+
+  def test_v2_player_pause_controls_context_authority(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    controller = self.connect_device(
+      "alice",
+      "Alic3",
+      "controller-1",
+      "root:controller",
+      ["controller"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+    self.get_messages(controller)
+    self.create_playback_context(phone, "context-create-1")
+    self.get_messages(phone)
+    self.get_messages(controller)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "player.pause",
+        "requestId": "v2-pause-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "baseControlVersion": 0,
+          "positionMs": 1200,
+        },
+      },
+      namespace="/emo",
+    )
+
+    ack = self.get_ack(self.get_messages(controller), "v2-pause-1")
+    phone_messages = self.get_messages(phone)
+    command = next(message for message in phone_messages if message["action"] == "player.pause")
+    context = get_state().get_playback_context("playback:alice:main")
+    self.assertTrue(ack["payload"]["updated"])
+    self.assertEqual(ack["payload"]["authorityClientId"], "phone-1")
+    self.assertEqual(ack["payload"]["playbackContext"]["state"], "paused")
+    self.assertNotIn("sessionId", ack["payload"]["playbackContext"])
+    self.assertEqual(command["targetClientId"], "phone-1")
+    self.assertEqual(command["payload"]["playbackContextId"], "playback:alice:main")
+    self.assertNotIn("sessionId", command["payload"])
+    self.assertEqual(context["state"], "paused")
+    self.assertEqual(context["positionMs"], 1200)
+    self.assertIsNone(getPlaybackState("root:phone", "phone-1"))
+
+  def test_v2_player_seek_updates_context_control_version(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    controller = self.connect_device(
+      "alice",
+      "Alic3",
+      "controller-1",
+      "root:controller",
+      ["controller"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+    self.get_messages(controller)
+    self.create_playback_context(phone, "context-create-1")
+    self.get_messages(phone)
+    self.get_messages(controller)
+
+    phone.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "phone-playback-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:phone",
+          "state": "playing",
+          "trackId": "song-1",
+          "positionMs": 500,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(phone)
+    context = get_state().get_playback_context("playback:alice:main")
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "player.seek",
+        "requestId": "v2-seek-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "baseControlVersion": context["controlVersion"],
+          "positionMs": 4200,
+        },
+      },
+      namespace="/emo",
+    )
+
+    ack = self.get_ack(self.get_messages(controller), "v2-seek-1")
+    phone_messages = self.get_messages(phone)
+    command = next(message for message in phone_messages if message["action"] == "player.seek")
+    updated = get_state().get_playback_context("playback:alice:main")
+    self.assertEqual(ack["payload"]["playbackContext"]["positionMs"], 4200)
+    self.assertEqual(
+      ack["payload"]["playbackContext"]["controlVersion"],
+      context["controlVersion"] + 1,
+    )
+    self.assertEqual(command["targetClientId"], "phone-1")
+    self.assertEqual(command["payload"]["positionMs"], 4200)
+    self.assertNotIn("sessionId", command["payload"])
+    self.assertEqual(updated["state"], "playing")
+    self.assertEqual(updated["positionMs"], 4200)
+    self.assertIsNone(getPlaybackState("root:phone", "phone-1"))
+
+  def test_v2_player_play_routes_to_context_authority(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    controller = self.connect_device(
+      "alice",
+      "Alic3",
+      "controller-1",
+      "root:controller",
+      ["controller"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+    self.get_messages(controller)
+    self.create_playback_context(phone, "context-create-1")
+    self.get_messages(phone)
+    self.get_messages(controller)
+
+    phone.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "phone-paused-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:phone",
+          "state": "paused",
+          "trackId": "song-1",
+          "positionMs": 500,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(phone)
+    context = get_state().get_playback_context("playback:alice:main")
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "player.play",
+        "requestId": "v2-play-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "baseControlVersion": context["controlVersion"],
+        },
+      },
+      namespace="/emo",
+    )
+
+    ack = self.get_ack(self.get_messages(controller), "v2-play-1")
+    phone_messages = self.get_messages(phone)
+    command = next(message for message in phone_messages if message["action"] == "player.play")
+    updated = get_state().get_playback_context("playback:alice:main")
+    self.assertEqual(command["targetClientId"], "phone-1")
+    self.assertEqual(command["payload"]["queueIndex"], 0)
+    self.assertEqual(command["payload"]["trackId"], "song-1")
+    self.assertEqual(command["payload"]["positionMs"], 500)
+    self.assertNotIn("sessionId", command["payload"])
+    self.assertEqual(ack["payload"]["playbackContext"]["state"], "playing")
+    self.assertEqual(ack["payload"]["playbackContext"]["positionMs"], 500)
+    self.assertEqual(
+      ack["payload"]["playbackContext"]["controlVersion"],
+      context["controlVersion"] + 1,
+    )
+    self.assertEqual(updated["state"], "playing")
+    self.assertEqual(updated["positionMs"], 500)
+    self.assertIsNone(getPlaybackState("root:phone", "phone-1"))
+
+  def test_v2_player_next_uses_context_queue(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    controller = self.connect_device(
+      "alice",
+      "Alic3",
+      "controller-1",
+      "root:controller",
+      ["controller"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+    self.get_messages(controller)
+    self.create_playback_context(
+      phone,
+      "context-create-1",
+      queue_song_ids=["song-1", "song-2", "song-3"],
+    )
+    self.get_messages(phone)
+    self.get_messages(controller)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "player.next",
+        "requestId": "v2-next-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "baseControlVersion": 0,
+        },
+      },
+      namespace="/emo",
+    )
+
+    ack = self.get_ack(self.get_messages(controller), "v2-next-1")
+    phone_messages = self.get_messages(phone)
+    command = next(message for message in phone_messages if message["action"] == "player.next")
+    context = get_state().get_playback_context("playback:alice:main")
+    self.assertEqual(command["targetClientId"], "phone-1")
+    self.assertEqual(command["payload"]["queueIndex"], 1)
+    self.assertEqual(command["payload"]["trackId"], "song-2")
+    self.assertEqual(command["payload"]["positionMs"], 0)
+    self.assertNotIn("sessionId", command["payload"])
+    self.assertEqual(ack["payload"]["playbackContext"]["controlVersion"], 1)
+    self.assertEqual(ack["payload"]["playbackContext"]["currentIndex"], 1)
+    self.assertEqual(ack["payload"]["playbackContext"]["trackId"], "song-2")
+    self.assertEqual(ack["payload"]["playbackContext"]["state"], "playing")
+    self.assertEqual(context["currentIndex"], 1)
+    self.assertEqual(context["trackId"], "song-2")
+    self.assertIsNone(getPlaybackState("root:phone", "phone-1"))
+
+  def test_v2_rapid_player_next_advances_from_optimistic_context(self):
+    capabilities = {CAPABILITY_PLAYBACK_CONTEXT_V2: True}
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities=capabilities,
+    )
+    controller = self.connect_device(
+      "alice",
+      "Alic3",
+      "controller-1",
+      "root:controller",
+      ["controller"],
+      capabilities=capabilities,
+    )
+    self.get_messages(phone)
+    self.get_messages(controller)
+    self.create_playback_context(
+      phone,
+      "context-create-1",
+      queue_song_ids=["song-1", "song-2", "song-3"],
+    )
+    self.get_messages(phone)
+    self.get_messages(controller)
+
+    for request_id, base_control_version in (("v2-next-1", 0), ("v2-next-2", 1)):
+      controller.emit(
+        "message",
+        {
+          "type": "command",
+          "action": "player.next",
+          "requestId": request_id,
+          "payload": {
+            "playbackContextId": "playback:alice:main",
+            "baseControlVersion": base_control_version,
+          },
+        },
+        namespace="/emo",
+      )
+      self.get_ack(self.get_messages(controller), request_id)
+
+    commands = [
+      message
+      for message in self.get_messages(phone)
+      if message["action"] == "player.next"
+    ]
+    context = get_state().get_playback_context("playback:alice:main")
+    self.assertEqual(
+      [message["payload"]["queueIndex"] for message in commands],
+      [1, 2],
+    )
+    self.assertEqual(context["currentIndex"], 2)
+    self.assertEqual(context["trackId"], "song-3")
+    self.assertEqual(context["controlVersion"], 2)
+
+  def test_v2_player_prev_uses_context_queue(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    controller = self.connect_device(
+      "alice",
+      "Alic3",
+      "controller-1",
+      "root:controller",
+      ["controller"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+    self.get_messages(controller)
+    self.create_playback_context(
+      phone,
+      "context-create-1",
+      queue_song_ids=["song-1", "song-2", "song-3"],
+      current_index=1,
+    )
+    self.get_messages(phone)
+    self.get_messages(controller)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "player.prev",
+        "requestId": "v2-prev-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "baseControlVersion": 0,
+        },
+      },
+      namespace="/emo",
+    )
+
+    ack = self.get_ack(self.get_messages(controller), "v2-prev-1")
+    phone_messages = self.get_messages(phone)
+    command = next(message for message in phone_messages if message["action"] == "player.prev")
+    context = get_state().get_playback_context("playback:alice:main")
+    self.assertEqual(command["targetClientId"], "phone-1")
+    self.assertEqual(command["payload"]["queueIndex"], 0)
+    self.assertEqual(command["payload"]["trackId"], "song-1")
+    self.assertEqual(command["payload"]["positionMs"], 0)
+    self.assertNotIn("sessionId", command["payload"])
+    self.assertEqual(ack["payload"]["playbackContext"]["controlVersion"], 1)
+    self.assertEqual(ack["payload"]["playbackContext"]["currentIndex"], 0)
+    self.assertEqual(ack["payload"]["playbackContext"]["trackId"], "song-1")
+    self.assertEqual(ack["payload"]["playbackContext"]["state"], "playing")
+    self.assertEqual(context["currentIndex"], 0)
+    self.assertEqual(context["trackId"], "song-1")
+    self.assertIsNone(getPlaybackState("root:phone", "phone-1"))
+
+  def test_v2_queue_play_item_uses_context_queue(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    controller = self.connect_device(
+      "alice",
+      "Alic3",
+      "controller-1",
+      "root:controller",
+      ["controller"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+    self.get_messages(controller)
+    self.create_playback_context(
+      phone,
+      "context-create-1",
+      queue_song_ids=["song-1", "song-2"],
+    )
+    self.get_messages(phone)
+    self.get_messages(controller)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "queue.playItem",
+        "requestId": "v2-play-item-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "baseControlVersion": 0,
+          "queueIndex": 1,
+          "positionMs": 50,
+        },
+      },
+      namespace="/emo",
+    )
+
+    ack = self.get_ack(self.get_messages(controller), "v2-play-item-1")
+    phone_messages = self.get_messages(phone)
+    command = next(message for message in phone_messages if message["action"] == "queue.playItem")
+    context = get_state().get_playback_context("playback:alice:main")
+    self.assertEqual(ack["payload"]["playbackContext"]["controlVersion"], 1)
+    self.assertEqual(ack["payload"]["playbackContext"]["currentIndex"], 1)
+    self.assertEqual(ack["payload"]["playbackContext"]["trackId"], "song-2")
+    self.assertEqual(ack["payload"]["playbackContext"]["state"], "playing")
+    self.assertEqual(command["targetClientId"], "phone-1")
+    self.assertEqual(command["payload"]["playbackContextId"], "playback:alice:main")
+    self.assertEqual(command["payload"]["queueIndex"], 1)
+    self.assertEqual(command["payload"]["trackId"], "song-2")
+    self.assertNotIn("sessionId", command["payload"])
+    self.assertEqual(context["currentIndex"], 1)
+    self.assertEqual(context["trackId"], "song-2")
+
+    phone.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "phone-play-item-confirm-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:phone",
+          "state": "playing",
+          "trackId": "song-2",
+          "currentIndex": 1,
+          "positionMs": 50,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(phone)
+    confirmed = get_state().get_playback_context("playback:alice:main")
+    self.assertEqual(confirmed["currentIndex"], 1)
+    self.assertEqual(confirmed["trackId"], "song-2")
+    self.assertEqual(confirmed["state"], "playing")
+    self.assertEqual(confirmed["positionMs"], 50)
+    self.assertIsNone(getPlaybackState("root:phone", "phone-1"))
+
+  def test_v2_queue_context_sync_requires_existing_context(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+
+    phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.context.sync",
+        "requestId": "queue-context-missing-1",
+        "payload": {
+          "playbackContextId": "playback:alice:missing",
+          "deviceSessionId": "root:phone",
+          "queueSongIds": ["song-1"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+
+    error = self.get_error(self.get_messages(phone), "queue-context-missing-1")
+    self.assertEqual(error["payload"]["code"], "not_found")
+    self.assertIsNone(get_state().get_playback_context("playback:alice:missing"))
+
+  def test_v2_queue_context_sync_requires_authority(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    pc = self.connect_device(
+      "alice",
+      "Alic3",
+      "pc-1",
+      "root:pc",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+    self.get_messages(pc)
+
+    phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "playback.context.create",
+        "requestId": "context-create-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:phone",
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(phone)
+
+    pc.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.context.sync",
+        "requestId": "queue-context-non-authority-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:pc",
+          "queueSongIds": ["song-1"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+
+    error = self.get_error(self.get_messages(pc), "queue-context-non-authority-1")
+    self.assertEqual(error["payload"]["code"], "forbidden")
+
+  def test_v2_queue_context_sync_does_not_write_emo_session_queue(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+
+    phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "playback.context.create",
+        "requestId": "context-create-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:phone",
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_messages(phone)
+
+    phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.context.sync",
+        "requestId": "queue-context-sync-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:phone",
+          "queueSongIds": ["song-1", "song-2"],
+          "currentIndex": 1,
+          "positionMs": 250,
+          "baseQueueRevision": 0,
+        },
+      },
+      namespace="/emo",
+    )
+
+    ack = self.get_ack(self.get_messages(phone), "queue-context-sync-1")
+    queue = ack["payload"]["queue"]
+    self.assertTrue(ack["payload"]["updated"])
+    self.assertEqual(queue["playbackContextId"], "playback:alice:main")
+    self.assertEqual(queue["currentIndex"], 1)
+    self.assertNotIn("sessionId", queue)
+    self.assertNotIn("sourceClientId", queue)
+    self.assertIsNone(getQueueState("playback:alice:main"))
+    persisted = getPlaybackContextState("playback:alice:main")
+    self.assertEqual(persisted["queueSongIds"], ["song-1", "song-2"])
+
   def test_queue_session_sync_creates_playback_context(self):
     phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
     pc = self.connect_device("alice", "Alic3", "pc-1", "root:pc", ["player"])
@@ -2165,6 +3428,14 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     complete_ack = self.get_ack(self.get_messages(pc), "handoff-complete-pc-1")
     self.assertEqual(complete_ack["payload"]["authorityClientId"], "pc-1")
+    phone_messages = self.get_messages(phone)
+    release = next(
+      message for message in phone_messages if message["action"] == "playback.handoff.release"
+    )
+    self.assertEqual(release["payload"]["reason"], "handoff_completed")
+    self.assertEqual(release["payload"]["authorityClientId"], "pc-1")
+    self.assertEqual(release["targetClientId"], "phone-1")
+    self.assertFalse(any(message["action"] == "player.pause" for message in phone_messages))
     context = get_state().get_playback_context("playback:alice:main")
     self.assertEqual(context["authorityClientId"], "pc-1")
     self.assertEqual(get_state().get_client("phone-1")["deviceSessionId"], "root:phone")
@@ -2355,6 +3626,12 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     expired = _expire_handoff_complete(start_ack["payload"]["handoffId"])
     self.assertEqual(expired["status"], "timed_out")
+    pc_messages = self.get_messages(pc)
+    release = next(
+      message for message in pc_messages if message["action"] == "playback.handoff.release"
+    )
+    self.assertEqual(release["payload"]["reason"], "timed_out")
+    self.assertEqual(release["targetClientId"], "pc-1")
     self.assertEqual(get_state().get_playback_context("playback:alice:main")["authorityClientId"], "phone-1")
 
     phone.emit(
@@ -2374,6 +3651,87 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     retry_ack = self.get_ack(self.get_messages(phone), "handoff-after-timeout-1")
     self.assertEqual(retry_ack["payload"]["status"], "preparing")
+
+  def test_v2_handoff_timeout_releases_target(self):
+    capabilities = {
+      CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+      "effectiveAtPlayback": True,
+      "playbackPrepare": True,
+    }
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities=capabilities,
+    )
+    pc = self.connect_device(
+      "alice",
+      "Alic3",
+      "pc-1",
+      "root:pc",
+      ["player"],
+      capabilities=capabilities,
+    )
+    self.get_messages(phone)
+    self.get_messages(pc)
+    self.create_playback_context(phone, "context-create-1")
+    self.get_messages(phone)
+    self.get_messages(pc)
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "playback.handoff.start",
+        "requestId": "v2-handoff-timeout-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "sourceClientId": "phone-1",
+          "targetClientId": "pc-1",
+          "baseControlVersion": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    start_ack = self.get_ack(self.get_messages(phone), "v2-handoff-timeout-1")
+    prepare = next(message for message in self.get_messages(pc) if message["action"] == "playback.prepare")
+
+    pc.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.ready",
+        "requestId": "v2-handoff-ready-timeout-1",
+        "payload": {
+          "prepareId": prepare["payload"]["prepareId"],
+          "ready": True,
+          "controlVersion": prepare["payload"]["controlVersion"],
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_ack(self.get_messages(pc), "v2-handoff-ready-timeout-1")
+
+    get_state().update_playback_handoff(
+      start_ack["payload"]["handoffId"],
+      complete_expires_at_ms=0,
+    )
+    expired = _expire_handoff_complete(start_ack["payload"]["handoffId"])
+    self.assertEqual(expired["status"], "timed_out")
+    pc_messages = self.get_messages(pc)
+    release = next(
+      message for message in pc_messages if message["action"] == "playback.handoff.release"
+    )
+    self.assertEqual(release["payload"]["reason"], "timed_out")
+    self.assertEqual(release["payload"]["playbackContextId"], "playback:alice:main")
+    self.assertNotIn("sessionId", release["payload"])
+    self.assertEqual(release["targetClientId"], "pc-1")
+    self.assertEqual(
+      get_state().get_playback_context("playback:alice:main")["authorityClientId"],
+      "phone-1",
+    )
 
   def test_duplicate_handoff_start_request_is_idempotent(self):
     capabilities = {"effectiveAtPlayback": True, "playbackPrepare": True}
@@ -2399,6 +3757,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     phone.emit("message", start_message, namespace="/emo")
     first_ack = self.get_ack(self.get_messages(phone), "handoff-idempotent-1")
     first_prepare = next(message for message in self.get_messages(pc) if message["action"] == "playback.prepare")
+    self.assertEqual(first_ack["payload"]["originClientId"], "phone-1")
 
     phone.emit("message", start_message, namespace="/emo")
     duplicate_ack = self.get_ack(self.get_messages(phone), "handoff-idempotent-1")
@@ -2408,6 +3767,1003 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertEqual(duplicate_ack["payload"]["handoffId"], first_ack["payload"]["handoffId"])
     self.assertEqual(duplicate_ack["payload"]["prepareId"], first_prepare["payload"]["prepareId"])
     self.assertFalse(any(message["action"] == "playback.prepare" for message in duplicate_target_messages))
+
+  def test_persisted_duplicate_handoff_start_rebuilds_missing_prepare(self):
+    capabilities = {"effectiveAtPlayback": True, "playbackPrepare": True}
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"], capabilities=capabilities)
+    pc = self.connect_device("alice", "Alic3", "pc-1", "root:pc", ["player"], capabilities=capabilities)
+    self.get_messages(phone)
+    self.get_messages(pc)
+
+    self.sync_playback_context(phone, "context-queue-1")
+    context = get_state().get_playback_context("playback:alice:main")
+    start_message = {
+      "type": "command",
+      "action": "playback.handoff.start",
+      "requestId": "handoff-rebuild-1",
+      "payload": {
+        "playbackContextId": "playback:alice:main",
+        "sourceClientId": "phone-1",
+        "targetClientId": "pc-1",
+        "baseControlVersion": context["controlVersion"],
+      },
+    }
+
+    phone.emit("message", start_message, namespace="/emo")
+    first_ack = self.get_ack(self.get_messages(phone), "handoff-rebuild-1")
+    first_prepare = next(message for message in self.get_messages(pc) if message["action"] == "playback.prepare")
+
+    state = get_state()
+    state._pending_prepares.clear()
+    state._handoffs.clear()
+    state._handoff_request_index.clear()
+    state._playback_contexts.clear()
+
+    phone.emit("message", start_message, namespace="/emo")
+    duplicate_ack = self.get_ack(self.get_messages(phone), "handoff-rebuild-1")
+    pc_messages = self.get_messages(pc)
+    rebuilt_prepare = next(message for message in pc_messages if message["action"] == "playback.prepare")
+
+    self.assertTrue(duplicate_ack["payload"]["duplicate"])
+    self.assertEqual(duplicate_ack["payload"]["handoffId"], first_ack["payload"]["handoffId"])
+    self.assertEqual(duplicate_ack["payload"]["prepareId"], first_prepare["payload"]["prepareId"])
+    self.assertEqual(rebuilt_prepare["payload"]["prepareId"], first_prepare["payload"]["prepareId"])
+    self.assertIsNotNone(get_state().get_prepare(first_prepare["payload"]["prepareId"]))
+
+  def test_restart_rejects_second_active_handoff_for_same_context(self):
+    capabilities = {"effectiveAtPlayback": True, "playbackPrepare": True}
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities=capabilities,
+    )
+    pc = self.connect_device(
+      "alice",
+      "Alic3",
+      "pc-1",
+      "root:pc",
+      ["player"],
+      capabilities=capabilities,
+    )
+    tablet = self.connect_device(
+      "alice",
+      "Alic3",
+      "tablet-1",
+      "root:tablet",
+      ["player"],
+      capabilities=capabilities,
+    )
+    self.get_messages(phone)
+    self.get_messages(pc)
+    self.get_messages(tablet)
+    self.sync_playback_context(phone, "context-queue-1")
+    context = get_state().get_playback_context("playback:alice:main")
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "playback.handoff.start",
+        "requestId": "handoff-before-restart-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "sourceClientId": "phone-1",
+          "targetClientId": "pc-1",
+          "baseControlVersion": context["controlVersion"],
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_ack(self.get_messages(phone), "handoff-before-restart-1")
+    self.get_messages(pc)
+
+    state = get_state()
+    state._pending_prepares.clear()
+    state._handoffs.clear()
+    state._handoff_request_index.clear()
+    state._playback_contexts.clear()
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "playback.handoff.start",
+        "requestId": "handoff-after-restart-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "sourceClientId": "phone-1",
+          "targetClientId": "tablet-1",
+          "baseControlVersion": context["controlVersion"],
+        },
+      },
+      namespace="/emo",
+    )
+    error = self.get_error(
+      self.get_messages(phone),
+      "handoff-after-restart-1",
+    )
+    self.assertEqual(error["payload"]["code"], "conflict")
+    self.assertFalse(
+      any(
+        message["action"] == "playback.prepare"
+        for message in self.get_messages(tablet)
+      )
+    )
+
+  def test_persisted_ready_handoff_retry_resends_player_play(self):
+    capabilities = {"effectiveAtPlayback": True, "playbackPrepare": True}
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities=capabilities,
+    )
+    pc = self.connect_device(
+      "alice",
+      "Alic3",
+      "pc-1",
+      "root:pc",
+      ["player"],
+      capabilities=capabilities,
+    )
+    self.get_messages(phone)
+    self.get_messages(pc)
+    self.sync_playback_context(phone, "context-queue-1")
+    context = get_state().get_playback_context("playback:alice:main")
+    start_message = {
+      "type": "command",
+      "action": "playback.handoff.start",
+      "requestId": "handoff-ready-retry-1",
+      "payload": {
+        "playbackContextId": "playback:alice:main",
+        "sourceClientId": "phone-1",
+        "targetClientId": "pc-1",
+        "baseControlVersion": context["controlVersion"],
+      },
+    }
+
+    phone.emit("message", start_message, namespace="/emo")
+    start_ack = self.get_ack(self.get_messages(phone), "handoff-ready-retry-1")
+    prepare = next(
+      message
+      for message in self.get_messages(pc)
+      if message["action"] == "playback.prepare"
+    )
+    pc.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.ready",
+        "requestId": "handoff-ready-retry-ready-1",
+        "payload": {
+          "prepareId": prepare["payload"]["prepareId"],
+          "ready": True,
+          "controlVersion": prepare["payload"]["controlVersion"],
+        },
+      },
+      namespace="/emo",
+    )
+    ready_messages = self.get_messages(pc)
+    self.get_ack(ready_messages, "handoff-ready-retry-ready-1")
+    self.assertTrue(
+      any(message["action"] == "player.play" for message in ready_messages)
+    )
+
+    state = get_state()
+    state._pending_prepares.clear()
+    state._handoffs.clear()
+    state._handoff_request_index.clear()
+    state._playback_contexts.clear()
+
+    phone.emit("message", start_message, namespace="/emo")
+    duplicate_ack = self.get_ack(
+      self.get_messages(phone),
+      "handoff-ready-retry-1",
+    )
+    replayed_messages = self.get_messages(pc)
+    replayed_play = next(
+      message
+      for message in replayed_messages
+      if message["action"] == "player.play"
+    )
+    self.assertTrue(duplicate_ack["payload"]["duplicate"])
+    self.assertEqual(duplicate_ack["payload"]["status"], "ready")
+    self.assertEqual(
+      replayed_play["payload"]["handoffId"],
+      start_ack["payload"]["handoffId"],
+    )
+
+  def test_v2_handoff_cancel_aborts_pending_prepare(self):
+    capabilities = {
+      CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+      "effectiveAtPlayback": True,
+      "playbackPrepare": True,
+    }
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities=capabilities,
+    )
+    pc = self.connect_device(
+      "alice",
+      "Alic3",
+      "pc-1",
+      "root:pc",
+      ["player"],
+      capabilities=capabilities,
+    )
+    self.get_messages(phone)
+    self.get_messages(pc)
+    self.create_playback_context(phone, "context-create-1")
+    self.get_messages(phone)
+    self.get_messages(pc)
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "playback.handoff.start",
+        "requestId": "v2-handoff-cancel-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "sourceClientId": "phone-1",
+          "targetClientId": "pc-1",
+          "baseControlVersion": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    start_ack = self.get_ack(self.get_messages(phone), "v2-handoff-cancel-1")
+    prepare = next(message for message in self.get_messages(pc) if message["action"] == "playback.prepare")
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "playback.handoff.cancel",
+        "requestId": "v2-handoff-cancel-command-1",
+        "payload": {
+          "handoffId": start_ack["payload"]["handoffId"],
+        },
+      },
+      namespace="/emo",
+    )
+
+    cancel_ack = self.get_ack(self.get_messages(phone), "v2-handoff-cancel-command-1")
+    pc_messages = self.get_messages(pc)
+    release = next(
+      message for message in pc_messages if message["action"] == "playback.handoff.release"
+    )
+    self.assertTrue(cancel_ack["payload"]["canceled"])
+    self.assertEqual(release["payload"]["reason"], "canceled")
+    self.assertEqual(release["payload"]["handoffId"], start_ack["payload"]["handoffId"])
+
+    pc.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.ready",
+        "requestId": "v2-handoff-late-ready-1",
+        "payload": {
+          "prepareId": prepare["payload"]["prepareId"],
+          "ready": True,
+          "controlVersion": prepare["payload"]["controlVersion"],
+        },
+      },
+      namespace="/emo",
+    )
+    late_ready_messages = self.get_messages(pc)
+    late_ready_ack = self.get_ack(late_ready_messages, "v2-handoff-late-ready-1")
+    self.assertTrue(late_ready_ack["payload"]["ignored"])
+    self.assertEqual(late_ready_ack["payload"]["status"], "canceled")
+    self.assertFalse(any(message["action"] == "player.play" for message in late_ready_messages))
+    self.assertEqual(
+      get_state().get_playback_handoff(start_ack["payload"]["handoffId"])["status"],
+      "canceled",
+    )
+    self.assertEqual(
+      get_state().get_playback_context("playback:alice:main")["authorityClientId"],
+      "phone-1",
+    )
+
+  def test_v2_handoff_complete_rejects_session_id(self):
+    capabilities = {
+      CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+      "effectiveAtPlayback": True,
+      "playbackPrepare": True,
+    }
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities=capabilities,
+    )
+    pc = self.connect_device(
+      "alice",
+      "Alic3",
+      "pc-1",
+      "root:pc",
+      ["player"],
+      capabilities=capabilities,
+    )
+    self.get_messages(phone)
+    self.get_messages(pc)
+    self.create_playback_context(phone, "context-create-1")
+    self.get_messages(phone)
+    self.get_messages(pc)
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "playback.handoff.start",
+        "requestId": "v2-handoff-complete-session-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "sourceClientId": "phone-1",
+          "targetClientId": "pc-1",
+          "baseControlVersion": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    start_ack = self.get_ack(self.get_messages(phone), "v2-handoff-complete-session-1")
+    prepare = next(message for message in self.get_messages(pc) if message["action"] == "playback.prepare")
+
+    pc.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.ready",
+        "requestId": "v2-handoff-complete-session-ready-1",
+        "payload": {
+          "prepareId": prepare["payload"]["prepareId"],
+          "ready": True,
+          "controlVersion": prepare["payload"]["controlVersion"],
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_ack(self.get_messages(pc), "v2-handoff-complete-session-ready-1")
+
+    pc.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.handoff.complete",
+        "requestId": "v2-handoff-complete-session-rejected-1",
+        "payload": {
+          "handoffId": start_ack["payload"]["handoffId"],
+          "playbackContextId": "playback:alice:main",
+          "sessionId": "legacy-room",
+          "state": "playing",
+          "trackId": "song-1",
+          "positionMs": 30100,
+          "controlVersion": prepare["payload"]["controlVersion"],
+        },
+      },
+      namespace="/emo",
+    )
+
+    error = self.get_error(self.get_messages(pc), "v2-handoff-complete-session-rejected-1")
+    self.assertEqual(error["payload"]["code"], "bad_request")
+    self.assertEqual(
+      get_state().get_playback_context("playback:alice:main")["authorityClientId"],
+      "phone-1",
+    )
+
+  def test_v2_handoff_cancel_rejects_session_id(self):
+    capabilities = {
+      CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+      "effectiveAtPlayback": True,
+      "playbackPrepare": True,
+    }
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities=capabilities,
+    )
+    pc = self.connect_device(
+      "alice",
+      "Alic3",
+      "pc-1",
+      "root:pc",
+      ["player"],
+      capabilities=capabilities,
+    )
+    self.get_messages(phone)
+    self.get_messages(pc)
+    self.create_playback_context(phone, "context-create-1")
+    self.get_messages(phone)
+    self.get_messages(pc)
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "playback.handoff.start",
+        "requestId": "v2-handoff-cancel-session-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "sourceClientId": "phone-1",
+          "targetClientId": "pc-1",
+          "baseControlVersion": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    start_ack = self.get_ack(self.get_messages(phone), "v2-handoff-cancel-session-1")
+    self.get_messages(pc)
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "playback.handoff.cancel",
+        "requestId": "v2-handoff-cancel-session-rejected-1",
+        "payload": {
+          "handoffId": start_ack["payload"]["handoffId"],
+          "sessionId": "legacy-room",
+        },
+      },
+      namespace="/emo",
+    )
+
+    error = self.get_error(self.get_messages(phone), "v2-handoff-cancel-session-rejected-1")
+    self.assertEqual(error["payload"]["code"], "bad_request")
+    self.assertEqual(
+      get_state().get_playback_handoff(start_ack["payload"]["handoffId"])["status"],
+      "preparing",
+    )
+
+  def test_v2_handoff_keeps_context_and_transfers_authority(self):
+    capabilities = {
+      CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+      "effectiveAtPlayback": True,
+      "playbackPrepare": True,
+    }
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities=capabilities,
+    )
+    pc = self.connect_device(
+      "alice",
+      "Alic3",
+      "pc-1",
+      "root:pc",
+      ["player"],
+      capabilities=capabilities,
+    )
+    self.get_messages(phone)
+    self.get_messages(pc)
+    self.create_playback_context(
+      phone,
+      "context-create-1",
+      queue_song_ids=["song-1", "song-2"],
+      current_index=0,
+      position_ms=30000,
+    )
+    self.get_messages(phone)
+    self.get_messages(pc)
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "playback.handoff.start",
+        "requestId": "v2-handoff-phone-pc-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "targetClientId": "pc-1",
+          "baseControlVersion": 0,
+        },
+      },
+      namespace="/emo",
+    )
+
+    start_ack = self.get_ack(self.get_messages(phone), "v2-handoff-phone-pc-1")
+    prepare = next(message for message in self.get_messages(pc) if message["action"] == "playback.prepare")
+    handoff = get_state().get_playback_handoff(start_ack["payload"]["handoffId"])
+    self.assertEqual(start_ack["payload"]["playbackContextId"], "playback:alice:main")
+    self.assertEqual(start_ack["payload"]["sourceClientId"], "phone-1")
+    self.assertEqual(start_ack["payload"]["originClientId"], "phone-1")
+    self.assertEqual(handoff["originClientId"], "phone-1")
+    self.assertEqual(prepare["payload"]["playbackContextId"], "playback:alice:main")
+    self.assertNotIn("sessionId", prepare["payload"])
+
+    pc.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.ready",
+        "requestId": "v2-handoff-ready-pc-1",
+        "payload": {
+          "prepareId": prepare["payload"]["prepareId"],
+          "ready": True,
+          "controlVersion": prepare["payload"]["controlVersion"],
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_ack(self.get_messages(pc), "v2-handoff-ready-pc-1")
+
+    pc.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.handoff.complete",
+        "requestId": "v2-handoff-complete-pc-1",
+        "payload": {
+          "handoffId": start_ack["payload"]["handoffId"],
+          "playbackContextId": "playback:alice:main",
+          "state": "playing",
+          "trackId": "song-1",
+          "positionMs": 30100,
+          "controlVersion": prepare["payload"]["controlVersion"],
+        },
+      },
+      namespace="/emo",
+    )
+
+    complete_ack = self.get_ack(self.get_messages(pc), "v2-handoff-complete-pc-1")
+    phone_messages = self.get_messages(phone)
+    release = next(
+      message for message in phone_messages if message["action"] == "playback.handoff.release"
+    )
+    context = get_state().get_playback_context("playback:alice:main")
+    self.assertTrue(complete_ack["payload"]["completed"])
+    self.assertEqual(complete_ack["payload"]["playbackContextId"], "playback:alice:main")
+    self.assertEqual(complete_ack["payload"]["authorityClientId"], "pc-1")
+    self.assertEqual(context["playbackContextId"], "playback:alice:main")
+    self.assertEqual(context["authorityClientId"], "pc-1")
+    self.assertEqual(context["originClientId"], "phone-1")
+    self.assertEqual(release["payload"]["reason"], "handoff_completed")
+    self.assertEqual(release["targetClientId"], "phone-1")
+
+  def test_v2_handoff_controller_origin_client_id_is_controller(self):
+    player_capabilities = {
+      CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+      "effectiveAtPlayback": True,
+      "playbackPrepare": True,
+    }
+    controller_capabilities = {CAPABILITY_PLAYBACK_CONTEXT_V2: True}
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities=player_capabilities,
+    )
+    pc = self.connect_device(
+      "alice",
+      "Alic3",
+      "pc-1",
+      "root:pc",
+      ["player"],
+      capabilities=player_capabilities,
+    )
+    controller = self.connect_device(
+      "alice",
+      "Alic3",
+      "controller-1",
+      "root:controller",
+      ["controller"],
+      capabilities=controller_capabilities,
+    )
+    self.get_messages(phone)
+    self.get_messages(pc)
+    self.get_messages(controller)
+    self.create_playback_context(phone, "context-create-1")
+    self.get_messages(phone)
+    self.get_messages(pc)
+    self.get_messages(controller)
+
+    controller.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "playback.handoff.start",
+        "requestId": "v2-controller-handoff-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "sourceClientId": "phone-1",
+          "targetClientId": "pc-1",
+          "baseControlVersion": 0,
+        },
+      },
+      namespace="/emo",
+    )
+
+    ack = self.get_ack(self.get_messages(controller), "v2-controller-handoff-1")
+    handoff = get_state().get_playback_handoff(ack["payload"]["handoffId"])
+    self.assertEqual(ack["payload"]["originClientId"], "controller-1")
+    self.assertEqual(handoff["originClientId"], "controller-1")
+    self.assertEqual(handoff["sourceClientId"], "phone-1")
+
+    prepare = next(message for message in self.get_messages(pc) if message["action"] == "playback.prepare")
+    pc.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.ready",
+        "requestId": "v2-controller-handoff-ready-1",
+        "payload": {
+          "prepareId": prepare["payload"]["prepareId"],
+          "ready": True,
+          "controlVersion": prepare["payload"]["controlVersion"],
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_ack(self.get_messages(pc), "v2-controller-handoff-ready-1")
+
+    pc.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.handoff.complete",
+        "requestId": "v2-controller-handoff-complete-1",
+        "payload": {
+          "handoffId": ack["payload"]["handoffId"],
+          "playbackContextId": "playback:alice:main",
+          "state": "playing",
+          "trackId": "song-1",
+          "positionMs": 100,
+          "controlVersion": prepare["payload"]["controlVersion"],
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_ack(self.get_messages(pc), "v2-controller-handoff-complete-1")
+    context = get_state().get_playback_context("playback:alice:main")
+    self.assertEqual(context["authorityClientId"], "pc-1")
+    self.assertEqual(context["originClientId"], "controller-1")
+
+  def test_v2_handoff_target_requires_prepare_capabilities(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={
+        CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+        "effectiveAtPlayback": True,
+        "playbackPrepare": True,
+      },
+    )
+    pc = self.connect_device(
+      "alice",
+      "Alic3",
+      "pc-1",
+      "root:pc",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+    self.get_messages(pc)
+    self.create_playback_context(phone, "context-create-1")
+    self.get_messages(phone)
+    self.get_messages(pc)
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "playback.handoff.start",
+        "requestId": "v2-handoff-missing-capability-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "sourceClientId": "phone-1",
+          "targetClientId": "pc-1",
+          "baseControlVersion": 0,
+        },
+      },
+      namespace="/emo",
+    )
+
+    error = self.get_error(self.get_messages(phone), "v2-handoff-missing-capability-1")
+    self.assertEqual(error["payload"]["code"], "forbidden")
+    self.assertIsNone(next(iter(get_state()._handoffs.values()), None))
+
+  def test_v2_handoff_start_does_not_restore_legacy_queue_as_context(self):
+    capabilities = {
+      CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+      "effectiveAtPlayback": True,
+      "playbackPrepare": True,
+    }
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities=capabilities,
+    )
+    pc = self.connect_device(
+      "alice",
+      "Alic3",
+      "pc-1",
+      "root:pc",
+      ["player"],
+      capabilities=capabilities,
+    )
+    self.get_messages(phone)
+    self.get_messages(pc)
+    saveQueueState("legacy-room", "alice", "phone-1", ["song-1"], 0, 0)
+    self.assertIsNotNone(getQueueState("legacy-room"))
+    self.assertIsNone(getPlaybackContextState("legacy-room"))
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "playback.handoff.start",
+        "requestId": "v2-handoff-legacy-queue-1",
+        "payload": {
+          "playbackContextId": "legacy-room",
+          "sourceClientId": "phone-1",
+          "targetClientId": "pc-1",
+          "baseControlVersion": 1,
+        },
+      },
+      namespace="/emo",
+    )
+
+    error = self.get_error(self.get_messages(phone), "v2-handoff-legacy-queue-1")
+    self.assertEqual(error["payload"]["code"], "not_found")
+    self.assertIsNone(getPlaybackContextState("legacy-room"))
+    self.assertIsNone(get_state().get_playback_context("legacy-room"))
+
+  def test_v2_playback_update_keeps_device_volume_in_device_state(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+    self.create_playback_context(phone, "context-create-1")
+
+    phone.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "v2-playback-volume-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:phone",
+          "state": "playing",
+          "trackId": "song-1",
+          "positionMs": 100,
+          "volume": 65,
+          "muted": True,
+          "outputDeviceId": "dac-1",
+          "audioDeviceName": "USB DAC",
+        },
+      },
+      namespace="/emo",
+    )
+
+    ack = self.get_ack(self.get_messages(phone), "v2-playback-volume-1")
+    context = get_state().get_playback_context("playback:alice:main")
+    persisted_context = getPlaybackContextState("playback:alice:main")
+    device_state = getDevicePlaybackState("playback:alice:main", "phone-1")
+
+    self.assertTrue(ack["payload"]["authoritative"])
+    self.assertIsNone(context["volume"])
+    self.assertIsNone(persisted_context["volume"])
+    self.assertNotIn("muted", context)
+    self.assertNotIn("outputDeviceId", context)
+    self.assertNotIn("audioDeviceName", context)
+    self.assertNotIn("muted", persisted_context)
+    self.assertNotIn("outputDeviceId", persisted_context)
+    self.assertNotIn("audioDeviceName", persisted_context)
+    self.assertEqual(device_state["volume"], 65)
+    self.assertTrue(device_state["muted"])
+    self.assertEqual(device_state["outputDeviceId"], "dac-1")
+    self.assertEqual(device_state["audioDeviceName"], "USB DAC")
+    self.assertTrue(device_state["isAuthority"])
+
+    phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "playback.context.status",
+        "requestId": "v2-playback-volume-status-1",
+        "payload": {"playbackContextId": "playback:alice:main"},
+      },
+      namespace="/emo",
+    )
+    status_ack = self.get_ack(
+      self.get_messages(phone),
+      "v2-playback-volume-status-1",
+    )
+    status_context = status_ack["payload"]["playbackContext"]
+    status_device = status_ack["payload"]["deviceStates"][0]
+    self.assertNotIn("muted", status_context)
+    self.assertNotIn("outputDeviceId", status_context)
+    self.assertNotIn("audioDeviceName", status_context)
+    self.assertNotIn("sessionId", status_device)
+    self.assertEqual(status_device["volume"], 65)
+    self.assertTrue(status_device["muted"])
+    self.assertEqual(status_device["outputDeviceId"], "dac-1")
+    self.assertEqual(status_device["audioDeviceName"], "USB DAC")
+
+  def test_v2_context_status_merges_persisted_and_runtime_device_states(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    pc = self.connect_device(
+      "alice",
+      "Alic3",
+      "pc-1",
+      "root:pc",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+    self.get_messages(pc)
+    self.create_playback_context(phone, "context-create-1")
+
+    phone.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "status-merge-phone-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:phone",
+          "state": "playing",
+          "trackId": "song-1",
+          "positionMs": 100,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_ack(self.get_messages(phone), "status-merge-phone-1")
+
+    pc.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "status-merge-pc-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:pc",
+          "state": "playing",
+          "trackId": "song-1",
+          "positionMs": 900,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_ack(self.get_messages(pc), "status-merge-pc-1")
+    self.assertEqual(
+      getDevicePlaybackState("playback:alice:main", "pc-1")["positionMs"],
+      900,
+    )
+
+    get_state()._device_playback_states.clear()
+    phone.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "status-merge-phone-2",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:phone",
+          "state": "playing",
+          "trackId": "song-1",
+          "positionMs": 200,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_ack(self.get_messages(phone), "status-merge-phone-2")
+
+    phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "playback.context.status",
+        "requestId": "status-merge-context-1",
+        "payload": {"playbackContextId": "playback:alice:main"},
+      },
+      namespace="/emo",
+    )
+    status_ack = self.get_ack(
+      self.get_messages(phone),
+      "status-merge-context-1",
+    )
+    device_states = {
+      device_state["clientId"]: device_state
+      for device_state in status_ack["payload"]["deviceStates"]
+    }
+    self.assertEqual(device_states["phone-1"]["positionMs"], 200)
+    self.assertEqual(device_states["pc-1"]["positionMs"], 900)
+
+  def test_v2_playback_update_serializes_logical_volume_without_volume(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+    self.create_playback_context(phone, "context-create-1")
+
+    phone.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "v2-playback-logical-volume-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:phone",
+          "state": "playing",
+          "trackId": "song-1",
+          "positionMs": 100,
+          "logicalVolume": 40,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_ack(self.get_messages(phone), "v2-playback-logical-volume-1")
+
+    phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "playback.context.status",
+        "requestId": "v2-playback-logical-volume-status-1",
+        "payload": {"playbackContextId": "playback:alice:main"},
+      },
+      namespace="/emo",
+    )
+
+    status_ack = self.get_ack(
+      self.get_messages(phone),
+      "v2-playback-logical-volume-status-1",
+    )
+    playback_context = status_ack["payload"]["playbackContext"]
+    persisted_context = getPlaybackContextState("playback:alice:main")
+
+    self.assertEqual(persisted_context["volume"], 40)
+    self.assertEqual(playback_context["logicalVolume"], 40)
+    self.assertNotIn("volume", playback_context)
 
   def test_new_playback_update_requires_existing_context(self):
     phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
@@ -2433,6 +4789,101 @@ class EmoWebSocketTestCase(unittest.TestCase):
     error = self.get_error(self.get_messages(phone), "unknown-context-playback-1")
     self.assertEqual(error["payload"]["code"], "not_found")
     self.assertIsNone(get_state().get_playback_context("playback:alice:missing"))
+
+  def test_strict_v2_session_id_payload_is_rejected(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+
+    phone.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "strict-v2-session-id-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:phone",
+          "sessionId": "legacy-room",
+          "state": "playing",
+          "trackId": "song-1",
+          "positionMs": 100,
+        },
+      },
+      namespace="/emo",
+    )
+
+    error = self.get_error(self.get_messages(phone), "strict-v2-session-id-1")
+    self.assertEqual(error["payload"]["code"], "bad_request")
+
+  def test_strict_v2_playback_update_does_not_fallback_to_device_session_id(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+
+    phone.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "strict-v2-missing-context-1",
+        "payload": {
+          "deviceSessionId": "root:phone",
+          "state": "playing",
+          "trackId": "song-1",
+          "positionMs": 100,
+        },
+      },
+      namespace="/emo",
+    )
+
+    error = self.get_error(self.get_messages(phone), "strict-v2-missing-context-1")
+    self.assertEqual(error["payload"]["code"], "bad_request")
+    self.assertIsNone(get_state().get_playback_context("root:phone"))
+
+  def test_context_compatible_session_id_payload_is_not_used_as_context_id(self):
+    phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])
+    self.get_messages(phone)
+    self.sync_playback_context(phone, "context-queue-1")
+    self.get_messages(phone)
+
+    phone.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "context-compatible-update-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:phone",
+          "sessionId": "legacy-wrong-context",
+          "state": "playing",
+          "trackId": "song-1",
+          "positionMs": 1234,
+        },
+      },
+      namespace="/emo",
+    )
+
+    ack = self.get_ack(self.get_messages(phone), "context-compatible-update-1")
+    self.assertEqual(ack["payload"]["playbackContextId"], "playback:alice:main")
+    context = get_state().get_playback_context("playback:alice:main")
+    self.assertEqual(context["positionMs"], 1234)
+    self.assertIsNone(get_state().get_playback_context("legacy-wrong-context"))
+    self.assertIsNone(getPlaybackState("root:phone", "phone-1"))
+    self.assertIsNone(getPlaybackState("legacy-wrong-context", "phone-1"))
 
   def test_playback_update_broadcasts_to_session_subscriber(self):
     player = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"])
@@ -2515,6 +4966,389 @@ class EmoWebSocketTestCase(unittest.TestCase):
     state = get_state()
     self.assertEqual(state.get_active_broadcast_for_client("phone-1"), broadcast_id)
     self.assertEqual(state.get_active_broadcast_for_client("pc-1"), broadcast_id)
+
+  def test_v2_broadcast_start_creates_broadcast_playback_context(self):
+    capabilities = {CAPABILITY_PLAYBACK_CONTEXT_V2: True}
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities=capabilities,
+    )
+    pc = self.connect_device(
+      "alice",
+      "Alic3",
+      "pc-1",
+      "root:pc",
+      ["player"],
+      capabilities=capabilities,
+    )
+    self.get_messages(phone)
+    self.get_messages(pc)
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "broadcast.start",
+        "requestId": "v2-broadcast-start-1",
+        "payload": {
+          "playbackContextId": "broadcast:alice:main",
+          "targetMode": "selectedClients",
+          "targetClientIds": ["phone-1", "pc-1"],
+          "queueSongIds": ["song-1", "song-2"],
+          "currentIndex": 0,
+          "positionMs": 1000,
+          "autoPlay": True,
+        },
+      },
+      namespace="/emo",
+    )
+
+    phone_messages = self.get_messages(phone)
+    pc_messages = self.get_messages(pc)
+    ack = self.get_ack(phone_messages, "v2-broadcast-start-1")
+    broadcast_id = ack["payload"]["broadcastId"]
+    context = get_state().get_playback_context("broadcast:alice:main")
+    pc_start = next(message for message in pc_messages if message["action"] == "broadcast.start")
+
+    self.assertEqual(ack["payload"]["broadcast"]["playbackContextId"], "broadcast:alice:main")
+    self.assertEqual(context["contextType"], "broadcast")
+    self.assertEqual(context["broadcastId"], broadcast_id)
+    self.assertEqual(context["authorityClientId"], "server")
+    self.assertEqual(context["participants"], ["phone-1", "pc-1"])
+    self.assertEqual(context["queueSongIds"], ["song-1", "song-2"])
+    self.assertEqual(context["state"], "playing")
+    self.assertEqual(pc_start["payload"]["playbackContextId"], "broadcast:alice:main")
+    self.assertEqual(pc_start["payload"]["contextType"], "broadcast")
+    self.assertNotIn("sessionId", pc_start["payload"])
+
+    pc.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "v2-broadcast-feedback-1",
+        "payload": {
+          "broadcastId": broadcast_id,
+          "playbackContextId": "broadcast:alice:main",
+          "deviceSessionId": "root:pc",
+          "mode": "broadcast",
+          "state": "playing",
+          "trackId": "song-1",
+          "positionMs": 1500,
+          "syncDriftMs": -100,
+        },
+      },
+      namespace="/emo",
+    )
+
+    feedback_ack = self.get_ack(self.get_messages(pc), "v2-broadcast-feedback-1")
+    device_state = get_state().get_device_playback_state("broadcast:alice:main", "pc-1")
+    participant_state = get_state().get_broadcast_participant_state(broadcast_id, "pc-1")
+    self.assertTrue(feedback_ack["payload"]["participantFeedback"])
+    self.assertEqual(device_state["mode"], "broadcast")
+    self.assertFalse(device_state["isAuthority"])
+    self.assertEqual(device_state["positionMs"], 1500)
+    self.assertEqual(participant_state["syncDriftMs"], -100)
+    self.assertIsNone(get_state().get_playback_state("root:pc", "pc-1"))
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "broadcast.status",
+        "requestId": "v2-broadcast-status-1",
+        "payload": {
+          "playbackContextId": "broadcast:alice:main",
+        },
+      },
+      namespace="/emo",
+    )
+    broadcast_status = self.get_ack(
+      self.get_messages(phone),
+      "v2-broadcast-status-1",
+    )
+    self.assertEqual(
+      broadcast_status["payload"]["broadcast"]["playbackContextId"],
+      "broadcast:alice:main",
+    )
+    self.assertEqual(
+      broadcast_status["payload"]["broadcast"]["contextType"],
+      "broadcast",
+    )
+
+    phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "playback.context.status",
+        "requestId": "v2-broadcast-context-status-1",
+        "payload": {"playbackContextId": "broadcast:alice:main"},
+      },
+      namespace="/emo",
+    )
+    context_status = self.get_ack(
+      self.get_messages(phone),
+      "v2-broadcast-context-status-1",
+    )
+    context_payload = context_status["payload"]["playbackContext"]
+    context_device = next(
+      state
+      for state in context_status["payload"]["deviceStates"]
+      if state["clientId"] == "pc-1"
+    )
+    self.assertEqual(context_payload["playbackContextId"], "broadcast:alice:main")
+    self.assertEqual(context_payload["contextType"], "broadcast")
+    self.assertEqual(context_payload["broadcastId"], broadcast_id)
+    self.assertEqual(
+      context_payload["trackId"],
+      broadcast_status["payload"]["broadcast"]["trackId"],
+    )
+    self.assertNotIn("sessionId", context_payload)
+    self.assertNotIn("sourceClientId", context_payload)
+    self.assertEqual(context_device["mode"], "broadcast")
+    self.assertEqual(context_device["syncDriftMs"], -100)
+    self.assertNotIn("sessionId", context_device)
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "broadcast.stop",
+        "requestId": "v2-broadcast-stop-1",
+        "payload": {
+          "broadcastId": broadcast_id,
+          "playbackContextId": "broadcast:alice:main",
+        },
+      },
+      namespace="/emo",
+    )
+
+    stop_ack = self.get_ack(self.get_messages(phone), "v2-broadcast-stop-1")
+    stopped_context = get_state().get_playback_context("broadcast:alice:main")
+    self.assertEqual(stop_ack["payload"]["broadcast"]["state"], "stopped")
+    self.assertEqual(stopped_context["state"], "stopped")
+    self.assertEqual(stopped_context["broadcastId"], broadcast_id)
+
+  def test_v2_broadcast_start_rejects_existing_playback_context_id(self):
+    capabilities = {CAPABILITY_PLAYBACK_CONTEXT_V2: True}
+    alice = self.connect_device(
+      "alice",
+      "Alic3",
+      "alice-phone",
+      "device:alice-phone",
+      ["player"],
+      capabilities=capabilities,
+    )
+    bob = self.connect_device(
+      "bob",
+      "B0b",
+      "bob-phone",
+      "device:bob-phone",
+      ["player"],
+      capabilities=capabilities,
+    )
+    self.get_messages(alice)
+    self.get_messages(bob)
+    self.create_playback_context(
+      alice,
+      "alice-context-create-1",
+      playback_context_id="shared-context-id",
+      device_session_id="device:alice-phone",
+    )
+
+    self.start_broadcast(
+      bob,
+      ["bob-phone"],
+      request_id="bob-context-collision-1",
+      playbackContextId="shared-context-id",
+      autoPlay=False,
+    )
+    cross_user_error = self.get_error(
+      self.get_messages(bob),
+      "bob-context-collision-1",
+    )
+    self.assertEqual(cross_user_error["payload"]["code"], "forbidden")
+
+    self.start_broadcast(
+      alice,
+      ["alice-phone"],
+      request_id="alice-context-collision-1",
+      playbackContextId="shared-context-id",
+      autoPlay=False,
+    )
+    same_user_error = self.get_error(
+      self.get_messages(alice),
+      "alice-context-collision-1",
+    )
+    self.assertEqual(same_user_error["payload"]["code"], "conflict")
+
+    persisted = getPlaybackContextState("shared-context-id")
+    self.assertEqual(persisted["userName"], "alice")
+    self.assertNotEqual(persisted.get("contextType"), "broadcast")
+    self.assertEqual(get_state().list_broadcasts(user_name="bob"), [])
+
+  def test_v2_broadcast_restores_from_persisted_playback_context(self):
+    capabilities = {CAPABILITY_PLAYBACK_CONTEXT_V2: True}
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities=capabilities,
+    )
+    pc = self.connect_device(
+      "alice",
+      "Alic3",
+      "pc-1",
+      "root:pc",
+      ["player"],
+      capabilities=capabilities,
+    )
+    self.get_messages(phone)
+    self.get_messages(pc)
+    self.start_broadcast(
+      phone,
+      ["phone-1", "pc-1"],
+      request_id="broadcast-restart-start-1",
+      playbackContextId="broadcast:alice:restart",
+      autoPlay=True,
+      controlPolicy="owner_only",
+    )
+    start_ack = self.get_ack(
+      self.get_messages(phone),
+      "broadcast-restart-start-1",
+    )
+    broadcast_id = start_ack["payload"]["broadcastId"]
+    self.get_messages(pc)
+
+    pc.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "broadcast-restart-feedback-1",
+        "payload": {
+          "broadcastId": broadcast_id,
+          "playbackContextId": "broadcast:alice:restart",
+          "deviceSessionId": "root:pc",
+          "state": "playing",
+          "trackId": "song-1",
+          "positionMs": 500,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_ack(self.get_messages(pc), "broadcast-restart-feedback-1")
+
+    state = get_state()
+    state._broadcasts.clear()
+    state._broadcast_participants.clear()
+    state._broadcast_playback_states.clear()
+    state._client_active_broadcast.clear()
+    state._playback_contexts.clear()
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "broadcast.status",
+        "requestId": "broadcast-restart-status-1",
+        "payload": {
+          "broadcastId": broadcast_id,
+          "playbackContextId": "broadcast:alice:restart",
+        },
+      },
+      namespace="/emo",
+    )
+    status_ack = self.get_ack(
+      self.get_messages(phone),
+      "broadcast-restart-status-1",
+    )
+    restored = get_state().get_broadcast(broadcast_id)
+    participant = get_state().get_broadcast_participant_state(
+      broadcast_id,
+      "pc-1",
+    )
+    self.assertEqual(status_ack["payload"]["broadcast"]["broadcastId"], broadcast_id)
+    self.assertEqual(restored["ownerClientId"], "phone-1")
+    self.assertEqual(restored["controlPolicy"], "owner_only")
+    self.assertEqual(restored["state"], "playing")
+    self.assertEqual(participant["positionMs"], 500)
+    self.assertEqual(get_state().get_active_broadcast_for_client("pc-1"), broadcast_id)
+
+    phone.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "broadcast.pause",
+        "requestId": "broadcast-restart-pause-1",
+        "payload": {
+          "broadcastId": broadcast_id,
+          "playbackContextId": "broadcast:alice:restart",
+          "positionMs": 700,
+        },
+      },
+      namespace="/emo",
+    )
+    pause_ack = self.get_ack(
+      self.get_messages(phone),
+      "broadcast-restart-pause-1",
+    )
+    self.assertEqual(pause_ack["payload"]["broadcast"]["state"], "paused")
+
+  def test_v2_broadcast_prepare_keeps_session_id_for_non_v2_target(self):
+    owner_capabilities = {
+      CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+      "effectiveAtPlayback": True,
+      "playbackPrepare": True,
+    }
+    prepare_capabilities = {"effectiveAtPlayback": True, "playbackPrepare": True}
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities=owner_capabilities,
+    )
+    pc = self.connect_device(
+      "alice",
+      "Alic3",
+      "pc-1",
+      "root:pc",
+      ["player"],
+      capabilities=prepare_capabilities,
+    )
+    self.get_messages(phone)
+    self.get_messages(pc)
+
+    self.start_broadcast(
+      phone,
+      ["phone-1", "pc-1"],
+      request_id="v2-broadcast-mixed-prepare-1",
+      playbackContextId="broadcast:alice:mixed",
+    )
+
+    phone_messages = self.get_messages(phone)
+    pc_messages = self.get_messages(pc)
+    ack = self.get_ack(phone_messages, "v2-broadcast-mixed-prepare-1")
+    phone_prepare = next(
+      message for message in phone_messages if message["action"] == "playback.prepare"
+    )
+    pc_prepare = next(
+      message for message in pc_messages if message["action"] == "playback.prepare"
+    )
+
+    self.assertTrue(ack["payload"]["preparing"])
+    self.assertEqual(phone_prepare["payload"]["playbackContextId"], "broadcast:alice:mixed")
+    self.assertNotIn("sessionId", phone_prepare["payload"])
+    self.assertEqual(pc_prepare["payload"]["playbackContextId"], "broadcast:alice:mixed")
+    self.assertEqual(pc_prepare["payload"]["sessionId"], "root:pc")
 
   def test_broadcast_start_uses_single_future_for_effective_at_clients(self):
     capabilities = {"effectiveAtPlayback": True}
@@ -3456,6 +6290,219 @@ class EmoWebSocketTestCase(unittest.TestCase):
     phone_messages = self.get_messages(phone)
     error = next(message for message in laptop_messages if message["action"] == "system.error")
     self.assertEqual(error["requestId"], "follow-seek-source-1")
+    self.assertEqual(error["payload"]["code"], "follow_control_forbidden")
+    self.assertFalse(any(message["action"] == "player.seek" for message in phone_messages))
+
+  def test_v2_follow_start_subscribes_playback_context_without_source_online(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    laptop = self.connect_device(
+      "alice",
+      "Alic3",
+      "laptop-1",
+      "root:laptop",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+    self.get_messages(laptop)
+    self.create_playback_context(
+      phone,
+      "v2-follow-context-create-1",
+      queue_song_ids=["song-source"],
+      position_ms=12000,
+    )
+    self.get_messages(laptop)
+
+    phone.disconnect(namespace="/emo")
+    self.clients.remove(phone)
+    self.assertIsNone(get_state().get_client("phone-1"))
+
+    laptop.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "follow.start",
+        "requestId": "v2-follow-start-1",
+        "payload": {
+          "sourcePlaybackContextId": "playback:alice:main",
+          "deviceSessionId": "root:laptop",
+        },
+      },
+      namespace="/emo",
+    )
+
+    follow_messages = self.get_messages(laptop)
+    follow_ack = self.get_ack(follow_messages, "v2-follow-start-1")
+    relationship = follow_ack["payload"]["relationship"]
+    self.assertEqual(relationship["sourcePlaybackContextId"], "playback:alice:main")
+    self.assertEqual(relationship["sourceClientId"], "phone-1")
+    self.assertIsNone(relationship["sourceSessionId"])
+    self.assertEqual(follow_ack["payload"]["subscriptions"], ["playback:alice:main"])
+    snapshot = next(
+      message for message in follow_messages if message["action"] == "playback.context.status"
+    )
+    playback_context = snapshot["payload"]["playbackContext"]
+    self.assertEqual(playback_context["playbackContextId"], "playback:alice:main")
+    self.assertEqual(playback_context["queueSongIds"], ["song-source"])
+    self.assertNotIn("sessionId", playback_context)
+    self.assertEqual(
+      get_state().get_follow_relationship("laptop-1")["sourcePlaybackContextId"],
+      "playback:alice:main",
+    )
+
+    laptop.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "follow.stop",
+        "requestId": "v2-follow-stop-1",
+        "payload": {
+          "sourcePlaybackContextId": "playback:alice:main",
+          "deviceSessionId": "root:laptop",
+        },
+      },
+      namespace="/emo",
+    )
+
+    stop_ack = self.get_ack(self.get_messages(laptop), "v2-follow-stop-1")
+    self.assertEqual(stop_ack["payload"]["subscriptions"], [])
+    self.assertIsNone(get_state().get_follow_relationship("laptop-1"))
+
+  def test_v2_follow_update_is_device_feedback_only(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    laptop = self.connect_device(
+      "alice",
+      "Alic3",
+      "laptop-1",
+      "root:laptop",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+    self.get_messages(laptop)
+    self.create_playback_context(
+      phone,
+      "v2-follow-feedback-context-create-1",
+      queue_song_ids=["song-source"],
+      position_ms=12000,
+    )
+    self.get_messages(phone)
+    self.get_messages(laptop)
+
+    laptop.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "follow.start",
+        "requestId": "v2-follow-feedback-start-1",
+        "payload": {
+          "sourcePlaybackContextId": "playback:alice:main",
+          "deviceSessionId": "root:laptop",
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_ack(self.get_messages(laptop), "v2-follow-feedback-start-1")
+
+    laptop.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "v2-follow-feedback-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:laptop",
+          "mode": "follow",
+          "state": "playing",
+          "trackId": "song-source",
+          "positionMs": 12300,
+          "syncDriftMs": -200,
+        },
+      },
+      namespace="/emo",
+    )
+
+    ack = self.get_ack(self.get_messages(laptop), "v2-follow-feedback-1")
+    self.assertTrue(ack["payload"]["deviceFeedback"])
+    self.assertFalse(ack["payload"]["authoritative"])
+    context = get_state().get_playback_context("playback:alice:main")
+    device_state = get_state().get_device_playback_state("playback:alice:main", "laptop-1")
+    self.assertEqual(context["positionMs"], 12000)
+    self.assertEqual(context["authorityClientId"], "phone-1")
+    self.assertEqual(device_state["mode"], "follow")
+    self.assertFalse(device_state["isAuthority"])
+    self.assertEqual(device_state["positionMs"], 12300)
+
+  def test_v2_follow_participant_cannot_control_source_context(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    laptop = self.connect_device(
+      "alice",
+      "Alic3",
+      "laptop-1",
+      "root:laptop",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+    self.get_messages(laptop)
+    self.create_playback_context(phone, "v2-follow-control-context-create-1")
+    self.get_messages(phone)
+    self.get_messages(laptop)
+
+    laptop.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "follow.start",
+        "requestId": "v2-follow-control-start-1",
+        "payload": {
+          "sourcePlaybackContextId": "playback:alice:main",
+          "deviceSessionId": "root:laptop",
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_ack(self.get_messages(laptop), "v2-follow-control-start-1")
+
+    laptop.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "player.seek",
+        "requestId": "v2-follow-control-seek-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:laptop",
+          "positionMs": 90000,
+        },
+      },
+      namespace="/emo",
+    )
+
+    error = self.get_error(self.get_messages(laptop), "v2-follow-control-seek-1")
+    phone_messages = self.get_messages(phone)
     self.assertEqual(error["payload"]["code"], "follow_control_forbidden")
     self.assertFalse(any(message["action"] == "player.seek" for message in phone_messages))
 

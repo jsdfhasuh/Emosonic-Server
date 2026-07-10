@@ -82,6 +82,13 @@ class PlaybackControlVersionMismatchError(Exception):
         self.current_control_version = current_control_version
 
 
+class PlaybackContextConflictError(Exception):
+    def __init__(self, playback_context_id, existing_context=None):
+        super().__init__("Playback context already belongs to another resource")
+        self.playback_context_id = playback_context_id
+        self.existing_context = dict(existing_context or {})
+
+
 class WebSocketState:
     def __init__(self):
         self._lock = threading.RLock()
@@ -317,6 +324,91 @@ class WebSocketState:
                 if session_info is None:
                     continue
                 if user_name is not None and session_info.get("userName") != user_name:
+                    continue
+                items.append(sid)
+            return items
+
+    def subscribe_playback_context(self, sid, playback_context_id):
+        if not playback_context_id:
+            return []
+        with self._lock:
+            subscriptions = self._playback_context_subscriptions.setdefault(sid, set())
+            subscriptions.add(playback_context_id)
+            return sorted(subscriptions)
+
+    def unsubscribe_playback_context(self, sid, playback_context_id=None):
+        with self._lock:
+            if sid not in self._playback_context_subscriptions:
+                return []
+            if playback_context_id is None:
+                self._playback_context_subscriptions[sid].clear()
+            else:
+                self._playback_context_subscriptions[sid].discard(playback_context_id)
+            subscriptions = self._playback_context_subscriptions[sid]
+            if not subscriptions:
+                self._playback_context_subscriptions.pop(sid, None)
+                return []
+            return sorted(subscriptions)
+
+    def list_playback_context_subscribers(
+        self,
+        playback_context_id,
+        user_name=None,
+        exclude_sid=None,
+    ):
+        with self._lock:
+            items = []
+            for sid, subscriptions in self._playback_context_subscriptions.items():
+                if exclude_sid is not None and sid == exclude_sid:
+                    continue
+                if playback_context_id not in subscriptions:
+                    continue
+                session_info = self._sessions.get(sid)
+                if session_info is None:
+                    continue
+                if user_name is not None and session_info.get("userName") != user_name:
+                    continue
+                items.append(sid)
+            return items
+
+    def clear_playback_context_subscriptions(self, playback_context_id):
+        if not playback_context_id:
+            return 0
+        with self._lock:
+            cleared = 0
+            for sid, subscriptions in list(self._playback_context_subscriptions.items()):
+                if playback_context_id not in subscriptions:
+                    continue
+                subscriptions.discard(playback_context_id)
+                cleared += 1
+                if not subscriptions:
+                    self._playback_context_subscriptions.pop(sid, None)
+            return cleared
+
+    def list_context_participant_sids(
+        self,
+        playback_context_id,
+        user_name=None,
+        exclude_sid=None,
+    ):
+        with self._lock:
+            context = self._playback_contexts.get(playback_context_id)
+            participant_client_ids = set()
+            if context is not None and context.get("authorityClientId"):
+                participant_client_ids.add(context.get("authorityClientId"))
+            for state_context_id, client_id in self._device_playback_states:
+                if state_context_id == playback_context_id:
+                    participant_client_ids.add(client_id)
+
+            items = []
+            for client_id in participant_client_ids:
+                sid = self._client_to_sid.get(client_id)
+                if sid is None or sid == exclude_sid:
+                    continue
+                client = self._clients.get(client_id)
+                if client is None:
+                    continue
+                if user_name is not None and client.get("userName") != user_name:
                     continue
                 items.append(sid)
             return items
@@ -660,6 +752,52 @@ class WebSocketState:
             context = self._playback_contexts.get(playback_context_id)
             return None if context is None else self._copy_playback_context_locked(context)
 
+    def create_playback_context(
+        self,
+        playback_context_id,
+        device_session_id,
+        user_name,
+        authority_client_id,
+        queue_song_ids=None,
+        current_index=0,
+        position_ms=0,
+        now=None,
+    ):
+        if not playback_context_id:
+            return None, False
+        server_updated_at_ms = _timestamp_ms(now)
+        queue_song_ids = list(queue_song_ids or [])
+        track_id = _queue_track_id(queue_song_ids, current_index)
+        with self._lock:
+            context = self._playback_contexts.get(playback_context_id)
+            if context is not None:
+                return self._copy_playback_context_locked(context), False
+
+            context = {
+                "playbackContextId": playback_context_id,
+                "sessionId": playback_context_id,
+                "userName": user_name,
+                "authorityClientId": authority_client_id,
+                "originClientId": authority_client_id,
+                "timelineId": _playback_context_timeline_id(playback_context_id),
+                "queueSongIds": queue_song_ids,
+                "currentIndex": current_index,
+                "trackId": track_id,
+                "state": "stopped",
+                "positionMs": position_ms,
+                "volume": None,
+                "queueRevision": 0,
+                "controlVersion": 0,
+                "version": 0,
+                "epoch": 0,
+                "deviceSessionId": device_session_id,
+                "serverUpdatedAtMs": server_updated_at_ms,
+                "updatedAt": server_updated_at_ms / 1000,
+                "authoritative": True,
+            }
+            self._playback_contexts[playback_context_id] = context
+            return self._copy_playback_context_locked(context), True
+
     def restore_playback_context(self, playback_context_id, payload, now=None):
         if not playback_context_id or payload is None:
             return None
@@ -689,6 +827,19 @@ class WebSocketState:
             "updatedAt": server_updated_at_ms / 1000,
             "authoritative": True,
         }
+        for field_name in (
+            "contextType",
+            "broadcastId",
+            "ownerClientId",
+            "participants",
+            "controlPolicy",
+            "followDelayMs",
+            "playbackRate",
+            "updatedByClientId",
+            "effectiveAtServerMs",
+        ):
+            if field_name in payload:
+                context[field_name] = payload[field_name]
         with self._lock:
             self._playback_contexts[playback_context_id] = context
             return self._copy_playback_context_locked(context)
@@ -759,6 +910,131 @@ class WebSocketState:
             context["updatedAt"] = server_updated_at_ms / 1000
             return self._copy_playback_context_locked(context)
 
+    def update_existing_playback_context_queue(
+        self,
+        playback_context_id,
+        device_session_id,
+        queue_song_ids,
+        current_index=0,
+        position_ms=0,
+        source_client_id=None,
+        user_name=None,
+        expected_queue_revision=None,
+        now=None,
+    ):
+        if not playback_context_id:
+            return None
+        server_updated_at_ms = _timestamp_ms(now)
+        queue_song_ids = list(queue_song_ids or [])
+        with self._lock:
+            context = self._playback_contexts.get(playback_context_id)
+            if context is None:
+                return None
+
+            current_revision = context.get("queueRevision", 0)
+            if (
+                expected_queue_revision is not None
+                and expected_queue_revision != current_revision
+            ):
+                raise QueueRevisionMismatchError(current_revision)
+
+            previous_queue_song_ids = list(context.get("queueSongIds") or [])
+            previous_index = context.get("currentIndex", 0)
+            previous_track_id = context.get("trackId")
+            next_track_id = _queue_track_id(queue_song_ids, current_index)
+            queue_identity_changed = (
+                previous_queue_song_ids != queue_song_ids
+                or previous_index != current_index
+            )
+            context["originClientId"] = source_client_id or context.get("originClientId")
+            context["userName"] = user_name or context.get("userName")
+            context["queueSongIds"] = queue_song_ids
+            context["currentIndex"] = current_index
+            context["trackId"] = next_track_id
+            context["positionMs"] = position_ms
+            context["queueRevision"] = (
+                current_revision + 1 if queue_identity_changed else current_revision
+            )
+            context["controlVersion"] = context.get("controlVersion", 0) + 1
+            context["version"] = context.get("version", 0) + 1
+            if context.get("epoch", 0) == 0:
+                context["epoch"] = 1
+            elif queue_identity_changed or previous_track_id != next_track_id:
+                context["epoch"] = context.get("epoch", 0) + 1
+            context["deviceSessionId"] = device_session_id
+            context["sessionId"] = playback_context_id
+            context["serverUpdatedAtMs"] = server_updated_at_ms
+            context["updatedAt"] = server_updated_at_ms / 1000
+            return self._copy_playback_context_locked(context)
+
+    def apply_playback_context_control(
+        self,
+        playback_context_id,
+        updated_by_client_id,
+        state_name=None,
+        position_ms=None,
+        current_index=None,
+        control_version=None,
+        now=None,
+    ):
+        if not playback_context_id:
+            return None
+        server_updated_at_ms = _timestamp_ms(now)
+        with self._lock:
+            context = self._playback_contexts.get(playback_context_id)
+            if context is None:
+                return None
+            if state_name is not None:
+                context["state"] = state_name
+            if position_ms is not None:
+                context["positionMs"] = position_ms
+            if current_index is not None:
+                if type(current_index) is not int or current_index < 0:
+                    raise ValueError("currentIndex must be a non-negative integer")
+                queue_song_ids = context.get("queueSongIds") or []
+                if current_index >= len(queue_song_ids):
+                    raise ValueError("currentIndex is out of bounds")
+                previous_index = context.get("currentIndex", 0)
+                previous_track_id = context.get("trackId")
+                context["currentIndex"] = current_index
+                context["trackId"] = queue_song_ids[current_index]
+                if (
+                    previous_index != current_index
+                    or previous_track_id != context.get("trackId")
+                ):
+                    context["queueRevision"] = context.get("queueRevision", 0) + 1
+                    context["epoch"] = max(1, context.get("epoch", 0) + 1)
+            context["originClientId"] = updated_by_client_id or context.get("originClientId")
+            if control_version is None:
+                control_version = context.get("controlVersion", 0) + 1
+            context["controlVersion"] = control_version
+            context["version"] = context.get("version", 0) + 1
+            context["serverUpdatedAtMs"] = server_updated_at_ms
+            context["updatedAt"] = server_updated_at_ms / 1000
+            return self._copy_playback_context_locked(context)
+
+    def close_playback_context(
+        self,
+        playback_context_id,
+        updated_by_client_id=None,
+        state_name="closed",
+        now=None,
+    ):
+        if not playback_context_id:
+            return None
+        server_updated_at_ms = _timestamp_ms(now)
+        with self._lock:
+            context = self._playback_contexts.get(playback_context_id)
+            if context is None:
+                return None
+            context["state"] = state_name
+            context["originClientId"] = updated_by_client_id or context.get("originClientId")
+            context["controlVersion"] = context.get("controlVersion", 0) + 1
+            context["version"] = context.get("version", 0) + 1
+            context["serverUpdatedAtMs"] = server_updated_at_ms
+            context["updatedAt"] = server_updated_at_ms / 1000
+            return self._copy_playback_context_locked(context)
+
     def record_device_playback_state(
         self,
         playback_context_id,
@@ -821,6 +1097,7 @@ class WebSocketState:
         client_id,
         user_name,
         playback_state,
+        create_if_missing=True,
         now=None,
     ):
         if not playback_context_id or not client_id:
@@ -828,12 +1105,17 @@ class WebSocketState:
         server_updated_at_ms = _timestamp_ms(now)
         playback_state = dict(playback_state or {})
         with self._lock:
-            context = self._get_or_create_playback_context_locked(
-                playback_context_id,
-                user_name=user_name,
-                authority_client_id=client_id,
-                now=now,
-            )
+            if create_if_missing:
+                context = self._get_or_create_playback_context_locked(
+                    playback_context_id,
+                    user_name=user_name,
+                    authority_client_id=client_id,
+                    now=now,
+                )
+            else:
+                context = self._playback_contexts.get(playback_context_id)
+                if context is None:
+                    return None, False
             authority_client_id = context.get("authorityClientId")
             authoritative = authority_client_id in (None, client_id)
             if not authoritative:
@@ -841,27 +1123,50 @@ class WebSocketState:
 
             previous_track_id = context.get("trackId")
             previous_index = context.get("currentIndex", 0)
+            previous_queue_song_ids = list(context.get("queueSongIds") or [])
             if not authority_client_id:
                 context["authorityClientId"] = client_id
             context["originClientId"] = playback_state.get("originClientId") or client_id
             context["userName"] = user_name or context.get("userName")
             if "queueSongIds" in playback_state:
-                context["queueSongIds"] = list(playback_state.get("queueSongIds") or [])
-            if isinstance(playback_state.get("currentIndex"), int):
+                queue_song_ids = playback_state.get("queueSongIds")
+                if not isinstance(queue_song_ids, list):
+                    raise ValueError("queueSongIds must be a list")
+                context["queueSongIds"] = list(queue_song_ids)
+            if "currentIndex" in playback_state:
+                if type(playback_state.get("currentIndex")) is not int:
+                    raise ValueError("currentIndex must be an integer")
                 context["currentIndex"] = playback_state["currentIndex"]
+            queue_song_ids = context.get("queueSongIds") or []
+            current_index = context.get("currentIndex", 0)
+            if current_index < 0:
+                raise ValueError("currentIndex must be a non-negative integer")
+            if queue_song_ids and current_index >= len(queue_song_ids):
+                raise ValueError("currentIndex is out of bounds")
+            if not queue_song_ids and current_index != 0:
+                raise ValueError("empty queue must use currentIndex=0")
             if "trackId" in playback_state:
                 context["trackId"] = playback_state.get("trackId")
-            elif context.get("trackId") is None:
+            elif (
+                previous_queue_song_ids != queue_song_ids
+                or previous_index != current_index
+                or context.get("trackId") is None
+            ):
                 context["trackId"] = _queue_track_id(
-                    context.get("queueSongIds") or [],
-                    context.get("currentIndex", 0),
+                    queue_song_ids,
+                    current_index,
                 )
             if "state" in playback_state:
                 context["state"] = playback_state.get("state") or "unknown"
             if "positionMs" in playback_state:
+                if (
+                    type(playback_state.get("positionMs")) is not int
+                    or playback_state.get("positionMs") < 0
+                ):
+                    raise ValueError("positionMs must be a non-negative integer")
                 context["positionMs"] = playback_state.get("positionMs", 0)
-            if "volume" in playback_state:
-                context["volume"] = playback_state.get("volume")
+            if "logicalVolume" in playback_state:
+                context["volume"] = playback_state.get("logicalVolume")
             context["deviceSessionId"] = device_session_id
             context["serverUpdatedAtMs"] = server_updated_at_ms
             context["updatedAt"] = server_updated_at_ms / 1000
@@ -875,8 +1180,14 @@ class WebSocketState:
                 context["epoch"] = context.get("epoch", 0) + 1
             if context.get("controlVersion", 0) <= 0:
                 context["controlVersion"] = 1
+            queue_identity_changed = (
+                previous_queue_song_ids != context.get("queueSongIds", [])
+                or previous_index != context.get("currentIndex", 0)
+            )
             if context.get("queueRevision", 0) <= 0:
                 context["queueRevision"] = 1
+            elif queue_identity_changed:
+                context["queueRevision"] = context.get("queueRevision", 0) + 1
             return self._copy_playback_context_locked(context), True
 
     def transfer_playback_authority(
@@ -887,6 +1198,7 @@ class WebSocketState:
         expected_control_version=None,
         next_control_version=None,
         playback_state=None,
+        origin_client_id=None,
         now=None,
     ):
         if not playback_context_id:
@@ -910,7 +1222,7 @@ class WebSocketState:
             previous_track_id = context.get("trackId")
             previous_index = context.get("currentIndex", 0)
             context["authorityClientId"] = target_client_id
-            context["originClientId"] = source_client_id
+            context["originClientId"] = origin_client_id or source_client_id
             if "queueSongIds" in playback_state:
                 context["queueSongIds"] = list(playback_state.get("queueSongIds") or [])
             if isinstance(playback_state.get("currentIndex"), int):
@@ -921,8 +1233,8 @@ class WebSocketState:
                 context["state"] = playback_state.get("state") or "unknown"
             if "positionMs" in playback_state:
                 context["positionMs"] = playback_state.get("positionMs", 0)
-            if "volume" in playback_state:
-                context["volume"] = playback_state.get("volume")
+            if "logicalVolume" in playback_state:
+                context["volume"] = playback_state.get("logicalVolume")
             context["controlVersion"] = (
                 next_control_version
                 if type(next_control_version) is int
@@ -954,10 +1266,16 @@ class WebSocketState:
         control_version,
         snapshot,
         prepare_id=None,
+        origin_client_id=None,
         now=None,
     ):
         now_ms = _timestamp_ms(now)
-        request_key = (user_name, request_id) if request_id else None
+        origin_client_id = origin_client_id or source_client_id
+        request_key = (
+            (user_name, origin_client_id, request_id)
+            if user_name and origin_client_id and request_id
+            else None
+        )
         with self._lock:
             if request_key and request_key in self._handoff_request_index:
                 existing_id = self._handoff_request_index[request_key]
@@ -978,7 +1296,7 @@ class WebSocketState:
                 "userName": user_name,
                 "sourceClientId": source_client_id,
                 "targetClientId": target_client_id,
-                "originClientId": source_client_id,
+                "originClientId": origin_client_id,
                 "status": "preparing",
                 "baseControlVersion": base_control_version,
                 "controlVersion": control_version,
@@ -998,11 +1316,13 @@ class WebSocketState:
             handoff = self._handoffs.get(handoff_id)
             return dict(handoff) if handoff is not None else None
 
-    def get_playback_handoff_by_request(self, user_name, request_id):
-        if not user_name or not request_id:
+    def get_playback_handoff_by_request(self, user_name, origin_client_id, request_id):
+        if not user_name or not origin_client_id or not request_id:
             return None
         with self._lock:
-            handoff_id = self._handoff_request_index.get((user_name, request_id))
+            handoff_id = self._handoff_request_index.get(
+                (user_name, origin_client_id, request_id)
+            )
             if handoff_id is None:
                 return None
             handoff = self._handoffs.get(handoff_id)
@@ -1362,6 +1682,7 @@ class WebSocketState:
         control_policy="participants_and_controllers_can_control",
         updated_by_client_id=None,
         effective_at_server_ms=None,
+        playback_context_id=None,
         now=None,
     ):
         now = time.time() if now is None else now
@@ -1393,6 +1714,8 @@ class WebSocketState:
             "followDelayMs": DEFAULT_FOLLOW_DELAY_MS,
             "controlPolicy": control_policy,
         }
+        if playback_context_id is not None:
+            broadcast["playbackContextId"] = playback_context_id
         if effective_at_server_ms is not None and state_name == "playing":
             broadcast["effectiveAtServerMs"] = effective_at_server_ms
         with self._lock:
@@ -1402,10 +1725,181 @@ class WebSocketState:
                 self._client_active_broadcast[client_id] = broadcast_id
         return dict(broadcast)
 
+    def upsert_broadcast_playback_context(
+        self,
+        playback_context_id,
+        broadcast_id,
+        user_name,
+        authority_client_id,
+        origin_client_id,
+        participants,
+        queue_song_ids,
+        owner_client_id=None,
+        control_policy=None,
+        follow_delay_ms=None,
+        current_index=0,
+        position_ms=0,
+        state_name="stopped",
+        queue_revision=None,
+        control_version=None,
+        version=None,
+        epoch=None,
+        timeline_id=None,
+        now=None,
+    ):
+        if not playback_context_id:
+            return None
+        server_updated_at_ms = _timestamp_ms(now)
+        queue_song_ids = list(queue_song_ids or [])
+        track_id = _queue_track_id(queue_song_ids, current_index)
+        with self._lock:
+            existing = self._playback_contexts.get(playback_context_id)
+            if existing is not None and not (
+                existing.get("userName") == user_name
+                and existing.get("contextType") == "broadcast"
+                and existing.get("broadcastId") == broadcast_id
+            ):
+                raise PlaybackContextConflictError(
+                    playback_context_id,
+                    existing_context=existing,
+                )
+            if existing is None:
+                existing = {
+                    "playbackContextId": playback_context_id,
+                    "sessionId": playback_context_id,
+                    "volume": None,
+                    "queueRevision": 0,
+                    "controlVersion": 0,
+                    "version": 0,
+                    "epoch": 0,
+                    "authoritative": True,
+                }
+                self._playback_contexts[playback_context_id] = existing
+
+            existing.update(
+                {
+                    "contextType": "broadcast",
+                    "broadcastId": broadcast_id,
+                    "userName": user_name,
+                    "authorityClientId": authority_client_id,
+                    "originClientId": origin_client_id,
+                    "ownerClientId": owner_client_id,
+                    "timelineId": timeline_id
+                    or _playback_context_timeline_id(playback_context_id),
+                    "participants": list(participants or []),
+                    "queueSongIds": queue_song_ids,
+                    "currentIndex": current_index,
+                    "trackId": track_id,
+                    "state": state_name,
+                    "positionMs": position_ms,
+                    "serverUpdatedAtMs": server_updated_at_ms,
+                    "updatedAt": server_updated_at_ms / 1000,
+                    "authoritative": True,
+                }
+            )
+            if control_policy is not None:
+                existing["controlPolicy"] = control_policy
+            if follow_delay_ms is not None:
+                existing["followDelayMs"] = follow_delay_ms
+            if queue_revision is not None:
+                existing["queueRevision"] = queue_revision
+            if control_version is not None:
+                existing["controlVersion"] = control_version
+            if version is not None:
+                existing["version"] = version
+            if epoch is not None:
+                existing["epoch"] = epoch
+            return self._copy_playback_context_locked(existing)
+
+    def restore_broadcast_playback_context(self, playback_context):
+        if not isinstance(playback_context, dict):
+            return None
+        playback_context_id = playback_context.get("playbackContextId")
+        broadcast_id = playback_context.get("broadcastId")
+        if (
+            not playback_context_id
+            or not broadcast_id
+            or playback_context.get("contextType") != "broadcast"
+        ):
+            return None
+
+        participants = list(playback_context.get("participants") or [])
+        queue_song_ids = list(playback_context.get("queueSongIds") or [])
+        current_index = _int_or_default(playback_context.get("currentIndex"), 0)
+        state_name = playback_context.get("state") or "stopped"
+        broadcast = {
+            "broadcastId": broadcast_id,
+            "playbackContextId": playback_context_id,
+            "timelineId": playback_context.get("timelineId")
+            or _broadcast_timeline_id(broadcast_id),
+            "userName": playback_context.get("userName"),
+            "ownerClientId": playback_context.get("ownerClientId")
+            or playback_context.get("originClientId"),
+            "authorityClientId": playback_context.get("authorityClientId")
+            or "server",
+            "originClientId": playback_context.get("originClientId"),
+            "participants": participants,
+            "queueSongIds": queue_song_ids,
+            "currentIndex": current_index,
+            "trackId": playback_context.get("trackId")
+            or _queue_track_id(queue_song_ids, current_index),
+            "positionMs": _int_or_default(playback_context.get("positionMs"), 0),
+            "state": state_name,
+            "playbackRate": playback_context.get("playbackRate", 1.0),
+            "version": _int_or_default(playback_context.get("version"), 0),
+            "epoch": _int_or_default(playback_context.get("epoch"), 0),
+            "queueRevision": _int_or_default(
+                playback_context.get("queueRevision"),
+                0,
+            ),
+            "controlVersion": _int_or_default(
+                playback_context.get("controlVersion"),
+                0,
+            ),
+            "updatedByClientId": playback_context.get("originClientId"),
+            "serverUpdatedAtMs": _timestamp_ms_from_payload(playback_context),
+            "updatedAt": playback_context.get("updatedAt"),
+            "followDelayMs": playback_context.get(
+                "followDelayMs",
+                DEFAULT_FOLLOW_DELAY_MS,
+            ),
+            "controlPolicy": playback_context.get("controlPolicy")
+            or "participants_and_controllers_can_control",
+        }
+        if playback_context.get("effectiveAtServerMs") is not None:
+            broadcast["effectiveAtServerMs"] = playback_context.get(
+                "effectiveAtServerMs"
+            )
+
+        with self._lock:
+            existing = self._broadcasts.get(broadcast_id)
+            if existing is not None:
+                if existing.get("playbackContextId") != playback_context_id:
+                    raise PlaybackContextConflictError(
+                        playback_context_id,
+                        existing_context=playback_context,
+                    )
+                return dict(existing)
+            self._broadcasts[broadcast_id] = broadcast
+            self._broadcast_participants[broadcast_id] = set(participants)
+            if state_name not in ("stopped", "ended", "closed", "expired"):
+                for client_id in participants:
+                    self._client_active_broadcast[client_id] = broadcast_id
+            return dict(broadcast)
+
     def get_broadcast(self, broadcast_id):
         with self._lock:
             broadcast = self._broadcasts.get(broadcast_id)
             return dict(broadcast) if broadcast is not None else None
+
+    def get_broadcast_by_playback_context(self, playback_context_id):
+        if not playback_context_id:
+            return None
+        with self._lock:
+            for broadcast in self._broadcasts.values():
+                if broadcast.get("playbackContextId") == playback_context_id:
+                    return dict(broadcast)
+            return None
 
     def list_broadcasts(self, user_name=None):
         with self._lock:
@@ -1626,9 +2120,12 @@ class WebSocketState:
         source_client_id,
         source_session_id,
         user_name,
+        source_playback_context_id=None,
         now=None,
     ):
-        if not follower_client_id or not source_client_id:
+        if not follower_client_id or (
+            not source_client_id and not source_playback_context_id
+        ):
             return None
         now_ms = _timestamp_ms(now)
         relationship = {
@@ -1641,6 +2138,8 @@ class WebSocketState:
             "createdAtMs": now_ms,
             "updatedAtMs": now_ms,
         }
+        if source_playback_context_id is not None:
+            relationship["sourcePlaybackContextId"] = source_playback_context_id
         with self._lock:
             existing = self._follow_relationships.get(follower_client_id)
             if existing is not None and existing.get("createdAtMs"):
@@ -1689,6 +2188,20 @@ class WebSocketState:
             "requestId": request_id,
         }
         with self._lock:
+            playback_context_id = prepare["commitPayload"].get(
+                "playbackContextId"
+            )
+            if action == "broadcast.start" and playback_context_id:
+                for existing_prepare in self._pending_prepares.values():
+                    if existing_prepare.get("status") != "preparing":
+                        continue
+                    if existing_prepare.get("action") != "broadcast.start":
+                        continue
+                    existing_context_id = (
+                        existing_prepare.get("commitPayload") or {}
+                    ).get("playbackContextId")
+                    if existing_context_id == playback_context_id:
+                        raise PlaybackContextConflictError(playback_context_id)
             self.supersede_prepares_for_timeline(timeline_id)
             self._pending_prepares[prepare_id] = prepare
             return self._copy_prepare_locked(prepare)
