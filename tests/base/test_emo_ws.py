@@ -2,8 +2,15 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
+
+from jsonschema import Draft202012Validator
 
 from supysonic.db import release_database
+from supysonic.emo.protocol_metadata import (
+  get_strict_v2_metadata,
+  get_strict_v2_registration_descriptor,
+)
 from supysonic.emo.ws import (
   CAPABILITY_PLAYBACK_CONTEXT_V2,
   _build_message,
@@ -373,6 +380,59 @@ class EmoWebSocketTestCase(unittest.TestCase):
     registered = ack["payload"]["client"]
     self.assertEqual(registered["deviceSessionId"], "device:player-v2")
     self.assertNotIn("sessionId", registered)
+
+  def test_v2_device_register_returns_strict_v2_metadata(self):
+    client = self.connect_authenticated_client("alice", "Alic3", "auth-player-v2")
+    commit = "a" * 40
+
+    with mock.patch.dict(
+      os.environ,
+      {"EMO_SERVER_BUILD_COMMIT": commit},
+      clear=False,
+    ):
+      messages = self.register_device(
+        client,
+        "register-player-v2",
+        {
+          "clientId": "player-v2",
+          "deviceName": "V2 Player",
+          "roles": ["player"],
+          "deviceSessionId": "device:player-v2",
+          "capabilities": {CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+        },
+      )
+      expected_metadata = get_strict_v2_metadata()
+
+    ack = self.get_ack(messages, "register-player-v2")
+    strict_v2 = ack["payload"]["strictV2"]
+    self.assertEqual(strict_v2, expected_metadata)
+    self.assertEqual(strict_v2["serverBuildCommit"], commit)
+    self.assertRegex(strict_v2["schemaHash"], r"^[0-9a-f]{64}$")
+    self.assertEqual(strict_v2["protocolVersion"], "2.0.0")
+    descriptor = get_strict_v2_registration_descriptor()
+    validator = Draft202012Validator(descriptor["schema"])
+    self.assertTrue(
+      validator.is_valid(ack),
+      list(validator.iter_errors(ack)),
+    )
+
+  def test_legacy_device_register_does_not_return_strict_v2_metadata(self):
+    client = self.connect_authenticated_client("alice", "Alic3", "auth-player-legacy")
+
+    messages = self.register_device(
+      client,
+      "register-player-legacy",
+      {
+        "clientId": "player-legacy",
+        "deviceName": "Legacy Player",
+        "roles": ["player"],
+        "sessionId": "legacy-room",
+      },
+    )
+
+    ack = self.get_ack(messages, "register-player-legacy")
+    self.assertNotIn("strictV2", ack["payload"])
+    self.assertEqual(ack["payload"]["client"]["sessionId"], "legacy-room")
 
   def test_v2_device_list_omits_session_id_aliases(self):
     legacy = self.connect_device("alice", "Alic3", "legacy-player-1", "legacy-room", ["player"])

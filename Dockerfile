@@ -1,6 +1,10 @@
 # 使用 Python 3.11 Alpine 作为基础镜像 (更稳定的选择)
 FROM python:3.11-alpine
 
+ARG SERVER_BUILD_COMMIT=unknown
+ENV EMO_SERVER_BUILD_COMMIT=$SERVER_BUILD_COMMIT
+LABEL org.opencontainers.image.revision=$SERVER_BUILD_COMMIT
+
 # 设置工作目录
 WORKDIR /app
 

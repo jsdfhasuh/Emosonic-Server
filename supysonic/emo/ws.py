@@ -9,6 +9,7 @@ from flask_socketio import Namespace, SocketIO, emit
 from ..db import close_connection, open_connection
 from ..logging_utils import format_log_event
 from ..managers.user import UserManager
+from .protocol_metadata import get_strict_v2_metadata
 from .ws_store import (
     createPlaybackContextState,
     getActivePlaybackHandoffs,
@@ -4479,7 +4480,10 @@ class EmoNamespace(Namespace):
                     client_request_id=request_id,
                     sid=request.sid,
                 )
-                _send_ack(request_id, {"client": current_client})
+                ack_payload = {"client": current_client}
+                if _is_strict_playback_context_v2(current_client):
+                    ack_payload["strictV2"] = get_strict_v2_metadata()
+                _send_ack(request_id, ack_payload)
                 _broadcast_clients(current_user_name)
                 if not _is_strict_playback_context_v2(current_client):
                     _restorePersistedState(request.sid, current_client.get("sessionId"))

@@ -1,0 +1,273 @@
+{
+  "protocolName": "emosonic-playback-context-v2-registration",
+  "protocolVersion": "2.0.0",
+  "coveredActions": {
+    "clientToServer": [
+      "device.register"
+    ],
+    "serverToClient": [
+      "system.ack(device.register)",
+      "system.error(device.register)"
+    ]
+  },
+  "schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "EmoSonic strict-v2 registration handshake",
+    "description": "The strict-v2 device registration request and its responses.",
+    "oneOf": [
+      {
+        "$ref": "#/$defs/strictRegisterRequest"
+      },
+      {
+        "$ref": "#/$defs/strictRegisterAck"
+      },
+      {
+        "$ref": "#/$defs/registerError"
+      }
+    ],
+    "$defs": {
+      "nonEmptyString": {
+        "type": "string",
+        "minLength": 1
+      },
+      "requestId": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "minLength": 1
+      },
+      "strictCapabilities": {
+        "type": "object",
+        "properties": {
+          "playbackContextV2": {
+            "const": true
+          },
+          "playbackPrepare": {
+            "type": "boolean"
+          },
+          "effectiveAtPlayback": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "playbackContextV2"
+        ],
+        "additionalProperties": true
+      },
+      "strictRegistrationPayload": {
+        "type": "object",
+        "properties": {
+          "clientId": {
+            "$ref": "#/$defs/nonEmptyString"
+          },
+          "deviceSessionId": {
+            "$ref": "#/$defs/nonEmptyString"
+          },
+          "deviceName": {
+            "type": "string"
+          },
+          "alias": {
+            "type": "string"
+          },
+          "deviceAlias": {
+            "type": "string"
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "capabilities": {
+            "$ref": "#/$defs/strictCapabilities"
+          }
+        },
+        "required": [
+          "clientId",
+          "deviceSessionId",
+          "capabilities"
+        ],
+        "not": {
+          "required": [
+            "sessionId"
+          ]
+        },
+        "additionalProperties": true
+      },
+      "strictClient": {
+        "type": "object",
+        "properties": {
+          "clientId": {
+            "$ref": "#/$defs/nonEmptyString"
+          },
+          "deviceSessionId": {
+            "$ref": "#/$defs/nonEmptyString"
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "capabilities": {
+            "$ref": "#/$defs/strictCapabilities"
+          },
+          "userName": {
+            "type": "string"
+          },
+          "deviceName": {
+            "type": "string"
+          },
+          "alias": {
+            "type": "string"
+          },
+          "connectedAt": {
+            "type": "number"
+          },
+          "lastSeenAt": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "clientId",
+          "deviceSessionId",
+          "roles",
+          "capabilities"
+        ],
+        "not": {
+          "required": [
+            "sessionId"
+          ]
+        },
+        "additionalProperties": true
+      },
+      "strictMetadata": {
+        "type": "object",
+        "properties": {
+          "protocolVersion": {
+            "$ref": "#/$defs/nonEmptyString"
+          },
+          "schemaHash": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "serverBuildCommit": {
+            "type": "string",
+            "pattern": "^(unknown|[0-9a-f]{40})$"
+          }
+        },
+        "required": [
+          "protocolVersion",
+          "schemaHash",
+          "serverBuildCommit"
+        ],
+        "additionalProperties": false
+      },
+      "strictRegisterRequest": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string"
+          },
+          "action": {
+            "const": "device.register"
+          },
+          "requestId": {
+            "$ref": "#/$defs/requestId"
+          },
+          "payload": {
+            "$ref": "#/$defs/strictRegistrationPayload"
+          }
+        },
+        "required": [
+          "action",
+          "payload"
+        ],
+        "additionalProperties": true
+      },
+      "strictRegisterAck": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "const": "system"
+          },
+          "action": {
+            "const": "system.ack"
+          },
+          "requestId": {
+            "$ref": "#/$defs/requestId"
+          },
+          "timestamp": {
+            "type": "number"
+          },
+          "payload": {
+            "type": "object",
+            "properties": {
+              "client": {
+                "$ref": "#/$defs/strictClient"
+              },
+              "strictV2": {
+                "$ref": "#/$defs/strictMetadata"
+              }
+            },
+            "required": [
+              "client",
+              "strictV2"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "type",
+          "action",
+          "requestId",
+          "timestamp",
+          "payload"
+        ],
+        "additionalProperties": true
+      },
+      "registerError": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "const": "system"
+          },
+          "action": {
+            "const": "system.error"
+          },
+          "requestId": {
+            "$ref": "#/$defs/requestId"
+          },
+          "timestamp": {
+            "type": "number"
+          },
+          "payload": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "$ref": "#/$defs/nonEmptyString"
+              },
+              "message": {
+                "$ref": "#/$defs/nonEmptyString"
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "type",
+          "action",
+          "requestId",
+          "timestamp",
+          "payload"
+        ],
+        "additionalProperties": true
+      }
+    }
+  }
+}

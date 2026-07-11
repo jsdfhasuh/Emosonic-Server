@@ -13,6 +13,7 @@ on:
       - pyproject.toml
       - setup.cfg
       - setup.py
+      - MANIFEST.in
       - Dockerfile
       - setup.sh
       - config.sample
@@ -51,6 +52,42 @@ jobs:
           coverage run -m unittest
           coverage run -a -m unittest tests.net.suite
 
+      - name: Build package artifacts
+        run: |
+          python -m build
+          python - <<'PY'
+          from pathlib import Path
+          import tarfile
+          import zipfile
+
+          expected_path = "supysonic/emo/strict_v2_registration_descriptor.json"
+          distribution_directory = Path("dist")
+          wheels = list(distribution_directory.glob("*.whl"))
+          source_distributions = list(distribution_directory.glob("*.tar.gz"))
+          assert wheels, "No wheel artifact was built"
+          assert source_distributions, "No source distribution artifact was built"
+          for wheel in wheels:
+              with zipfile.ZipFile(wheel) as archive:
+                  assert expected_path in archive.namelist(), wheel
+          for source_distribution in source_distributions:
+              with tarfile.open(source_distribution) as archive:
+                  assert any(
+                      name.endswith(expected_path) for name in archive.getnames()
+                  ), source_distribution
+          PY
+          wheel_target="$RUNNER_TEMP/emosonic-protocol-wheel"
+          sdist_target="$RUNNER_TEMP/emosonic-protocol-sdist"
+          python -m pip install --no-deps --target "$wheel_target" dist/*.whl
+          (
+            cd "$RUNNER_TEMP"
+            PYTHONPATH="$wheel_target" python -c 'from supysonic.emo.protocol_metadata import get_strict_v2_metadata; assert get_strict_v2_metadata()["protocolVersion"] == "2.0.0"'
+          )
+          python -m pip install --no-deps --target "$sdist_target" dist/*.tar.gz
+          (
+            cd "$RUNNER_TEMP"
+            PYTHONPATH="$sdist_target" python -c 'from supysonic.emo.protocol_metadata import get_strict_v2_metadata; assert get_strict_v2_metadata()["protocolVersion"] == "2.0.0"'
+          )
+
       - name: Upload coverage
         uses: codecov/codecov-action@v4
         with:
@@ -66,4 +103,14 @@ jobs:
 
       - name: Build Docker image
         run: |
-          docker build -t emosonic-server:test .
+          docker build \
+            --build-arg SERVER_BUILD_COMMIT=${{ github.sha }} \
+            -t emosonic-server:test .
+
+      - name: Verify Docker image metadata
+        run: |
+          docker run --rm --entrypoint python \
+            -e "EMO_EXPECTED_SERVER_BUILD_COMMIT=${{ github.sha }}" \
+            emosonic-server:test \
+            -c 'import os, re; from supysonic.emo.protocol_metadata import get_strict_v2_metadata; metadata = get_strict_v2_metadata(); expected = os.environ["EMO_EXPECTED_SERVER_BUILD_COMMIT"]; assert metadata["serverBuildCommit"] == expected, metadata; assert re.fullmatch(r"[0-9a-f]{40}", metadata["serverBuildCommit"]), metadata; assert re.fullmatch(r"[0-9a-f]{64}", metadata["schemaHash"]), metadata; print(metadata)'
+          test "$(docker image inspect emosonic-server:test --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = "${{ github.sha }}"

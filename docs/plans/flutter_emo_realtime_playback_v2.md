@@ -86,7 +86,7 @@
     }
   }
 }
-// ack: { "payload": { "client": { clientId, deviceSessionId, deviceName, alias, roles, capabilities, ... } } }
+// strict-v2 ack: { "payload": { "client": { ... }, "strictV2": { protocolVersion, schemaHash, serverBuildCommit } } }
 ```
 
 要点：
@@ -95,6 +95,29 @@
 - **strict-v2 下 `deviceSessionId` 是必填非空**（`_register_device`：strict-v2 分支不再从 `sessionId`/`clientId` 兜底）；缺失或空 → `bad_request`。只有非 v2（legacy）客户端才有 `deviceSessionId → sessionId → clientId` 的兜底。strict-v2 的 client info 里也**不含 `sessionId` 键**。
 - handoff / 两阶段群播的**目标设备**必须同时具备 `playbackPrepare` + `effectiveAtPlayback`，否则相关操作 `forbidden`。
 - 注册成功后服务端会向同用户所有在线设备广播一条 `state` / `device.list`（设备上下线通知）。strict-v2 客户端注册时**不会**触发 legacy 持久态恢复。
+
+### 1.1.1 strictV2 注册握手元数据
+
+当且仅当注册 payload 声明 capabilities.playbackContextV2=true 时，成功 ACK 会额外包含：
+
+~~~json5
+{
+  "strictV2": {
+    "protocolVersion": "2.0.0",
+    "schemaHash": "<64位小写 SHA-256>",
+    "serverBuildCommit": "<40位小写 Git SHA 或 unknown>"
+  }
+}
+~~~
+
+这三项描述的是**注册握手 profile**，不是所有 realtime action 的完整 schema：
+
+- schemaHash 只覆盖 strict-v2 device.register 请求、对应的 system.ack/system.error 以及必要消息信封；
+- 它不保证 playback.update、player.*、follow.*、broadcast.* 或 handoff.* 的 payload 形状；
+- Flutter lab 的预期值必须来自部署 manifest、CI 输出或测试环境配置，不能用 Flutter commit、fixture 或刚收到的 ACK 推测；
+- serverBuildCommit=unknown 只允许本地开发。正式部署验证必须拒绝 unknown、短 SHA 或非法 SHA；
+- 普通客户端可将 serverBuildCommit 用于诊断；协议兼容应以支持的 protocolVersion 与 schemaHash 为准。
+- 非 Docker 的源码、wheel 或 systemd 部署必须在启动服务前显式设置完整 SHA 格式的 `EMO_SERVER_BUILD_COMMIT`；未设置时服务端会报告 `unknown`。
 
 ### 1.2 device.list（拉当前在线设备）
 ```json5
@@ -535,6 +558,7 @@ participant 用 **`playback.update`** 且 payload 带 `broadcastId`（strict-v2 
 ## 7. Flutter 客户端接入清单
 
 ### 7.1 连接层
+- [ ] 正式 Flutter lab 从受信任的部署 manifest/CI 读取 strictV2 三项预期值，并在注册 ACK 后校验。
 - [ ] Socket.IO 连接到 namespace `/emo`，路径 `/emo/ws`；所有业务消息用 `message` 事件收发。
 - [ ] 统一的请求封装：每条请求生成 `requestId`，用 `Completer`/`Future` 按 `requestId` 匹配 `system.ack` / `system.error`，带超时。
 - [ ] 统一错误处理：把 §0.3 的 9 个 code 映射成业务异常；`conflict` 时读取 `currentControlVersion` 等做重试。
