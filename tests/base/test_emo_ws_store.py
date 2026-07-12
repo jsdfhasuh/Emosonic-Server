@@ -1,13 +1,21 @@
-import unittest
+import concurrent.futures
 import os
 import tempfile
+import threading
 import time
+import unittest
 
 from supysonic import db
 from supysonic.emo.ws_store import (
+    PlaybackContextClosedError,
+    PlaybackContextIntentConflictError,
+    PlaybackContextStaleVersionError,
+    closeStrictPlaybackContextState,
     createPlaybackContextState,
+    createStrictPlaybackContextState,
     deletePlaybackContext,
     expirePlaybackContext,
+    failActivePlaybackHandoffsForRestart,
     getActivePlaybackHandoffs,
     getDevicePlaybackState,
     getDevicePlaybackStates,
@@ -20,6 +28,8 @@ from supysonic.emo.ws_store import (
     getPlaybackStates,
     getQueueState,
     listUserPlaybackContexts,
+    listPlaybackContexts,
+    mutateStrictPlaybackContextControl,
     saveDevicePlaybackState,
     savePlaybackContextState,
     savePlaybackHandoff,
@@ -59,6 +69,44 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertEqual(queue_state["queueSongIds"][0], "songId1")
         self.assertEqual(queue_state["queueRevision"], 1)
         self.assertIn("serverUpdatedAtMs", queue_state)
+
+    def test_strict_context_mutations_serialize_same_base_cursor(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            0,
+            "playing",
+        )
+        barrier = threading.Barrier(2)
+
+        def mutate(action):
+            barrier.wait()
+            try:
+                mutateStrictPlaybackContextControl(
+                    "context-1",
+                    "alice",
+                    "controller-1",
+                    action,
+                    1,
+                    position_ms=100 if action == "player.seek" else None,
+                )
+                return "accepted"
+            except PlaybackContextStaleVersionError:
+                return "stale"
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(
+                executor.map(mutate, ("player.pause", "player.seek"))
+            )
+
+        self.assertEqual(sorted(results), ["accepted", "stale"])
+        persisted = getPlaybackContextState("context-1")
+        self.assertEqual(persisted["version"], 2)
+        self.assertEqual(persisted["controlVersion"], 2)
 
     def test_save_and_load_playback_state(self):
         savePlaybackState(
@@ -219,6 +267,137 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertEqual(context["authorityClientId"], "phone-1")
         self.assertEqual(context["trackId"], "song-1")
         self.assertEqual(context["controlVersion"], 1)
+
+    def test_strict_create_persists_identity_fingerprint_and_initial_cursors(self):
+        created_context, created = createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "phone-1",
+            "device:phone-1",
+            ["song-2", "song-1"],
+            0,
+            1200,
+            "playing",
+        )
+        replayed_context, replayed = createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "phone-1",
+            "device:phone-1",
+            ["song-2", "song-1"],
+            0,
+            1200,
+            "playing",
+        )
+
+        self.assertTrue(created)
+        self.assertFalse(replayed)
+        self.assertEqual(created_context, replayed_context)
+        self.assertEqual(created_context["queueSongIds"], ["song-2", "song-1"])
+        self.assertEqual(created_context["authorityDeviceSessionId"], "device:phone-1")
+        self.assertEqual(created_context["lifecycle"], "active")
+        self.assertRegex(created_context["creationFingerprint"], r"^[0-9a-f]{64}$")
+        for cursor_name in ("epoch", "version", "queueRevision", "controlVersion"):
+            self.assertEqual(created_context[cursor_name], 1)
+
+    def test_strict_create_rejects_different_intent_and_closed_id(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "phone-1",
+            "device:phone-1",
+            ["song-1"],
+            0,
+            0,
+            "stopped",
+        )
+
+        with self.assertRaises(PlaybackContextIntentConflictError) as conflict:
+            createStrictPlaybackContextState(
+                "context-1",
+                "alice",
+                "phone-1",
+                "device:phone-1",
+                ["song-2"],
+                0,
+                0,
+                "stopped",
+            )
+        self.assertEqual(conflict.exception.playback_context["version"], 1)
+
+        closed = closeStrictPlaybackContextState("context-1", "alice")
+        closed_again = closeStrictPlaybackContextState("context-1", "alice")
+        self.assertEqual(closed["version"], 2)
+        self.assertEqual(closed_again["version"], 2)
+        self.assertEqual(closed_again["state"], "stopped")
+        self.assertEqual(closed_again["lifecycle"], "closed")
+        with self.assertRaises(PlaybackContextClosedError):
+            createStrictPlaybackContextState(
+                "context-1",
+                "alice",
+                "phone-1",
+                "device:phone-1",
+                ["song-1"],
+                0,
+                0,
+                "stopped",
+            )
+
+    def test_restart_listing_preserves_active_and_closed_contexts(self):
+        createStrictPlaybackContextState(
+            "active-context",
+            "alice",
+            "phone-1",
+            "device:phone-1",
+            ["song-1"],
+            0,
+            0,
+            "playing",
+        )
+        createStrictPlaybackContextState(
+            "closed-context",
+            "alice",
+            "phone-1",
+            "device:phone-1",
+            ["song-2"],
+            0,
+            100,
+            "paused",
+        )
+        closeStrictPlaybackContextState("closed-context", "alice")
+
+        contexts = listPlaybackContexts()
+
+        self.assertEqual(
+            [context["playbackContextId"] for context in contexts],
+            ["active-context", "closed-context"],
+        )
+        self.assertEqual(contexts[0]["authorityDeviceSessionId"], "device:phone-1")
+        self.assertEqual(contexts[0]["version"], 1)
+        self.assertEqual(contexts[1]["lifecycle"], "closed")
+        self.assertEqual(contexts[1]["state"], "paused")
+        self.assertEqual(contexts[1]["version"], 2)
+
+    def test_restart_marks_nonterminal_handoff_failed(self):
+        savePlaybackHandoff(
+            {
+                "handoffId": "handoff-active",
+                "requestId": "request-active",
+                "playbackContextId": "context-1",
+                "userName": "alice",
+                "sourceClientId": "phone-1",
+                "targetClientId": "desktop-1",
+                "status": "ready",
+                "baseControlVersion": 1,
+            }
+        )
+
+        reconciled = failActivePlaybackHandoffsForRestart()
+        handoff = getPlaybackHandoff("handoff-active")
+
+        self.assertEqual(reconciled, ["handoff-active"])
+        self.assertEqual(handoff["status"], "failed")
+        self.assertEqual(handoff["errorCode"], "server_restart")
 
     def test_update_playback_context_state_requires_existing_record(self):
         missing = updatePlaybackContextState(
@@ -459,7 +638,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertNotIn("sessionId", v2_context)
         self.assertNotIn("sourceClientId", v2_context)
         self.assertNotIn("volume", v2_context)
-        self.assertEqual(v2_context["logicalVolume"], 40)
+        self.assertNotIn("logicalVolume", v2_context)
         self.assertEqual(v2_context["playbackContextId"], "playback:alice:main")
         self.assertEqual(v2_context["authorityClientId"], "phone-1")
 
@@ -475,6 +654,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 "state": "playing",
                 "trackId": "song-1",
                 "positionMs": 999,
+                "clientSeq": 1,
                 "muted": True,
                 "outputDeviceId": "dac-1",
                 "audioDeviceName": "USB DAC",
@@ -504,6 +684,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 "state": "playing",
                 "trackId": "song-1",
                 "positionMs": 999,
+                "clientSeq": 1,
                 "muted": True,
                 "outputDeviceId": "dac-1",
                 "audioDeviceName": "USB DAC",
@@ -522,8 +703,9 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertEqual(v2_feedback["clientId"], "pc-1")
         self.assertEqual(v2_feedback["deviceSessionId"], "root:pc")
         self.assertTrue(v2_feedback["muted"])
-        self.assertEqual(v2_feedback["outputDeviceId"], "dac-1")
-        self.assertEqual(v2_feedback["audioDeviceName"], "USB DAC")
+        self.assertEqual(v2_feedback["clientSeq"], 1)
+        self.assertNotIn("outputDeviceId", v2_feedback)
+        self.assertNotIn("audioDeviceName", v2_feedback)
 
     def test_save_and_load_playback_handoff(self):
         savePlaybackHandoff(

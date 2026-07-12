@@ -117,6 +117,10 @@ class StrictRequestCache:
                 if key[0] == connection_nonce:
                     self._entries.pop(key, None)
 
+    def clear_all(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
     def size(self) -> int:
         with self._lock:
             self._prune_locked(self._time_fn())

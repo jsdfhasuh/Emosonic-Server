@@ -1,5 +1,11 @@
+import hashlib
 import json
+import threading
 import time
+from contextlib import contextmanager
+from functools import wraps
+
+from peewee import IntegrityError
 
 from ..db import (
     EmoDevicePlaybackState,
@@ -9,9 +15,53 @@ from ..db import (
     EmoPlaybackState,
     EmoSessionQueue,
     close_connection,
+    db,
     now,
     open_connection,
 )
+
+
+class PlaybackContextClosedError(Exception):
+    def __init__(self, playback_context):
+        super().__init__("Playback context is closed")
+        self.playback_context = playback_context
+
+
+class PlaybackContextIntentConflictError(Exception):
+    def __init__(self, playback_context):
+        super().__init__("playbackContextId already exists with different initial intent")
+        self.playback_context = playback_context
+
+
+class PlaybackContextStaleVersionError(Exception):
+    def __init__(self, playback_context, cursor_name):
+        super().__init__("Playback context %s is stale" % cursor_name)
+        self.playback_context = playback_context
+        self.cursor_name = cursor_name
+
+
+_strict_playback_context_locks = {}
+_strict_playback_context_locks_guard = threading.Lock()
+
+
+@contextmanager
+def _strict_playback_context_lock(playback_context_id):
+    with _strict_playback_context_locks_guard:
+        context_lock = _strict_playback_context_locks.setdefault(
+            playback_context_id,
+            threading.RLock(),
+        )
+    with context_lock:
+        yield
+
+
+def _serialize_strict_playback_context_mutation(function):
+    @wraps(function)
+    def serialized(playback_context_id, *args, **kwargs):
+        with _strict_playback_context_lock(playback_context_id):
+            return function(playback_context_id, *args, **kwargs)
+
+    return serialized
 
 
 def _strip_transient_playback_fields(payload):
@@ -32,33 +82,48 @@ def _payload_value_or_default(payload, key, default):
 def serializePlaybackContextV2(playback_context):
     if playback_context is None:
         return None
-    payload = dict(playback_context)
-    payload["queueSongIds"] = list(payload.get("queueSongIds") or [])
-    logical_volume = payload.pop("logicalVolume", None)
-    stored_volume = payload.pop("volume", None)
-    if logical_volume is None:
-        logical_volume = stored_volume
-    if logical_volume is not None:
-        payload["logicalVolume"] = logical_volume
-    payload.pop("sessionId", None)
-    payload.pop("sourceClientId", None)
+    payload = {
+        "playbackContextId": playback_context.get("playbackContextId"),
+        "authorityClientId": playback_context.get("authorityClientId"),
+        "queueSongIds": list(playback_context.get("queueSongIds") or []),
+        "currentIndex": playback_context.get("currentIndex", 0),
+        "state": playback_context.get("state") or "stopped",
+        "positionMs": playback_context.get("positionMs", 0),
+        "queueRevision": playback_context.get("queueRevision", 1),
+        "controlVersion": playback_context.get("controlVersion", 1),
+        "version": playback_context.get("version", 1),
+        "epoch": playback_context.get("epoch", 1),
+    }
+    for field_name in ("trackId", "timelineId", "serverUpdatedAtMs"):
+        value = playback_context.get(field_name)
+        if value is not None:
+            payload[field_name] = value
     return payload
 
 
 def serializeDevicePlaybackStateV2(device_state):
     if device_state is None:
         return None
-    payload = dict(device_state)
     client_id = (
-        payload.get("clientId")
-        or payload.get("ownerClientId")
-        or payload.get("sourceClientId")
+        device_state.get("clientId")
+        or device_state.get("ownerClientId")
+        or device_state.get("sourceClientId")
     )
-    if client_id is not None:
-        payload["clientId"] = client_id
-    payload.pop("sessionId", None)
-    payload.pop("sourceClientId", None)
-    payload.pop("ownerClientId", None)
+    payload = {
+        "playbackContextId": device_state.get("playbackContextId"),
+        "clientId": client_id,
+        "deviceSessionId": device_state.get("deviceSessionId"),
+        "state": device_state.get("state"),
+        "positionMs": device_state.get("positionMs", 0),
+        "clientSeq": device_state.get("clientSeq"),
+        "serverUpdatedAtMs": device_state.get("serverUpdatedAtMs"),
+    }
+    if any(value is None for value in payload.values()):
+        return None
+    for field_name in ("trackId", "volume", "muted"):
+        value = device_state.get(field_name)
+        if value is not None:
+            payload[field_name] = value
     return payload
 
 
@@ -291,8 +356,12 @@ def _playback_context_payload(record):
             "sessionId": record.playback_context_id,
             "userName": record.user_name,
             "authorityClientId": record.authority_client_id,
+            "authorityDeviceSessionId": record.authority_device_session_id,
             "originClientId": record.origin_client_id,
             "sourceClientId": record.authority_client_id,
+            "timelineId": record.timeline_id,
+            "creationFingerprint": record.creation_fingerprint,
+            "lifecycle": record.lifecycle,
             "queueSongIds": queue_song_ids,
             "currentIndex": record.current_index,
             "trackId": record.track_id,
@@ -308,6 +377,8 @@ def _playback_context_payload(record):
             "authoritative": True,
         }
     )
+    if record.closed_at is not None:
+        payload["closedAtMs"] = int(record.closed_at.timestamp() * 1000)
     return payload
 
 
@@ -320,6 +391,271 @@ def getPlaybackContextState(playback_context_id):
         if record is None:
             return None
         return _playback_context_payload(record)
+    finally:
+        close_connection()
+
+
+def playbackContextCreationFingerprint(
+    user_name,
+    authority_client_id,
+    authority_device_session_id,
+    queue_song_ids,
+    current_index,
+    position_ms,
+    state_name,
+):
+    canonical = json.dumps(
+        {
+            "userName": user_name,
+            "authorityClientId": authority_client_id,
+            "authorityDeviceSessionId": authority_device_session_id,
+            "queueSongIds": list(queue_song_ids),
+            "currentIndex": current_index,
+            "positionMs": position_ms,
+            "state": state_name,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _resolveStrictPlaybackContextCreate(record, user_name, creation_fingerprint):
+    playback_context = _playback_context_payload(record)
+    if record.user_name != user_name:
+        raise PermissionError("Playback context belongs to another user")
+    if record.lifecycle == "closed":
+        raise PlaybackContextClosedError(playback_context)
+    if record.creation_fingerprint != creation_fingerprint:
+        raise PlaybackContextIntentConflictError(playback_context)
+    return playback_context, False
+
+
+@_serialize_strict_playback_context_mutation
+def createStrictPlaybackContextState(
+    playback_context_id,
+    user_name,
+    authority_client_id,
+    authority_device_session_id,
+    queue_song_ids,
+    current_index,
+    position_ms,
+    state_name,
+    timeline_id=None,
+):
+    queue_song_ids = list(queue_song_ids)
+    track_id = queue_song_ids[current_index]
+    timeline_id = timeline_id or "playback:%s" % playback_context_id
+    fingerprint = playbackContextCreationFingerprint(
+        user_name,
+        authority_client_id,
+        authority_device_session_id,
+        queue_song_ids,
+        current_index,
+        position_ms,
+        state_name,
+    )
+    open_connection(reuse=True)
+    try:
+        with db.atomic():
+            record = EmoPlaybackContext.get_or_none(
+                EmoPlaybackContext.playback_context_id == playback_context_id
+            )
+            if record is not None:
+                return _resolveStrictPlaybackContextCreate(
+                    record,
+                    user_name,
+                    fingerprint,
+                )
+            try:
+                with db.atomic():
+                    record = EmoPlaybackContext.create(
+                        playback_context_id=playback_context_id,
+                        user_name=user_name,
+                        authority_client_id=authority_client_id,
+                        authority_device_session_id=authority_device_session_id,
+                        origin_client_id=authority_client_id,
+                        timeline_id=timeline_id,
+                        creation_fingerprint=fingerprint,
+                        lifecycle="active",
+                        queue_json=json.dumps(queue_song_ids, ensure_ascii=True),
+                        current_index=current_index,
+                        track_id=track_id,
+                        state=state_name,
+                        position_ms=position_ms,
+                        queue_revision=1,
+                        control_version=1,
+                        version=1,
+                        epoch=1,
+                        playback_json=json.dumps({}, ensure_ascii=True),
+                    )
+            except IntegrityError:
+                record = EmoPlaybackContext.get(
+                    EmoPlaybackContext.playback_context_id == playback_context_id
+                )
+                return _resolveStrictPlaybackContextCreate(
+                    record,
+                    user_name,
+                    fingerprint,
+                )
+            return _playback_context_payload(record), True
+    finally:
+        close_connection()
+
+
+@_serialize_strict_playback_context_mutation
+def closeStrictPlaybackContextState(playback_context_id, user_name):
+    open_connection(reuse=True)
+    try:
+        with db.atomic():
+            record = EmoPlaybackContext.get_or_none(
+                EmoPlaybackContext.playback_context_id == playback_context_id
+            )
+            if record is None:
+                return None
+            if record.user_name != user_name:
+                raise PermissionError("Playback context belongs to another user")
+            if record.lifecycle != "closed":
+                closed_at = now()
+                record.lifecycle = "closed"
+                record.closed_at = closed_at
+                record.version = max(1, record.version) + 1
+                record.updated_at = closed_at
+                record.save(
+                    only=(
+                        EmoPlaybackContext.lifecycle,
+                        EmoPlaybackContext.closed_at,
+                        EmoPlaybackContext.version,
+                        EmoPlaybackContext.updated_at,
+                    )
+                )
+            return _playback_context_payload(record)
+    finally:
+        close_connection()
+
+
+def _getStrictPlaybackContextRecord(playback_context_id, user_name):
+    record = EmoPlaybackContext.get_or_none(
+        EmoPlaybackContext.playback_context_id == playback_context_id
+    )
+    if record is None:
+        return None
+    if record.user_name != user_name:
+        raise PermissionError("Playback context belongs to another user")
+    if record.lifecycle == "closed":
+        raise PlaybackContextClosedError(_playback_context_payload(record))
+    return record
+
+
+@_serialize_strict_playback_context_mutation
+def mutateStrictPlaybackContextQueue(
+    playback_context_id,
+    user_name,
+    authority_client_id,
+    authority_device_session_id,
+    queue_song_ids,
+    current_index,
+    position_ms,
+    base_queue_revision,
+    base_control_version=None,
+):
+    queue_song_ids = list(queue_song_ids)
+    open_connection(reuse=True)
+    try:
+        with db.atomic():
+            record = _getStrictPlaybackContextRecord(playback_context_id, user_name)
+            if record is None:
+                return None
+            if (
+                record.authority_client_id != authority_client_id
+                or record.authority_device_session_id != authority_device_session_id
+            ):
+                raise PermissionError("Playback context authority identity mismatch")
+            current = _playback_context_payload(record)
+            if base_queue_revision != record.queue_revision:
+                raise PlaybackContextStaleVersionError(current, "queueRevision")
+
+            previous_index = record.current_index
+            previous_track = record.track_id
+            next_track = queue_song_ids[current_index]
+            control_changed = (
+                previous_index != current_index
+                or previous_track != next_track
+                or record.position_ms != position_ms
+            )
+            if control_changed:
+                if base_control_version is None:
+                    raise ValueError(
+                        "baseControlVersion is required when canonical playback changes"
+                    )
+                if base_control_version != record.control_version:
+                    raise PlaybackContextStaleVersionError(current, "controlVersion")
+            elif (
+                base_control_version is not None
+                and base_control_version != record.control_version
+            ):
+                raise PlaybackContextStaleVersionError(current, "controlVersion")
+
+            record.queue_json = json.dumps(queue_song_ids, ensure_ascii=True)
+            record.current_index = current_index
+            record.track_id = next_track
+            record.position_ms = position_ms
+            record.version += 1
+            record.queue_revision += 1
+            if control_changed:
+                record.control_version += 1
+            record.updated_at = now()
+            record.save()
+            return _playback_context_payload(record)
+    finally:
+        close_connection()
+
+
+@_serialize_strict_playback_context_mutation
+def mutateStrictPlaybackContextControl(
+    playback_context_id,
+    user_name,
+    updated_by_client_id,
+    action,
+    base_control_version,
+    base_queue_revision=None,
+    position_ms=None,
+    current_index=None,
+):
+    open_connection(reuse=True)
+    try:
+        with db.atomic():
+            record = _getStrictPlaybackContextRecord(playback_context_id, user_name)
+            if record is None:
+                return None
+            current = _playback_context_payload(record)
+            if base_control_version != record.control_version:
+                raise PlaybackContextStaleVersionError(current, "controlVersion")
+            if (
+                action == "queue.playItem"
+                and base_queue_revision != record.queue_revision
+            ):
+                raise PlaybackContextStaleVersionError(current, "queueRevision")
+
+            queue_song_ids = json.loads(record.queue_json)
+            if current_index is not None:
+                record.current_index = current_index
+                record.track_id = queue_song_ids[current_index]
+            if action in {"player.play", "queue.playItem", "player.next", "player.prev"}:
+                record.state = "playing"
+            elif action == "player.pause":
+                record.state = "paused"
+            if position_ms is not None:
+                record.position_ms = position_ms
+            record.origin_client_id = updated_by_client_id
+            record.version += 1
+            record.control_version += 1
+            if action in {"queue.playItem", "player.next", "player.prev"}:
+                record.queue_revision += 1
+            record.updated_at = now()
+            record.save()
+            return _playback_context_payload(record)
     finally:
         close_connection()
 
@@ -349,7 +685,12 @@ def _writePlaybackContextState(
                 playback_context_id=playback_context_id,
                 user_name=user_name,
                 authority_client_id=payload.get("authorityClientId"),
+                authority_device_session_id=payload.get("authorityDeviceSessionId")
+                or payload.get("deviceSessionId"),
                 origin_client_id=payload.get("originClientId"),
+                timeline_id=payload.get("timelineId"),
+                creation_fingerprint=payload.get("creationFingerprint"),
+                lifecycle=payload.get("lifecycle") or "active",
                 queue_json=queue_json,
                 current_index=payload.get("currentIndex", 0),
                 track_id=payload.get("trackId"),
@@ -361,6 +702,7 @@ def _writePlaybackContextState(
                 version=_payload_value_or_default(payload, "version", 1),
                 epoch=_payload_value_or_default(payload, "epoch", 1),
                 playback_json=json.dumps(payload, ensure_ascii=True),
+                closed_at=payload.get("closedAt"),
             )
             return True
 
@@ -370,7 +712,17 @@ def _writePlaybackContextState(
             raise PermissionError("Playback context belongs to another user")
         record.user_name = user_name
         record.authority_client_id = payload.get("authorityClientId")
+        record.authority_device_session_id = payload.get(
+            "authorityDeviceSessionId",
+            record.authority_device_session_id,
+        )
         record.origin_client_id = payload.get("originClientId")
+        record.timeline_id = payload.get("timelineId", record.timeline_id)
+        record.creation_fingerprint = payload.get(
+            "creationFingerprint",
+            record.creation_fingerprint,
+        )
+        record.lifecycle = payload.get("lifecycle", record.lifecycle)
         record.queue_json = queue_json
         record.current_index = payload.get("currentIndex", 0)
         record.track_id = payload.get("trackId")
@@ -382,6 +734,8 @@ def _writePlaybackContextState(
         record.version = _payload_value_or_default(payload, "version", 1)
         record.epoch = _payload_value_or_default(payload, "epoch", 1)
         record.playback_json = json.dumps(payload, ensure_ascii=True)
+        if payload.get("closedAt") is not None:
+            record.closed_at = payload["closedAt"]
         record.updated_at = now()
         record.save()
         return True
@@ -428,6 +782,39 @@ def listUserPlaybackContexts(user_name):
             .order_by(EmoPlaybackContext.updated_at.desc())
         )
         return [_playback_context_payload(record) for record in query]
+    finally:
+        close_connection()
+
+
+def listPlaybackContexts():
+    open_connection(reuse=True)
+    try:
+        query = EmoPlaybackContext.select().order_by(
+            EmoPlaybackContext.playback_context_id.asc()
+        )
+        return [_playback_context_payload(record) for record in query]
+    finally:
+        close_connection()
+
+
+def failActivePlaybackHandoffsForRestart():
+    open_connection(reuse=True)
+    try:
+        with db.atomic():
+            query = EmoPlaybackHandoff.select().where(
+                EmoPlaybackHandoff.status.in_(
+                    ("preparing", "ready", "committed", "committing")
+                )
+            )
+            reconciled = []
+            for record in query:
+                record.status = "failed"
+                record.error_code = "server_restart"
+                record.error_message = "Server restarted before handoff completed"
+                record.updated_at = now()
+                record.save()
+                reconciled.append(record.handoff_id)
+            return reconciled
     finally:
         close_connection()
 

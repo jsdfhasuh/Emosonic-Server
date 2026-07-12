@@ -342,7 +342,11 @@ CREATE TABLE IF NOT EXISTS emo_playback_context (
     playback_context_id VARCHAR(128) NOT NULL UNIQUE,
     user_name VARCHAR(64) NOT NULL,
     authority_client_id VARCHAR(128),
+    authority_device_session_id VARCHAR(128),
     origin_client_id VARCHAR(128),
+    timeline_id VARCHAR(128),
+    creation_fingerprint VARCHAR(64),
+    lifecycle VARCHAR(16) NOT NULL DEFAULT 'active',
     queue_json TEXT NOT NULL,
     current_index INTEGER NOT NULL DEFAULT 0,
     track_id VARCHAR(128),
@@ -354,6 +358,7 @@ CREATE TABLE IF NOT EXISTS emo_playback_context (
     version INTEGER NOT NULL DEFAULT 1,
     epoch INTEGER NOT NULL DEFAULT 1,
     playback_json TEXT,
+    closed_at TIMESTAMP,
     created_at TIMESTAMP NOT NULL,
     updated_at TIMESTAMP NOT NULL
 );

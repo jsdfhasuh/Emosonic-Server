@@ -25,7 +25,13 @@ from .strict_v2_runtime import (
     request_fingerprint,
 )
 from .ws_store import (
+    PlaybackContextClosedError,
+    PlaybackContextIntentConflictError,
+    PlaybackContextStaleVersionError,
+    closeStrictPlaybackContextState,
     createPlaybackContextState,
+    createStrictPlaybackContextState,
+    failActivePlaybackHandoffsForRestart,
     getActivePlaybackHandoffs,
     getLocalQueueState,
     getLocalQueueStates,
@@ -36,6 +42,9 @@ from .ws_store import (
     getPlaybackState,
     getPlaybackStates,
     getQueueState,
+    listPlaybackContexts,
+    mutateStrictPlaybackContextControl,
+    mutateStrictPlaybackContextQueue,
     saveDevicePlaybackState,
     saveLocalQueueState,
     savePlaybackContextState,
@@ -198,6 +207,10 @@ class PlaybackAuthorityOfflineError(Exception):
     pass
 
 
+class CapabilityRequiredError(PermissionError):
+    pass
+
+
 class FollowControlForbiddenError(PermissionError):
     pass
 
@@ -298,6 +311,14 @@ def _build_action_log_context(action, request_id, current_user_name, current_cli
 
 def init_socketio(app):
     socketio.init_app(app, path="/emo/ws")
+    strict_request_cache.clear_all()
+    state.restore_strict_playback_contexts(listPlaybackContexts())
+    failed_handoffs = failActivePlaybackHandoffsForRestart()
+    if failed_handoffs:
+        logger.warning(
+            "Marked %d active Emo handoffs failed after restart",
+            len(failed_handoffs),
+        )
     metadata = get_strict_v2_metadata()
     logger.warning(
         format_log_event(
@@ -377,7 +398,13 @@ def _message_for_recipient(message, target_sid):
     outgoing = dict(message)
     if outgoing.get("action") not in {"system.ack", "system.error", "system.pong", "device.list"}:
         outgoing.pop("targetClientId", None)
-    outgoing["payload"] = _strip_strict_transport_fields(outgoing.get("payload"))
+    outgoing_payload = _strip_strict_transport_fields(outgoing.get("payload"))
+    if (
+        isinstance(outgoing_payload, dict)
+        and outgoing.get("action") not in {"system.pong", "broadcast.playItem"}
+    ):
+        outgoing_payload.pop("serverTimeMs", None)
+    outgoing["payload"] = outgoing_payload
     outgoing["connectionNonce"] = connection_nonce
     outgoing["connectionEpoch"] = 1
     return outgoing
@@ -560,7 +587,7 @@ def _send_ack(request_id=None, payload=None):
     _emit_message(_build_message("system", "system.ack", payload, requestId=request_id))
 
 
-def _send_error(code, message, request_id=None):
+def _send_error(code, message, request_id=None, **fields):
     current_client = (
         state.get_client_for_sid(request.sid) if has_request_context() else None
     )
@@ -570,6 +597,7 @@ def _send_error(code, message, request_id=None):
         elif code == "follow_control_forbidden":
             code = "forbidden"
     payload = {"code": code, "message": message}
+    payload.update({key: value for key, value in fields.items() if value is not None})
     _emit_message(_build_message("system", "system.error", payload, requestId=request_id))
 
 
@@ -582,6 +610,20 @@ def _send_direct_response(msg_type, action, request_id, payload):
             requestId=request_id,
         )
     )
+
+
+def _run_post_commit_push(action, request_id, push):
+    try:
+        return push()
+    except Exception:
+        _log_emo_event(
+            logging.ERROR,
+            "post_commit_push",
+            result="emit_failed",
+            action=action,
+            client_request_id=request_id,
+        )
+        return None
 
 
 def _get_session_user():
@@ -671,7 +713,7 @@ def _broadcast_context_queue_v2(user_name, playback_context_id):
     message = _build_message(
         "state",
         "queue.context.sync",
-        serializePlaybackContextV2(context),
+        _build_context_queue_payload_v2(context),
     )
     target_sids = set(
         state.list_playback_context_subscribers(
@@ -687,6 +729,25 @@ def _broadcast_context_queue_v2(user_name, playback_context_id):
     )
     for target_sid in target_sids:
         _emit_message(message, target_sid)
+
+
+def _build_context_queue_payload_v2(context):
+    payload = {
+        "playbackContextId": context.get("playbackContextId"),
+        "authorityClientId": context.get("authorityClientId"),
+        "queueSongIds": list(context.get("queueSongIds") or []),
+        "currentIndex": context.get("currentIndex", 0),
+        "positionMs": context.get("positionMs", 0),
+        "queueRevision": context.get("queueRevision", 1),
+        "controlVersion": context.get("controlVersion", 1),
+        "version": context.get("version", 1),
+        "epoch": context.get("epoch", 1),
+        "serverUpdatedAtMs": context.get("serverUpdatedAtMs"),
+    }
+    timeline_id = context.get("timelineId")
+    if timeline_id is not None:
+        payload["timelineId"] = timeline_id
+    return payload
 
 
 def _broadcast_playback_context_state(user_name, playback_context_id):
@@ -2377,8 +2438,141 @@ def _create_source_prepare(current_user_name, current_client, target_client_id, 
     return prepare
 
 
+def _handle_strict_v2_context_control(
+    current_user_name,
+    current_client,
+    action,
+    payload,
+    request_id,
+):
+    playback_context_id = payload["playbackContextId"]
+    context = _get_existing_playback_context(playback_context_id)
+    if context is None:
+        raise LookupError("Playback context not found")
+    _ensure_playback_context_for_user(context, current_user_name)
+    _ensure_playback_context_active(context)
+    if not _has_role(current_client, "controller"):
+        raise PermissionError("Player control requires the controller role")
+
+    authority_client_id = context.get("authorityClientId")
+    authority_client = state.get_client(
+        authority_client_id,
+        user_name=current_user_name,
+    )
+    authority_sid = state.get_sid_for_client(
+        authority_client_id,
+        user_name=current_user_name,
+    )
+    if authority_client is None or authority_sid is None:
+        raise PlaybackAuthorityOfflineError("Playback context authority is offline")
+    if (
+        authority_client.get("deviceSessionId")
+        != context.get("authorityDeviceSessionId")
+    ):
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority device is not connected"
+        )
+    if not _has_role(authority_client, "player"):
+        raise PlaybackAuthorityOfflineError("Playback context authority is not a player")
+
+    required_capability = {
+        "player.pause": CAPABILITY_CAN_PAUSE,
+        "player.seek": CAPABILITY_CAN_SEEK,
+    }.get(action, CAPABILITY_CAN_PLAY)
+    if not _client_supports(authority_client, required_capability):
+        raise CapabilityRequiredError(
+            "Playback authority lacks %s" % required_capability
+        )
+
+    queue_song_ids = list(context.get("queueSongIds") or [])
+    current_index = context.get("currentIndex", 0)
+    requested_index = None
+    position_ms = payload.get("positionMs")
+    if action == "queue.playItem":
+        requested_index = payload["queueIndex"]
+        if requested_index >= len(queue_song_ids):
+            raise ValueError("queue.playItem queueIndex is out of bounds")
+        position_ms = 0
+    elif action == "player.next":
+        requested_index = current_index + 1
+        if requested_index >= len(queue_song_ids):
+            raise ValueError("player.next queueIndex is out of bounds")
+        position_ms = 0
+    elif action == "player.prev":
+        if current_index <= 0:
+            raise ValueError("player.prev queueIndex is out of bounds")
+        requested_index = current_index - 1
+        position_ms = 0
+    elif action == "player.play" and position_ms is None:
+        position_ms = context.get("positionMs", 0)
+
+    updated_context = mutateStrictPlaybackContextControl(
+        playback_context_id,
+        current_user_name,
+        current_client.get("clientId"),
+        action,
+        payload["baseControlVersion"],
+        base_queue_revision=payload.get("baseQueueRevision"),
+        position_ms=position_ms,
+        current_index=requested_index,
+    )
+    if updated_context is None:
+        raise LookupError("Playback context not found")
+    state.restore_playback_context(playback_context_id, updated_context)
+
+    source_client_id = current_client.get("clientId")
+    if action == "queue.playItem":
+        outgoing_payload = {
+            "playbackContextId": playback_context_id,
+            "queueSongIds": list(updated_context["queueSongIds"]),
+            "queueIndex": updated_context["currentIndex"],
+            "queueRevision": updated_context["queueRevision"],
+            "controlVersion": updated_context["controlVersion"],
+            "sourceClientId": source_client_id,
+        }
+    else:
+        outgoing_payload = {
+            "playbackContextId": playback_context_id,
+            "controlVersion": updated_context["controlVersion"],
+            "sourceClientId": source_client_id,
+        }
+        if action in {"player.play", "player.pause", "player.seek"}:
+            outgoing_payload["positionMs"] = updated_context["positionMs"]
+    _emit_message(
+        _build_message("command", action, outgoing_payload),
+        authority_sid,
+    )
+    _send_ack(request_id)
+    if action == "queue.playItem":
+        _run_post_commit_push(
+            action,
+            request_id,
+            lambda: _broadcast_context_queue_v2(
+                current_user_name,
+                playback_context_id,
+            ),
+        )
+    _run_post_commit_push(
+        action,
+        request_id,
+        lambda: _broadcast_playback_context_state_v2(
+            current_user_name,
+            playback_context_id,
+        ),
+    )
+    return True
+
+
 def _handle_v2_context_control(current_user_name, current_client, action, payload, request_id):
     strict_v2 = _is_strict_playback_context_v2(current_client)
+    if strict_v2:
+        return _handle_strict_v2_context_control(
+            current_user_name,
+            current_client,
+            action,
+            payload,
+            request_id,
+        )
     playback_context_id = _resolve_v2_playback_context_id(
         payload,
         strict_v2=strict_v2,
@@ -3618,6 +3812,11 @@ def _ensure_playback_context_for_user(context, user_name):
         raise PermissionError("Playback context authority belongs to another user")
 
 
+def _ensure_playback_context_active(context):
+    if context.get("lifecycle") == "closed":
+        raise PlaybackContextClosedError(context)
+
+
 def _validate_playback_context_queue_payload(payload):
     queue_song_ids = payload.get("queueSongIds")
     if queue_song_ids is None:
@@ -3736,12 +3935,21 @@ def _build_playback_context_status_payload(playback_context):
             continue
         device_states_by_client_id[client_id] = device_state
     device_states.extend(device_states_by_client_id.values())
+    serialized_device_states = [
+        serializeDevicePlaybackStateV2(device_state)
+        for device_state in device_states
+    ]
+    serialized_device_states = sorted(
+        (
+            device_state
+            for device_state in serialized_device_states
+            if device_state is not None
+        ),
+        key=lambda device_state: device_state["clientId"],
+    )
     return {
         "playbackContext": serializePlaybackContextV2(playback_context),
-        "deviceStates": [
-            serializeDevicePlaybackStateV2(device_state)
-            for device_state in device_states
-        ],
+        "deviceStates": serialized_device_states,
     }
 
 
@@ -3756,7 +3964,13 @@ def _push_playback_context_snapshot(sid, playback_context):
     )
 
 
-def _handle_playback_context_create(current_user_name, current_client, payload, request_id):
+def _handle_playback_context_create(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+    sid,
+):
     if current_client is None:
         raise PermissionError("Register the device before creating playback context")
     _reject_session_id_for_strict_v2(payload, strict_v2=True)
@@ -3770,33 +3984,30 @@ def _handle_playback_context_create(current_user_name, current_client, payload, 
     )
     if not isinstance(device_session_id, str) or not device_session_id:
         raise ValueError("playback.context.create requires a non-empty deviceSessionId")
+    if not _has_role(current_client, "player"):
+        raise PermissionError("Only a player can create a playback context")
+    if device_session_id != current_client.get("deviceSessionId"):
+        raise PermissionError("deviceSessionId does not match the registered device")
 
     queue_song_ids, current_index, position_ms = _validate_playback_context_queue_payload(
         payload
     )
-    playback_context = _get_existing_playback_context(playback_context_id)
-    if playback_context is not None:
-        _ensure_playback_context_for_user(playback_context, current_user_name)
-        _send_direct_response(
-            "state",
-            "playback.context.create",
-            request_id,
-            serializePlaybackContextV2(playback_context),
-        )
-        return playback_context
-
-    playback_context, created = state.create_playback_context(
+    playback_context, _created = createStrictPlaybackContextState(
         playback_context_id,
-        device_session_id,
         current_user_name,
         current_client.get("clientId"),
-        queue_song_ids=queue_song_ids,
-        current_index=current_index,
-        position_ms=position_ms,
+        device_session_id,
+        queue_song_ids,
+        current_index,
+        position_ms,
+        payload["state"],
     )
     _ensure_playback_context_for_user(playback_context, current_user_name)
-    if created:
-        _create_playback_context_snapshot(current_user_name, playback_context)
+    playback_context = state.restore_playback_context(
+        playback_context_id,
+        playback_context,
+    )
+    state.subscribe_playback_context(sid, playback_context_id)
     _send_direct_response(
         "state",
         "playback.context.create",
@@ -3818,6 +4029,7 @@ def _handle_playback_context_status(current_user_name, current_client, payload, 
     if playback_context is None:
         raise LookupError("Playback context not found")
     _ensure_playback_context_for_user(playback_context, current_user_name)
+    _ensure_playback_context_active(playback_context)
     _send_direct_response(
         "state",
         "playback.context.status",
@@ -3845,6 +4057,7 @@ def _handle_playback_context_subscribe(
     if playback_context is None:
         raise LookupError("Playback context not found")
     _ensure_playback_context_for_user(playback_context, current_user_name)
+    _ensure_playback_context_active(playback_context)
     state.subscribe_playback_context(sid, playback_context_id)
     _send_ack(request_id)
     return playback_context
@@ -3867,6 +4080,7 @@ def _handle_playback_context_unsubscribe(
     playback_context = _get_existing_playback_context(playback_context_id)
     if playback_context is not None:
         _ensure_playback_context_for_user(playback_context, current_user_name)
+        _ensure_playback_context_active(playback_context)
     state.unsubscribe_playback_context(sid, playback_context_id)
     _send_ack(request_id)
     return playback_context
@@ -3890,15 +4104,23 @@ def _handle_playback_context_close(current_user_name, current_client, payload, r
     ):
         raise PermissionError("Only playback context authority or a controller can close context")
 
-    closed_context = state.close_playback_context(
+    closed_context = closeStrictPlaybackContextState(
         playback_context_id,
-        updated_by_client_id=current_client.get("clientId"),
+        current_user_name,
     )
     if closed_context is None:
         raise LookupError("Playback context not found")
-    _update_playback_context_snapshot(current_user_name, closed_context)
+    state.restore_playback_context(playback_context_id, closed_context)
     _send_ack(request_id)
-    _broadcast_playback_context_closed_v2(current_user_name, playback_context_id)
+    _run_post_commit_push(
+        "playback.context.close",
+        request_id,
+        lambda: _broadcast_playback_context_closed_v2(
+            current_user_name,
+            playback_context_id,
+        ),
+    )
+    state.stop_follow_relationships_for_context(playback_context_id)
     state.clear_playback_context_subscriptions(playback_context_id)
     return closed_context
 
@@ -3922,34 +4144,42 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
     if playback_context is None:
         raise LookupError("Playback context not found")
     _ensure_playback_context_for_user(playback_context, current_user_name)
+    _ensure_playback_context_active(playback_context)
     if playback_context.get("authorityClientId") != current_client.get("clientId"):
         raise PermissionError("Playback context authority mismatch")
+    if (
+        device_session_id != current_client.get("deviceSessionId")
+        or playback_context.get("authorityDeviceSessionId") != device_session_id
+    ):
+        raise PermissionError("Playback context authority device mismatch")
 
     queue_song_ids, current_index, position_ms = _validate_playback_context_queue_payload(
         payload
     )
-    try:
-        updated_context = state.update_existing_playback_context_queue(
-            playback_context_id,
-            device_session_id,
-            queue_song_ids,
-            current_index,
-            position_ms,
-            current_client.get("clientId"),
-            user_name=current_user_name,
-            expected_queue_revision=_get_base_queue_revision(payload),
-        )
-    except QueueRevisionMismatchError as exc:
-        raise QueueConflictError(
-            "Queue revision conflict",
-            current_queue_revision=exc.current_revision,
-        )
+    updated_context = mutateStrictPlaybackContextQueue(
+        playback_context_id,
+        current_user_name,
+        current_client.get("clientId"),
+        device_session_id,
+        queue_song_ids,
+        current_index,
+        position_ms,
+        _get_base_queue_revision(payload),
+        payload.get("baseControlVersion"),
+    )
     if updated_context is None:
         raise LookupError("Playback context not found")
 
-    _update_playback_context_snapshot(current_user_name, updated_context)
+    state.restore_playback_context(playback_context_id, updated_context)
     _send_ack(request_id)
-    _broadcast_context_queue_v2(current_user_name, playback_context_id)
+    _run_post_commit_push(
+        "queue.context.sync",
+        request_id,
+        lambda: _broadcast_context_queue_v2(
+            current_user_name,
+            playback_context_id,
+        ),
+    )
     return updated_context
 
 
@@ -4777,6 +5007,7 @@ class EmoNamespace(Namespace):
         session_info, client_info = state.unregister_session(request.sid)
         if session_info is not None and session_info.get("connectionNonce"):
             strict_request_cache.clear_connection(session_info["connectionNonce"])
+            state.clear_strict_feedback_connection(session_info["connectionNonce"])
         _log_socket_access("disconnect")
         _log_emo_event(logging.INFO, "socket_disconnect", sid=request.sid)
         if client_info is not None:
@@ -5209,6 +5440,7 @@ class EmoNamespace(Namespace):
                     current_client,
                     payload,
                     request_id,
+                    request.sid,
                 )
                 _log_emo_event(
                     logging.INFO,
@@ -5442,9 +5674,14 @@ class EmoNamespace(Namespace):
                     if context is None:
                         raise LookupError("Playback context not found")
                     _ensure_playback_context_for_user(context, current_user_name)
-                    authoritative_update = context.get("authorityClientId") in (
-                        None,
-                        current_client.get("clientId"),
+                    _ensure_playback_context_active(context)
+                    if strict_v2 and device_session_id != current_client.get("deviceSessionId"):
+                        raise PermissionError(
+                            "deviceSessionId does not match the registered device"
+                        )
+                    authoritative_update = (
+                        context.get("authorityClientId") == current_client.get("clientId")
+                        and context.get("authorityDeviceSessionId") == device_session_id
                     )
                     playback_payload = _normalize_v2_playback_update_payload(
                         playback_payload,
@@ -5452,32 +5689,51 @@ class EmoNamespace(Namespace):
                         authoritative=authoritative_update,
                     )
 
-                    authoritative_context, authoritative = state.apply_authority_playback_update(
-                        playback_context_id,
-                        device_session_id,
-                        current_client.get("clientId"),
-                        current_user_name,
-                        playback_payload,
-                        create_if_missing=False,
-                    )
-                    device_feedback = state.record_device_playback_state(
-                        playback_context_id,
-                        device_session_id,
-                        current_client.get("clientId"),
-                        current_user_name,
-                        playback_payload,
-                        is_authority=authoritative,
-                        mode=playback_payload.get("mode") or "normal",
-                    )
-                    if authoritative:
+                    if strict_v2:
+                        authoritative_context = context
+                        authoritative = authoritative_update
+                        device_feedback, feedback_created = (
+                            state.record_strict_device_playback_state(
+                                playback_context_id,
+                                device_session_id,
+                                current_client.get("clientId"),
+                                current_user_name,
+                                playback_payload,
+                                session_info.get("connectionNonce"),
+                                is_authority=authoritative,
+                            )
+                        )
+                    else:
+                        authoritative_context, authoritative = (
+                            state.apply_authority_playback_update(
+                                playback_context_id,
+                                device_session_id,
+                                current_client.get("clientId"),
+                                current_user_name,
+                                playback_payload,
+                                create_if_missing=False,
+                            )
+                        )
+                        device_feedback = state.record_device_playback_state(
+                            playback_context_id,
+                            device_session_id,
+                            current_client.get("clientId"),
+                            current_user_name,
+                            playback_payload,
+                            is_authority=authoritative,
+                            mode=playback_payload.get("mode") or "normal",
+                        )
+                        feedback_created = True
+                    if authoritative and not strict_v2:
                         _update_playback_context_snapshot(
                             current_user_name,
                             authoritative_context,
                         )
-                    _save_device_playback_state_snapshot(
-                        current_user_name,
-                        device_feedback,
-                    )
+                    if feedback_created:
+                        _save_device_playback_state_snapshot(
+                            current_user_name,
+                            device_feedback,
+                        )
                     _log_emo_event(
                         logging.INFO,
                         "playback_update",
@@ -5509,12 +5765,20 @@ class EmoNamespace(Namespace):
                             else None
                         )
                     _send_ack(request_id, ack_payload)
-                    update_message = _broadcast_v2_playback_update(
-                        current_user_name,
-                        playback_context_id,
-                        device_feedback,
-                    )
-                    if authoritative:
+                    if strict_v2 and not feedback_created:
+                        update_message = _build_message(
+                            "event",
+                            "playback.update",
+                            _build_v2_playback_update_payload(device_feedback),
+                        )
+                        _emit_message(update_message, request.sid)
+                    else:
+                        update_message = _broadcast_v2_playback_update(
+                            current_user_name,
+                            playback_context_id,
+                            device_feedback,
+                        )
+                    if authoritative and not strict_v2:
                         _broadcast_playback_context_state_v2(
                             current_user_name,
                             playback_context_id,
@@ -5917,6 +6181,40 @@ class EmoNamespace(Namespace):
                     source_client_id=None if current_client is None else current_client.get("clientId"),
                 )
                 _send_error("not_supported", f"Unsupported action: {action}", request_id)
+        except PlaybackContextStaleVersionError as exc:
+            playback_context = exc.playback_context or {}
+            fields = {
+                "playbackContextId": playback_context.get("playbackContextId"),
+            }
+            if exc.cursor_name == "controlVersion":
+                fields["currentControlVersion"] = playback_context.get(
+                    "controlVersion"
+                )
+            elif exc.cursor_name == "queueRevision":
+                fields["currentQueueRevision"] = playback_context.get(
+                    "queueRevision"
+                )
+            _send_error("stale_version", str(exc), request_id, **fields)
+        except PlaybackContextClosedError as exc:
+            playback_context = exc.playback_context or {}
+            _send_error(
+                "context_closed",
+                str(exc),
+                request_id,
+                playbackContextId=playback_context.get("playbackContextId")
+                or payload.get("playbackContextId"),
+            )
+        except PlaybackContextIntentConflictError as exc:
+            playback_context = exc.playback_context or {}
+            _send_error(
+                "conflict",
+                str(exc),
+                request_id,
+                playbackContextId=playback_context.get("playbackContextId"),
+                currentControlVersion=playback_context.get("controlVersion"),
+                currentQueueRevision=playback_context.get("queueRevision"),
+                currentVersion=playback_context.get("version"),
+            )
         except QueueConflictError as exc:
             event_name = _get_action_event_name(action) or "bad_message"
             _log_emo_event(
@@ -6001,10 +6299,14 @@ class EmoNamespace(Namespace):
                 )
             )
         except ClientSeqStaleError as exc:
+            strict_v2 = _is_strict_playback_context_v2(current_client)
+            error_code = (
+                "client_sequence_conflict" if strict_v2 else "stale_client_seq"
+            )
             _log_emo_event(
                 logging.WARNING,
                 _get_action_event_name(action) or "bad_message",
-                result="stale_client_seq",
+                result=error_code,
                 reason=str(exc),
                 **_build_action_log_context(
                     action,
@@ -6020,7 +6322,7 @@ class EmoNamespace(Namespace):
                     "system",
                     "system.error",
                     {
-                        "code": "stale_client_seq",
+                        "code": error_code,
                         "message": str(exc),
                         "currentClientSeq": exc.current_seq,
                     },
@@ -6071,6 +6373,8 @@ class EmoNamespace(Namespace):
                 sid=request.sid,
             )
             _send_error("not_supported", str(exc), request_id)
+        except CapabilityRequiredError as exc:
+            _send_error("capability_required", str(exc), request_id)
         except PermissionError as exc:
             _log_emo_event(
                 logging.WARNING,

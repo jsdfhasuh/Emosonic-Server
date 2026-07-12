@@ -129,6 +129,8 @@ class WebSocketState:
         self._playback_contexts = {}
         # (playbackContextId, clientId) -> device feedback state
         self._device_playback_states = {}
+        # (playbackContextId, clientId, connectionNonce, connectionEpoch) -> sequence record
+        self._strict_feedback_sequences = {}
         # handoffId -> playback authority handoff state
         self._handoffs = {}
         # (userName, requestId) -> handoffId for idempotent start requests
@@ -859,6 +861,10 @@ class WebSocketState:
             "authoritative": True,
         }
         for field_name in (
+            "authorityDeviceSessionId",
+            "creationFingerprint",
+            "lifecycle",
+            "closedAtMs",
             "contextType",
             "broadcastId",
             "ownerClientId",
@@ -1104,6 +1110,105 @@ class WebSocketState:
                         device_state["isAuthority"] = False
             self._device_playback_states[(playback_context_id, client_id)] = payload
             return dict(payload)
+
+    def record_strict_device_playback_state(
+        self,
+        playback_context_id,
+        device_session_id,
+        client_id,
+        user_name,
+        playback_state,
+        connection_nonce,
+        connection_epoch=1,
+        is_authority=False,
+        now=None,
+    ):
+        client_seq = playback_state.get("clientSeq")
+        sequence_key = (
+            playback_context_id,
+            client_id,
+            connection_nonce,
+            connection_epoch,
+        )
+        fingerprint = {
+            key: playback_state.get(key)
+            for key in (
+                "playbackContextId",
+                "deviceSessionId",
+                "state",
+                "trackId",
+                "positionMs",
+                "volume",
+                "muted",
+                "clientSeq",
+            )
+            if key in playback_state
+        }
+        server_updated_at_ms = _timestamp_ms(now)
+        with self._lock:
+            previous = self._strict_feedback_sequences.get(sequence_key)
+            if previous is not None:
+                previous_seq = previous["clientSeq"]
+                if client_seq < previous_seq:
+                    raise ClientSeqStaleError(previous_seq)
+                if client_seq == previous_seq:
+                    if previous["fingerprint"] != fingerprint:
+                        raise ClientSeqStaleError(previous_seq)
+                    return dict(previous["deviceState"]), False
+
+            payload = dict(playback_state)
+            payload.update(
+                {
+                    "playbackContextId": playback_context_id,
+                    "deviceSessionId": device_session_id,
+                    "sessionId": device_session_id,
+                    "sourceClientId": client_id,
+                    "state": payload["state"],
+                    "positionMs": payload["positionMs"],
+                    "isAuthority": bool(is_authority),
+                    "mode": "normal",
+                    "serverUpdatedAtMs": server_updated_at_ms,
+                    "updatedAt": server_updated_at_ms / 1000,
+                    "userName": user_name,
+                }
+            )
+            self._device_playback_states[(playback_context_id, client_id)] = payload
+            self._strict_feedback_sequences[sequence_key] = {
+                "clientSeq": client_seq,
+                "fingerprint": fingerprint,
+                "deviceState": dict(payload),
+            }
+            return dict(payload), True
+
+    def clear_strict_feedback_connection(self, connection_nonce):
+        with self._lock:
+            for key in list(self._strict_feedback_sequences):
+                if key[2] == connection_nonce:
+                    self._strict_feedback_sequences.pop(key, None)
+
+    def restore_strict_playback_contexts(self, playback_contexts):
+        with self._lock:
+            self._sessions.clear()
+            self._clients.clear()
+            self._client_to_sid.clear()
+            self._session_subscriptions.clear()
+            self._playback_contexts.clear()
+            self._device_playback_states.clear()
+            self._strict_feedback_sequences.clear()
+            self._playback_context_subscriptions.clear()
+            self._follow_relationships.clear()
+            self._pending_prepares.clear()
+            self._handoffs.clear()
+            self._handoff_request_index.clear()
+            self._broadcasts.clear()
+            self._broadcast_participants.clear()
+            self._broadcast_playback_states.clear()
+            self._client_active_broadcast.clear()
+        for playback_context in playback_contexts:
+            self.restore_playback_context(
+                playback_context.get("playbackContextId"),
+                playback_context,
+            )
 
     def get_device_playback_state(self, playback_context_id, client_id):
         with self._lock:
@@ -2187,6 +2292,21 @@ class WebSocketState:
             relationship["active"] = False
             relationship["updatedAtMs"] = now_ms
             return dict(relationship)
+
+    def stop_follow_relationships_for_context(self, playback_context_id, now=None):
+        now_ms = _timestamp_ms(now)
+        stopped = []
+        with self._lock:
+            for relationship in self._follow_relationships.values():
+                if (
+                    relationship.get("active")
+                    and relationship.get("sourcePlaybackContextId")
+                    == playback_context_id
+                ):
+                    relationship["active"] = False
+                    relationship["updatedAtMs"] = now_ms
+                    stopped.append(dict(relationship))
+        return stopped
 
     def create_prepare(
         self,
