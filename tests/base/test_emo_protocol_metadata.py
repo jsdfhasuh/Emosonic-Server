@@ -35,7 +35,7 @@ class EmoProtocolMetadataTestCase(unittest.TestCase):
             descriptor["protocolName"],
             "emosonic-playback-context-v2-registration",
         )
-        self.assertEqual(descriptor["protocolVersion"], "2.0.0")
+        self.assertEqual(descriptor["protocolVersion"], "2.1.0")
         self.assertEqual(
             descriptor["coveredActions"]["clientToServer"],
             ["device.register"],
@@ -132,7 +132,7 @@ class EmoProtocolMetadataTestCase(unittest.TestCase):
     def test_schema_hash_does_not_include_protocol_version(self):
         descriptor = protocol_metadata.get_strict_v2_registration_descriptor()
         changed_version_descriptor = copy.deepcopy(descriptor)
-        changed_version_descriptor["protocolVersion"] = "2.1.0"
+        changed_version_descriptor["protocolVersion"] = "2.2.0"
 
         self.assertEqual(
             protocol_metadata.calculate_strict_v2_schema_hash(
@@ -215,6 +215,31 @@ class EmoProtocolMetadataTestCase(unittest.TestCase):
             metadata["protocolVersion"] = "changed"
             current_metadata = protocol_metadata.get_strict_v2_metadata()
 
-        self.assertEqual(current_metadata["protocolVersion"], "2.0.0")
+        self.assertEqual(current_metadata["protocolVersion"], "2.1.0")
         self.assertEqual(current_metadata["serverBuildCommit"], commit)
         self.assertRegex(current_metadata["schemaHash"], r"^[0-9a-f]{64}$")
+
+    def test_registration_metadata_adds_connection_evidence(self):
+        nonce = "nonce-for-current-socket"
+
+        static_metadata = protocol_metadata.get_strict_v2_metadata()
+        metadata = protocol_metadata.get_strict_v2_registration_metadata(nonce)
+
+        self.assertNotIn("connectionNonce", static_metadata)
+        self.assertNotIn("connectionEpoch", static_metadata)
+        self.assertEqual(
+            {
+                "protocolVersion": metadata["protocolVersion"],
+                "schemaHash": metadata["schemaHash"],
+                "serverBuildCommit": metadata["serverBuildCommit"],
+            },
+            static_metadata,
+        )
+        self.assertEqual(metadata["connectionNonce"], nonce)
+        self.assertEqual(
+            metadata["connectionEpoch"],
+            protocol_metadata.STRICT_V2_CONNECTION_EPOCH,
+        )
+
+        with self.assertRaisesRegex(ValueError, "connectionNonce"):
+            protocol_metadata.get_strict_v2_registration_metadata("")

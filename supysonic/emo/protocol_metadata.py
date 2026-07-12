@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 _DESCRIPTOR_PATH = Path(__file__).with_name("strict_v2_registration_descriptor.json")
 _BUILD_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _UNKNOWN_BUILD_COMMIT = "unknown"
+STRICT_V2_CONNECTION_EPOCH = 1
 _WARNED_BUILD_COMMIT_VALUES = set()  # type: Set[str]
 
 
@@ -167,3 +168,18 @@ def get_strict_v2_metadata() -> Dict[str, str]:
         "schemaHash": get_strict_v2_schema_hash(),
         "serverBuildCommit": get_server_build_commit(),
     }
+
+
+def get_strict_v2_registration_metadata(connection_nonce: str) -> Dict[str, object]:
+    connection_nonce = _require_non_empty_string(
+        connection_nonce,
+        "connectionNonce",
+    )
+    metadata = get_strict_v2_metadata()
+    metadata.update(
+        {
+            "connectionNonce": connection_nonce,
+            "connectionEpoch": STRICT_V2_CONNECTION_EPOCH,
+        }
+    )
+    return metadata

@@ -1,9 +1,14 @@
+import secrets
 import threading
 import time
 
 
 DEFAULT_CLIENT_STALE_SECONDS = 90
 DEFAULT_FOLLOW_DELAY_MS = 0
+
+
+def _new_connection_nonce() -> str:
+    return secrets.token_urlsafe(32)
 
 
 def _timestamp_ms(now=None):
@@ -138,6 +143,7 @@ class WebSocketState:
                 "sid": sid,
                 "connectedAt": now,
                 "lastSeenAt": now,
+                "connectionNonce": _new_connection_nonce(),
                 "authenticated": False,
                 "userName": None,
                 "clientId": None,

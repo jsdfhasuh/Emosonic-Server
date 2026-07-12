@@ -1,6 +1,6 @@
 {
   "protocolName": "emosonic-playback-context-v2-registration",
-  "protocolVersion": "2.0.0",
+  "protocolVersion": "2.1.0",
   "coveredActions": {
     "clientToServer": [
       "device.register"
@@ -155,12 +155,21 @@
           "serverBuildCommit": {
             "type": "string",
             "pattern": "^(unknown|[0-9a-f]{40})$"
+          },
+          "connectionNonce": {
+            "$ref": "#/$defs/nonEmptyString"
+          },
+          "connectionEpoch": {
+            "type": "integer",
+            "const": 1
           }
         },
         "required": [
           "protocolVersion",
           "schemaHash",
-          "serverBuildCommit"
+          "serverBuildCommit",
+          "connectionNonce",
+          "connectionEpoch"
         ],
         "additionalProperties": false
       },

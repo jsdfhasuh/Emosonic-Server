@@ -4,7 +4,7 @@ import unittest
 from jsonschema import Draft202012Validator
 
 from supysonic.emo.protocol_metadata import (
-    get_strict_v2_metadata,
+    get_strict_v2_registration_metadata,
     get_strict_v2_registration_descriptor,
 )
 
@@ -50,7 +50,9 @@ class EmoRegistrationDescriptorTestCase(unittest.TestCase):
                         "playbackContextV2": True,
                     },
                 },
-                "strictV2": get_strict_v2_metadata(),
+                "strictV2": get_strict_v2_registration_metadata(
+                    "nonce-for-descriptor-test"
+                ),
             },
         }
 
@@ -74,6 +76,18 @@ class EmoRegistrationDescriptorTestCase(unittest.TestCase):
         ack["payload"]["strictV2"]["unexpected"] = True
 
         self.assertFalse(self.validator.is_valid(ack))
+
+    def test_descriptor_requires_connection_evidence(self):
+        missing_nonce = self._strict_register_ack()
+        del missing_nonce["payload"]["strictV2"]["connectionNonce"]
+        invalid_epoch = self._strict_register_ack()
+        invalid_epoch["payload"]["strictV2"]["connectionEpoch"] = 2
+        boolean_epoch = self._strict_register_ack()
+        boolean_epoch["payload"]["strictV2"]["connectionEpoch"] = True
+
+        self.assertFalse(self.validator.is_valid(missing_nonce))
+        self.assertFalse(self.validator.is_valid(invalid_epoch))
+        self.assertFalse(self.validator.is_valid(boolean_epoch))
 
     def test_descriptor_rejects_a_legacy_ack_as_strict_ack(self):
         legacy_ack = self._strict_register_ack()

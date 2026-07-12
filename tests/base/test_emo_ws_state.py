@@ -46,6 +46,20 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
         self.assertEqual(removed["deviceName"], "Living Room")
         self.assertIsNone(self.state.get_sid_for_client("player-1"))
 
+    def test_each_registered_session_has_unique_connection_evidence(self):
+        self.state.register_session("sid-1", now=100)
+        self.state.register_session("sid-2", now=100)
+
+        first_session = self.state.get_session("sid-1")
+        second_session = self.state.get_session("sid-2")
+
+        self.assertIsInstance(first_session["connectionNonce"], str)
+        self.assertTrue(first_session["connectionNonce"])
+        self.assertNotEqual(
+            first_session["connectionNonce"],
+            second_session["connectionNonce"],
+        )
+
     def test_touch_session_updates_client_last_seen(self):
         self.state.register_session("sid-1", now=100)
         self.state.authenticate_session("sid-1", "alice")

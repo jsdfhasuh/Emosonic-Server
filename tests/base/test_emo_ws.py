@@ -405,15 +405,59 @@ class EmoWebSocketTestCase(unittest.TestCase):
 
     ack = self.get_ack(messages, "register-player-v2")
     strict_v2 = ack["payload"]["strictV2"]
-    self.assertEqual(strict_v2, expected_metadata)
+    self.assertEqual(
+      {
+        "protocolVersion": strict_v2["protocolVersion"],
+        "schemaHash": strict_v2["schemaHash"],
+        "serverBuildCommit": strict_v2["serverBuildCommit"],
+      },
+      expected_metadata,
+    )
     self.assertEqual(strict_v2["serverBuildCommit"], commit)
     self.assertRegex(strict_v2["schemaHash"], r"^[0-9a-f]{64}$")
-    self.assertEqual(strict_v2["protocolVersion"], "2.0.0")
+    self.assertEqual(strict_v2["protocolVersion"], "2.1.0")
+    self.assertIsInstance(strict_v2["connectionNonce"], str)
+    self.assertTrue(strict_v2["connectionNonce"])
+    self.assertEqual(strict_v2["connectionEpoch"], 1)
     descriptor = get_strict_v2_registration_descriptor()
     validator = Draft202012Validator(descriptor["schema"])
     self.assertTrue(
       validator.is_valid(ack),
       list(validator.iter_errors(ack)),
+    )
+
+  def test_v2_device_register_nonce_is_unique_per_connection(self):
+    first_client = self.connect_authenticated_client("alice", "Alic3", "auth-player-v2-first")
+    second_client = self.connect_authenticated_client("alice", "Alic3", "auth-player-v2-second")
+
+    first_ack = self.get_ack(
+      self.register_device(
+        first_client,
+        "register-player-v2-first",
+        {
+          "clientId": "player-v2-first",
+          "deviceSessionId": "device:player-v2-first",
+          "capabilities": {CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+        },
+      ),
+      "register-player-v2-first",
+    )
+    second_ack = self.get_ack(
+      self.register_device(
+        second_client,
+        "register-player-v2-second",
+        {
+          "clientId": "player-v2-second",
+          "deviceSessionId": "device:player-v2-second",
+          "capabilities": {CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+        },
+      ),
+      "register-player-v2-second",
+    )
+
+    self.assertNotEqual(
+      first_ack["payload"]["strictV2"]["connectionNonce"],
+      second_ack["payload"]["strictV2"]["connectionNonce"],
     )
 
   def test_legacy_device_register_does_not_return_strict_v2_metadata(self):
