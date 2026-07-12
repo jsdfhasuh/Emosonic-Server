@@ -1,5 +1,6 @@
 include config.sample
 include README.md
+include supysonic/emo/strict_v2_conformance.json
 include supysonic/emo/strict_v2_registration_descriptor.json
 recursive-include supysonic/schema *
 recursive-include supysonic/templates *

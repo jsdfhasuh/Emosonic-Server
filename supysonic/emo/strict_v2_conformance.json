@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "contractSha256": "ca069c6ad52447ea4f7ace7d795460c5ec759e5708b2f45acfbe50903aa4b3a3",
+  "profiles": {
+    "core": {
+      "codeConformanceReady": false,
+      "evidence": []
+    },
+    "follow": {
+      "codeConformanceReady": false,
+      "evidence": []
+    },
+    "handoff": {
+      "codeConformanceReady": false,
+      "evidence": []
+    },
+    "broadcast": {
+      "codeConformanceReady": false,
+      "evidence": []
+    }
+  }
+}
