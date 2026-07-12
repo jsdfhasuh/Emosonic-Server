@@ -53,3 +53,21 @@ the failing assertions is not an accepted resolution.
 | Contract/action/REQ inventory | `tests.base.test_emo_strict_v2_manifest` |
 | Code conformance fail-closed behavior | `tests.base.test_emo_strict_v2_conformance` |
 | Database migrations | `tests.base.test_emo_schema_migration` |
+
+The independently runnable legacy WebSocket entry point is:
+
+```text
+python -m unittest tests.emo_legacy_suite
+
+Ran 83 tests in 7.666s
+FAILED (failures=1)
+```
+
+It selects existing `EmoWebSocketTestCase` methods whose names contain neither `strict` nor `_v2_`. The module
+also explicitly assigns the three historical duplicate-Handoff tests to the strict Handoff surface because their
+names predate the naming convention. Its name intentionally does not start with `test_`, so default discovery
+does not execute the same tests twice. New strict tests belong in their fixed profile modules rather than relying
+on this filter.
+
+The remaining failure is the already attributed legacy Follow error-code regression. The suite itself is now
+independently runnable and contains no known r5 direct-response or Handoff ACK assertions.
