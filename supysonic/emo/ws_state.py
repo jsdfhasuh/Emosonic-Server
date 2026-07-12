@@ -136,6 +136,17 @@ class WebSocketState:
         # sid -> subscribed playbackContextIds
         self._playback_context_subscriptions = {}
 
+    @staticmethod
+    def _client_key(user_name, client_id):
+        return (user_name, client_id)
+
+    def _find_client_key_locked(self, client_id, user_name=None):
+        if user_name is not None:
+            key = self._client_key(user_name, client_id)
+            return key if key in self._clients else None
+        matches = [key for key in self._clients if key[1] == client_id]
+        return matches[0] if len(matches) == 1 else None
+
     def register_session(self, sid, now=None):
         now = time.time() if now is None else now
         with self._lock:
@@ -172,13 +183,14 @@ class WebSocketState:
         client_info["connectedAt"] = now
         client_info["lastSeenAt"] = now
         with self._lock:
-            previous_sid = self._client_to_sid.get(client_id)
+            client_key = self._client_key(client_info.get("userName"), client_id)
+            previous_sid = self._client_to_sid.get(client_key)
             if previous_sid is not None and previous_sid != sid:
                 previous_session = self._sessions.get(previous_sid)
                 if previous_session is not None:
                     previous_session["clientId"] = None
-            self._clients[client_id] = client_info
-            self._client_to_sid[client_id] = sid
+            self._clients[client_key] = client_info
+            self._client_to_sid[client_key] = sid
             session_info = self._sessions.get(sid)
             if session_info is not None:
                 session_info["clientId"] = client_id
@@ -196,8 +208,9 @@ class WebSocketState:
                 return None
             session_info["lastSeenAt"] = now
             client_id = session_info.get("clientId")
-            if client_id and self._client_to_sid.get(client_id) == sid:
-                client_info = self._clients.get(client_id)
+            client_key = self._client_key(session_info.get("userName"), client_id)
+            if client_id and self._client_to_sid.get(client_key) == sid:
+                client_info = self._clients.get(client_key)
                 if client_info is not None:
                     client_info["lastSeenAt"] = now
             return dict(session_info)
@@ -209,18 +222,19 @@ class WebSocketState:
         now = time.time() if now is None else now
         removed = []
         with self._lock:
-            for client_id, client_info in list(self._clients.items()):
+            for client_key, client_info in list(self._clients.items()):
+                client_id = client_info.get("clientId")
                 last_seen_at = client_info.get("lastSeenAt") or client_info.get("connectedAt")
                 if last_seen_at is None or now - last_seen_at <= stale_after_seconds:
                     continue
 
-                sid = self._client_to_sid.get(client_id)
+                sid = self._client_to_sid.get(client_key)
                 if sid is not None:
                     session_info = self._sessions.get(sid)
                     if session_info is not None and session_info.get("clientId") == client_id:
                         session_info["clientId"] = None
-                self._client_to_sid.pop(client_id, None)
-                removed_client = self._clients.pop(client_id)
+                self._client_to_sid.pop(client_key, None)
+                removed_client = self._clients.pop(client_key)
                 self._mark_broadcast_participant_offline_locked(client_id, now=now)
                 self._deactivate_follow_relationships_for_client_locked(client_id, now=now)
                 removed.append(removed_client)
@@ -236,22 +250,25 @@ class WebSocketState:
             client_id = session_info.get("clientId")
             client_info = None
             if client_id:
-                current_sid = self._client_to_sid.get(client_id)
+                client_key = self._client_key(session_info.get("userName"), client_id)
+                current_sid = self._client_to_sid.get(client_key)
                 if current_sid == sid:
-                    self._client_to_sid.pop(client_id, None)
-                    client_info = self._clients.pop(client_id, None)
+                    self._client_to_sid.pop(client_key, None)
+                    client_info = self._clients.pop(client_key, None)
                     self._mark_broadcast_participant_offline_locked(client_id)
                     self._deactivate_follow_relationships_for_client_locked(client_id)
             return session_info, client_info
 
-    def get_client(self, client_id):
+    def get_client(self, client_id, user_name=None):
         with self._lock:
-            client = self._clients.get(client_id)
+            client_key = self._find_client_key_locked(client_id, user_name=user_name)
+            client = None if client_key is None else self._clients.get(client_key)
             return dict(client) if client is not None else None
 
-    def get_sid_for_client(self, client_id):
+    def get_sid_for_client(self, client_id, user_name=None):
         with self._lock:
-            return self._client_to_sid.get(client_id)
+            client_key = self._find_client_key_locked(client_id, user_name=user_name)
+            return None if client_key is None else self._client_to_sid.get(client_key)
 
     def get_client_for_sid(self, sid):
         # Resolve the current sending device from a live Socket.IO sid.
@@ -259,7 +276,10 @@ class WebSocketState:
             session_info = self._sessions.get(sid)
             if session_info is None or not session_info.get("clientId"):
                 return None
-            client = self._clients.get(session_info["clientId"])
+            client_key = self._client_key(
+                session_info.get("userName"), session_info["clientId"]
+            )
+            client = self._clients.get(client_key)
             return dict(client) if client is not None else None
 
     def list_clients(self, user_name=None, session_id=None, stale_after_seconds=None, now=None):
@@ -284,7 +304,8 @@ class WebSocketState:
                 client_id = session_info.get("clientId")
                 if not client_id:
                     continue
-                client = self._clients.get(client_id)
+                client_key = self._client_key(session_info.get("userName"), client_id)
+                client = self._clients.get(client_key)
                 if client is None:
                     continue
                 if user_name is not None and client.get("userName") != user_name:
@@ -408,10 +429,14 @@ class WebSocketState:
 
             items = []
             for client_id in participant_client_ids:
-                sid = self._client_to_sid.get(client_id)
+                client_key = self._find_client_key_locked(
+                    client_id,
+                    user_name=user_name,
+                )
+                sid = None if client_key is None else self._client_to_sid.get(client_key)
                 if sid is None or sid == exclude_sid:
                     continue
-                client = self._clients.get(client_id)
+                client = self._clients.get(client_key)
                 if client is None:
                     continue
                 if user_name is not None and client.get("userName") != user_name:

@@ -46,6 +46,64 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
         self.assertEqual(removed["deviceName"], "Living Room")
         self.assertIsNone(self.state.get_sid_for_client("player-1"))
 
+    def test_same_client_id_is_isolated_by_authenticated_user(self):
+        for sid, user_name in (("sid-alice", "alice"), ("sid-bob", "bob")):
+            self.state.register_session(sid, now=100)
+            self.state.authenticate_session(sid, user_name)
+            self.state.register_client(
+                sid,
+                "phone-1",
+                {
+                    "userName": user_name,
+                    "deviceName": "%s phone" % user_name,
+                    "roles": ["player"],
+                    "deviceSessionId": "device:%s" % user_name,
+                },
+                now=100,
+            )
+
+        self.assertEqual(
+            self.state.get_sid_for_client("phone-1", user_name="alice"),
+            "sid-alice",
+        )
+        self.assertEqual(
+            self.state.get_sid_for_client("phone-1", user_name="bob"),
+            "sid-bob",
+        )
+        self.assertIsNone(self.state.get_sid_for_client("phone-1"))
+        self.assertEqual(
+            self.state.get_client("phone-1", user_name="alice")["deviceSessionId"],
+            "device:alice",
+        )
+
+    def test_same_user_client_registration_atomically_replaces_sid_mapping(self):
+        for sid in ("sid-old", "sid-new"):
+            self.state.register_session(sid, now=100)
+            self.state.authenticate_session(sid, "alice")
+
+        self.state.register_client(
+            "sid-old",
+            "phone-1",
+            {"userName": "alice", "roles": ["player"]},
+            now=100,
+        )
+        self.state.register_client(
+            "sid-new",
+            "phone-1",
+            {"userName": "alice", "roles": ["player"]},
+            now=101,
+        )
+
+        self.assertEqual(
+            self.state.get_sid_for_client("phone-1", user_name="alice"),
+            "sid-new",
+        )
+        self.assertIsNone(self.state.get_client_for_sid("sid-old"))
+        self.assertEqual(
+            self.state.get_client_for_sid("sid-new")["clientId"],
+            "phone-1",
+        )
+
     def test_each_registered_session_has_unique_connection_evidence(self):
         self.state.register_session("sid-1", now=100)
         self.state.register_session("sid-2", now=100)

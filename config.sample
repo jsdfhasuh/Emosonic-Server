@@ -56,6 +56,13 @@ log_rotate = yes
 ; Default: 90
 ;emo_client_timeout = 90
 
+; Strict-v2 profiles require both packaged conformance readiness and an explicit
+; deployment switch. Keep these disabled until the matching freeze evidence exists.
+;emo_strict_v2_core_enabled = off
+;emo_strict_v2_follow_enabled = off
+;emo_strict_v2_handoff_enabled = off
+;emo_strict_v2_broadcast_enabled = off
+
 ; Directory used by /emo/upload_log and /emo/logs for uploaded diagnostic files.
 ; Default: ./logs
 emo_log_upload_dir = /var/supysonic/emo-logs

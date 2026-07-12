@@ -17,6 +17,7 @@ from supysonic.emo.ws import (
   _commit_prepare,
   _expire_handoff_complete,
   _expire_prepare,
+  init_socketio,
   socketio,
 )
 from supysonic.emo.ws_store import (
@@ -35,6 +36,19 @@ from supysonic.web import create_application
 from tests.testbase import TestConfig
 
 
+STRICT_V2_CAPABILITIES = {
+  "playbackContextV2": True,
+  "playbackPrepare": False,
+  "effectiveAtPlayback": False,
+  "canPlay": True,
+  "canPause": True,
+  "canSeek": True,
+  "canSetVolume": True,
+  "supportsFollow": True,
+  "supportsBroadcast": True,
+}
+
+
 class EmoWebSocketTestCase(unittest.TestCase):
   def setUp(self):
     self.__db = tempfile.mkstemp()
@@ -43,6 +57,21 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.config.BASE["database_uri"] = "sqlite:///" + self.__db[1]
     self.config.WEBAPP["cache_dir"] = self.__dir
     self.config.WEBAPP["mount_emosonic"] = True
+    self.config.WEBAPP["emo_strict_v2_core_enabled"] = True
+    self.config.WEBAPP["emo_strict_v2_follow_enabled"] = True
+    self.config.WEBAPP["emo_strict_v2_handoff_enabled"] = True
+    self.config.WEBAPP["emo_strict_v2_broadcast_enabled"] = True
+
+    self.strict_conformance_patcher = mock.patch(
+      "supysonic.emo.strict_v2_readiness.get_code_conformance_readiness",
+      return_value={
+        "core": True,
+        "follow": True,
+        "handoff": True,
+        "broadcast": True,
+      },
+    )
+    self.strict_conformance_patcher.start()
 
     self.app = create_application(self.config)
     self.http_client = self.app.test_client()
@@ -80,6 +109,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     shutil.rmtree(self.__dir)
     os.close(self.__db[0])
     os.remove(self.__db[1])
+    self.strict_conformance_patcher.stop()
 
   def connect_authenticated_client(self, user_name, password, request_id="auth-1"):
     client = socketio.test_client(self.app, namespace="/emo", flask_test_client=self.http_client)
@@ -96,12 +126,42 @@ class EmoWebSocketTestCase(unittest.TestCase):
       namespace="/emo",
     )
     auth_messages = self.get_messages(client)
-    self.assertTrue(
-      any(message["action"] == "system.ack" and message["requestId"] == request_id for message in auth_messages)
-    )
+    auth_ack = self.get_ack(auth_messages, request_id)
+    self.assertEqual(auth_ack["payload"]["action"], "auth.login")
     return client
 
+  def test_socketio_initialization_logs_strict_v2_static_metadata(self):
+    metadata = {
+      "protocolVersion": "2.1.0",
+      "schemaHash": "a" * 64,
+      "serverBuildCommit": "b" * 40,
+    }
+
+    with mock.patch.object(socketio, "init_app") as init_app:
+      with mock.patch("supysonic.emo.ws.get_strict_v2_metadata", return_value=metadata):
+        with self.assertLogs("supysonic.emo.ws", level="WARNING") as logs:
+          init_socketio(self.app)
+
+    init_app.assert_called_once_with(self.app, path="/emo/ws")
+    self.assertEqual(
+      logs.output,
+      [
+        "WARNING:supysonic.emo.ws:"
+        "emo event=strict_v2_registration_metadata "
+        "protocol_version=2.1.0 "
+        f"schema_hash={'a' * 64} "
+        f"server_build_commit={'b' * 40}",
+      ],
+    )
+
   def register_device(self, client, request_id, payload):
+    payload = dict(payload)
+    capabilities = payload.get("capabilities")
+    if isinstance(capabilities, dict) and capabilities.get(CAPABILITY_PLAYBACK_CONTEXT_V2) is True:
+      strict_capabilities = dict(STRICT_V2_CAPABILITIES)
+      strict_capabilities.update(capabilities)
+      payload["capabilities"] = strict_capabilities
+      payload.setdefault("deviceName", payload.get("clientId"))
     client.emit(
       "message",
       {
@@ -139,6 +199,9 @@ class EmoWebSocketTestCase(unittest.TestCase):
     }
     if register_payload["capabilities"].get(CAPABILITY_PLAYBACK_CONTEXT_V2) is True:
       register_payload["deviceSessionId"] = session_id
+      strict_capabilities = dict(STRICT_V2_CAPABILITIES)
+      strict_capabilities.update(register_payload["capabilities"])
+      register_payload["capabilities"] = strict_capabilities
     else:
       register_payload["sessionId"] = session_id
 
@@ -377,9 +440,10 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
 
     ack = self.get_ack(messages, "register-player-v2")
-    registered = ack["payload"]["client"]
-    self.assertEqual(registered["deviceSessionId"], "device:player-v2")
-    self.assertNotIn("sessionId", registered)
+    self.assertEqual(ack["payload"]["deviceSessionId"], "device:player-v2")
+    self.assertNotIn("client", ack["payload"])
+    self.assertNotIn("sessionId", ack["payload"])
+    self.assertEqual(len(ack["payload"]["negotiatedCapabilities"]), 9)
 
   def test_v2_device_register_returns_strict_v2_metadata(self):
     client = self.connect_authenticated_client("alice", "Alic3", "auth-player-v2")
@@ -405,6 +469,9 @@ class EmoWebSocketTestCase(unittest.TestCase):
 
     ack = self.get_ack(messages, "register-player-v2")
     strict_v2 = ack["payload"]["strictV2"]
+    self.assertEqual(ack["payload"]["action"], "device.register")
+    self.assertEqual(ack["payload"]["clientId"], "player-v2")
+    self.assertEqual(ack["payload"]["deviceSessionId"], "device:player-v2")
     self.assertEqual(
       {
         "protocolVersion": strict_v2["protocolVersion"],
@@ -425,6 +492,268 @@ class EmoWebSocketTestCase(unittest.TestCase):
       validator.is_valid(ack),
       list(validator.iter_errors(ack)),
     )
+
+  def test_strict_replies_echo_action_and_include_connection_provenance(self):
+    client = self.connect_authenticated_client("alice", "Alic3", "auth-strict-replies")
+    registration = self.get_ack(
+      self.register_device(
+        client,
+        "register-strict-replies",
+        {
+          "clientId": "strict-replies",
+          "deviceSessionId": "device:strict-replies",
+          "capabilities": {CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+        },
+      ),
+      "register-strict-replies",
+    )
+    strict_v2 = registration["payload"]["strictV2"]
+
+    client.emit(
+      "message",
+      {
+        "type": "system",
+        "action": "system.ping",
+        "requestId": "strict-ping-1",
+        "payload": {},
+      },
+      namespace="/emo",
+    )
+    pong = next(
+      message
+      for message in self.get_messages(client)
+      if message["action"] == "system.pong"
+    )
+    self.assertEqual(pong["connectionNonce"], strict_v2["connectionNonce"])
+    self.assertEqual(pong["connectionEpoch"], strict_v2["connectionEpoch"])
+
+    client.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "device.list",
+        "requestId": "strict-device-list-1",
+        "payload": {},
+      },
+      namespace="/emo",
+    )
+    device_list = next(
+      message
+      for message in self.get_messages(client)
+      if message["action"] == "device.list"
+    )
+    self.assertEqual(device_list["requestId"], "strict-device-list-1")
+    self.assertEqual(device_list["connectionNonce"], strict_v2["connectionNonce"])
+    self.assertEqual(device_list["connectionEpoch"], strict_v2["connectionEpoch"])
+
+    error = self.get_error(
+      self.register_device(
+        client,
+        "invalid-strict-register-1",
+        {
+          "clientId": "strict-replies",
+          "capabilities": {CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+        },
+      ),
+      "invalid-strict-register-1",
+    )
+    self.assertEqual(error["payload"]["action"], "device.register")
+    self.assertEqual(error["connectionNonce"], strict_v2["connectionNonce"])
+    self.assertEqual(error["connectionEpoch"], strict_v2["connectionEpoch"])
+
+  def test_strict_registration_rejects_incomplete_roles_and_capabilities(self):
+    client = self.connect_authenticated_client("alice", "Alic3", "auth-invalid-strict-register")
+    incomplete_capabilities = dict(STRICT_V2_CAPABILITIES)
+    del incomplete_capabilities["supportsBroadcast"]
+
+    client.emit(
+      "message",
+      {
+        "type": "device",
+        "action": "device.register",
+        "requestId": "invalid-strict-capabilities-1",
+        "payload": {
+          "clientId": "invalid-strict-capabilities",
+          "deviceSessionId": "device:invalid-strict-capabilities",
+          "deviceName": "Invalid strict client",
+          "roles": ["player", "controller"],
+          "capabilities": incomplete_capabilities,
+        },
+      },
+      namespace="/emo",
+    )
+    capability_error = self.get_error(
+      self.get_messages(client),
+      "invalid-strict-capabilities-1",
+    )
+    self.assertEqual(capability_error["payload"]["action"], "device.register")
+    self.assertEqual(capability_error["payload"]["code"], "bad_request")
+
+    client.emit(
+      "message",
+      {
+        "type": "device",
+        "action": "device.register",
+        "requestId": "invalid-strict-roles-1",
+        "payload": {
+          "clientId": "invalid-strict-roles",
+          "deviceSessionId": "device:invalid-strict-roles",
+          "deviceName": "Invalid strict client",
+          "roles": ["player", "player"],
+          "capabilities": STRICT_V2_CAPABILITIES,
+        },
+      },
+      namespace="/emo",
+    )
+    roles_error = self.get_error(self.get_messages(client), "invalid-strict-roles-1")
+    self.assertEqual(roles_error["payload"]["action"], "device.register")
+    self.assertEqual(roles_error["payload"]["code"], "bad_request")
+
+  def test_strict_playback_update_broadcasts_feedback_and_context_status(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    observer = self.connect_device(
+      "alice",
+      "Alic3",
+      "observer-1",
+      "root:observer",
+      ["controller"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+    self.get_messages(observer)
+    self.create_playback_context(phone, "context-create-feedback-1")
+    self.get_messages(phone)
+    self.get_messages(observer)
+
+    observer.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "playback.context.subscribe",
+        "requestId": "context-subscribe-feedback-1",
+        "payload": {"playbackContextId": "playback:alice:main"},
+      },
+      namespace="/emo",
+    )
+    self.get_messages(observer)
+
+    phone.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": "playback-feedback-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "deviceSessionId": "root:phone",
+          "state": "playing",
+          "trackId": "song-1",
+          "positionMs": 1200,
+          "clientSeq": 7,
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_ack(self.get_messages(phone), "playback-feedback-1")
+    observer_messages = self.get_messages(observer)
+    feedback = next(
+      message
+      for message in observer_messages
+      if message["action"] == "playback.update"
+    )
+    status = next(
+      message
+      for message in observer_messages
+      if message["action"] == "playback.context.status"
+    )
+
+    self.assertEqual(feedback["type"], "event")
+    self.assertEqual(
+      feedback["payload"],
+      {
+        "playbackContextId": "playback:alice:main",
+        "sourceClientId": "phone-1",
+        "deviceSessionId": "root:phone",
+        "state": "playing",
+        "positionMs": 1200,
+        "trackId": "song-1",
+        "clientSeq": 7,
+        "serverUpdatedAtMs": feedback["payload"]["serverUpdatedAtMs"],
+        "serverTimeMs": feedback["payload"]["serverTimeMs"],
+      },
+    )
+    self.assertEqual(status["type"], "state")
+    self.assertEqual(status["payload"]["playbackContext"]["state"], "playing")
+
+  def test_strict_follow_and_broadcast_require_declared_capabilities(self):
+    source = self.connect_device(
+      "alice",
+      "Alic3",
+      "source-1",
+      "root:source",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    unsupported = self.connect_device(
+      "alice",
+      "Alic3",
+      "unsupported-1",
+      "root:unsupported",
+      ["player"],
+      capabilities={
+        CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+        "supportsFollow": False,
+        "supportsBroadcast": False,
+      },
+    )
+    self.get_messages(source)
+    self.get_messages(unsupported)
+    self.create_playback_context(source, "context-create-capability-1", device_session_id="root:source")
+    self.get_messages(source)
+    self.get_messages(unsupported)
+
+    unsupported.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "follow.start",
+        "requestId": "follow-no-capability-1",
+        "payload": {
+          "sourcePlaybackContextId": "playback:alice:main",
+          "deviceSessionId": "root:unsupported",
+        },
+      },
+      namespace="/emo",
+    )
+    follow_error = self.get_error(self.get_messages(unsupported), "follow-no-capability-1")
+    self.assertEqual(follow_error["payload"]["code"], "forbidden")
+
+    unsupported.emit(
+      "message",
+      {
+        "type": "command",
+        "action": "broadcast.start",
+        "requestId": "broadcast-no-capability-1",
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "targetMode": "selectedClients",
+          "targetClientIds": ["source-1"],
+          "queueSongIds": ["song-1"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+    broadcast_error = self.get_error(self.get_messages(unsupported), "broadcast-no-capability-1")
+    self.assertEqual(broadcast_error["payload"]["code"], "forbidden")
 
   def test_v2_device_register_nonce_is_unique_per_connection(self):
     first_client = self.connect_authenticated_client("alice", "Alic3", "auth-player-v2-first")
@@ -707,7 +1036,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
   def test_system_ping_refreshes_registered_client_last_seen(self):
     client = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"])
     state = get_state()
-    state._clients["player-1"]["lastSeenAt"] = 1
+    state._clients[("alice", "player-1")]["lastSeenAt"] = 1
 
     client.emit(
       "message",
@@ -2718,15 +3047,21 @@ class EmoWebSocketTestCase(unittest.TestCase):
 
     close_ack = self.get_ack(self.get_messages(phone), "context-close-1")
     observer_messages = self.get_messages(observer)
-    update = next(message for message in observer_messages if message["action"] == "playback.update")
+    closed = next(
+      message
+      for message in observer_messages
+      if message["action"] == "playback.context.closed"
+    )
     runtime_context = get_state().get_playback_context("playback:alice:main")
     persisted_context = getPlaybackContextState("playback:alice:main")
 
     self.assertTrue(close_ack["payload"]["closed"])
     self.assertEqual(close_ack["payload"]["playbackContext"]["state"], "closed")
     self.assertNotIn("sessionId", close_ack["payload"]["playbackContext"])
-    self.assertEqual(update["payload"]["state"], "closed")
-    self.assertNotIn("sessionId", update["payload"])
+    self.assertEqual(closed["type"], "event")
+    self.assertEqual(closed["payload"], {"playbackContextId": "playback:alice:main"})
+    self.assertIn("connectionNonce", closed)
+    self.assertEqual(closed["connectionEpoch"], 1)
     self.assertEqual(runtime_context["state"], "closed")
     self.assertEqual(persisted_context["state"], "closed")
     self.assertEqual(
@@ -2783,7 +3118,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertEqual(ack["payload"]["authorityClientId"], "phone-1")
     self.assertEqual(ack["payload"]["playbackContext"]["state"], "paused")
     self.assertNotIn("sessionId", ack["payload"]["playbackContext"])
-    self.assertEqual(command["targetClientId"], "phone-1")
+    self.assertNotIn("targetClientId", command)
     self.assertEqual(command["payload"]["playbackContextId"], "playback:alice:main")
     self.assertNotIn("sessionId", command["payload"])
     self.assertEqual(context["state"], "paused")
@@ -2856,7 +3191,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
       ack["payload"]["playbackContext"]["controlVersion"],
       context["controlVersion"] + 1,
     )
-    self.assertEqual(command["targetClientId"], "phone-1")
+    self.assertNotIn("targetClientId", command)
     self.assertEqual(command["payload"]["positionMs"], 4200)
     self.assertNotIn("sessionId", command["payload"])
     self.assertEqual(updated["state"], "playing")
@@ -2923,10 +3258,14 @@ class EmoWebSocketTestCase(unittest.TestCase):
     phone_messages = self.get_messages(phone)
     command = next(message for message in phone_messages if message["action"] == "player.play")
     updated = get_state().get_playback_context("playback:alice:main")
-    self.assertEqual(command["targetClientId"], "phone-1")
-    self.assertEqual(command["payload"]["queueIndex"], 0)
-    self.assertEqual(command["payload"]["trackId"], "song-1")
+    self.assertNotIn("targetClientId", command)
+    self.assertEqual(command["payload"]["playbackContextId"], "playback:alice:main")
+    self.assertEqual(command["payload"]["sourceClientId"], "controller-1")
+    self.assertEqual(command["payload"]["controlVersion"], context["controlVersion"] + 1)
     self.assertEqual(command["payload"]["positionMs"], 500)
+    self.assertNotIn("baseControlVersion", command["payload"])
+    self.assertNotIn("queueIndex", command["payload"])
+    self.assertNotIn("trackId", command["payload"])
     self.assertNotIn("sessionId", command["payload"])
     self.assertEqual(ack["payload"]["playbackContext"]["state"], "playing")
     self.assertEqual(ack["payload"]["playbackContext"]["positionMs"], 500)
@@ -2983,10 +3322,14 @@ class EmoWebSocketTestCase(unittest.TestCase):
     phone_messages = self.get_messages(phone)
     command = next(message for message in phone_messages if message["action"] == "player.next")
     context = get_state().get_playback_context("playback:alice:main")
-    self.assertEqual(command["targetClientId"], "phone-1")
-    self.assertEqual(command["payload"]["queueIndex"], 1)
-    self.assertEqual(command["payload"]["trackId"], "song-2")
-    self.assertEqual(command["payload"]["positionMs"], 0)
+    self.assertNotIn("targetClientId", command)
+    self.assertEqual(command["payload"]["playbackContextId"], "playback:alice:main")
+    self.assertEqual(command["payload"]["sourceClientId"], "controller-1")
+    self.assertEqual(command["payload"]["controlVersion"], 1)
+    self.assertNotIn("baseControlVersion", command["payload"])
+    self.assertNotIn("queueIndex", command["payload"])
+    self.assertNotIn("trackId", command["payload"])
+    self.assertNotIn("positionMs", command["payload"])
     self.assertNotIn("sessionId", command["payload"])
     self.assertEqual(ack["payload"]["playbackContext"]["controlVersion"], 1)
     self.assertEqual(ack["payload"]["playbackContext"]["currentIndex"], 1)
@@ -3047,8 +3390,11 @@ class EmoWebSocketTestCase(unittest.TestCase):
     ]
     context = get_state().get_playback_context("playback:alice:main")
     self.assertEqual(
-      [message["payload"]["queueIndex"] for message in commands],
+      [message["payload"]["controlVersion"] for message in commands],
       [1, 2],
+    )
+    self.assertTrue(
+      all("queueIndex" not in message["payload"] for message in commands)
     )
     self.assertEqual(context["currentIndex"], 2)
     self.assertEqual(context["trackId"], "song-3")
@@ -3100,10 +3446,14 @@ class EmoWebSocketTestCase(unittest.TestCase):
     phone_messages = self.get_messages(phone)
     command = next(message for message in phone_messages if message["action"] == "player.prev")
     context = get_state().get_playback_context("playback:alice:main")
-    self.assertEqual(command["targetClientId"], "phone-1")
-    self.assertEqual(command["payload"]["queueIndex"], 0)
-    self.assertEqual(command["payload"]["trackId"], "song-1")
-    self.assertEqual(command["payload"]["positionMs"], 0)
+    self.assertNotIn("targetClientId", command)
+    self.assertEqual(command["payload"]["playbackContextId"], "playback:alice:main")
+    self.assertEqual(command["payload"]["sourceClientId"], "controller-1")
+    self.assertEqual(command["payload"]["controlVersion"], 1)
+    self.assertNotIn("baseControlVersion", command["payload"])
+    self.assertNotIn("queueIndex", command["payload"])
+    self.assertNotIn("trackId", command["payload"])
+    self.assertNotIn("positionMs", command["payload"])
     self.assertNotIn("sessionId", command["payload"])
     self.assertEqual(ack["payload"]["playbackContext"]["controlVersion"], 1)
     self.assertEqual(ack["payload"]["playbackContext"]["currentIndex"], 0)
@@ -3164,10 +3514,15 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertEqual(ack["payload"]["playbackContext"]["currentIndex"], 1)
     self.assertEqual(ack["payload"]["playbackContext"]["trackId"], "song-2")
     self.assertEqual(ack["payload"]["playbackContext"]["state"], "playing")
-    self.assertEqual(command["targetClientId"], "phone-1")
+    self.assertNotIn("targetClientId", command)
     self.assertEqual(command["payload"]["playbackContextId"], "playback:alice:main")
+    self.assertEqual(command["payload"]["queueSongIds"], ["song-1", "song-2"])
     self.assertEqual(command["payload"]["queueIndex"], 1)
-    self.assertEqual(command["payload"]["trackId"], "song-2")
+    self.assertEqual(command["payload"]["queueRevision"], context["queueRevision"])
+    self.assertEqual(command["payload"]["controlVersion"], context["controlVersion"])
+    self.assertEqual(command["payload"]["sourceClientId"], "controller-1")
+    self.assertNotIn("baseControlVersion", command["payload"])
+    self.assertNotIn("trackId", command["payload"])
     self.assertNotIn("sessionId", command["payload"])
     self.assertEqual(context["currentIndex"], 1)
     self.assertEqual(context["trackId"], "song-2")
@@ -3831,7 +4186,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertEqual(release["payload"]["reason"], "timed_out")
     self.assertEqual(release["payload"]["playbackContextId"], "playback:alice:main")
     self.assertNotIn("sessionId", release["payload"])
-    self.assertEqual(release["targetClientId"], "pc-1")
+    self.assertNotIn("targetClientId", release)
     self.assertEqual(
       get_state().get_playback_context("playback:alice:main")["authorityClientId"],
       "phone-1",
@@ -4439,7 +4794,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertEqual(context["authorityClientId"], "pc-1")
     self.assertEqual(context["originClientId"], "phone-1")
     self.assertEqual(release["payload"]["reason"], "handoff_completed")
-    self.assertEqual(release["targetClientId"], "phone-1")
+    self.assertNotIn("targetClientId", release)
 
   def test_v2_handoff_controller_origin_client_id_is_controller(self):
     player_capabilities = {
@@ -6042,7 +6397,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     broadcast_id = ack["payload"]["broadcastId"]
 
     state = get_state()
-    state._clients["pc-1"]["lastSeenAt"] = 1
+    state._clients[("alice", "pc-1")]["lastSeenAt"] = 1
     state.prune_stale_clients(stale_after_seconds=5, now=10)
 
     participant_state = state.get_broadcast_participant_state(broadcast_id, "pc-1")

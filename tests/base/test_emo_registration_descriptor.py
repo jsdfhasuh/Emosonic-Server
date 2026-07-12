@@ -25,11 +25,17 @@ class EmoRegistrationDescriptorTestCase(unittest.TestCase):
                 "clientId": "phone-1",
                 "deviceSessionId": "device:phone-1",
                 "deviceName": "Alice phone",
-                "roles": ["player"],
+                "roles": ["player", "controller"],
                 "capabilities": {
                     "playbackContextV2": True,
                     "playbackPrepare": True,
                     "effectiveAtPlayback": True,
+                    "canPlay": True,
+                    "canPause": True,
+                    "canSeek": True,
+                    "canSetVolume": True,
+                    "supportsFollow": True,
+                    "supportsBroadcast": True,
                 },
             },
         }
@@ -41,14 +47,19 @@ class EmoRegistrationDescriptorTestCase(unittest.TestCase):
             "requestId": "register-phone-1",
             "timestamp": 1000.0,
             "payload": {
-                "client": {
-                    "userName": "alice",
-                    "clientId": "phone-1",
-                    "deviceSessionId": "device:phone-1",
-                    "roles": ["player"],
-                    "capabilities": {
-                        "playbackContextV2": True,
-                    },
+                "action": "device.register",
+                "clientId": "phone-1",
+                "deviceSessionId": "device:phone-1",
+                "negotiatedCapabilities": {
+                    "playbackContextV2": True,
+                    "playbackPrepare": True,
+                    "effectiveAtPlayback": True,
+                    "canPlay": True,
+                    "canPause": True,
+                    "canSeek": True,
+                    "canSetVolume": True,
+                    "supportsFollow": True,
+                    "supportsBroadcast": True,
                 },
                 "strictV2": get_strict_v2_registration_metadata(
                     "nonce-for-descriptor-test"
@@ -89,12 +100,30 @@ class EmoRegistrationDescriptorTestCase(unittest.TestCase):
         self.assertFalse(self.validator.is_valid(invalid_epoch))
         self.assertFalse(self.validator.is_valid(boolean_epoch))
 
+    def test_descriptor_requires_all_capabilities_and_accepts_single_role(self):
+        missing_capability = self._strict_register_request()
+        del missing_capability["payload"]["capabilities"]["supportsBroadcast"]
+        single_role = self._strict_register_request()
+        single_role["payload"]["roles"] = ["player"]
+        duplicate_roles = self._strict_register_request()
+        duplicate_roles["payload"]["roles"] = ["player", "player"]
+
+        self.assertFalse(self.validator.is_valid(missing_capability))
+        self.assertTrue(self.validator.is_valid(single_role))
+        self.assertFalse(self.validator.is_valid(duplicate_roles))
+
     def test_descriptor_rejects_a_legacy_ack_as_strict_ack(self):
         legacy_ack = self._strict_register_ack()
         del legacy_ack["payload"]["strictV2"]
-        legacy_ack["payload"]["client"]["sessionId"] = "legacy-room"
+        legacy_ack["payload"]["client"] = {"sessionId": "legacy-room"}
 
         self.assertFalse(self.validator.is_valid(legacy_ack))
+
+    def test_descriptor_requires_the_correlated_request_action(self):
+        ack = self._strict_register_ack()
+        del ack["payload"]["action"]
+
+        self.assertFalse(self.validator.is_valid(ack))
 
     def test_descriptor_accepts_a_registration_error(self):
         error = {
@@ -103,8 +132,10 @@ class EmoRegistrationDescriptorTestCase(unittest.TestCase):
             "requestId": "register-phone-1",
             "timestamp": 1000.0,
             "payload": {
+                "action": "device.register",
                 "code": "bad_request",
                 "message": "deviceSessionId must be a non-empty string",
+                "retryable": False,
             },
         }
 
