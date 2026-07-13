@@ -67,6 +67,62 @@ class ConfigTestCase(unittest.TestCase):
             DefaultConfig.WEBAPP = original_webapp
             DefaultConfig.LASTFM = original_lastfm
 
+    def test_emo_strict_v2_safety_defaults_and_ini_values(self):
+        defaults = DefaultConfig.WEBAPP
+        self.assertEqual(defaults["emo_allowed_origins"], "")
+        self.assertFalse(defaults["emo_development_mode"])
+        self.assertEqual(defaults["emo_socketio_ping_interval"], 25)
+        self.assertEqual(defaults["emo_socketio_ping_timeout"], 20)
+        self.assertEqual(defaults["emo_unauthenticated_connections_per_ip"], 10)
+        self.assertEqual(defaults["emo_authenticated_connections_per_user"], 20)
+        self.assertEqual(
+            defaults["emo_strict_requests_per_connection_per_minute"],
+            120,
+        )
+
+        config_file_path = None
+        try:
+            with NamedTemporaryFile("w", delete=False) as config_file:
+                config_file.write(
+                    "[webapp]\n"
+                    "emo_allowed_origins = https://music.example\n"
+                    "emo_development_mode = on\n"
+                    "emo_socketio_ping_interval = 15\n"
+                    "emo_socketio_ping_timeout = 10\n"
+                    "emo_unauthenticated_connections_per_ip = 4\n"
+                    "emo_authenticated_connections_per_user = 8\n"
+                    "emo_strict_requests_per_connection_per_minute = 60\n"
+                    "emo_strict_shutdown_grace_seconds = 3\n"
+                )
+                config_file.flush()
+                config_file_path = config_file.name
+
+            conf = IniConfig(config_file_path)
+
+            self.assertEqual(
+                conf.WEBAPP["emo_allowed_origins"],
+                "https://music.example",
+            )
+            self.assertTrue(conf.WEBAPP["emo_development_mode"])
+            self.assertEqual(conf.WEBAPP["emo_socketio_ping_interval"], 15)
+            self.assertEqual(conf.WEBAPP["emo_socketio_ping_timeout"], 10)
+            self.assertEqual(
+                conf.WEBAPP["emo_unauthenticated_connections_per_ip"],
+                4,
+            )
+            self.assertEqual(
+                conf.WEBAPP["emo_authenticated_connections_per_user"],
+                8,
+            )
+            self.assertEqual(
+                conf.WEBAPP["emo_strict_requests_per_connection_per_minute"],
+                60,
+            )
+            self.assertEqual(conf.WEBAPP["emo_strict_shutdown_grace_seconds"], 3)
+        finally:
+            if config_file_path:
+                os.remove(config_file_path)
+
     def test_recommendation_agent_config_defaults_and_ini_values(self):
         original_agent = DefaultConfig.RECOMMENDATION_AGENT.copy()
 

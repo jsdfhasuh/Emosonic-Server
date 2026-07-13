@@ -11,6 +11,7 @@ from supysonic.emo.ws_store import (
     PlaybackContextIntentConflictError,
     PlaybackContextStaleVersionError,
     closeStrictPlaybackContextState,
+    completeStrictPlaybackHandoff,
     createPlaybackContextState,
     createStrictPlaybackContextState,
     deletePlaybackContext,
@@ -38,6 +39,7 @@ from supysonic.emo.ws_store import (
     saveQueueState,
     serializeDevicePlaybackStateV2,
     serializePlaybackContextV2,
+    terminateStrictPlaybackHandoff,
     updatePlaybackContextState,
 )
 
@@ -107,6 +109,246 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         persisted = getPlaybackContextState("context-1")
         self.assertEqual(persisted["version"], 2)
         self.assertEqual(persisted["controlVersion"], 2)
+
+    def test_complete_and_cancel_handoff_have_one_atomic_terminal_winner(self):
+        createStrictPlaybackContextState(
+            "context-handoff",
+            "alice",
+            "source-1",
+            "device:source-1",
+            ["song-1"],
+            0,
+            100,
+            "playing",
+        )
+        savePlaybackHandoff(
+            {
+                "handoffId": "handoff-1",
+                "requestId": "handoff-start-1",
+                "playbackContextId": "context-handoff",
+                "userName": "alice",
+                "sourceClientId": "source-1",
+                "targetClientId": "target-1",
+                "originClientId": "controller-1",
+                "status": "committed",
+                "baseControlVersion": 1,
+                "controlVersion": 2,
+                "prepareId": "prepare-1",
+                "snapshot": {
+                    "handoffControlVersion": 2,
+                    "prepareId": "prepare-1",
+                },
+            }
+        )
+        barrier = threading.Barrier(2)
+
+        def complete():
+            barrier.wait()
+            try:
+                result = completeStrictPlaybackHandoff(
+                    "context-handoff",
+                    "handoff-1",
+                    "alice",
+                    "target-1",
+                    "device:target-1",
+                    position_ms=200,
+                )
+                return "completed" if result[3] else "completed_replay"
+            except ValueError:
+                return "complete_lost"
+
+        def cancel():
+            barrier.wait()
+            result = terminateStrictPlaybackHandoff(
+                "context-handoff",
+                "handoff-1",
+                "alice",
+                "cancelled",
+            )
+            return "cancelled" if result[1] else "cancel_lost"
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            complete_future = executor.submit(complete)
+            cancel_future = executor.submit(cancel)
+            results = {complete_future.result(), cancel_future.result()}
+
+        handoff = getPlaybackHandoff("handoff-1")
+        context = getPlaybackContextState("context-handoff")
+        self.assertIn(
+            results,
+            (
+                {"completed", "cancel_lost"},
+                {"complete_lost", "cancelled"},
+            ),
+        )
+        self.assertIn(handoff["status"], {"completed", "cancelled"})
+        if handoff["status"] == "completed":
+            self.assertEqual(context["authorityClientId"], "target-1")
+            self.assertEqual(context["controlVersion"], 2)
+        else:
+            self.assertEqual(context["authorityClientId"], "source-1")
+            self.assertEqual(context["controlVersion"], 1)
+
+    def test_complete_and_timeout_handoff_have_one_atomic_terminal_winner(self):
+        createStrictPlaybackContextState(
+            "context-timeout",
+            "alice",
+            "source-1",
+            "device:source-1",
+            ["song-1"],
+            0,
+            100,
+            "playing",
+        )
+        savePlaybackHandoff(
+            {
+                "handoffId": "handoff-timeout",
+                "requestId": "handoff-start-timeout",
+                "playbackContextId": "context-timeout",
+                "userName": "alice",
+                "sourceClientId": "source-1",
+                "targetClientId": "target-1",
+                "originClientId": "controller-1",
+                "status": "committed",
+                "baseControlVersion": 1,
+                "controlVersion": 2,
+                "prepareId": "prepare-timeout",
+                "snapshot": {
+                    "handoffControlVersion": 2,
+                    "prepareId": "prepare-timeout",
+                },
+            }
+        )
+        barrier = threading.Barrier(2)
+
+        def complete():
+            barrier.wait()
+            try:
+                result = completeStrictPlaybackHandoff(
+                    "context-timeout",
+                    "handoff-timeout",
+                    "alice",
+                    "target-1",
+                    "device:target-1",
+                )
+                return "completed" if result[3] else "completed_replay"
+            except ValueError:
+                return "complete_lost"
+
+        def timeout():
+            barrier.wait()
+            result = terminateStrictPlaybackHandoff(
+                "context-timeout",
+                "handoff-timeout",
+                "alice",
+                "timed_out",
+                error_code="commit_timeout",
+            )
+            return "timed_out" if result[1] else "timeout_lost"
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            complete_future = executor.submit(complete)
+            timeout_future = executor.submit(timeout)
+            results = {complete_future.result(), timeout_future.result()}
+
+        handoff = getPlaybackHandoff("handoff-timeout")
+        context = getPlaybackContextState("context-timeout")
+        self.assertIn(
+            results,
+            (
+                {"completed", "timeout_lost"},
+                {"complete_lost", "timed_out"},
+            ),
+        )
+        if handoff["status"] == "completed":
+            self.assertEqual(context["authorityClientId"], "target-1")
+        else:
+            self.assertEqual(handoff["status"], "timed_out")
+            self.assertEqual(handoff["errorCode"], "commit_timeout")
+            self.assertEqual(context["authorityClientId"], "source-1")
+
+    def test_close_and_complete_handoff_are_linearized_by_context_tombstone(self):
+        createStrictPlaybackContextState(
+            "context-close-race",
+            "alice",
+            "source-1",
+            "device:source-1",
+            ["song-1"],
+            0,
+            100,
+            "playing",
+        )
+        savePlaybackHandoff(
+            {
+                "handoffId": "handoff-close-race",
+                "requestId": "handoff-start-close-race",
+                "playbackContextId": "context-close-race",
+                "userName": "alice",
+                "sourceClientId": "source-1",
+                "targetClientId": "target-1",
+                "originClientId": "controller-1",
+                "status": "committed",
+                "baseControlVersion": 1,
+                "controlVersion": 2,
+                "prepareId": "prepare-close-race",
+                "snapshot": {
+                    "handoffControlVersion": 2,
+                    "prepareId": "prepare-close-race",
+                },
+            }
+        )
+        barrier = threading.Barrier(2)
+
+        def close_context():
+            barrier.wait()
+            closed = closeStrictPlaybackContextState(
+                "context-close-race",
+                "alice",
+            )
+            return "closed", closed
+
+        def complete_handoff():
+            barrier.wait()
+            try:
+                completed = completeStrictPlaybackHandoff(
+                    "context-close-race",
+                    "handoff-close-race",
+                    "alice",
+                    "target-1",
+                    "device:target-1",
+                )
+                return "completed", completed[0]
+            except PlaybackContextClosedError as exc:
+                return "context_closed", exc.playback_context
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            close_future = executor.submit(close_context)
+            complete_future = executor.submit(complete_handoff)
+            outcomes = {
+                close_future.result()[0],
+                complete_future.result()[0],
+            }
+
+        context = getPlaybackContextState("context-close-race")
+        handoff = getPlaybackHandoff("handoff-close-race")
+        self.assertIn(
+            outcomes,
+            (
+                {"closed", "context_closed"},
+                {"closed", "completed"},
+            ),
+        )
+        self.assertEqual(context["lifecycle"], "closed")
+        if handoff["status"] == "completed":
+            self.assertEqual(context["authorityClientId"], "target-1")
+            self.assertEqual(context["version"], 3)
+            self.assertEqual(context["controlVersion"], 2)
+        else:
+            self.assertEqual(handoff["status"], "failed")
+            self.assertEqual(handoff["errorCode"], "context_closed")
+            self.assertEqual(context["authorityClientId"], "source-1")
+            self.assertEqual(context["version"], 2)
+            self.assertEqual(context["controlVersion"], 1)
 
     def test_save_and_load_playback_state(self):
         savePlaybackState(

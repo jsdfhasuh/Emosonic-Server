@@ -29,6 +29,7 @@ __ https://listenbrainz.org/
    transcoding
    jukebox
    logging_integration
+   emosonic_strict_v2_deployment
    man/index
    api
 

@@ -94,6 +94,59 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
         if: ${{ !cancelled() }}
 
+  database-migrations:
+    name: Database Migrations
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r ci-requirements.txt psycopg2-binary
+
+      - name: Start migration databases
+        run: |
+          docker compose -f tests/compose.emo_migrations.yml up -d --wait
+
+      - name: Record database images and versions
+        run: |
+          evidence="$RUNNER_TEMP/emosonic-migration-evidence.txt"
+          postgres_id=$(docker compose -f tests/compose.emo_migrations.yml ps -q postgres)
+          mysql_id=$(docker compose -f tests/compose.emo_migrations.yml ps -q mysql)
+          {
+            docker exec "$postgres_id" postgres --version
+            docker exec "$mysql_id" mysql --version
+            docker image inspect postgres:16.9-alpine --format 'postgres image={{index .RepoDigests 0}}'
+            docker image inspect mysql:8.4.5 --format 'mysql image={{index .RepoDigests 0}}'
+          } | tee "$evidence"
+
+      - name: Run migration tests
+        env:
+          SUPYSONIC_MIGRATION_EVIDENCE_FILE: ${{ runner.temp }}/emosonic-migration-evidence.txt
+          SUPYSONIC_TEST_MYSQL_URI: mysql://supysonic:supysonic@127.0.0.1:53306/supysonic_test
+          SUPYSONIC_TEST_POSTGRES_URI: postgresql://supysonic:supysonic@127.0.0.1:55432/supysonic_test
+        run: |
+          python -m unittest -v tests.base.test_emo_schema_migration 2>&1 | tee -a "$SUPYSONIC_MIGRATION_EVIDENCE_FILE"
+
+      - name: Stop migration databases
+        if: ${{ always() }}
+        run: |
+          docker compose -f tests/compose.emo_migrations.yml down -v --remove-orphans
+
+      - name: Upload migration evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: emosonic-database-migration-evidence
+          path: ${{ runner.temp }}/emosonic-migration-evidence.txt
+
   docker-build:
     name: Docker Build
     runs-on: ubuntu-latest

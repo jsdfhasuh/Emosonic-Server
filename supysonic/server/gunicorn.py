@@ -10,6 +10,25 @@ from gunicorn.app.base import BaseApplication
 from ._base import BaseServer
 
 
+def _drain_emo_realtime(worker):
+    application = getattr(worker, "wsgi", None)
+    if application is None:
+        return
+    application_config = getattr(application, "config", {})
+    webapp_config = application_config.get("WEBAPP", {})
+    if not webapp_config.get("mount_emosonic", False):
+        return
+    app_context = getattr(application, "app_context", None)
+    if app_context is None:
+        return
+    from ..emo.ws import begin_strict_v2_shutdown
+
+    with app_context():
+        begin_strict_v2_shutdown(
+            webapp_config.get("emo_strict_shutdown_grace_seconds", 5)
+        )
+
+
 class GunicornApp(BaseApplication):
     def __init__(self, **config):
         self.__config = config
@@ -32,6 +51,7 @@ class GunicornApp(BaseApplication):
             self.cfg.set("workers", processes)
         if threads is not None:
             self.cfg.set("threads", threads)
+        self.cfg.set("worker_int", _drain_emo_realtime)
 
 
 class GunicornServer(BaseServer):

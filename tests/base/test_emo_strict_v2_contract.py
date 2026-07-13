@@ -2,8 +2,11 @@ import copy
 import unittest
 
 from supysonic.emo.strict_v2_contract import (
+    STRICT_OUTPUT_ACTIONS,
+    StrictOutputValidationError,
     StrictRequestValidationError,
     is_strict_registration_request,
+    validate_strict_output,
     validate_strict_request,
 )
 
@@ -113,6 +116,21 @@ class StrictV2ContractTestCase(unittest.TestCase):
         with self.assertRaisesRegex(StrictRequestValidationError, "duplicates"):
             validate_strict_request(request)
 
+        broadcast = {
+            "type": "command",
+            "action": "broadcast.start",
+            "requestId": "broadcast-1",
+            "payload": {
+                "playbackContextId": "context-1",
+                "queueSongIds": ["song-1"],
+                "currentIndex": 0,
+                "positionMs": 0,
+                "participants": ["client-%d" % index for index in range(101)],
+            },
+        }
+        with self.assertRaisesRegex(StrictRequestValidationError, "100"):
+            validate_strict_request(broadcast)
+
     def test_rejects_invalid_ready_field_combinations(self):
         request = {
             "type": "event",
@@ -126,6 +144,10 @@ class StrictV2ContractTestCase(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(StrictRequestValidationError, "errorCode"):
+            validate_strict_request(request)
+
+        request["payload"]["errorCode"] = "INVALID-CODE"
+        with self.assertRaisesRegex(StrictRequestValidationError, "invalid format"):
             validate_strict_request(request)
 
     def test_unknown_action_is_correlated_not_supported(self):
@@ -151,6 +173,207 @@ class StrictV2ContractTestCase(unittest.TestCase):
             "payload": {"u": "alice", "p": "secret"},
         }
         self.assertFalse(is_strict_registration_request(login))
+
+    def _output(self, msg_type, action, payload, request_id=None):
+        message = {
+            "type": msg_type,
+            "action": action,
+            "payload": payload,
+            "timestamp": 1000.0,
+            "connectionNonce": "nonce-1",
+            "connectionEpoch": 1,
+        }
+        if request_id is not None:
+            message["requestId"] = request_id
+        return message
+
+    def test_validates_closed_ack_error_and_direct_response_outputs(self):
+        messages = [
+            self._output(
+                "system",
+                "system.ack",
+                {"action": "player.pause"},
+                "pause-1",
+            ),
+            self._output(
+                "system",
+                "system.error",
+                {
+                    "action": "player.seek",
+                    "code": "stale_version",
+                    "message": "control cursor is stale",
+                    "retryable": False,
+                    "playbackContextId": "context-1",
+                    "currentControlVersion": 2,
+                },
+                "seek-1",
+            ),
+            self._output(
+                "system",
+                "system.pong",
+                {"serverTimeMs": 1000},
+                "ping-1",
+            ),
+        ]
+
+        for message in messages:
+            with self.subTest(action=message["action"]):
+                self.assertEqual(validate_strict_output(message), message)
+
+    def test_validates_context_status_and_feedback_outputs(self):
+        context = {
+            "playbackContextId": "context-1",
+            "authorityClientId": "player-1",
+            "queueSongIds": ["song-1"],
+            "currentIndex": 0,
+            "trackId": "song-1",
+            "state": "playing",
+            "positionMs": 1200,
+            "queueRevision": 1,
+            "controlVersion": 1,
+            "version": 1,
+            "epoch": 1,
+            "timelineId": "timeline-1",
+            "serverUpdatedAtMs": 1000,
+        }
+        status = self._output(
+            "state",
+            "playback.context.status",
+            {
+                "playbackContext": context,
+                "deviceStates": [
+                    {
+                        "playbackContextId": "context-1",
+                        "clientId": "player-1",
+                        "deviceSessionId": "device:player-1",
+                        "state": "playing",
+                        "positionMs": 1200,
+                        "clientSeq": 1,
+                        "serverUpdatedAtMs": 1000,
+                    }
+                ],
+            },
+            "status-1",
+        )
+        feedback = self._output(
+            "event",
+            "playback.update",
+            {
+                "playbackContextId": "context-1",
+                "sourceClientId": "player-1",
+                "deviceSessionId": "device:player-1",
+                "state": "playing",
+                "positionMs": 1200,
+                "clientSeq": 1,
+                "serverUpdatedAtMs": 1000,
+            },
+        )
+
+        self.assertEqual(validate_strict_output(status), status)
+        self.assertEqual(validate_strict_output(feedback), feedback)
+
+    def test_validates_broadcast_status_and_timed_push_outputs(self):
+        snapshot = {
+            "playbackContextId": "context-1",
+            "broadcastId": "broadcast-1",
+            "ownerClientId": "controller-1",
+            "authorityClientId": "player-1",
+            "queueSongIds": ["song-1"],
+            "currentIndex": 0,
+            "trackId": "song-1",
+            "positionMs": 0,
+            "state": "playing",
+            "version": 2,
+            "queueRevision": 1,
+            "controlVersion": 2,
+            "epoch": 1,
+            "serverUpdatedAtMs": 1000,
+            "playbackRate": 1.0,
+            "participants": ["player-1"],
+        }
+        status = self._output(
+            "system",
+            "system.ack",
+            {
+                "action": "broadcast.status",
+                "broadcast": snapshot,
+                "participantStates": [
+                    {
+                        "broadcastId": "broadcast-1",
+                        "clientId": "player-1",
+                        "state": "playing",
+                        "positionMs": 0,
+                        "online": True,
+                    }
+                ],
+            },
+            "broadcast-status-1",
+        )
+        timed_snapshot = dict(
+            snapshot,
+            effectiveAtServerMs=1250,
+            serverTimeMs=1000,
+        )
+        push = self._output(
+            "command",
+            "broadcast.play",
+            timed_snapshot,
+        )
+
+        self.assertEqual(validate_strict_output(status), status)
+        self.assertEqual(validate_strict_output(push), push)
+
+    def test_rejects_unknown_null_and_forbidden_output_fields(self):
+        messages = [
+            self._output(
+                "system",
+                "system.ack",
+                {"action": "player.play", "unexpected": True},
+                "play-1",
+            ),
+            self._output(
+                "event",
+                "playback.context.closed",
+                {"playbackContextId": None},
+            ),
+            self._output(
+                "event",
+                "playback.context.closed",
+                {"playbackContextId": "context-1", "sessionId": "legacy"},
+            ),
+        ]
+
+        for message in messages:
+            with self.subTest(message=message):
+                with self.assertRaises(StrictOutputValidationError):
+                    validate_strict_output(message)
+
+    def test_rejects_request_id_on_push_and_missing_registered_provenance(self):
+        push_with_request_id = self._output(
+            "event",
+            "playback.context.closed",
+            {"playbackContextId": "context-1"},
+            "close-1",
+        )
+        missing_provenance = self._output(
+            "event",
+            "playback.context.closed",
+            {"playbackContextId": "context-1"},
+        )
+        del missing_provenance["connectionNonce"]
+        del missing_provenance["connectionEpoch"]
+
+        with self.assertRaises(StrictOutputValidationError):
+            validate_strict_output(push_with_request_id)
+        with self.assertRaises(StrictOutputValidationError):
+            validate_strict_output(missing_provenance)
+
+    def test_output_action_inventory_is_closed(self):
+        self.assertEqual(len(STRICT_OUTPUT_ACTIONS), 26)
+        self.assertIn("system.ack", STRICT_OUTPUT_ACTIONS)
+        self.assertIn("playback.context.status", STRICT_OUTPUT_ACTIONS)
+        self.assertIn("playback.handoff.status", STRICT_OUTPUT_ACTIONS)
+        self.assertIn("broadcast.stop", STRICT_OUTPUT_ACTIONS)
 
 
 if __name__ == "__main__":

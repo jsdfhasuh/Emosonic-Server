@@ -51,6 +51,36 @@ log_rotate = yes
 ; Enable the emosonic websocket endpoint at /emo/ws. Default: on
 ;emo_ws_enabled = on
 
+; Exact comma-separated origins allowed to open the Emo Socket.IO endpoint.
+; Empty means same-origin only. A wildcard is rejected outside explicit
+; development mode. Default: empty
+;emo_allowed_origins = https://music.example
+;emo_development_mode = off
+
+; Socket.IO heartbeat and per-connection pending emit limits.
+; Defaults: ping interval 25s, ping timeout 20s, 100 pending emits.
+;emo_socketio_ping_interval = 25
+;emo_socketio_ping_timeout = 20
+;emo_socketio_max_pending_emits_per_connection = 100
+
+; Emo connection limits. Defaults: 10 unauthenticated connections per IP and
+; 20 authenticated connections per user.
+;emo_unauthenticated_connections_per_ip = 10
+;emo_authenticated_connections_per_user = 20
+
+; Strict-v2 action limits. Higher values are ignored unless the load-test
+; evidence setting names reviewed evidence. Lower positive values are allowed.
+;emo_strict_requests_per_connection_per_minute = 120
+;emo_strict_controls_per_connection_per_second = 20
+;emo_strict_creates_per_connection_per_minute = 10
+;emo_strict_handoff_starts_per_connection_per_minute = 10
+;emo_strict_broadcast_starts_per_connection_per_minute = 10
+;emo_strict_rate_limit_load_test_evidence =
+
+; Seconds allowed for in-flight strict-v2 requests to settle during graceful
+; shutdown before remaining Socket.IO connections are closed. Default: 5
+;emo_strict_shutdown_grace_seconds = 5
+
 ; Seconds before a registered Emo Socket.IO client is considered offline if it
 ; sends no business message or system.ping. Set to 0 to disable stale cleanup.
 ; Default: 90

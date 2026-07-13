@@ -1,12 +1,24 @@
+import base64
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
 from supysonic.db import release_database
 from supysonic.emo import ws as emo_ws
-from supysonic.emo.ws import socketio, strict_request_cache
+from supysonic.emo.strict_v2_conformance import get_code_conformance_readiness
+from supysonic.emo.strict_v2_contract import (
+    StrictOutputValidationError,
+    validate_strict_output,
+)
+from supysonic.emo.strict_v2_safety import strict_v2_safety
+from supysonic.emo.ws import (
+    begin_strict_v2_shutdown,
+    socketio,
+    strict_request_cache,
+)
 from supysonic.emo.ws_state import get_state
 from supysonic.emo.ws_store import getPlaybackContextState
 from supysonic.managers.user import UserManager
@@ -64,7 +76,15 @@ class StrictV2CoreTestCase(unittest.TestCase):
             if event["name"] != "message":
                 continue
             args = event.get("args")
-            messages.append(args[0] if isinstance(args, list) else args)
+            message = args[0] if isinstance(args, list) else args
+            payload = message.get("payload") if isinstance(message, dict) else None
+            if "connectionNonce" in message or (
+                message.get("action") == "system.ack"
+                and isinstance(payload, dict)
+                and "strictV2" in payload
+            ):
+                validate_strict_output(message)
+            messages.append(message)
         return messages
 
     def authenticate(self, client, user_name="alice", password="Alic3", request_id="auth-1"):
@@ -340,6 +360,88 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(registered["roles"], ["player"])
         self.assertIn("rawCapabilities", registered)
 
+    def test_each_physical_socket_uses_distinct_128_bit_nonce_and_epoch(self):
+        nonces = []
+        for index in range(2):
+            client_id = "nonce-client-%d" % index
+            client = self.connect()
+            self.authenticate(
+                client,
+                request_id="auth-%s" % client_id,
+            )
+            with self.enable_all_profiles():
+                response = self.register(
+                    client,
+                    "register-%s" % client_id,
+                    self.strict_registration_payload(
+                        client_id=client_id,
+                        device_session_id="device:%s" % client_id,
+                    ),
+                )
+            ack = next(
+                message
+                for message in response
+                if message.get("requestId") == "register-%s" % client_id
+            )
+            nonce = ack["connectionNonce"]
+            metadata = ack["payload"]["strictV2"]
+            decoded = base64.urlsafe_b64decode(
+                nonce + "=" * (-len(nonce) % 4)
+            )
+
+            self.assertGreaterEqual(len(decoded), 16)
+            self.assertEqual(ack["connectionEpoch"], 1)
+            self.assertEqual(metadata["connectionNonce"], nonce)
+            self.assertEqual(metadata["connectionEpoch"], 1)
+            nonces.append(nonce)
+
+        self.assertEqual(len(set(nonces)), 2)
+
+    def test_packaged_optional_false_manifest_overrides_enabled_deployment(self):
+        client = self.connect()
+        self.authenticate(client)
+        self.app.config["WEBAPP"].update(
+            {
+                "emo_strict_v2_core_enabled": True,
+                "emo_strict_v2_follow_enabled": True,
+                "emo_strict_v2_handoff_enabled": True,
+                "emo_strict_v2_broadcast_enabled": True,
+            }
+        )
+        packaged_readiness = get_code_conformance_readiness()
+        self.assertEqual(
+            packaged_readiness,
+            {
+                "core": False,
+                "follow": False,
+                "handoff": False,
+                "broadcast": False,
+            },
+        )
+        core_only_readiness = dict(packaged_readiness, core=True)
+
+        with mock.patch(
+            "supysonic.emo.strict_v2_readiness.get_code_conformance_readiness",
+            return_value=core_only_readiness,
+        ):
+            response = self.register(
+                client,
+                "register-packaged-optional-false-1",
+                self.strict_registration_payload(["player", "controller"]),
+            )
+
+        ack = next(
+            message
+            for message in response
+            if message.get("requestId") == "register-packaged-optional-false-1"
+        )
+        negotiated = ack["payload"]["negotiatedCapabilities"]
+        self.assertTrue(negotiated["playbackContextV2"])
+        self.assertFalse(negotiated["supportsFollow"])
+        self.assertFalse(negotiated["playbackPrepare"])
+        self.assertFalse(negotiated["effectiveAtPlayback"])
+        self.assertFalse(negotiated["supportsBroadcast"])
+
     def test_same_user_registration_disconnects_old_sid(self):
         old_client = self.connect()
         new_client = self.connect()
@@ -393,7 +495,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
         )
         self.assertIsNone(get_state().get_client("phone-1"))
 
-    def test_duplicate_register_replays_cached_ack_without_second_mutation(self):
+    def test_register_repeated_100_times_replays_without_second_mutation(self):
         client = self.connect()
         self.authenticate(client)
         payload = self.strict_registration_payload()
@@ -402,16 +504,51 @@ class StrictV2CoreTestCase(unittest.TestCase):
             "supysonic.emo.ws._register_device",
             wraps=emo_ws._register_device,
         ) as register_device:
-            first = self.register(client, "register-replay-1", payload)
-            second = self.register(client, "register-replay-1", payload)
+            responses = [
+                self.register(client, "register-replay-1", payload)
+                for _attempt in range(100)
+            ]
 
         first_ack = next(
             message
-            for message in first
+            for message in responses[0]
             if message.get("requestId") == "register-replay-1"
         )
-        self.assertEqual(second, [first_ack])
+        self.assertTrue(
+            all(response == [first_ack] for response in responses[1:])
+        )
         register_device.assert_called_once()
+
+    def test_register_post_ack_push_failure_does_not_emit_second_settlement(self):
+        client = self.connect()
+        self.authenticate(client)
+        payload = self.strict_registration_payload()
+
+        with self.enable_all_profiles(), mock.patch.object(
+            emo_ws,
+            "_register_device",
+            wraps=emo_ws._register_device,
+        ) as register_device, mock.patch.object(
+            emo_ws,
+            "_broadcast_clients",
+            side_effect=RuntimeError("injected post-ACK device-list failure"),
+        ) as broadcast_clients:
+            first = self.register(
+                client,
+                "register-post-ack-failure",
+                payload,
+            )
+            retry = self.register(
+                client,
+                "register-post-ack-failure",
+                payload,
+            )
+
+        self.assertEqual([message["action"] for message in first], ["system.ack"])
+        self.assertEqual([message["action"] for message in retry], ["system.ack"])
+        self.assertEqual(retry[0], first[0])
+        self.assertEqual(register_device.call_count, 1)
+        self.assertEqual(broadcast_clients.call_count, 1)
 
     def test_reused_register_request_id_with_different_payload_conflicts(self):
         client = self.connect()
@@ -530,6 +667,60 @@ class StrictV2CoreTestCase(unittest.TestCase):
         for cursor_name in ("epoch", "version", "queueRevision", "controlVersion"):
             self.assertEqual(persisted_context[cursor_name], 1)
 
+    def test_playback_update_push_failure_replays_persisted_confirmation(self):
+        client = self.ready_strict_client()
+        self.create_context(client, state="stopped", position_ms=0)
+        request_id = "playback-update-push-failure"
+        update = {
+            "type": "event",
+            "action": "playback.update",
+            "requestId": request_id,
+            "payload": {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "state": "playing",
+                "positionMs": 25,
+                "clientSeq": 1,
+                "trackId": "song-2",
+            },
+        }
+        settled_before_push = []
+
+        def fail_after_settlement(*_args, **_kwargs):
+            settled_before_push.append(
+                any(
+                    cached_request_id == request_id and entry.result is not None
+                    for (_nonce, cached_request_id), entry
+                    in strict_request_cache._entries.items()
+                )
+            )
+            raise RuntimeError("injected feedback push failure")
+
+        with mock.patch.object(
+            emo_ws,
+            "_broadcast_v2_playback_update",
+            side_effect=fail_after_settlement,
+        ):
+            client.emit("message", update, namespace="/emo")
+
+        self.assertEqual(settled_before_push, [True])
+        self.assertEqual(self.messages(client), [])
+        feedback = get_state().get_device_playback_state(
+            "context-1",
+            "phone-1",
+        )
+        self.assertEqual(feedback["positionMs"], 25)
+        self.assertEqual(feedback["clientSeq"], 1)
+
+        client.emit("message", update, namespace="/emo")
+        replay = self.messages(client)
+        self.assertEqual(
+            [message["action"] for message in replay],
+            ["playback.update"],
+        )
+        self.assertEqual(replay[0]["payload"]["positionMs"], 25)
+        self.assertEqual(replay[0]["payload"]["clientSeq"], 1)
+
     def test_playback_update_client_sequence_conflict_does_not_mutate_feedback(self):
         client = self.ready_strict_client()
         self.create_context(client, state="stopped", position_ms=0)
@@ -542,7 +733,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
                 "deviceSessionId": "device:phone-1",
                 "state": "playing",
                 "positionMs": 10,
-                "clientSeq": 1,
+                "clientSeq": 2,
                 "trackId": "song-2",
             },
         }
@@ -557,9 +748,129 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertTrue(any(message["action"] == "playback.update" for message in first))
         self.assertEqual(len(response), 1)
         self.assertEqual(response[0]["payload"]["code"], "client_sequence_conflict")
-        self.assertEqual(response[0]["payload"]["currentClientSeq"], 1)
+        self.assertEqual(response[0]["payload"]["currentClientSeq"], 2)
         feedback = get_state().get_device_playback_state("context-1", "phone-1")
         self.assertEqual(feedback["positionMs"], 10)
+
+        stale = dict(update, requestId="playback-update-seq-stale")
+        stale["payload"] = dict(update["payload"], clientSeq=1)
+        client.emit("message", stale, namespace="/emo")
+        stale_response = self.messages(client)
+
+        self.assertEqual(len(stale_response), 1)
+        self.assertEqual(
+            stale_response[0]["payload"]["code"],
+            "client_sequence_conflict",
+        )
+        self.assertEqual(stale_response[0]["payload"]["currentClientSeq"], 2)
+        self.assertEqual(
+            get_state().get_device_playback_state("context-1", "phone-1")[
+                "positionMs"
+            ],
+            10,
+        )
+
+    def test_playback_update_same_sequence_and_content_is_idempotent(self):
+        client = self.ready_strict_client()
+        self.create_context(client, state="stopped", position_ms=0)
+        payload = {
+            "playbackContextId": "context-1",
+            "deviceSessionId": "device:phone-1",
+            "state": "playing",
+            "positionMs": 25,
+            "clientSeq": 1,
+            "trackId": "song-2",
+        }
+
+        first = self.emit_strict(
+            client,
+            "event",
+            "playback.update",
+            "playback-update-seq-idempotent-1",
+            payload,
+        )
+        first_feedback = get_state().get_device_playback_state(
+            "context-1",
+            "phone-1",
+        )
+        second = self.emit_strict(
+            client,
+            "event",
+            "playback.update",
+            "playback-update-seq-idempotent-2",
+            payload,
+        )
+        second_feedback = get_state().get_device_playback_state(
+            "context-1",
+            "phone-1",
+        )
+
+        self.assertEqual([message["action"] for message in first], ["playback.update"])
+        self.assertEqual([message["action"] for message in second], ["playback.update"])
+        self.assertEqual(first[0]["payload"], second[0]["payload"])
+        self.assertEqual(
+            first_feedback["serverUpdatedAtMs"],
+            second_feedback["serverUpdatedAtMs"],
+        )
+        self.assertEqual(first_feedback["clientSeq"], 1)
+        persisted_context = getPlaybackContextState("context-1")
+        for cursor_name in ("epoch", "version", "queueRevision", "controlVersion"):
+            self.assertEqual(persisted_context[cursor_name], 1)
+
+    def test_playback_update_sequence_restarts_on_new_connection_nonce(self):
+        client = self.ready_strict_client()
+        self.create_context(client, state="stopped", position_ms=0)
+        first_sid = get_state().get_sid_for_client("phone-1", user_name="alice")
+        first_nonce = get_state().get_session(first_sid)["connectionNonce"]
+        first_update = self.emit_strict(
+            client,
+            "event",
+            "playback.update",
+            "playback-update-before-reconnect",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "state": "playing",
+                "positionMs": 30,
+                "clientSeq": 7,
+                "trackId": "song-2",
+            },
+        )
+        self.assertEqual(
+            [message["action"] for message in first_update],
+            ["playback.update"],
+        )
+        client.disconnect(namespace="/emo")
+
+        replacement = self.ready_strict_client()
+        replacement_sid = get_state().get_sid_for_client(
+            "phone-1",
+            user_name="alice",
+        )
+        replacement_session = get_state().get_session(replacement_sid)
+        self.assertNotEqual(replacement_session["connectionNonce"], first_nonce)
+        restarted = self.emit_strict(
+            replacement,
+            "event",
+            "playback.update",
+            "playback-update-after-reconnect",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "state": "playing",
+                "positionMs": 40,
+                "clientSeq": 1,
+                "trackId": "song-2",
+            },
+        )
+
+        self.assertEqual(
+            [message["action"] for message in restarted],
+            ["playback.update"],
+        )
+        feedback = get_state().get_device_playback_state("context-1", "phone-1")
+        self.assertEqual(feedback["clientSeq"], 1)
+        self.assertEqual(feedback["positionMs"], 40)
 
     def test_device_list_is_sorted_and_contains_only_contract_fields(self):
         phone = self.connect()
@@ -626,6 +937,126 @@ class StrictV2CoreTestCase(unittest.TestCase):
 
     def test_transport_message_limit_is_256_kib(self):
         self.assertEqual(socketio.server.eio.max_http_buffer_size, 256 * 1024)
+        self.assertEqual(socketio.server.eio.ping_interval, 25)
+        self.assertEqual(socketio.server.eio.ping_timeout, 20)
+
+    def test_production_origin_defaults_to_same_origin(self):
+        self.assertIsNone(socketio.server.eio.cors_allowed_origins)
+        rejected = self.http_client.get(
+            "/emo/ws/?EIO=4&transport=polling",
+            headers={"Origin": "https://untrusted.example"},
+        )
+        self.assertEqual(rejected.status_code, 400)
+
+        accepted = self.http_client.get(
+            "/emo/ws/?EIO=4&transport=polling",
+            headers={"Origin": "http://localhost"},
+        )
+        self.assertEqual(accepted.status_code, 200)
+
+    def test_eleventh_unauthenticated_connection_from_ip_is_rejected(self):
+        clients = [self.connect() for _ in range(11)]
+
+        self.assertTrue(all(client.is_connected("/emo") for client in clients[:10]))
+        self.assertFalse(clients[10].is_connected("/emo"))
+
+    def test_twenty_first_authenticated_connection_for_user_is_rejected(self):
+        for index in range(20):
+            client = self.connect()
+            response = self.authenticate(
+                client,
+                request_id="auth-limit-%d" % index,
+            )
+            self.assertEqual(response[0]["action"], "system.ack")
+
+        overflow = self.connect()
+        overflow.emit(
+            "message",
+            {
+                "type": "auth",
+                "action": "auth.login",
+                "requestId": "auth-limit-overflow",
+                "payload": {"u": "alice", "p": "Alic3"},
+            },
+            namespace="/emo",
+        )
+        self.assertFalse(overflow.is_connected("/emo"))
+
+    def test_rate_limit_settles_before_context_mutation(self):
+        client = self.ready_strict_client()
+        safety_config = dict(self.app.config["WEBAPP"])
+        safety_config["emo_strict_creates_per_connection_per_minute"] = 1
+        strict_v2_safety.configure(safety_config)
+        self.create_context(client)
+
+        response = self.emit_strict(
+            client,
+            "command",
+            "playback.context.create",
+            "context-create-rate-limited",
+            {
+                "playbackContextId": "context-rate-limited",
+                "deviceSessionId": "device:phone-1",
+                "queueSongIds": ["song-1"],
+                "currentIndex": 0,
+                "positionMs": 0,
+                "state": "stopped",
+            },
+        )
+
+        self.assertEqual(len(response), 1)
+        error = response[0]
+        self.assertEqual(error["payload"]["code"], "rate_limited")
+        self.assertTrue(error["payload"]["retryable"])
+        self.assertGreater(error["payload"]["retryAfterMs"], 0)
+        self.assertIsNone(getPlaybackContextState("context-rate-limited"))
+
+    def test_graceful_shutdown_rejects_new_connections_and_closes_existing(self):
+        client = self.ready_strict_client()
+
+        with self.app.app_context():
+            self.assertTrue(begin_strict_v2_shutdown(0))
+
+        self.assertFalse(client.is_connected("/emo"))
+        replacement = self.connect()
+        self.assertFalse(replacement.is_connected("/emo"))
+
+    def test_shutdown_rejects_heartbeat_as_a_new_strict_request(self):
+        client = self.ready_strict_client()
+        self.assertTrue(strict_v2_safety.begin_shutdown(0))
+
+        response = self.emit_strict(
+            client,
+            "system",
+            "system.ping",
+            "ping-during-shutdown",
+            {},
+        )
+
+        self.assertEqual(len(response), 1)
+        self.assertEqual(response[0]["action"], "system.error")
+        self.assertEqual(response[0]["payload"]["code"], "internal_error")
+
+    def test_internal_error_log_is_diagnostic_but_does_not_include_exception_text(self):
+        client = self.ready_strict_client()
+        exception_text = "password=Alic3 path=/private/music.db"
+
+        with mock.patch.object(
+            emo_ws,
+            "_handle_playback_context_create",
+            side_effect=RuntimeError(exception_text),
+        ), self.assertLogs("supysonic.emo.ws", level="ERROR") as captured:
+            response = self.create_context(
+                client,
+                request_id="context-internal-error",
+            )
+
+        self.assertEqual(response[0]["payload"]["code"], "internal_error")
+        combined = "\n".join(captured.output)
+        self.assertIn("exception_type=RuntimeError", combined)
+        self.assertIn("client_request_id=context-internal-error", combined)
+        self.assertNotIn(exception_text, combined)
+        self.assertNotIn("Alic3", combined)
 
     def test_context_create_persists_exact_initial_snapshot_and_subscribes(self):
         client = self.ready_strict_client()
@@ -665,6 +1096,108 @@ class StrictV2CoreTestCase(unittest.TestCase):
             len(get_state().list_playback_context_subscribers("context-1")),
             1,
         )
+
+    def test_context_create_response_emit_failure_replays_persisted_response(self):
+        client = self.ready_strict_client()
+        request = {
+            "type": "command",
+            "action": "playback.context.create",
+            "requestId": "context-create-response-failure",
+            "payload": {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "queueSongIds": ["song-2", "song-1"],
+                "currentIndex": 0,
+                "positionMs": 1200,
+                "state": "playing",
+            },
+        }
+        real_emit = emo_ws.socketio.emit
+
+        def fail_direct_response(event, message, **kwargs):
+            if message["action"] == "playback.context.create":
+                raise RuntimeError("injected direct response failure")
+            return real_emit(event, message, **kwargs)
+
+        with mock.patch.object(
+            emo_ws,
+            "createStrictPlaybackContextState",
+            wraps=emo_ws.createStrictPlaybackContextState,
+        ) as create_context, mock.patch.object(
+            emo_ws.socketio,
+            "emit",
+            side_effect=fail_direct_response,
+        ):
+            client.emit("message", request, namespace="/emo")
+
+        self.assertEqual(self.messages(client), [])
+        persisted = getPlaybackContextState("context-1")
+        self.assertEqual(persisted["queueSongIds"], ["song-2", "song-1"])
+        self.assertEqual(create_context.call_count, 1)
+
+        client.emit("message", request, namespace="/emo")
+        replay = self.messages(client)
+        self.assertEqual(
+            [message["action"] for message in replay],
+            ["playback.context.create"],
+        )
+        self.assertEqual(replay[0]["requestId"], request["requestId"])
+        self.assertEqual(replay[0]["payload"]["version"], 1)
+        self.assertEqual(create_context.call_count, 1)
+
+    def test_queue_sync_ack_backpressure_replays_without_second_mutation(self):
+        client = self.ready_strict_client()
+        self.create_context(client)
+        self.messages(client)
+        target_sid = get_state().get_sid_for_client(
+            "phone-1",
+            user_name="alice",
+        )
+        safety_config = dict(self.app.config["WEBAPP"])
+        safety_config["emo_socketio_max_pending_emits_per_connection"] = 1
+        strict_v2_safety.configure(safety_config)
+        self.assertTrue(strict_v2_safety.reserve_emit(target_sid))
+        request = {
+            "type": "state",
+            "action": "queue.context.sync",
+            "requestId": "queue-ack-backpressure",
+            "payload": {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "queueSongIds": ["song-2", "song-3"],
+                "currentIndex": 0,
+                "positionMs": 1200,
+                "baseQueueRevision": 1,
+            },
+        }
+
+        try:
+            with mock.patch.object(
+                emo_ws,
+                "mutateStrictPlaybackContextQueue",
+                wraps=emo_ws.mutateStrictPlaybackContextQueue,
+            ) as mutate_queue:
+                client.emit("message", request, namespace="/emo")
+        finally:
+            strict_v2_safety.release_emit(target_sid)
+
+        self.assertEqual(self.messages(client), [])
+        persisted = getPlaybackContextState("context-1")
+        self.assertEqual(persisted["queueSongIds"], ["song-2", "song-3"])
+        self.assertEqual(persisted["version"], 2)
+        self.assertEqual(mutate_queue.call_count, 1)
+
+        client.emit("message", request, namespace="/emo")
+        replay = self.messages(client)
+        self.assertEqual(
+            [message["action"] for message in replay],
+            ["system.ack"],
+        )
+        self.assertEqual(
+            replay[0]["payload"],
+            {"action": "queue.context.sync"},
+        )
+        self.assertEqual(mutate_queue.call_count, 1)
 
     def test_context_create_retry_after_runtime_reset_uses_persisted_intent(self):
         client = self.ready_strict_client()
@@ -848,6 +1381,121 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(persisted["controlVersion"], 2)
         self.assertEqual(persisted["queueRevision"], 1)
         self.assertEqual(persisted["epoch"], 1)
+
+    def test_control_does_not_mutate_when_authority_emit_capacity_is_unavailable(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-1",
+            device_session_id="device:controller-1",
+        )
+        self.messages(player)
+        self.messages(controller)
+        authority_sid = get_state().get_sid_for_client(
+            "phone-1",
+            user_name="alice",
+        )
+        safety_config = dict(self.app.config["WEBAPP"])
+        safety_config["emo_socketio_max_pending_emits_per_connection"] = 1
+        strict_v2_safety.configure(safety_config)
+        self.assertTrue(strict_v2_safety.reserve_emit(authority_sid))
+
+        try:
+            response = self.emit_strict(
+                controller,
+                "command",
+                "player.seek",
+                "seek-backpressure",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                    "positionMs": 42000,
+                },
+            )
+        finally:
+            strict_v2_safety.release_emit(authority_sid)
+
+        self.assertEqual(len(response), 1)
+        self.assertEqual(response[0]["payload"]["code"], "authority_offline")
+        persisted = getPlaybackContextState("context-1")
+        self.assertEqual(persisted["positionMs"], 1200)
+        self.assertEqual(persisted["version"], 1)
+        self.assertEqual(persisted["controlVersion"], 1)
+        self.assertFalse(
+            any(
+                message["action"] == "player.seek"
+                for message in self.messages(player)
+            )
+        )
+
+    def test_strict_emit_rejects_invalid_output_before_socketio_send(self):
+        client = self.ready_strict_client()
+        self.messages(client)
+        target_sid = get_state().get_sid_for_client(
+            "phone-1",
+            user_name="alice",
+        )
+        invalid = emo_ws._build_message(
+            "event",
+            "playback.context.closed",
+            {},
+        )
+
+        with self.assertRaises(StrictOutputValidationError):
+            emo_ws._emit_message(invalid, target_sid)
+
+        self.assertEqual(self.messages(client), [])
+
+    def test_emit_buffer_limit_rejects_second_concurrent_socketio_send(self):
+        client = self.ready_strict_client()
+        self.messages(client)
+        target_sid = get_state().get_sid_for_client(
+            "phone-1",
+            user_name="alice",
+        )
+        safety_config = dict(self.app.config["WEBAPP"])
+        safety_config["emo_socketio_max_pending_emits_per_connection"] = 1
+        strict_v2_safety.configure(safety_config)
+        emit_started = threading.Event()
+        release_emit = threading.Event()
+        thread_errors = []
+        message = emo_ws._build_message(
+            "event",
+            "playback.context.closed",
+            {"playbackContextId": "context-buffer-test"},
+        )
+
+        def blocking_emit(*args, **kwargs):
+            emit_started.set()
+            release_emit.wait(1)
+
+        def first_send():
+            try:
+                emo_ws._emit_message(message, target_sid)
+            except Exception as exc:  # pragma: nocover - asserted below
+                thread_errors.append(exc)
+
+        with mock.patch.object(
+            emo_ws.socketio,
+            "emit",
+            side_effect=blocking_emit,
+        ) as socket_emit:
+            thread = threading.Thread(target=first_send)
+            thread.start()
+            self.assertTrue(emit_started.wait(1))
+
+            with self.assertRaisesRegex(RuntimeError, "send buffer is full"):
+                emo_ws._emit_message(message, target_sid)
+
+            self.assertEqual(socket_emit.call_count, 1)
+            release_emit.set()
+            thread.join(1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(thread_errors, [])
+        self.assertTrue(strict_v2_safety.reserve_emit(target_sid))
+        strict_v2_safety.release_emit(target_sid)
 
     def test_queue_sync_cursor_matrix_and_closed_push_schema(self):
         client = self.ready_strict_client()
@@ -1055,15 +1703,23 @@ class StrictV2CoreTestCase(unittest.TestCase):
 
         for action in ("playback.context.status", "playback.context.subscribe"):
             with self.subTest(action=action):
-                response = self.emit_strict(
-                    other,
-                    "state",
-                    action,
-                    "cross-user-%s" % action,
-                    {"playbackContextId": "context-1"},
-                )
-                self.assertEqual(len(response), 1)
-                self.assertEqual(response[0]["payload"]["code"], "forbidden")
+                error_payloads = []
+                for playback_context_id in ("context-1", "unknown-context"):
+                    response = self.emit_strict(
+                        other,
+                        "state",
+                        action,
+                        "cross-user-%s-%s"
+                        % (action, playback_context_id),
+                        {"playbackContextId": playback_context_id},
+                    )
+                    self.assertEqual(len(response), 1)
+                    self.assertEqual(
+                        response[0]["payload"]["code"],
+                        "forbidden",
+                    )
+                    error_payloads.append(response[0]["payload"])
+                self.assertEqual(error_payloads[0], error_payloads[1])
 
     def test_context_close_notifies_and_stops_followers(self):
         owner = self.ready_strict_client()

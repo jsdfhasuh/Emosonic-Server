@@ -1,5 +1,10 @@
 # Goal: 实现 Emosonic 群播 Broadcast Playback v1
 
+> **Superseded / legacy Goal.** 本文仅保留为历史实现证据，不是 strict-v2 r5
+> Broadcast contract。当前权威要求见
+> `specs/emosonic_strict_v2_socketio_server_contract.md` 和
+> `docs/goal/emosonic_strict_v2_r5_server_adaptation.md`。
+
 ## 一、总体目标
 
 在跟播 Follow Playback v1 完成后，实现第一版“群播”能力。
