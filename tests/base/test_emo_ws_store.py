@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 from supysonic import db
 from supysonic.emo.ws_store import (
@@ -109,6 +110,51 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         persisted = getPlaybackContextState("context-1")
         self.assertEqual(persisted["version"], 2)
         self.assertEqual(persisted["controlVersion"], 2)
+
+    def test_strict_context_creates_serialize_sqlite_write_upgrade(self) -> None:
+        second_read = threading.Event()
+        read_lock = threading.Lock()
+        read_count = 0
+        original_get = db.EmoPlaybackContext.get_or_none
+
+        def synchronized_get(*args: object, **kwargs: object) -> object:
+            nonlocal read_count
+            record = original_get(*args, **kwargs)
+            with read_lock:
+                read_count += 1
+                current_read = read_count
+            if current_read == 1:
+                second_read.wait(timeout=0.25)
+            else:
+                second_read.set()
+            return record
+
+        def create(index: int) -> bool:
+            _context, created = createStrictPlaybackContextState(
+                "context-%d" % index,
+                "alice",
+                "player-%d" % index,
+                "device:player-%d" % index,
+                ["song-%d" % index],
+                0,
+                0,
+                "playing",
+            )
+            return created
+
+        with mock.patch.object(
+            db.EmoPlaybackContext,
+            "get_or_none",
+            side_effect=synchronized_get,
+        ):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(create, (1, 2)))
+
+        self.assertEqual(results, [True, True])
+        self.assertEqual(
+            [context["playbackContextId"] for context in listPlaybackContexts()],
+            ["context-1", "context-2"],
+        )
 
     def test_complete_and_cancel_handoff_have_one_atomic_terminal_winner(self):
         createStrictPlaybackContextState(

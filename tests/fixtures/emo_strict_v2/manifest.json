@@ -500,9 +500,10 @@
       "profiles": ["core", "follow", "handoff", "broadcast"],
       "testModules": ["tests.base.test_emo_strict_v2_conformance", "tests.base.test_emo_strict_v2_core"],
       "testMethods": [
-        "tests.base.test_emo_strict_v2_conformance.StrictV2ConformanceTestCase.test_shipped_manifest_starts_with_every_profile_disabled",
+        "tests.base.test_emo_strict_v2_conformance.StrictV2ConformanceTestCase.test_local_test_manifest_fails_closed_outside_test_mode",
+        "tests.base.test_emo_strict_v2_conformance.StrictV2ConformanceTestCase.test_local_test_manifest_requires_explicit_test_mode",
         "tests.base.test_emo_strict_v2_conformance.StrictV2ConformanceTestCase.test_missing_manifest_fails_closed",
-        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_packaged_optional_false_manifest_overrides_enabled_deployment"
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_code_disabled_optional_profiles_override_enabled_deployment"
       ]
     },
     "REQ-016": {

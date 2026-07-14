@@ -73,5 +73,6 @@ target/
 
 #logs
 logs/
+test_logs/
 =1.0.0
 session.json

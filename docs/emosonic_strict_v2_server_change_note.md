@@ -16,7 +16,15 @@
 - 已按 strict-v2 契约实现的客户端不需要降级；应按本文的完整 `device.register` payload
   注册。
 
-## 2. `auth.login`：ACK 必须按 action 关联
+## 2. `auth.login`：浏览器 OTP 与 ACK 关联
+
+网页 `/player` 和 `/control` 不会接触用户真实账户密码。已登录的同源页面先使用带 CSRF header 的
+`POST /emo/browser-auth-password` 获取短期、一次性的 `browser-otp:<opaque>` password
+credential，再把返回的 `userName` 和 credential 分别放入 `payload.u`、`payload.p`。
+
+该 OTP 由认证层显式验证，并绑定当前 authenticated user 与浏览器 Cookie session；它不是“存在
+Flask session 就忽略 `u/p`”的例外。OTP 只保存摘要、短期有效、成功或失败消费后不能重放，响应带
+`Cache-Control: no-store`。普通非浏览器客户端仍可在相同 `u/p` wire shape 中使用账户密码。
 
 服务端成功登录会回显请求的 `requestId`，并在 ACK payload 中回显原 action：
 

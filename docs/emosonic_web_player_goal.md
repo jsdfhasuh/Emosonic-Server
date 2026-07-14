@@ -1,5 +1,10 @@
 # Goal：网页播放器接入 Emosonic 现有 Socket.IO 多端播放体系
 
+> **Superseded / legacy Web 方案。** 本文只记录 `emo_web_realtime_protocol=legacy` 的历史
+> `sessionId` 客户端，不定义 PlaybackContext strict-v2 wire shape。strict-v2 网页实现与配置见
+> `docs/emosonic_web_strict_v2.rst`，唯一 wire contract 见
+> `specs/emosonic_strict_v2_socketio_server_contract.md`。
+
 ## 背景
 
 Emosonic Server 目前已经具备音乐流媒体能力，音频播放应复用现有流媒体接口；同时项目中已经存在一套基于 Socket.IO 的实时通信体系，用于设备注册、播放状态同步、队列同步、单播控制和群播控制。

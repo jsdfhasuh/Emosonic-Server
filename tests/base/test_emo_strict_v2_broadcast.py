@@ -677,7 +677,13 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         )
         broadcast_id = start_ack["payload"]["broadcastId"]
         self.get_messages(authority)
-        self.get_messages(participant)
+        participant_start = next(
+            message
+            for message in self.get_messages(participant)
+            if message["action"] == "broadcast.start"
+        )
+        self.assertEqual(participant_start["payload"]["state"], "paused")
+        self.assertTrue(get_state().is_broadcast_active(broadcast_id))
 
         actions = [
             ("broadcast.play", {}, "command", (2, 1, 2, "playing", 0)),

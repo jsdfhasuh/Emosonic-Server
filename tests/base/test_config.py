@@ -79,6 +79,13 @@ class ConfigTestCase(unittest.TestCase):
             defaults["emo_strict_requests_per_connection_per_minute"],
             120,
         )
+        self.assertEqual(defaults["emo_web_realtime_protocol"], "legacy")
+        self.assertEqual(defaults["emo_browser_otp_ttl_seconds"], 60)
+        self.assertEqual(defaults["emo_browser_otp_outstanding_per_session"], 4)
+        self.assertFalse(defaults["emo_web_strict_v2_follow_enabled"])
+        self.assertFalse(defaults["emo_web_strict_v2_handoff_enabled"])
+        self.assertFalse(defaults["emo_web_strict_v2_broadcast_enabled"])
+        self.assertFalse(defaults["emo_web_strict_v2_acceptance_mode"])
 
         config_file_path = None
         try:
@@ -93,6 +100,13 @@ class ConfigTestCase(unittest.TestCase):
                     "emo_authenticated_connections_per_user = 8\n"
                     "emo_strict_requests_per_connection_per_minute = 60\n"
                     "emo_strict_shutdown_grace_seconds = 3\n"
+                    "emo_web_realtime_protocol = strict_v2\n"
+                    "emo_browser_otp_ttl_seconds = 45\n"
+                    "emo_browser_otp_outstanding_per_session = 6\n"
+                    "emo_web_strict_v2_follow_enabled = on\n"
+                    "emo_web_strict_v2_handoff_enabled = on\n"
+                    "emo_web_strict_v2_broadcast_enabled = on\n"
+                    "emo_web_strict_v2_acceptance_mode = on\n"
                 )
                 config_file.flush()
                 config_file_path = config_file.name
@@ -119,6 +133,16 @@ class ConfigTestCase(unittest.TestCase):
                 60,
             )
             self.assertEqual(conf.WEBAPP["emo_strict_shutdown_grace_seconds"], 3)
+            self.assertEqual(conf.WEBAPP["emo_web_realtime_protocol"], "strict_v2")
+            self.assertEqual(conf.WEBAPP["emo_browser_otp_ttl_seconds"], 45)
+            self.assertEqual(
+                conf.WEBAPP["emo_browser_otp_outstanding_per_session"],
+                6,
+            )
+            self.assertTrue(conf.WEBAPP["emo_web_strict_v2_follow_enabled"])
+            self.assertTrue(conf.WEBAPP["emo_web_strict_v2_handoff_enabled"])
+            self.assertTrue(conf.WEBAPP["emo_web_strict_v2_broadcast_enabled"])
+            self.assertTrue(conf.WEBAPP["emo_web_strict_v2_acceptance_mode"])
         finally:
             if config_file_path:
                 os.remove(config_file_path)

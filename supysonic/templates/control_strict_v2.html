@@ -1,0 +1,848 @@
+{% extends "layout.html" %}
+{% block body %}
+<style>
+  .strict-control { max-width: 1240px; margin: 0 auto; }
+  .strict-control-grid { display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 1rem; }
+  .strict-control-grid > * { min-width: 0; }
+  .strict-card { border: 1px solid #d8dde5; border-radius: 14px; background: #fff; padding: 1rem; margin-bottom: 1rem; }
+  .strict-status { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: 1rem; }
+  .strict-status span { border-radius: 999px; background: #edf2f7; padding: .3rem .65rem; font-size: .82rem; }
+  .strict-device { width: 100%; text-align: left; overflow-wrap: anywhere; border: 1px solid #e2e7ee; border-radius: 10px; background: #fff; padding: .7rem; margin-bottom: .5rem; }
+  .strict-device.is-selected { border-color: #0b57d0; box-shadow: 0 0 0 2px rgba(11, 87, 208, .15); }
+  .strict-muted { color: #667085; }
+  .strict-meta { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: .35rem .7rem; font-size: .88rem; }
+  .strict-meta > * { min-width: 0; overflow-wrap: anywhere; }
+  .strict-controls { display: flex; flex-wrap: wrap; gap: .5rem; }
+  .strict-queue { list-style: none; padding: 0; max-height: 320px; overflow: auto; }
+  .strict-queue li { display: flex; gap: .6rem; align-items: center; border-top: 1px solid #edf0f4; padding: .55rem 0; }
+  .strict-queue li.is-current { color: #0b57d0; font-weight: 700; }
+  .strict-queue button { margin-left: auto; }
+  .strict-log { white-space: pre-wrap; max-height: 260px; overflow: auto; font-size: .82rem; }
+  @media (max-width: 850px) { .strict-control-grid { grid-template-columns: 1fr; } }
+</style>
+
+<main class="strict-control" id="strict-control-root" data-meta-url="{{ url_for('frontend.control_track_meta') }}">
+  <div class="mb-3">
+    <h1 class="h3 mb-1">EmoSonic Control Console</h1>
+    <div class="strict-muted">PlaybackContext strict-v2 2.1.0 · 不支持远程音量和全量远端队列改写</div>
+  </div>
+  <div class="strict-status">
+    <span id="strict-control-connection">disconnected</span>
+    <span id="strict-control-context">no context</span>
+    <span id="strict-control-broadcast">no broadcast</span>
+    <span id="strict-control-handoff">no handoff</span>
+  </div>
+  <div class="alert alert-danger d-none" id="strict-control-error" role="alert"></div>
+
+  <div class="strict-control-grid">
+    <aside>
+      <div class="strict-card">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <h2 class="h5 mb-0">在线播放器</h2>
+          <button class="btn btn-sm btn-outline-secondary" id="strict-refresh-devices" type="button">刷新</button>
+        </div>
+        <div id="strict-device-list"></div>
+      </div>
+      <div class="strict-card">
+        <h2 class="h5">控制台身份</h2>
+        <div class="strict-meta">
+          <span>clientId</span><code id="strict-control-client-id"></code>
+          <span>deviceSessionId</span><code id="strict-control-device-id"></code>
+          <span>protocol</span><code id="strict-control-protocol">-</code>
+          <span>schema</span><code id="strict-control-schema">-</code>
+          <span>build</span><code id="strict-control-build">-</code>
+          <span>capabilities</span><code id="strict-control-capabilities">-</code>
+        </div>
+      </div>
+    </aside>
+
+    <section>
+      <div class="strict-card">
+        <h2 class="h5">PlaybackContext</h2>
+        <div class="strict-meta mb-3">
+          <span>player</span><code id="strict-selected-player">-</code>
+          <span>playbackContextId</span><code id="strict-selected-context">-</code>
+          <span>state</span><strong id="strict-selected-state">-</strong>
+          <span>position</span><span id="strict-selected-position">-</span>
+          <span>queueRevision</span><span id="strict-selected-queue-revision">-</span>
+          <span>controlVersion</span><span id="strict-selected-control-version">-</span>
+        </div>
+        <div class="strict-controls mb-3">
+          <button class="btn btn-primary" data-control="player.play" type="button">播放</button>
+          <button class="btn btn-outline-secondary" data-control="player.pause" type="button">暂停</button>
+          <button class="btn btn-outline-secondary" data-control="player.prev" type="button">上一首</button>
+          <button class="btn btn-outline-secondary" data-control="player.next" type="button">下一首</button>
+          <button class="btn btn-outline-secondary" id="strict-seek-back" type="button">-15 秒</button>
+          <button class="btn btn-outline-secondary" id="strict-seek-forward" type="button">+15 秒</button>
+          <button class="btn btn-outline-secondary" disabled type="button" title="strict-v2 2.1.0 没有远程音量 action">远程音量不可用</button>
+        </div>
+        <ul class="strict-queue" id="strict-control-queue"></ul>
+      </div>
+
+      <div class="strict-card">
+        <h2 class="h5">Broadcast</h2>
+        <div class="strict-controls mb-2">
+          <button class="btn btn-dark" id="strict-broadcast-start" type="button">向支持设备开始群播</button>
+          <button class="btn btn-outline-primary" data-broadcast="broadcast.play" type="button">播放</button>
+          <button class="btn btn-outline-secondary" data-broadcast="broadcast.pause" type="button">暂停</button>
+          <button class="btn btn-outline-secondary" id="strict-broadcast-seek-back" type="button">-15 秒</button>
+          <button class="btn btn-outline-secondary" id="strict-broadcast-seek-forward" type="button">+15 秒</button>
+          <button class="btn btn-outline-secondary" id="strict-broadcast-queue-sync" type="button">同步 Context 队列</button>
+          <button class="btn btn-outline-danger" data-broadcast="broadcast.stop" type="button">停止</button>
+          <button class="btn btn-outline-secondary" id="strict-broadcast-status-button" type="button">状态</button>
+        </div>
+        <div class="strict-muted" id="strict-broadcast-summary">没有活动 Broadcast。</div>
+      </div>
+
+      <div class="strict-card">
+        <h2 class="h5">Handoff</h2>
+        <select class="form-select mb-2" id="strict-handoff-target"></select>
+        <div class="strict-controls">
+          <button class="btn btn-dark" id="strict-handoff-start" type="button">开始 Handoff</button>
+          <button class="btn btn-outline-danger" id="strict-handoff-cancel" type="button">取消</button>
+        </div>
+        <div class="strict-muted mt-2" id="strict-handoff-summary">没有活动 Handoff。</div>
+      </div>
+
+      <div class="strict-card">
+        <h2 class="h5">Follow</h2>
+        <div class="strict-muted">strict Follow 必须由实际 follower player 发起；控制台只展示来源，不代替播放器发送请求。</div>
+      </div>
+
+      <div class="strict-card">
+        <h2 class="h5">事件</h2>
+        <div class="strict-log" id="strict-control-log"></div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+<script src="{{ url_for('static', filename='js/emo_strict_v2_client.js') }}"></script>
+<script>
+(() => {
+  'use strict';
+  const bootstrap = {{ emo_web_bootstrap | tojson }};
+  const optionalProfiles = bootstrap.strictV2Profiles || {};
+  const api = window.EmoStrictV2;
+  const root = document.getElementById('strict-control-root');
+  const META_BATCH_SIZE = 50;
+  const clientId = api.stableIdentity(sessionStorage, 'emosonic.webControl.clientId.v2', 'web-control-');
+  const deviceSessionId = api.stableIdentity(sessionStorage, 'emosonic.webControl.deviceSessionId.v2', 'web-control-device:');
+  const state = {
+    client: null,
+    devices: [],
+    bindings: [],
+    selectedClientId: null,
+    selectedContextId: null,
+    pendingContextId: null,
+    selectionGeneration: 0,
+    contextRenderGeneration: 0,
+    context: null,
+    controlBusy: false,
+    deviceStates: [],
+    trackMeta: {},
+    activeBroadcast: null,
+    broadcastBusy: false,
+    participantStates: [],
+    handoff: null,
+    logLines: [],
+  };
+  const capabilities = {
+    playbackContextV2: true,
+    playbackPrepare: false,
+    effectiveAtPlayback: false,
+    canPlay: false,
+    canPause: false,
+    canSeek: false,
+    canSetVolume: false,
+    supportsFollow: false,
+    supportsBroadcast: optionalProfiles.broadcast === true,
+  };
+
+  function text(id, value) { document.getElementById(id).textContent = value; }
+  function displayName(device) { return device?.alias?.trim() || device?.deviceName?.trim() || device?.clientId || '-'; }
+  function formatMs(value) {
+    const seconds = Math.max(0, Math.floor((Number(value) || 0) / 1000));
+    return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+  }
+  function log(message, level = 'info') {
+    state.logLines.unshift(`[${new Date().toLocaleTimeString()}] ${level}: ${message}`);
+    state.logLines = state.logLines.slice(0, 40);
+    text('strict-control-log', state.logLines.join('\n'));
+  }
+  function showError(message) {
+    const element = document.getElementById('strict-control-error');
+    element.textContent = message;
+    element.classList.remove('d-none');
+    log(message, 'error');
+  }
+  function clearError() { document.getElementById('strict-control-error').classList.add('d-none'); }
+
+  function updateCapabilityUi() {
+    const selected = state.devices.find((device) => device.clientId === state.selectedClientId);
+    const targetCapabilities = selected?.capabilities || {};
+    const actionCapability = {
+      'player.play': 'canPlay',
+      'player.pause': 'canPause',
+      'player.prev': 'canPlay',
+      'player.next': 'canPlay',
+    };
+    document.querySelectorAll('[data-control]').forEach((button) => {
+      button.disabled = (
+        !state.context
+        || state.controlBusy
+        || !targetCapabilities[actionCapability[button.dataset.control]]
+      );
+    });
+    const seekEnabled = Boolean(
+      state.context && targetCapabilities.canSeek && !state.controlBusy
+    );
+    document.getElementById('strict-seek-back').disabled = !seekEnabled;
+    document.getElementById('strict-seek-forward').disabled = !seekEnabled;
+    const broadcastEnabled = Boolean(
+      state.client?.capability('supportsBroadcast')
+      && targetCapabilities.supportsBroadcast
+    );
+    document.getElementById('strict-broadcast-start').disabled = (
+      !broadcastEnabled || !state.context || state.broadcastBusy || Boolean(state.activeBroadcast)
+    );
+    document.querySelectorAll('[data-broadcast]').forEach((button) => {
+      button.disabled = !broadcastEnabled || !state.activeBroadcast || state.broadcastBusy;
+    });
+    document.getElementById('strict-broadcast-status-button').disabled = !broadcastEnabled || !state.activeBroadcast || state.broadcastBusy;
+    document.getElementById('strict-broadcast-seek-back').disabled = !broadcastEnabled || !state.activeBroadcast || state.broadcastBusy;
+    document.getElementById('strict-broadcast-seek-forward').disabled = !broadcastEnabled || !state.activeBroadcast || state.broadcastBusy;
+    document.getElementById('strict-broadcast-queue-sync').disabled = !broadcastEnabled || !state.activeBroadcast || !state.context || state.broadcastBusy;
+    const terminalHandoff = state.handoff
+      && ['completed', 'failed', 'cancelled', 'timedOut'].includes(state.handoff.status);
+    document.getElementById('strict-handoff-start').disabled = (
+      !state.context
+      || !document.getElementById('strict-handoff-target').value
+      || Boolean(state.handoff && !terminalHandoff)
+    );
+    document.getElementById('strict-handoff-cancel').disabled = !state.handoff || terminalHandoff;
+  }
+
+  async function ensureMeta(trackIds) {
+    const missing = Array.from(new Set((trackIds || []).filter((id) => id && !state.trackMeta[id])));
+    for (let offset = 0; offset < missing.length; offset += META_BATCH_SIZE) {
+      const params = new URLSearchParams();
+      missing.slice(offset, offset + META_BATCH_SIZE).forEach((id) => params.append('ids', id));
+      const response = await fetch(`${root.dataset.metaUrl}?${params}`, { credentials: 'same-origin' });
+      if (!response.ok) throw new Error(`曲目元数据加载失败 (${response.status})`);
+      Object.assign(state.trackMeta, await response.json());
+    }
+  }
+
+  function playerDevices() {
+    return state.devices.filter((device) => device.clientId !== clientId && device.roles.includes('player'));
+  }
+
+  function bindingFor(clientIdValue) {
+    const device = state.devices.find((item) => item.clientId === clientIdValue);
+    if (!device) return null;
+    return state.bindings.find((binding) => (
+      binding.clientId === device.clientId && binding.deviceSessionId === device.deviceSessionId
+    )) || null;
+  }
+
+  function renderDevices() {
+    const container = document.getElementById('strict-device-list');
+    container.innerHTML = '';
+    const players = playerDevices();
+    if (!players.length) {
+      container.innerHTML = '<div class="strict-muted">没有在线 strict player。</div>';
+    }
+    players.forEach((device) => {
+      const binding = bindingFor(device.clientId);
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = `strict-device${device.clientId === state.selectedClientId ? ' is-selected' : ''}`;
+      const name = document.createElement('strong');
+      name.textContent = displayName(device);
+      const client = document.createElement('small');
+      client.textContent = device.clientId;
+      const context = document.createElement('small');
+      context.textContent = binding ? binding.playbackContextId : '没有活动 Context';
+      button.append(name, document.createElement('br'), client, document.createElement('br'), context);
+      button.addEventListener('click', () => selectPlayer(device.clientId).catch((error) => showError(error.message)));
+      container.append(button);
+    });
+    renderHandoffTargets();
+    updateCapabilityUi();
+  }
+
+  function renderHandoffTargets() {
+    const select = document.getElementById('strict-handoff-target');
+    select.innerHTML = '<option value="">选择目标 player</option>';
+    playerDevices().filter((device) => (
+      device.clientId !== state.selectedClientId
+      && device.capabilities.playbackPrepare
+      && device.capabilities.effectiveAtPlayback
+    )).forEach((device) => {
+      const option = document.createElement('option');
+      option.value = device.clientId;
+      option.textContent = `${displayName(device)} · ${device.clientId}`;
+      select.append(option);
+    });
+    updateCapabilityUi();
+  }
+
+  function projectedPosition() {
+    if (!state.context) return 0;
+    const feedback = state.deviceStates.find((item) => item.clientId === state.context.authorityClientId);
+    const source = feedback || state.context;
+    const base = source.positionMs || 0;
+    const projected = source.state !== 'playing' || !source.serverUpdatedAtMs
+      ? base
+      : base + Math.max(0, state.client.serverNowMs() - source.serverUpdatedAtMs);
+    return Math.max(0, Math.round(projected));
+  }
+
+  function projectedBroadcastPosition() {
+    const snapshot = state.activeBroadcast;
+    if (!snapshot) return 0;
+    const base = snapshot.positionMs || 0;
+    const projected = snapshot.state !== 'playing' || !snapshot.serverUpdatedAtMs
+      ? base
+      : base + Math.max(0, state.client.serverNowMs() - snapshot.serverUpdatedAtMs);
+    return Math.max(0, Math.round(projected));
+  }
+
+  async function renderContext() {
+    const renderGeneration = ++state.contextRenderGeneration;
+    const selectionGeneration = state.selectionGeneration;
+    const selectedContextId = state.selectedContextId;
+    const context = state.context;
+    text('strict-selected-player', state.selectedClientId || '-');
+    text('strict-selected-context', state.selectedContextId || '-');
+    text('strict-control-context', state.selectedContextId ? 'context selected' : 'no context');
+    const authorityFeedback = state.deviceStates.find((item) => item.clientId === context?.authorityClientId);
+    text('strict-selected-state', authorityFeedback?.state || context?.state || '-');
+    text('strict-selected-position', context ? formatMs(projectedPosition()) : '-');
+    text('strict-selected-queue-revision', context?.queueRevision ?? '-');
+    text('strict-selected-control-version', context?.controlVersion ?? '-');
+    updateCapabilityUi();
+    const list = document.getElementById('strict-control-queue');
+    list.innerHTML = '';
+    if (!context?.queueSongIds?.length) {
+      list.innerHTML = '<li class="strict-muted">没有 canonical queue。</li>';
+      return;
+    }
+    await ensureMeta(context.queueSongIds);
+    if (
+      renderGeneration !== state.contextRenderGeneration
+      || selectionGeneration !== state.selectionGeneration
+      || selectedContextId !== state.selectedContextId
+    ) return;
+    list.innerHTML = '';
+    context.queueSongIds.forEach((trackId, index) => {
+      const item = document.createElement('li');
+      if (index === context.currentIndex) item.classList.add('is-current');
+      item.append(document.createTextNode(`${index + 1}. ${state.trackMeta[trackId]?.label || trackId}`));
+      const play = document.createElement('button');
+      play.type = 'button';
+      play.className = 'btn btn-sm btn-outline-primary';
+      play.textContent = '播放此项';
+      play.disabled = !state.devices.find((device) => device.clientId === state.selectedClientId)?.capabilities.canPlay;
+      play.addEventListener('click', () => {
+        runControlOperation(() => sendControl('queue.playItem', { queueIndex: index }))
+          .catch((error) => showError(error.message));
+      });
+      item.append(play);
+      if (state.activeBroadcast) {
+        const broadcastPlay = document.createElement('button');
+        broadcastPlay.type = 'button';
+        broadcastPlay.className = 'btn btn-sm btn-outline-dark';
+        broadcastPlay.textContent = '群播播此项';
+        broadcastPlay.addEventListener('click', () => {
+          runBroadcastOperation(() => broadcastAction('broadcast.playItem', { queueIndex: index }))
+            .catch((error) => showError(error.message));
+        });
+        item.append(broadcastPlay);
+      }
+      list.append(item);
+    });
+  }
+
+  async function refreshBindings() {
+    state.bindings = await state.client.fetchContextBindings();
+    if (state.selectedClientId && !bindingFor(state.selectedClientId)) {
+      await unsubscribeSelected();
+      state.selectedClientId = null;
+    }
+    if (!state.selectedClientId) {
+      const first = playerDevices().find((device) => bindingFor(device.clientId));
+      if (first) await selectPlayer(first.clientId);
+    }
+    renderDevices();
+  }
+
+  async function unsubscribeSelected() {
+    state.selectionGeneration += 1;
+    state.pendingContextId = null;
+    if (!state.selectedContextId) {
+      state.selectedClientId = null;
+      state.context = null;
+      return;
+    }
+    const previous = state.selectedContextId;
+    state.selectedClientId = null;
+    state.selectedContextId = null;
+    state.context = null;
+    await state.client.unsubscribe(previous).catch(() => {});
+  }
+
+  async function selectPlayer(nextClientId) {
+    const binding = bindingFor(nextClientId);
+    if (!binding) throw new Error('所选 player 没有可发现的活动 PlaybackContext');
+    const nextContextId = binding.playbackContextId;
+    const previousClientId = state.selectedClientId;
+    const previousContextId = state.selectedContextId;
+    const generation = ++state.selectionGeneration;
+    state.pendingContextId = nextContextId;
+    if (previousContextId && previousContextId !== nextContextId) {
+      state.selectedClientId = null;
+      state.selectedContextId = null;
+      state.context = null;
+      await state.client.unsubscribe(previousContextId).catch(() => {});
+      if (generation !== state.selectionGeneration) return;
+    }
+    try {
+      const response = await state.client.subscribe(nextContextId);
+      if (generation !== state.selectionGeneration) {
+        if (
+          state.pendingContextId !== nextContextId
+          && state.selectedContextId !== nextContextId
+        ) {
+          await state.client.unsubscribe(nextContextId).catch(() => {});
+        }
+        return;
+      }
+      state.selectedClientId = nextClientId;
+      state.selectedContextId = nextContextId;
+      state.pendingContextId = null;
+      applyStatus(response.payload);
+      renderDevices();
+    } catch (error) {
+      if (generation !== state.selectionGeneration) return;
+      state.pendingContextId = null;
+      if (
+        previousContextId !== nextContextId
+        || ['not_found', 'context_closed'].includes(error.code)
+      ) {
+        state.selectedClientId = null;
+        state.selectedContextId = null;
+        state.context = null;
+      } else {
+        state.selectedClientId = previousClientId;
+        state.selectedContextId = previousContextId;
+      }
+      renderDevices();
+      throw error;
+    }
+  }
+
+  function applyStatus(payload) {
+    const receivedContext = payload.playbackContext;
+    if (!receivedContext || receivedContext.playbackContextId !== state.selectedContextId) return false;
+    const incomingCurrent = state.client.isCurrentContextSnapshot(receivedContext);
+    const cursor = state.client.cursor(receivedContext.playbackContextId);
+    const context = cursor ? { ...receivedContext, ...cursor } : receivedContext;
+    if (
+      !incomingCurrent
+      && state.context
+      && Number.isInteger(context.epoch)
+      && Number.isInteger(context.version)
+      && Number.isInteger(state.context.epoch)
+      && Number.isInteger(state.context.version)
+      && (
+        state.context.epoch > context.epoch
+        || (state.context.epoch === context.epoch && state.context.version >= context.version)
+      )
+    ) {
+      return false;
+    }
+    if (
+      state.context
+      && Number.isInteger(context.epoch)
+      && Number.isInteger(context.version)
+      && Number.isInteger(state.context.epoch)
+      && Number.isInteger(state.context.version)
+      && (
+        context.epoch < state.context.epoch
+        || (context.epoch === state.context.epoch && context.version < state.context.version)
+      )
+    ) {
+      return false;
+    }
+    state.context = context;
+    if (incomingCurrent) state.deviceStates = payload.deviceStates || [];
+    renderContext().catch((error) => showError(error.message));
+    return true;
+  }
+
+  async function refreshSelected() {
+    if (!state.selectedContextId) return;
+    const selectedContextId = state.selectedContextId;
+    const response = await state.client.refreshContext(selectedContextId);
+    if (state.selectedContextId === selectedContextId) applyStatus(response.payload);
+  }
+
+  async function sendControl(action, extras, retry = true) {
+    if (!state.selectedContextId || !state.context) throw new Error('请先选择活动 PlaybackContext');
+    const payload = {
+      playbackContextId: state.selectedContextId,
+      baseControlVersion: state.context.controlVersion,
+      ...(extras || {}),
+    };
+    if (action === 'queue.playItem') payload.baseQueueRevision = state.context.queueRevision;
+    try {
+      await state.client.request(action, payload);
+      await refreshSelected();
+      clearError();
+      log(`${action} accepted`);
+    } catch (error) {
+      if (retry && error.code === 'stale_version') {
+        await refreshSelected();
+        return sendControl(action, extras, false);
+      }
+      if (['authority_offline', 'capability_required'].includes(error.code)) showError(`${error.code}: ${error.message}`);
+      throw error;
+    }
+  }
+
+  async function runControlOperation(operation) {
+    if (state.controlBusy) return;
+    state.controlBusy = true;
+    updateCapabilityUi();
+    try {
+      await operation();
+    } finally {
+      state.controlBusy = false;
+      updateCapabilityUi();
+    }
+  }
+
+  function renderBroadcast() {
+    const snapshot = state.activeBroadcast;
+    text('strict-control-broadcast', snapshot ? `${snapshot.state} · ${snapshot.broadcastId}` : 'no broadcast');
+    if (!snapshot) {
+      text('strict-broadcast-summary', '没有活动 Broadcast。');
+      updateCapabilityUi();
+      return;
+    }
+    text('strict-broadcast-summary', `${snapshot.broadcastId} · ${snapshot.state} · participants ${snapshot.participants.length} · queueRevision ${snapshot.queueRevision} · controlVersion ${snapshot.controlVersion}`);
+    updateCapabilityUi();
+  }
+
+  async function startBroadcast() {
+    if (!state.client.capability('supportsBroadcast')) throw new Error('capability_required: supportsBroadcast');
+    if (!state.context?.queueSongIds?.length) throw new Error('当前 Context 没有可群播队列');
+    const participants = playerDevices()
+      .filter((device) => device.capabilities.supportsBroadcast)
+      .map((device) => device.clientId)
+      .sort();
+    if (!participants.includes(state.context.authorityClientId)) participants.push(state.context.authorityClientId);
+    participants.sort();
+    const response = await state.client.request('broadcast.start', {
+      playbackContextId: state.selectedContextId,
+      queueSongIds: state.context.queueSongIds.slice(),
+      currentIndex: state.context.currentIndex,
+      positionMs: projectedPosition(),
+      participants,
+      autoPlay: state.context.state === 'playing',
+    });
+    state.activeBroadcast = {
+      playbackContextId: state.selectedContextId,
+      broadcastId: response.payload.broadcastId,
+    };
+    await refreshBroadcast();
+  }
+
+  async function runBroadcastOperation(operation) {
+    if (state.broadcastBusy) return;
+    state.broadcastBusy = true;
+    updateCapabilityUi();
+    try {
+      await operation();
+    } finally {
+      state.broadcastBusy = false;
+      updateCapabilityUi();
+    }
+  }
+
+  async function broadcastAction(action, extras = {}) {
+    const snapshot = state.activeBroadcast;
+    if (!snapshot?.broadcastId) throw new Error('没有活动 Broadcast');
+    await state.client.request(action, {
+      playbackContextId: snapshot.playbackContextId,
+      broadcastId: snapshot.broadcastId,
+      ...extras,
+    });
+    if (action === 'broadcast.stop') {
+      state.activeBroadcast = null;
+      state.participantStates = [];
+      renderBroadcast();
+      renderContext().catch((error) => showError(error.message));
+    } else {
+      await refreshBroadcast();
+    }
+  }
+
+  async function refreshBroadcast() {
+    const snapshot = state.activeBroadcast;
+    if (!snapshot?.broadcastId) return;
+    const response = await state.client.request('broadcast.status', {
+      playbackContextId: snapshot.playbackContextId,
+      broadcastId: snapshot.broadcastId,
+    });
+    state.activeBroadcast = response.payload.broadcast?.state === 'stopped'
+      ? null
+      : response.payload.broadcast;
+    state.participantStates = response.payload.participantStates;
+    renderBroadcast();
+    renderContext().catch((error) => showError(error.message));
+  }
+
+  async function syncBroadcastQueue(retry = true) {
+    if (!state.activeBroadcast || !state.context) throw new Error('没有可同步的 Broadcast 或 Context');
+    try {
+      await state.client.request('broadcast.queue.sync', {
+        playbackContextId: state.activeBroadcast.playbackContextId,
+        broadcastId: state.activeBroadcast.broadcastId,
+        queueSongIds: state.context.queueSongIds.slice(),
+        currentIndex: state.context.currentIndex,
+        positionMs: projectedPosition(),
+        baseQueueRevision: state.activeBroadcast.queueRevision,
+        baseControlVersion: state.activeBroadcast.controlVersion,
+      });
+    } catch (error) {
+      if (retry && error.code === 'stale_version') {
+        await refreshBroadcast();
+        return syncBroadcastQueue(false);
+      }
+      throw error;
+    }
+    await refreshBroadcast();
+  }
+
+  function renderHandoff() {
+    const handoff = state.handoff;
+    text('strict-control-handoff', handoff ? `${handoff.status} · ${handoff.handoffId}` : 'no handoff');
+    text('strict-handoff-summary', handoff ? `${handoff.handoffId} · ${handoff.status}${handoff.errorCode ? ` · ${handoff.errorCode}` : ''}` : '没有活动 Handoff。');
+    updateCapabilityUi();
+  }
+
+  async function startHandoff() {
+    if (!state.selectedContextId || !state.context) throw new Error('请先选择 source Context');
+    const targetClientId = document.getElementById('strict-handoff-target').value;
+    if (!targetClientId) throw new Error('请选择具备完整 Handoff capability 的目标 player');
+    const response = await state.client.request('playback.handoff.start', {
+      playbackContextId: state.selectedContextId,
+      targetClientId,
+      baseControlVersion: state.context.controlVersion,
+    });
+    state.handoff = {
+      playbackContextId: state.selectedContextId,
+      handoffId: response.payload.handoffId,
+      prepareId: response.payload.prepareId,
+      status: response.payload.status,
+    };
+    renderHandoff();
+  }
+
+  async function cancelHandoff() {
+    if (!state.handoff) return;
+    await state.client.request('playback.handoff.cancel', {
+      playbackContextId: state.handoff.playbackContextId,
+      handoffId: state.handoff.handoffId,
+      reason: 'cancelled_by_web_control',
+    });
+  }
+
+  function onEvent(message) {
+    const action = message.action;
+    if (action === 'device.list') {
+      state.devices = message.payload.devices;
+      refreshBindings().catch((error) => showError(error.message));
+    } else if (action === 'playback.context.status' && message.payload.playbackContext.playbackContextId === state.selectedContextId) {
+      applyStatus(message.payload);
+    } else if (action === 'queue.context.sync' && message.payload.playbackContextId === state.selectedContextId) {
+      const cursor = state.client.cursor(state.selectedContextId);
+      if (cursor) {
+        state.context = { ...(state.context || {}), ...cursor };
+        renderContext().catch((error) => showError(error.message));
+      }
+    } else if (action === 'playback.update' && message.payload.playbackContextId === state.selectedContextId) {
+      const index = state.deviceStates.findIndex((item) => item.clientId === message.payload.sourceClientId);
+      const next = { ...message.payload, clientId: message.payload.sourceClientId };
+      if (index >= 0) state.deviceStates[index] = next; else state.deviceStates.push(next);
+      renderContext().catch((error) => showError(error.message));
+    } else if (action === 'playback.context.closed' && message.payload.playbackContextId === state.selectedContextId) {
+      state.client.forgetSubscription(message.payload.playbackContextId);
+      unsubscribeSelected().then(refreshBindings);
+    } else if (action.startsWith('broadcast.') && action !== 'broadcast.status') {
+      state.activeBroadcast = action === 'broadcast.stop' || message.payload.state === 'stopped'
+        ? null
+        : message.payload;
+      if (!state.activeBroadcast) state.participantStates = [];
+      renderBroadcast();
+    } else if (action === 'playback.handoff.status') {
+      state.handoff = { ...(state.handoff || {}), ...message.payload };
+      renderHandoff();
+      if (message.payload.status === 'completed') {
+        refreshBindings().then(refreshSelected).catch((error) => showError(error.message));
+      }
+    } else if (action === 'playback.handoff.cancel') {
+      state.handoff = { ...(state.handoff || {}), ...message.payload, status: 'cancelled' };
+      renderHandoff();
+    } else if (action === 'system.error') {
+      showError(`${message.payload.code}: ${message.payload.message}`);
+    }
+  }
+
+  function bindUi() {
+    text('strict-control-client-id', clientId);
+    text('strict-control-device-id', deviceSessionId);
+    document.querySelectorAll('[data-control]').forEach((button) => {
+      button.addEventListener('click', () => {
+        runControlOperation(() => sendControl(button.dataset.control))
+          .catch((error) => showError(error.message));
+      });
+    });
+    document.getElementById('strict-seek-back').addEventListener('click', () => {
+      runControlOperation(() => sendControl('player.seek', { positionMs: Math.max(0, projectedPosition() - 15000) }))
+        .catch((error) => showError(error.message));
+    });
+    document.getElementById('strict-seek-forward').addEventListener('click', () => {
+      runControlOperation(() => sendControl('player.seek', { positionMs: projectedPosition() + 15000 }))
+        .catch((error) => showError(error.message));
+    });
+    document.getElementById('strict-refresh-devices').addEventListener('click', () => {
+      state.client.request('device.list', {}).then(refreshBindings).catch((error) => showError(error.message));
+    });
+    document.getElementById('strict-broadcast-start').addEventListener('click', () => {
+      runBroadcastOperation(startBroadcast).catch((error) => showError(error.message));
+    });
+    document.querySelectorAll('[data-broadcast]').forEach((button) => {
+      button.addEventListener('click', () => {
+        runBroadcastOperation(() => broadcastAction(button.dataset.broadcast))
+          .catch((error) => showError(error.message));
+      });
+    });
+    document.getElementById('strict-broadcast-status-button').addEventListener('click', () => refreshBroadcast().catch((error) => showError(error.message)));
+    document.getElementById('strict-broadcast-seek-back').addEventListener('click', () => {
+      runBroadcastOperation(() => broadcastAction('broadcast.seek', { positionMs: Math.max(0, projectedBroadcastPosition() - 15000) }))
+        .catch((error) => showError(error.message));
+    });
+    document.getElementById('strict-broadcast-seek-forward').addEventListener('click', () => {
+      runBroadcastOperation(() => broadcastAction('broadcast.seek', { positionMs: projectedBroadcastPosition() + 15000 }))
+        .catch((error) => showError(error.message));
+    });
+    document.getElementById('strict-broadcast-queue-sync').addEventListener('click', () => {
+      runBroadcastOperation(syncBroadcastQueue).catch((error) => showError(error.message));
+    });
+    document.getElementById('strict-handoff-start').addEventListener('click', () => startHandoff().catch((error) => showError(error.message)));
+    document.getElementById('strict-handoff-cancel').addEventListener('click', () => cancelHandoff().catch((error) => showError(error.message)));
+    document.getElementById('strict-handoff-target').addEventListener('change', updateCapabilityUi);
+  }
+
+  function start() {
+    bindUi();
+    renderDevices();
+    renderContext().catch((error) => showError(error.message));
+    renderBroadcast();
+    renderHandoff();
+    state.client = new api.StrictV2Client({
+      ioFactory: window.io,
+      socketUrl: window.location.origin + '/emo',
+      socketPath: '/emo/ws',
+      authPasswordUrl: bootstrap.authPasswordUrl,
+      contextBindingsUrl: bootstrap.contextBindingsUrl,
+      csrfToken: bootstrap.csrfToken,
+      registration: {
+        clientId,
+        deviceSessionId,
+        deviceName: 'Web Control Console',
+        roles: ['controller'],
+        capabilities,
+      },
+      onState(connectionState, detail) {
+        text('strict-control-connection', connectionState);
+        if (connectionState === 'registered' && detail) {
+          text('strict-control-protocol', detail.metadata.protocolVersion);
+          text('strict-control-schema', detail.metadata.schemaHash);
+          text('strict-control-build', detail.metadata.serverBuildCommit);
+          text('strict-control-capabilities', JSON.stringify(detail.negotiatedCapabilities));
+        }
+        updateCapabilityUi();
+      },
+      onEvent,
+      onDebug(summary) { log(JSON.stringify(summary), 'debug'); },
+      onReady() {
+        refreshBindings()
+          .then(() => (state.activeBroadcast ? refreshBroadcast() : null))
+          .catch((error) => showError(error.message));
+      },
+      onBootstrapError(error) { showError(`strict-v2 bootstrap failed: ${error.message}`); },
+      onProtocolError(error) { showError(`protocol error: ${error.message}`); },
+    });
+    if (bootstrap.acceptanceMode) {
+      window.__emoStrictV2Acceptance = {
+        clientId,
+        deviceSessionId,
+        snapshot() {
+          return {
+            connectionState: state.client.state,
+            selectedClientId: state.selectedClientId,
+            selectedContextId: state.selectedContextId,
+            authorityClientId: state.context?.authorityClientId || null,
+            authorityDeviceSessionId: state.context?.authorityDeviceSessionId || null,
+            controlVersion: state.context?.controlVersion ?? null,
+            broadcastId: state.activeBroadcast?.broadcastId || null,
+            broadcastState: state.activeBroadcast?.state || null,
+            broadcastControlVersion: state.activeBroadcast?.controlVersion ?? null,
+            broadcastQueueRevision: state.activeBroadcast?.queueRevision ?? null,
+            broadcastBusy: state.broadcastBusy,
+            handoffId: state.handoff?.handoffId || null,
+            handoffStatus: state.handoff?.status || null,
+            devices: state.devices.map((device) => ({
+              clientId: device.clientId,
+              deviceSessionId: device.deviceSessionId,
+              roles: device.roles.slice(),
+            })),
+          };
+        },
+        setControlVersion(value) {
+          if (state.context) state.context.controlVersion = value;
+        },
+        async requestExpectError(action, payload) {
+          try {
+            await state.client.request(action, payload || {});
+            return null;
+          } catch (error) {
+            showError(`${error.code || 'error'}: ${error.message}`);
+            return { code: error.code || null, message: error.message };
+          }
+        },
+        forceProtocolError(message = 'acceptance injected protocol failure') {
+          state.client._protocolError(new api.StrictProtocolError(message));
+        },
+      };
+    }
+    state.client.connect();
+    updateCapabilityUi();
+    setInterval(() => {
+      if (state.context) text('strict-selected-position', formatMs(projectedPosition()));
+    }, 5000);
+    setInterval(() => {
+      if (state.client.state === 'ready') refreshBindings().catch(() => {});
+    }, 10000);
+  }
+
+  start();
+})();
+</script>
+{% endblock %}

@@ -34,8 +34,12 @@ def get_deployment_readiness(webapp_config: Mapping[str, object]) -> Dict[str, b
 def get_effective_profile_readiness(
     webapp_config: Mapping[str, object],
     code_readiness: Optional[Mapping[str, bool]] = None,
+    allow_local_test_evidence: bool = False,
 ) -> Dict[str, bool]:
-    code = dict(code_readiness or get_code_conformance_readiness())
+    code = dict(
+        code_readiness
+        or get_code_conformance_readiness(allow_local_test_evidence)
+    )
     deployment = get_deployment_readiness(webapp_config)
     return {
         profile: bool(code.get(profile, False) and deployment[profile])
@@ -48,6 +52,7 @@ def negotiate_capabilities(
     roles: Sequence[str],
     webapp_config: Mapping[str, object],
     code_readiness: Optional[Mapping[str, bool]] = None,
+    allow_local_test_evidence: bool = False,
 ) -> Dict[str, bool]:
     if set(client_capabilities) != set(STRICT_CAPABILITIES) or not all(
         isinstance(client_capabilities[name], bool) for name in STRICT_CAPABILITIES
@@ -55,7 +60,11 @@ def negotiate_capabilities(
         raise ValueError("client capabilities must contain exactly 9 booleans")
 
     role_set = set(roles)
-    readiness = get_effective_profile_readiness(webapp_config, code_readiness)
+    readiness = get_effective_profile_readiness(
+        webapp_config,
+        code_readiness,
+        allow_local_test_evidence,
+    )
     if not readiness["core"]:
         raise CoreProfileNotReady("strict-v2 Core profile is not ready")
 

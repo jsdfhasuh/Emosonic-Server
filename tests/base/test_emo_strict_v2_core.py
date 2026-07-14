@@ -8,7 +8,6 @@ from unittest import mock
 
 from supysonic.db import release_database
 from supysonic.emo import ws as emo_ws
-from supysonic.emo.strict_v2_conformance import get_code_conformance_readiness
 from supysonic.emo.strict_v2_contract import (
     StrictOutputValidationError,
     validate_strict_output,
@@ -397,7 +396,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
 
         self.assertEqual(len(set(nonces)), 2)
 
-    def test_packaged_optional_false_manifest_overrides_enabled_deployment(self):
+    def test_code_disabled_optional_profiles_override_enabled_deployment(self):
         client = self.connect()
         self.authenticate(client)
         self.app.config["WEBAPP"].update(
@@ -408,17 +407,12 @@ class StrictV2CoreTestCase(unittest.TestCase):
                 "emo_strict_v2_broadcast_enabled": True,
             }
         )
-        packaged_readiness = get_code_conformance_readiness()
-        self.assertEqual(
-            packaged_readiness,
-            {
-                "core": False,
-                "follow": False,
-                "handoff": False,
-                "broadcast": False,
-            },
-        )
-        core_only_readiness = dict(packaged_readiness, core=True)
+        core_only_readiness = {
+            "core": True,
+            "follow": False,
+            "handoff": False,
+            "broadcast": False,
+        }
 
         with mock.patch(
             "supysonic.emo.strict_v2_readiness.get_code_conformance_readiness",
@@ -454,12 +448,14 @@ class StrictV2CoreTestCase(unittest.TestCase):
                 "register-old",
                 self.strict_registration_payload(device_session_id="device:old"),
             )
-            self.register(
+            response = self.register(
                 new_client,
                 "register-new",
                 self.strict_registration_payload(device_session_id="device:new"),
             )
 
+        self.assertEqual(response[0]["action"], "system.ack")
+        self.assertEqual(response[0]["requestId"], "register-new")
         self.assertFalse(old_client.is_connected(namespace="/emo"))
         self.assertTrue(new_client.is_connected(namespace="/emo"))
         registered = get_state().get_client("phone-1", user_name="alice")

@@ -7,9 +7,10 @@ from typing import Dict, Optional
 from flask import current_app, g, has_request_context, request, session
 from flask_socketio import Namespace, SocketIO, disconnect
 
-from ..db import close_connection, open_connection
+from ..db import User, close_connection, open_connection
 from ..logging_utils import format_log_event
 from ..managers.user import UserManager
+from .browser_auth import BROWSER_OTP_PREFIX, browser_one_time_passwords
 from .protocol_metadata import (
     get_strict_v2_metadata,
     get_strict_v2_registration_metadata,
@@ -789,15 +790,27 @@ def _get_session_user():
         close_connection()
 
 
-def _authenticate(payload):
-    session_user = _get_session_user()
-    if session_user is not None:
-        return session_user
-
+def _authenticate(payload: Dict[str, object]) -> Optional[User]:
     user_name = payload.get("u")
     password = payload.get("p")
     if not user_name or not password:
         return None
+
+    if isinstance(password, str) and password.startswith(BROWSER_OTP_PREFIX):
+        session_user = _get_session_user()
+        browser_session_id = session.get("emo_browser_session_id")
+        if (
+            session_user is not None
+            and session_user.name == user_name
+            and isinstance(browser_session_id, str)
+            and browser_session_id
+            and browser_one_time_passwords.consume(
+                user_name,
+                browser_session_id,
+                password,
+            )
+        ):
+            return session_user
 
     open_connection(reuse=True)
     try:
@@ -809,6 +822,8 @@ def _authenticate(payload):
 def _broadcast_clients(user_name):
     clients = _list_clients(user_name=user_name)
     for target_sid, target_client in state.list_sids(user_name=user_name):
+        if target_client is None:
+            continue
         message = _build_message(
             "state",
             "device.list",
@@ -1242,6 +1257,7 @@ def _register_device(sid, user_name, payload):
             capabilities,
             roles,
             current_app.config["WEBAPP"],
+            allow_local_test_evidence=current_app.testing,
         )
     else:
         if device_name is None:
@@ -1283,10 +1299,7 @@ def _register_device(sid, user_name, payload):
     if not strict_v2:
         client_info["sessionId"] = device_session_id
 
-    previous_sid = state.get_sid_for_client(client_id, user_name=user_name)
     registered_client = state.register_client(sid, client_id, client_info)
-    if previous_sid is not None and previous_sid != sid:
-        socketio.server.disconnect(previous_sid, namespace="/emo")
     return registered_client
 
 
@@ -3776,7 +3789,7 @@ def _handle_strict_broadcast_start(
             queue_song_ids,
             current_index,
             position_ms,
-            "playing" if auto_play else "stopped",
+            "playing" if auto_play else "paused",
             "owner_only",
             client_id,
             playback_context_id=playback_context_id,
@@ -6877,6 +6890,10 @@ class EmoNamespace(Namespace):
             elif action == "device.register":
                 if not current_user_name:
                     raise PermissionError("Authenticate first")
+                previous_sid = state.get_sid_for_client(
+                    payload.get("clientId"),
+                    user_name=current_user_name,
+                )
                 current_client = _register_device(request.sid, current_user_name, payload)
                 if _is_strict_playback_context_v2(current_client):
                     _resume_strict_broadcast_authority_registration(
@@ -6907,6 +6924,8 @@ class EmoNamespace(Namespace):
                 else:
                     ack_payload["client"] = current_client
                 _send_ack(request_id, ack_payload)
+                if previous_sid is not None and previous_sid != request.sid:
+                    socketio.server.disconnect(previous_sid, namespace="/emo")
                 _broadcast_clients(current_user_name)
                 if not _is_strict_playback_context_v2(current_client):
                     _restorePersistedState(request.sid, current_client.get("sessionId"))

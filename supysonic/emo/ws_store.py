@@ -4,9 +4,9 @@ import threading
 import time
 from contextlib import contextmanager
 from functools import wraps
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterator, Optional, Tuple
 
-from peewee import IntegrityError
+from peewee import IntegrityError, SqliteDatabase
 
 from ..db import (
     EmoDevicePlaybackState,
@@ -63,6 +63,16 @@ def _serialize_strict_playback_context_mutation(function):
             return function(playback_context_id, *args, **kwargs)
 
     return serialized
+
+
+@contextmanager
+def _strict_playback_context_transaction() -> Iterator[None]:
+    if isinstance(db.obj, SqliteDatabase):
+        with db.atomic("IMMEDIATE"):
+            yield
+        return
+    with db.atomic():
+        yield
 
 
 def _strip_transient_playback_fields(payload):
@@ -459,7 +469,7 @@ def createStrictPlaybackContextState(
     )
     open_connection(reuse=True)
     try:
-        with db.atomic():
+        with _strict_playback_context_transaction():
             record = EmoPlaybackContext.get_or_none(
                 EmoPlaybackContext.playback_context_id == playback_context_id
             )
@@ -509,7 +519,7 @@ def createStrictPlaybackContextState(
 def closeStrictPlaybackContextState(playback_context_id, user_name):
     open_connection(reuse=True)
     try:
-        with db.atomic():
+        with _strict_playback_context_transaction():
             record = EmoPlaybackContext.get_or_none(
                 EmoPlaybackContext.playback_context_id == playback_context_id
             )
@@ -582,7 +592,7 @@ def mutateStrictPlaybackContextQueue(
     queue_song_ids = list(queue_song_ids)
     open_connection(reuse=True)
     try:
-        with db.atomic():
+        with _strict_playback_context_transaction():
             record = _getStrictPlaybackContextRecord(playback_context_id, user_name)
             if record is None:
                 return None
@@ -644,7 +654,7 @@ def mutateStrictPlaybackContextControl(
 ):
     open_connection(reuse=True)
     try:
-        with db.atomic():
+        with _strict_playback_context_transaction():
             record = _getStrictPlaybackContextRecord(playback_context_id, user_name)
             if record is None:
                 return None
@@ -810,7 +820,7 @@ def completeStrictPlaybackHandoff(
 ]:
     open_connection(reuse=True)
     try:
-        with db.atomic():
+        with _strict_playback_context_transaction():
             context_record = EmoPlaybackContext.get_or_none(
                 EmoPlaybackContext.playback_context_id == playback_context_id
             )
@@ -1000,7 +1010,7 @@ def terminateStrictPlaybackHandoff(
         raise ValueError("Unsupported handoff terminal status")
     open_connection(reuse=True)
     try:
-        with db.atomic():
+        with _strict_playback_context_transaction():
             record = EmoPlaybackHandoff.get_or_none(
                 EmoPlaybackHandoff.handoff_id == handoff_id
             )
@@ -1050,7 +1060,7 @@ def commitStrictPlaybackHandoff(
 ) -> Optional[Tuple[Dict[str, object], bool]]:
     open_connection(reuse=True)
     try:
-        with db.atomic():
+        with _strict_playback_context_transaction():
             record = EmoPlaybackHandoff.get_or_none(
                 EmoPlaybackHandoff.handoff_id == handoff_id
             )

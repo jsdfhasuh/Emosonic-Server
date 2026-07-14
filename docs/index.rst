@@ -30,6 +30,7 @@ __ https://listenbrainz.org/
    jukebox
    logging_integration
    emosonic_strict_v2_deployment
+   emosonic_web_strict_v2
    man/index
    api
 

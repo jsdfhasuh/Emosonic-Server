@@ -3,20 +3,28 @@
   "contractSha256": "ca069c6ad52447ea4f7ace7d795460c5ec759e5708b2f45acfbe50903aa4b3a3",
   "profiles": {
     "core": {
-      "codeConformanceReady": false,
-      "evidence": []
+      "codeConformanceReady": true,
+      "evidence": [
+        "local-test-only:test_supysonic:2026-07-13:serverBuildCommit=7f0015b2c5fb4657e4e2f120aa674e55e8164d01"
+      ]
     },
     "follow": {
-      "codeConformanceReady": false,
-      "evidence": []
+      "codeConformanceReady": true,
+      "evidence": [
+        "local-test-only:test_supysonic:2026-07-13:serverBuildCommit=7f0015b2c5fb4657e4e2f120aa674e55e8164d01"
+      ]
     },
     "handoff": {
-      "codeConformanceReady": false,
-      "evidence": []
+      "codeConformanceReady": true,
+      "evidence": [
+        "local-test-only:test_supysonic:2026-07-13:serverBuildCommit=7f0015b2c5fb4657e4e2f120aa674e55e8164d01"
+      ]
     },
     "broadcast": {
-      "codeConformanceReady": false,
-      "evidence": []
+      "codeConformanceReady": true,
+      "evidence": [
+        "local-test-only:test_supysonic:2026-07-13:serverBuildCommit=7f0015b2c5fb4657e4e2f120aa674e55e8164d01"
+      ]
     }
   }
 }

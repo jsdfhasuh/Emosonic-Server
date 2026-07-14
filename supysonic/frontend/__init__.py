@@ -6,9 +6,11 @@
 #
 # Distributed under terms of the GNU AGPLv3 license.
 
+import hmac
 import json
 import logging
 import os
+import secrets
 import time
 import uuid
 from datetime import datetime
@@ -52,6 +54,12 @@ from ..db import (
 )
 from ..api.media import _get_cover_path
 from ..emo.ws_state import DEFAULT_CLIENT_STALE_SECONDS, get_state
+from ..emo.browser_auth import (
+    BrowserOneTimePasswordCapacityExceeded,
+    BrowserOneTimePasswordRateLimited,
+    browser_one_time_passwords,
+)
+from ..emo.ws_store import listUserPlaybackContexts
 from ..home_smart_cards import build_home_smart_cards
 from ..managers.user import UserManager
 from ..api.media import __new_get_cover_path
@@ -200,6 +208,208 @@ def login_only(f):
         return f(*args, **kwargs)
 
     return decorated_func
+
+
+def _emo_web_protocol() -> str:
+    value = str(
+        current_app.config["WEBAPP"].get("emo_web_realtime_protocol", "legacy")
+    ).strip().lower()
+    return value if value in {"legacy", "strict_v2"} else "legacy"
+
+
+def _emo_browser_bootstrap() -> Dict[str, object]:
+    browser_session_id = session.get("emo_browser_session_id")
+    if not browser_session_id:
+        browser_session_id = secrets.token_urlsafe(24)
+        session["emo_browser_session_id"] = browser_session_id
+    csrf_token = session.get("emo_browser_csrf_token")
+    if not csrf_token:
+        csrf_token = secrets.token_urlsafe(32)
+        session["emo_browser_csrf_token"] = csrf_token
+    return {
+        "userName": request.user.name,
+        "authPasswordUrl": url_for("frontend.emo_browser_auth_password"),
+        "contextBindingsUrl": url_for("frontend.emo_web_context_bindings"),
+        "csrfToken": csrf_token,
+        "protocol": _emo_web_protocol(),
+        "strictV2Profiles": {
+            "follow": bool(
+                current_app.config["WEBAPP"].get(
+                    "emo_web_strict_v2_follow_enabled", False
+                )
+            ),
+            "handoff": bool(
+                current_app.config["WEBAPP"].get(
+                    "emo_web_strict_v2_handoff_enabled", False
+                )
+            ),
+            "broadcast": bool(
+                current_app.config["WEBAPP"].get(
+                    "emo_web_strict_v2_broadcast_enabled", False
+                )
+            ),
+        },
+        "acceptanceMode": bool(
+            current_app.config["WEBAPP"].get(
+                "emo_web_strict_v2_acceptance_mode", False
+            )
+        ),
+    }
+
+
+def _no_store(response: Response) -> Response:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+def _emo_browser_request_origin() -> str:
+    scheme = request.scheme
+    forwarded_proto = request.headers.get("X-Forwarded-Proto", "")
+    if forwarded_proto:
+        candidate = forwarded_proto.split(",", 1)[0].strip().lower()
+        if candidate in {"http", "https"}:
+            scheme = candidate
+    return f"{scheme}://{request.host}"
+
+
+@frontend.route("/emo/browser-auth-password", methods=["POST"])
+@login_only
+def emo_browser_auth_password() -> Response:
+    origin = request.headers.get("Origin")
+    if origin and origin.rstrip("/") != _emo_browser_request_origin():
+        abort(403, description="Browser authentication requires same origin")
+    expected_csrf = session.get("emo_browser_csrf_token")
+    supplied_csrf = request.headers.get("X-Emo-CSRF-Token", "")
+    if (
+        not isinstance(expected_csrf, str)
+        or not supplied_csrf
+        or not hmac.compare_digest(expected_csrf, supplied_csrf)
+    ):
+        abort(403, description="Invalid browser authentication CSRF token")
+
+    browser_session_id = session.get("emo_browser_session_id")
+    if not isinstance(browser_session_id, str) or not browser_session_id:
+        abort(403, description="Browser session is not initialized")
+
+    ttl_seconds = current_app.config["WEBAPP"].get(
+        "emo_browser_otp_ttl_seconds", 60
+    )
+    try:
+        ttl_seconds = max(1, int(ttl_seconds))
+    except (TypeError, ValueError):
+        ttl_seconds = 60
+    issues_per_minute = current_app.config["WEBAPP"].get(
+        "emo_browser_otp_issues_per_session_per_minute", 12
+    )
+    outstanding_per_session = current_app.config["WEBAPP"].get(
+        "emo_browser_otp_outstanding_per_session", 4
+    )
+    global_capacity = current_app.config["WEBAPP"].get(
+        "emo_browser_otp_global_capacity", 10000
+    )
+    try:
+        issues_per_minute = max(1, int(issues_per_minute))
+    except (TypeError, ValueError):
+        issues_per_minute = 12
+    try:
+        outstanding_per_session = max(1, int(outstanding_per_session))
+    except (TypeError, ValueError):
+        outstanding_per_session = 4
+    try:
+        global_capacity = max(1, int(global_capacity))
+    except (TypeError, ValueError):
+        global_capacity = 10000
+    try:
+        password, expires_at_ms = browser_one_time_passwords.issue(
+            request.user.name,
+            browser_session_id,
+            ttl_seconds=ttl_seconds,
+            max_issues_per_minute=issues_per_minute,
+            outstanding_per_session=outstanding_per_session,
+            global_capacity=global_capacity,
+        )
+    except BrowserOneTimePasswordRateLimited as exc:
+        response = jsonify({"error": "rate_limited"})
+        response.status_code = 429
+        response.headers["Retry-After"] = str((exc.retry_after_ms + 999) // 1000)
+        return _no_store(response)
+    except BrowserOneTimePasswordCapacityExceeded:
+        response = jsonify({"error": "temporarily_unavailable"})
+        response.status_code = 503
+        response.headers["Retry-After"] = "1"
+        return _no_store(response)
+    return _no_store(
+        jsonify(
+            {
+                "userName": request.user.name,
+                "oneTimePassword": password,
+                "expiresAtMs": expires_at_ms,
+            }
+        )
+    )
+
+
+@frontend.route("/emo/web-context-bindings")
+@login_only
+def emo_web_context_bindings() -> Response:
+    bindings = []
+    for context in listUserPlaybackContexts(request.user.name):
+        if context.get("lifecycle") != "active":
+            continue
+        client_id = context.get("authorityClientId")
+        device_session_id = context.get("authorityDeviceSessionId")
+        playback_context_id = context.get("playbackContextId")
+        if not all(
+            isinstance(value, str) and value
+            for value in (client_id, device_session_id, playback_context_id)
+        ):
+            continue
+        bindings.append(
+            {
+                "clientId": client_id,
+                "deviceSessionId": device_session_id,
+                "playbackContextId": playback_context_id,
+            }
+        )
+    bindings.sort(key=lambda item: item["clientId"])
+    return _no_store(jsonify({"bindings": bindings}))
+
+
+@frontend.route("/emo/web-strict-v2-acceptance-state")
+@login_only
+def emo_web_strict_v2_acceptance_state() -> Response:
+    if not current_app.config["WEBAPP"].get(
+        "emo_web_strict_v2_acceptance_mode", False
+    ):
+        abort(404)
+
+    contexts = []
+    for context in listUserPlaybackContexts(request.user.name):
+        if context.get("lifecycle") != "active":
+            continue
+        authority_client_id = context.get("authorityClientId")
+        live_client = state.get_client(
+            authority_client_id,
+            user_name=request.user.name,
+        )
+        contexts.append(
+            {
+                "playbackContextId": context.get("playbackContextId"),
+                "authorityClientId": authority_client_id,
+                "authorityDeviceSessionId": context.get(
+                    "authorityDeviceSessionId"
+                ),
+                "authorityClientPresent": live_client is not None,
+                "authoritySidPresent": state.get_sid_for_client(
+                    authority_client_id,
+                    user_name=request.user.name,
+                )
+                is not None,
+            }
+        )
+    contexts.sort(key=lambda item: item["playbackContextId"] or "")
+    return _no_store(jsonify({"contexts": contexts}))
 
 
 def getConnectedDevices(user_name=None):
@@ -1338,8 +1548,14 @@ def admin_tasks_data():
 
 @frontend.route("/control")
 @login_only
-def control_index():
-    return render_template("control.html")
+def control_index() -> str:
+    bootstrap = _emo_browser_bootstrap()
+    template = (
+        "control_strict_v2.html"
+        if bootstrap["protocol"] == "strict_v2"
+        else "control.html"
+    )
+    return render_template(template, emo_web_bootstrap=bootstrap)
 
 
 PLAYER_SEARCH_LIMIT = 50
@@ -1388,8 +1604,14 @@ def _valid_track_ids(raw_ids):
 
 @frontend.route("/player")
 @login_only
-def player_index():
-    return render_template("player.html")
+def player_index() -> str:
+    bootstrap = _emo_browser_bootstrap()
+    template = (
+        "player_strict_v2.html"
+        if bootstrap["protocol"] == "strict_v2"
+        else "player.html"
+    )
+    return render_template(template, emo_web_bootstrap=bootstrap)
 
 
 @frontend.route("/player/search")
