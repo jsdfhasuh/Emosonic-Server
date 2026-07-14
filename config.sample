@@ -93,6 +93,12 @@ log_rotate = yes
 ;emo_strict_v2_handoff_enabled = off
 ;emo_strict_v2_broadcast_enabled = off
 
+; Development/test deployments may explicitly accept packaged
+; local-test-only conformance evidence for external client integration.
+; This switch is ignored unless emo_development_mode is also on. Never enable
+; either setting in production. Default: off
+;emo_strict_v2_allow_local_test_evidence = off
+
 ; Select the browser implementation rendered by both /player and /control.
 ; Allowed values: legacy, strict_v2. There is no automatic fallback.
 ; Default: legacy

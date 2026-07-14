@@ -62,6 +62,7 @@ class DefaultConfig:
         "emo_strict_v2_follow_enabled": False,
         "emo_strict_v2_handoff_enabled": False,
         "emo_strict_v2_broadcast_enabled": False,
+        "emo_strict_v2_allow_local_test_evidence": False,
         "emo_web_realtime_protocol": "legacy",
         "emo_browser_otp_ttl_seconds": 60,
         "emo_browser_otp_issues_per_session_per_minute": 12,

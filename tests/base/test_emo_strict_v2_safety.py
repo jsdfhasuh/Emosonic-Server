@@ -249,6 +249,18 @@ class StrictV2SafetyTestCase(unittest.TestCase):
             ready,
         )
 
+    def test_multi_process_check_honors_development_local_evidence_gate(self):
+        config = {
+            "emo_strict_v2_core_enabled": True,
+            "emo_development_mode": False,
+            "emo_strict_v2_allow_local_test_evidence": True,
+        }
+        validate_strict_v2_worker_count(2, config)
+
+        config["emo_development_mode"] = True
+        with self.assertRaises(RuntimeError):
+            validate_strict_v2_worker_count(2, config)
+
     def test_server_cli_fails_before_starting_multiple_ready_workers(self):
         readiness = {
             "core": True,

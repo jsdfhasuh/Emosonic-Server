@@ -21,7 +21,12 @@ from .strict_v2_contract import (
     validate_strict_output,
     validate_strict_request,
 )
-from .strict_v2_readiness import CoreProfileNotReady, negotiate_capabilities
+from .strict_v2_readiness import (
+    CoreProfileNotReady,
+    is_local_test_evidence_allowed,
+    is_local_test_evidence_requested,
+    negotiate_capabilities,
+)
 from .strict_v2_runtime import (
     RequestFingerprintConflict,
     StrictRequestCache,
@@ -364,6 +369,32 @@ def _build_action_log_context(action, request_id, current_user_name, current_cli
 def init_socketio(app):
     webapp_config = app.config["WEBAPP"]
     development = bool(webapp_config.get("emo_development_mode", False))
+    local_test_evidence_requested = is_local_test_evidence_requested(
+        webapp_config
+    )
+    local_test_evidence_allowed = is_local_test_evidence_allowed(
+        webapp_config,
+        app.testing,
+    )
+    if local_test_evidence_requested:
+        if local_test_evidence_allowed:
+            logger.warning(
+                format_log_event(
+                    "emo",
+                    "strict_v2_local_test_evidence",
+                    result="enabled",
+                    app_testing=app.testing,
+                )
+            )
+        else:
+            logger.warning(
+                format_log_event(
+                    "emo",
+                    "strict_v2_local_test_evidence",
+                    result="ignored",
+                    reason="development_mode_disabled",
+                )
+            )
     allowed_origins = resolve_allowed_origins(
         webapp_config,
         development=development,
@@ -1257,7 +1288,10 @@ def _register_device(sid, user_name, payload):
             capabilities,
             roles,
             current_app.config["WEBAPP"],
-            allow_local_test_evidence=current_app.testing,
+            allow_local_test_evidence=is_local_test_evidence_allowed(
+                current_app.config["WEBAPP"],
+                current_app.testing,
+            ),
         )
     else:
         if device_name is None:

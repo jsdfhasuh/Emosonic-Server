@@ -158,6 +158,12 @@ Configuration relative to the HTTP server.
    Invalid values fail back to the explicit legacy page; a strict-v2 protocol
    failure never causes an automatic runtime downgrade. Defaults to ``legacy``.
 
+``emo_strict_v2_allow_local_test_evidence``
+   Allows a development deployment to use packaged ``local-test-only:``
+   conformance evidence for external client integration testing. This option
+   is effective only when ``emo_development_mode`` is also enabled. Both
+   settings must remain disabled in production. Defaults to ``off``.
+
 ``emo_browser_otp_ttl_seconds``
    Lifetime of the one-time, same-origin browser password used by the web
    player and control console for Socket.IO ``auth.login``. The credential is
@@ -245,6 +251,10 @@ Sample configuration::
 
    ; Render both /player and /control with legacy or strict-v2 realtime logic.
    ;emo_web_realtime_protocol = legacy
+
+   ; Development-only gate for local-test-only conformance evidence.
+   ; Requires emo_development_mode = on. Never enable in production.
+   ;emo_strict_v2_allow_local_test_evidence = off
 
    ; One-time browser Socket.IO password lifetime. Default: 60 seconds.
    ;emo_browser_otp_ttl_seconds = 60

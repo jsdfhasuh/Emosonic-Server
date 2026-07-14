@@ -307,6 +307,57 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(error["payload"]["code"], "not_supported")
         self.assertIsNone(get_state().get_client("phone-1"))
 
+    def test_non_testing_deployment_requires_dual_local_evidence_gate(self):
+        client = self.connect()
+        self.authenticate(client)
+        self.app.testing = False
+        self.app.config["WEBAPP"].update(
+            {
+                "emo_strict_v2_core_enabled": True,
+                "emo_strict_v2_follow_enabled": True,
+                "emo_strict_v2_handoff_enabled": True,
+                "emo_strict_v2_broadcast_enabled": True,
+                "emo_strict_v2_allow_local_test_evidence": True,
+                "emo_development_mode": False,
+            }
+        )
+
+        try:
+            rejected = self.register(
+                client,
+                "register-local-evidence-rejected",
+                self.strict_registration_payload(),
+            )
+            error = next(
+                message
+                for message in rejected
+                if message.get("requestId")
+                == "register-local-evidence-rejected"
+            )
+            self.assertEqual(error["action"], "system.error")
+            self.assertEqual(error["payload"]["code"], "not_supported")
+
+            self.app.config["WEBAPP"]["emo_development_mode"] = True
+            accepted = self.register(
+                client,
+                "register-local-evidence-accepted",
+                self.strict_registration_payload(),
+            )
+            ack = next(
+                message
+                for message in accepted
+                if message.get("requestId")
+                == "register-local-evidence-accepted"
+            )
+            self.assertEqual(ack["action"], "system.ack")
+            self.assertTrue(
+                ack["payload"]["negotiatedCapabilities"][
+                    "playbackContextV2"
+                ]
+            )
+        finally:
+            self.app.testing = True
+
     def test_ready_core_registers_single_role_and_returns_full_negotiation(self):
         client = self.connect()
         self.authenticate(client)

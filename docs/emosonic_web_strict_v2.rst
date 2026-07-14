@@ -83,6 +83,12 @@ Acceptance deployments can enable the web capability advertisements with
 ``emo_web_strict_v2_handoff_enabled``. These settings default to ``off`` and do
 not bypass the matching server readiness gates.
 
+When the packaged conformance evidence is marked ``local-test-only:``, a
+normally deployed integration server must additionally enable both
+``emo_development_mode`` and
+``emo_strict_v2_allow_local_test_evidence``. This development-only gate must
+remain disabled in production.
+
 Verification
 ------------
 

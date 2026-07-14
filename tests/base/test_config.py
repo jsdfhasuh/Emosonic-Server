@@ -79,6 +79,9 @@ class ConfigTestCase(unittest.TestCase):
             defaults["emo_strict_requests_per_connection_per_minute"],
             120,
         )
+        self.assertFalse(
+            defaults["emo_strict_v2_allow_local_test_evidence"]
+        )
         self.assertEqual(defaults["emo_web_realtime_protocol"], "legacy")
         self.assertEqual(defaults["emo_browser_otp_ttl_seconds"], 60)
         self.assertEqual(defaults["emo_browser_otp_outstanding_per_session"], 4)
@@ -100,6 +103,7 @@ class ConfigTestCase(unittest.TestCase):
                     "emo_authenticated_connections_per_user = 8\n"
                     "emo_strict_requests_per_connection_per_minute = 60\n"
                     "emo_strict_shutdown_grace_seconds = 3\n"
+                    "emo_strict_v2_allow_local_test_evidence = on\n"
                     "emo_web_realtime_protocol = strict_v2\n"
                     "emo_browser_otp_ttl_seconds = 45\n"
                     "emo_browser_otp_outstanding_per_session = 6\n"
@@ -131,6 +135,9 @@ class ConfigTestCase(unittest.TestCase):
             self.assertEqual(
                 conf.WEBAPP["emo_strict_requests_per_connection_per_minute"],
                 60,
+            )
+            self.assertTrue(
+                conf.WEBAPP["emo_strict_v2_allow_local_test_evidence"]
             )
             self.assertEqual(conf.WEBAPP["emo_strict_shutdown_grace_seconds"], 3)
             self.assertEqual(conf.WEBAPP["emo_web_realtime_protocol"], "strict_v2")

@@ -16,6 +16,29 @@ origins. A wildcard is rejected unless both ``emo_allowed_origins=*`` and
 ``emo_development_mode=true`` are explicitly configured; development wildcard
 mode emits a security warning.
 
+Development conformance evidence
+--------------------------------
+
+Normal deployments reject conformance evidence prefixed with
+``local-test-only:`` even when the matching profile deployment switches are
+enabled. This prevents test results from silently becoming production
+readiness.
+
+An isolated development deployment may explicitly enable external Strict V2
+client integration with both settings:
+
+.. code-block:: ini
+
+   [webapp]
+   emo_development_mode = on
+   emo_strict_v2_allow_local_test_evidence = on
+
+The local-evidence switch is ignored unless development mode is also enabled,
+and enabling it emits a startup warning. It affects code-readiness evaluation
+only; the required ``emo_strict_v2_*_enabled`` profile switches must still be
+enabled independently. Disable the local-evidence switch after collecting the
+fixed-build evidence, and never use it for a production rollout.
+
 Runtime limits
 --------------
 

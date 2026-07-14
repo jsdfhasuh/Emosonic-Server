@@ -24,6 +24,30 @@ def _enabled(value: object) -> bool:
     return False
 
 
+def is_local_test_evidence_requested(
+    webapp_config: Mapping[str, object],
+) -> bool:
+    return _enabled(
+        webapp_config.get(
+            "emo_strict_v2_allow_local_test_evidence",
+            False,
+        )
+    )
+
+
+def is_local_test_evidence_allowed(
+    webapp_config: Mapping[str, object],
+    app_testing: bool = False,
+) -> bool:
+    """Allow local evidence only in tests or an explicit development deployment."""
+    if app_testing:
+        return True
+    return bool(
+        _enabled(webapp_config.get("emo_development_mode", False))
+        and is_local_test_evidence_requested(webapp_config)
+    )
+
+
 def get_deployment_readiness(webapp_config: Mapping[str, object]) -> Dict[str, bool]:
     return {
         profile: _enabled(webapp_config.get(config_key, False))
@@ -34,8 +58,12 @@ def get_deployment_readiness(webapp_config: Mapping[str, object]) -> Dict[str, b
 def get_effective_profile_readiness(
     webapp_config: Mapping[str, object],
     code_readiness: Optional[Mapping[str, bool]] = None,
-    allow_local_test_evidence: bool = False,
+    allow_local_test_evidence: Optional[bool] = None,
 ) -> Dict[str, bool]:
+    if allow_local_test_evidence is None:
+        allow_local_test_evidence = is_local_test_evidence_allowed(
+            webapp_config
+        )
     code = dict(
         code_readiness
         or get_code_conformance_readiness(allow_local_test_evidence)
@@ -52,7 +80,7 @@ def negotiate_capabilities(
     roles: Sequence[str],
     webapp_config: Mapping[str, object],
     code_readiness: Optional[Mapping[str, bool]] = None,
-    allow_local_test_evidence: bool = False,
+    allow_local_test_evidence: Optional[bool] = None,
 ) -> Dict[str, bool]:
     if set(client_capabilities) != set(STRICT_CAPABILITIES) or not all(
         isinstance(client_capabilities[name], bool) for name in STRICT_CAPABILITIES

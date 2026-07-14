@@ -17,7 +17,8 @@ PlaybackContext strict-v2 共享客户端及服务端路由。
 6. 大播放队列按批次请求元数据，不生成超长 URL；
 7. Context、Follow、Broadcast 和 Handoff 在目标媒体缺失时不会播放旧音频；
 8. Handoff prepare/commit、Broadcast paused 状态和设备重置的 Context 生命周期安全；
-9. legacy 页面、strict-v2 服务端 profile、文档和发行包保持可用。
+9. 普通部署只有同时开启 development mode 和本地测试证据开关时才允许联调；
+10. legacy 页面、strict-v2 服务端 profile、文档和发行包保持可用。
 
 ## 2. 测试环境
 
@@ -44,7 +45,23 @@ python -m unittest \
 覆盖 OTP、代理 Origin、密码回退、精确模板行为、元数据分批、旧媒体保护、
 Handoff 校验、设备重置和 Broadcast paused 状态。
 
-### 3.2 共享 JavaScript 客户端
+### 3.2 测试部署 readiness 门禁
+
+```bash
+python -m unittest \
+  tests.base.test_config \
+  tests.base.test_emo_strict_v2_conformance \
+  tests.base.test_emo_strict_v2_readiness \
+  tests.base.test_emo_strict_v2_safety \
+  tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_non_testing_deployment_requires_dual_local_evidence_gate
+```
+
+预期：36 项通过，1 项平台相关测试跳过。
+
+重点检查默认关闭、仅开启一个开关仍 fail-closed、双重门禁允许正常 Strict V2
+注册，以及启用 Core 后的单进程约束。
+
+### 3.3 共享 JavaScript 客户端
 
 ```bash
 node --test tests/js/emo_strict_v2_client.test.js
@@ -55,7 +72,7 @@ node --test tests/js/emo_strict_v2_client.test.js
 重点检查 request settlement、迟到响应 tombstone、连接 provenance、Context cursor、
 settlement 历史上限及 owner lock。
 
-### 3.3 strict-v2 与 legacy 回归
+### 3.4 strict-v2 与 legacy 回归
 
 ```bash
 python -m unittest \
@@ -68,7 +85,7 @@ python -m unittest \
 
 预期：174 项测试全部通过。
 
-### 3.4 完整 Python 回归
+### 3.5 完整 Python 回归
 
 ```bash
 python -m unittest
@@ -76,7 +93,7 @@ python -m unittest
 
 预期：完整测试套件通过；允许仓库中已有的显式 skip。
 
-### 3.5 文档、语法和发行包
+### 3.6 文档、语法和发行包
 
 ```bash
 node --check supysonic/static/js/emo_strict_v2_client.js
@@ -120,9 +137,10 @@ node tests/browser/emo_web_strict_v2_acceptance.js
 | 检查项 | 结果 |
 | --- | --- |
 | 复审修复定向 Python 测试 | PASS，21 项 |
+| 测试部署 readiness 门禁 | PASS，36 项，跳过 1 项 |
 | JavaScript 客户端测试 | PASS，18 项 |
 | strict-v2 与 legacy 回归 | PASS，174 项 |
-| 完整 Python 回归 | PASS，1219 项，跳过 3 项 |
+| 完整 Python 回归 | PASS，1223 项，跳过 3 项 |
 | Sphinx HTML | PASS |
 | wheel / sdist | PASS |
 | JavaScript 语法与 `git diff --check` | PASS |
