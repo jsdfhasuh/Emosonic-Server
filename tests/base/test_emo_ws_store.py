@@ -8,6 +8,7 @@ from unittest import mock
 
 from supysonic import db
 from supysonic.emo.ws_store import (
+    PlaybackContextAuthorityAmbiguousError,
     PlaybackContextClosedError,
     PlaybackContextIntentConflictError,
     PlaybackContextStaleVersionError,
@@ -29,6 +30,7 @@ from supysonic.emo.ws_store import (
     getPlaybackState,
     getPlaybackStates,
     getQueueState,
+    listActivePlaybackContextBindings,
     listUserPlaybackContexts,
     listPlaybackContexts,
     mutateStrictPlaybackContextControl,
@@ -110,6 +112,300 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         persisted = getPlaybackContextState("context-1")
         self.assertEqual(persisted["version"], 2)
         self.assertEqual(persisted["controlVersion"], 2)
+
+    def test_control_fails_closed_when_authority_pair_has_multiple_active_contexts(self):
+        for context_id in ("context-1", "context-2"):
+            createStrictPlaybackContextState(
+                context_id,
+                "alice",
+                "player-1",
+                "device:player-1",
+                ["song-1"],
+                0,
+                0,
+                "playing",
+            )
+
+        with self.assertRaises(
+            PlaybackContextAuthorityAmbiguousError
+        ) as conflict:
+            mutateStrictPlaybackContextControl(
+                "context-1",
+                "alice",
+                "controller-1",
+                "player.pause",
+                1,
+            )
+
+        canonical = conflict.exception.playback_context
+        self.assertEqual(canonical["playbackContextId"], "context-1")
+        self.assertEqual(canonical["controlVersion"], 1)
+        self.assertEqual(canonical["queueRevision"], 1)
+        self.assertEqual(canonical["version"], 1)
+        self.assertEqual(getPlaybackContextState("context-1")["state"], "playing")
+
+        closeStrictPlaybackContextState("context-2", "alice")
+        updated = mutateStrictPlaybackContextControl(
+            "context-1",
+            "alice",
+            "controller-1",
+            "player.pause",
+            1,
+        )
+        self.assertEqual(updated["state"], "paused")
+        self.assertEqual(updated["controlVersion"], 2)
+
+    def test_create_and_control_are_linearized_by_authority_pair(self):
+        for iteration in range(10):
+            first_context_id = "linear-context-%d-a" % iteration
+            second_context_id = "linear-context-%d-b" % iteration
+            client_id = "linear-player-%d" % iteration
+            device_session_id = "device:linear-player-%d" % iteration
+            createStrictPlaybackContextState(
+                first_context_id,
+                "alice",
+                client_id,
+                device_session_id,
+                ["song-1"],
+                0,
+                0,
+                "playing",
+            )
+            barrier = threading.Barrier(2)
+
+            def create_second():
+                barrier.wait()
+                createStrictPlaybackContextState(
+                    second_context_id,
+                    "alice",
+                    client_id,
+                    device_session_id,
+                    ["song-2"],
+                    0,
+                    0,
+                    "playing",
+                )
+                return "created"
+
+            def control_first():
+                barrier.wait()
+                try:
+                    mutateStrictPlaybackContextControl(
+                        first_context_id,
+                        "alice",
+                        "controller-1",
+                        "player.pause",
+                        1,
+                    )
+                    return "controlled"
+                except PlaybackContextAuthorityAmbiguousError:
+                    return "conflict"
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=2
+            ) as executor:
+                create_future = executor.submit(create_second)
+                control_future = executor.submit(control_first)
+                self.assertEqual(create_future.result(timeout=2), "created")
+                control_result = control_future.result(timeout=2)
+
+            canonical = getPlaybackContextState(first_context_id)
+            if control_result == "controlled":
+                self.assertEqual(canonical["state"], "paused")
+                self.assertEqual(canonical["controlVersion"], 2)
+            else:
+                self.assertEqual(control_result, "conflict")
+                self.assertEqual(canonical["state"], "playing")
+                self.assertEqual(canonical["controlVersion"], 1)
+
+    def test_close_and_control_are_linearized_by_context_and_authority_pair(self):
+        for iteration in range(10):
+            context_id = "close-control-context-%d" % iteration
+            client_id = "close-control-player-%d" % iteration
+            createStrictPlaybackContextState(
+                context_id,
+                "alice",
+                client_id,
+                "device:%s" % client_id,
+                ["song-1"],
+                0,
+                0,
+                "playing",
+            )
+            barrier = threading.Barrier(2)
+
+            def close_context():
+                barrier.wait()
+                closeStrictPlaybackContextState(context_id, "alice")
+                return "closed"
+
+            def control_context():
+                barrier.wait()
+                try:
+                    mutateStrictPlaybackContextControl(
+                        context_id,
+                        "alice",
+                        "controller-1",
+                        "player.pause",
+                        1,
+                    )
+                    return "controlled"
+                except PlaybackContextClosedError:
+                    return "context_closed"
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=2
+            ) as executor:
+                close_future = executor.submit(close_context)
+                control_future = executor.submit(control_context)
+                self.assertEqual(close_future.result(timeout=2), "closed")
+                control_result = control_future.result(timeout=2)
+
+            canonical = getPlaybackContextState(context_id)
+            self.assertEqual(canonical["lifecycle"], "closed")
+            if control_result == "controlled":
+                self.assertEqual(canonical["state"], "paused")
+                self.assertEqual(canonical["controlVersion"], 2)
+                self.assertEqual(canonical["version"], 3)
+            else:
+                self.assertEqual(control_result, "context_closed")
+                self.assertEqual(canonical["state"], "playing")
+                self.assertEqual(canonical["controlVersion"], 1)
+                self.assertEqual(canonical["version"], 2)
+
+    def test_handoff_and_control_are_linearized_by_authority_pair(self):
+        for iteration in range(10):
+            source_context_id = "handoff-control-source-%d" % iteration
+            target_context_id = "handoff-control-target-%d" % iteration
+            source_client_id = "handoff-control-source-player-%d" % iteration
+            target_client_id = "handoff-control-target-player-%d" % iteration
+            target_device_session_id = "device:%s" % target_client_id
+            handoff_id = "handoff-control-%d" % iteration
+            createStrictPlaybackContextState(
+                source_context_id,
+                "alice",
+                source_client_id,
+                "device:%s" % source_client_id,
+                ["song-source"],
+                0,
+                0,
+                "playing",
+            )
+            createStrictPlaybackContextState(
+                target_context_id,
+                "alice",
+                target_client_id,
+                target_device_session_id,
+                ["song-target"],
+                0,
+                0,
+                "playing",
+            )
+            savePlaybackHandoff(
+                {
+                    "handoffId": handoff_id,
+                    "requestId": "handoff-control-start-%d" % iteration,
+                    "playbackContextId": source_context_id,
+                    "userName": "alice",
+                    "sourceClientId": source_client_id,
+                    "targetClientId": target_client_id,
+                    "originClientId": "controller-1",
+                    "status": "committed",
+                    "baseControlVersion": 1,
+                    "controlVersion": 2,
+                    "prepareId": "prepare-handoff-control-%d" % iteration,
+                    "snapshot": {
+                        "handoffControlVersion": 2,
+                        "prepareId": "prepare-handoff-control-%d" % iteration,
+                    },
+                }
+            )
+            barrier = threading.Barrier(2)
+
+            def complete_handoff():
+                barrier.wait()
+                return completeStrictPlaybackHandoff(
+                    source_context_id,
+                    handoff_id,
+                    "alice",
+                    target_client_id,
+                    target_device_session_id,
+                )
+
+            def control_target_context():
+                barrier.wait()
+                try:
+                    mutateStrictPlaybackContextControl(
+                        target_context_id,
+                        "alice",
+                        "controller-1",
+                        "player.pause",
+                        1,
+                    )
+                    return "controlled"
+                except PlaybackContextAuthorityAmbiguousError:
+                    return "conflict"
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=2
+            ) as executor:
+                handoff_future = executor.submit(complete_handoff)
+                control_future = executor.submit(control_target_context)
+                handoff_result = handoff_future.result(timeout=2)
+                control_result = control_future.result(timeout=2)
+
+            source_context = getPlaybackContextState(source_context_id)
+            target_context = getPlaybackContextState(target_context_id)
+            self.assertTrue(handoff_result.mutated)
+            self.assertEqual(
+                handoff_result.affected_authority_pairs,
+                tuple(
+                    sorted(
+                        (
+                            (
+                                "alice",
+                                source_client_id,
+                                "device:%s" % source_client_id,
+                            ),
+                            (
+                                "alice",
+                                target_client_id,
+                                target_device_session_id,
+                            ),
+                        )
+                    )
+                ),
+            )
+            self.assertEqual(
+                source_context["authorityClientId"],
+                target_client_id,
+            )
+            self.assertEqual(
+                handoff_result.canonical_context,
+                source_context,
+            )
+            self.assertEqual(getPlaybackHandoff(handoff_id)["status"], "completed")
+            if control_result == "controlled":
+                self.assertEqual(target_context["state"], "paused")
+                self.assertEqual(target_context["controlVersion"], 2)
+            else:
+                self.assertEqual(control_result, "conflict")
+                self.assertEqual(target_context["state"], "playing")
+                self.assertEqual(target_context["controlVersion"], 1)
+
+            replay_result = completeStrictPlaybackHandoff(
+                source_context_id,
+                handoff_id,
+                "alice",
+                target_client_id,
+                target_device_session_id,
+            )
+            self.assertFalse(replay_result.mutated)
+            self.assertEqual(replay_result.affected_authority_pairs, ())
+            self.assertEqual(
+                replay_result.canonical_context,
+                getPlaybackContextState(source_context_id),
+            )
 
     def test_strict_context_creates_serialize_sqlite_write_upgrade(self) -> None:
         second_read = threading.Event()
@@ -557,7 +853,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertEqual(context["controlVersion"], 1)
 
     def test_strict_create_persists_identity_fingerprint_and_initial_cursors(self):
-        created_context, created = createStrictPlaybackContextState(
+        created_result = createStrictPlaybackContextState(
             "context-1",
             "alice",
             "phone-1",
@@ -567,7 +863,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             1200,
             "playing",
         )
-        replayed_context, replayed = createStrictPlaybackContextState(
+        replayed_result = createStrictPlaybackContextState(
             "context-1",
             "alice",
             "phone-1",
@@ -577,9 +873,20 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             1200,
             "playing",
         )
+        created_context, created = created_result
+        replayed_context, replayed = replayed_result
 
         self.assertTrue(created)
         self.assertFalse(replayed)
+        self.assertTrue(created_result.mutated)
+        self.assertEqual(
+            created_result.affected_authority_pairs,
+            (("alice", "phone-1", "device:phone-1"),),
+        )
+        self.assertEqual(created_result.canonical_context, created_context)
+        self.assertFalse(replayed_result.mutated)
+        self.assertEqual(replayed_result.affected_authority_pairs, ())
+        self.assertEqual(replayed_result.canonical_context, replayed_context)
         self.assertEqual(created_context, replayed_context)
         self.assertEqual(created_context["queueSongIds"], ["song-2", "song-1"])
         self.assertEqual(created_context["authorityDeviceSessionId"], "device:phone-1")
@@ -615,6 +922,15 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
 
         closed = closeStrictPlaybackContextState("context-1", "alice")
         closed_again = closeStrictPlaybackContextState("context-1", "alice")
+        self.assertTrue(closed.mutated)
+        self.assertEqual(
+            closed.affected_authority_pairs,
+            (("alice", "phone-1", "device:phone-1"),),
+        )
+        self.assertEqual(closed.canonical_context, dict(closed))
+        self.assertFalse(closed_again.mutated)
+        self.assertEqual(closed_again.affected_authority_pairs, ())
+        self.assertEqual(closed_again.canonical_context, dict(closed_again))
         self.assertEqual(closed["version"], 2)
         self.assertEqual(closed_again["version"], 2)
         self.assertEqual(closed_again["state"], "stopped")
@@ -665,6 +981,64 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertEqual(contexts[1]["lifecycle"], "closed")
         self.assertEqual(contexts[1]["state"], "paused")
         self.assertEqual(contexts[1]["version"], 2)
+
+    def test_list_active_playback_context_bindings_filters_exact_pair_and_user(self):
+        for context_id, user_name, client_id, device_session_id in (
+            ("context-b", "alice", "player-1", "device:player-1"),
+            ("context-a", "alice", "player-1", "device:player-1"),
+            ("context-c", "alice", "player-1", "device:player-1"),
+            ("context-other-device", "alice", "player-1", "device:player-2"),
+            ("context-other-user", "bob", "player-1", "device:player-1"),
+        ):
+            createStrictPlaybackContextState(
+                context_id,
+                user_name,
+                client_id,
+                device_session_id,
+                ["song-1"],
+                0,
+                0,
+                "playing",
+            )
+        closeStrictPlaybackContextState("context-b", "alice")
+
+        bindings = listActivePlaybackContextBindings(
+            "alice",
+            "player-1",
+            "device:player-1",
+        )
+
+        self.assertEqual(
+            bindings,
+            [
+                {
+                    "playbackContextId": "context-a",
+                    "authorityClientId": "player-1",
+                    "authorityDeviceSessionId": "device:player-1",
+                },
+                {
+                    "playbackContextId": "context-c",
+                    "authorityClientId": "player-1",
+                    "authorityDeviceSessionId": "device:player-1",
+                }
+            ],
+        )
+        self.assertEqual(
+            listActivePlaybackContextBindings(
+                "alice",
+                "player-1",
+                "device:missing",
+            ),
+            [],
+        )
+        self.assertEqual(
+            listActivePlaybackContextBindings(
+                "carol",
+                "player-1",
+                "device:player-1",
+            ),
+            [],
+        )
 
     def test_restart_marks_nonterminal_handoff_failed(self):
         savePlaybackHandoff(

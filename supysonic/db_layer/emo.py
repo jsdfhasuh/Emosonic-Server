@@ -72,6 +72,19 @@ class EmoPlaybackContext(_Model):
     created_at = DateTimeField(default=now)
     updated_at = DateTimeField(default=now)
 
+    class Meta:
+        indexes = (
+            (
+                (
+                    'user_name',
+                    'lifecycle',
+                    'authority_client_id',
+                    'authority_device_session_id',
+                ),
+                False,
+            ),
+        )
+
 
 class EmoDevicePlaybackState(_Model):
     id = PrimaryKeyField()

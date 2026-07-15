@@ -16,6 +16,7 @@ from .protocol_metadata import (
     get_strict_v2_registration_metadata,
 )
 from .strict_v2_contract import (
+    ACTION_SCHEMAS,
     StrictRequestValidationError,
     is_strict_registration_request,
     validate_strict_output,
@@ -34,6 +35,7 @@ from .strict_v2_runtime import (
 )
 from .strict_v2_safety import resolve_allowed_origins, strict_v2_safety
 from .ws_store import (
+    PlaybackContextAuthorityAmbiguousError,
     PlaybackContextClosedError,
     PlaybackContextIntentConflictError,
     PlaybackContextStaleVersionError,
@@ -53,6 +55,7 @@ from .ws_store import (
     getPlaybackState,
     getPlaybackStates,
     getQueueState,
+    listActivePlaybackContextBindings,
     listPlaybackContexts,
     mutateStrictPlaybackContextControl,
     mutateStrictPlaybackContextQueue,
@@ -139,6 +142,7 @@ ACTION_EVENT_NAMES = {
     "follow.stop": "follow_stop",
     "playback.ready": "playback_ready",
     "playback.context.create": "playback_context_create",
+    "playback.context.list": "playback_context_list",
     "playback.context.status": "playback_context_status",
     "playback.context.subscribe": "playback_context_subscribe",
     "playback.context.unsubscribe": "playback_context_unsubscribe",
@@ -245,8 +249,13 @@ def _log_emo_event(level, event, **fields):
     if has_request_context() and getattr(g, "emo_strict_request", False):
         allowed_fields = {
             "action",
+            "authority_client_id",
+            "authority_device_session_id",
             "client_request_id",
+            "context_count",
             "exception_type",
+            "failed_sid_count",
+            "recipient_count",
             "result",
             "source_client_id",
             "user",
@@ -533,7 +542,7 @@ def _message_for_recipient(message, target_sid):
             if isinstance(connection_nonce, str) and connection_nonce:
                 outgoing["connectionNonce"] = connection_nonce
                 outgoing["connectionEpoch"] = 1
-    validate_strict_output(outgoing)
+    validate_strict_output(outgoing, registered=strict_target)
     return outgoing
 
 
@@ -794,6 +803,77 @@ def _send_direct_response(msg_type, action, request_id, payload):
     )
 
 
+def _prepare_strict_request_cache(
+    message,
+    session_info,
+    action,
+    request_id,
+):
+    connection_nonce = (
+        None if session_info is None else session_info.get("connectionNonce")
+    )
+    fingerprint = request_fingerprint(
+        message.get("type"),
+        action,
+        message.get("payload"),
+    )
+    try:
+        lookup = strict_request_cache.lookup_or_reserve(
+            connection_nonce,
+            request_id,
+            fingerprint,
+        )
+    except RequestFingerprintConflict as exc:
+        _send_error("conflict", str(exc), request_id)
+        return False
+    if lookup.status == "cached":
+        for cached_message in lookup.result["messages"]:
+            _emit_message(
+                cached_message,
+                request.sid,
+                record_settlement=False,
+            )
+        return False
+    if lookup.status == "in_flight":
+        _log_emo_event(
+            logging.INFO,
+            "strict_v2_duplicate_in_flight",
+            action=action,
+            client_request_id=request_id,
+            sid=request.sid,
+        )
+        return False
+    g.emo_request_cache_context = {
+        "connectionNonce": connection_nonce,
+        "requestId": request_id,
+        "fingerprint": fingerprint,
+    }
+    g.emo_suppress_success_ack = action in EVENT_CONFIRMED_ACTIONS
+
+    retry_after_ms = strict_v2_safety.check_rate_limit(
+        connection_nonce,
+        action,
+    )
+    if retry_after_ms is None:
+        return True
+    _log_emo_event(
+        logging.WARNING,
+        "strict_v2_rate_limit",
+        result="rate_limited",
+        action=action,
+        client_request_id=request_id,
+        user=None if session_info is None else session_info.get("userName"),
+        source_client_id=None,
+    )
+    _send_error(
+        "rate_limited",
+        "Strict-v2 request rate limit exceeded",
+        request_id,
+        retryAfterMs=retry_after_ms,
+    )
+    return False
+
+
 def _run_post_commit_push(action, request_id, push):
     try:
         return push()
@@ -861,6 +941,71 @@ def _broadcast_clients(user_name):
             {"devices": _serialize_clients_for_target(clients, target_client)},
         )
         _emit_message(message, target_sid)
+
+
+def _disconnect_strict_recipient(target_sid):
+    try:
+        socketio.server.disconnect(target_sid, namespace="/emo")
+    except Exception:
+        logger.exception(
+            "Unable to disconnect a stale strict-v2 recipient"
+        )
+
+
+def _broadcast_playback_context_bindings_changed(
+    user_name,
+    affected_authority_pairs,
+):
+    authority_pairs = sorted(
+        {
+            tuple(authority_pair)
+            for authority_pair in affected_authority_pairs
+            if (
+                isinstance(authority_pair, (list, tuple))
+                and len(authority_pair) == 3
+                and authority_pair[0] == user_name
+            )
+        }
+    )
+    for _, authority_client_id, authority_device_session_id in authority_pairs:
+        recipient_sids = state.list_strict_controller_sids(user_name)
+        failed_sids = []
+        for target_sid in recipient_sids:
+            if not strict_v2_safety.reserve_emit(target_sid):
+                failed_sids.append(target_sid)
+                _disconnect_strict_recipient(target_sid)
+                continue
+            try:
+                _emit_message(
+                    _build_message(
+                        "event",
+                        "playback.context.bindings.changed",
+                        {
+                            "authorityClientId": authority_client_id,
+                            "authorityDeviceSessionId": (
+                                authority_device_session_id
+                            ),
+                        },
+                    ),
+                    target_sid,
+                    record_settlement=False,
+                    emit_reserved=True,
+                )
+            except Exception:
+                failed_sids.append(target_sid)
+                _disconnect_strict_recipient(target_sid)
+            finally:
+                strict_v2_safety.release_emit(target_sid)
+        _log_emo_event(
+            logging.INFO if not failed_sids else logging.ERROR,
+            "playback_context_bindings_changed",
+            result="success" if not failed_sids else "recipient_failed",
+            user=user_name,
+            authority_client_id=authority_client_id,
+            authority_device_session_id=authority_device_session_id,
+            recipient_count=len(recipient_sids),
+            failed_sid_count=len(failed_sids),
+        )
 
 
 def _broadcast_queue(user_name, session_id):
@@ -3293,24 +3438,14 @@ def _handle_strict_v2_context_control(
             "Playback authority lacks %s" % required_capability
         )
 
-    queue_song_ids = list(context.get("queueSongIds") or [])
-    current_index = context.get("currentIndex", 0)
     requested_index = None
     position_ms = payload.get("positionMs")
     if action == "queue.playItem":
         requested_index = payload["queueIndex"]
-        if requested_index >= len(queue_song_ids):
-            raise ValueError("queue.playItem queueIndex is out of bounds")
         position_ms = 0
     elif action == "player.next":
-        requested_index = current_index + 1
-        if requested_index >= len(queue_song_ids):
-            raise ValueError("player.next queueIndex is out of bounds")
         position_ms = 0
     elif action == "player.prev":
-        if current_index <= 0:
-            raise ValueError("player.prev queueIndex is out of bounds")
-        requested_index = current_index - 1
         position_ms = 0
     elif action == "player.play" and position_ms is None:
         position_ms = context.get("positionMs", 0)
@@ -5317,7 +5452,7 @@ def _handle_playback_context_create(
     queue_song_ids, current_index, position_ms = _validate_playback_context_queue_payload(
         payload
     )
-    playback_context, _created = createStrictPlaybackContextState(
+    create_result = createStrictPlaybackContextState(
         playback_context_id,
         current_user_name,
         current_client.get("clientId"),
@@ -5327,6 +5462,7 @@ def _handle_playback_context_create(
         position_ms,
         payload["state"],
     )
+    playback_context, _created = create_result
     _ensure_playback_context_for_user(playback_context, current_user_name)
     playback_context = state.restore_playback_context(
         playback_context_id,
@@ -5339,7 +5475,56 @@ def _handle_playback_context_create(
         request_id,
         serializePlaybackContextV2(playback_context),
     )
+    if create_result.mutated:
+        _run_post_commit_push(
+            "playback.context.create",
+            request_id,
+            lambda: _broadcast_playback_context_bindings_changed(
+                current_user_name,
+                create_result.affected_authority_pairs,
+            ),
+        )
     return playback_context
+
+
+def _handle_playback_context_list(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+):
+    if current_client is None:
+        raise PermissionError(
+            "Register the device before listing playback contexts"
+        )
+    if not _client_supports(
+        current_client,
+        CAPABILITY_PLAYBACK_CONTEXT_V2,
+    ):
+        raise CapabilityRequiredError(
+            "playbackContextV2 is required to list playback contexts"
+        )
+    if not _has_role(current_client, "controller"):
+        raise PermissionError(
+            "Only a controller can list playback contexts"
+        )
+
+    authority_client_id = payload["authorityClientId"]
+    authority_device_session_id = payload[
+        "authorityDeviceSessionId"
+    ]
+    bindings = listActivePlaybackContextBindings(
+        current_user_name,
+        authority_client_id,
+        authority_device_session_id,
+    )
+    _send_direct_response(
+        "state",
+        "playback.context.list",
+        request_id,
+        {"contexts": bindings},
+    )
+    return bindings
 
 
 def _handle_playback_context_status(current_user_name, current_client, payload, request_id):
@@ -5460,6 +5645,15 @@ def _handle_playback_context_close(current_user_name, current_client, payload, r
             playback_context_id,
         ),
     )
+    if closed_context.mutated:
+        _run_post_commit_push(
+            "playback.context.close",
+            request_id,
+            lambda: _broadcast_playback_context_bindings_changed(
+                current_user_name,
+                closed_context.affected_authority_pairs,
+            ),
+        )
     state.stop_follow_relationships_for_context(playback_context_id)
     state.clear_playback_context_subscriptions(playback_context_id)
     return closed_context
@@ -6343,6 +6537,11 @@ def _handle_handoff_complete(
         if result is None:
             raise LookupError("Playback handoff not found")
         updated_context, completed_handoff, device_state, _mutated = result
+        if result.mutated:
+            completed_handoff["_bindingMutation"] = {
+                "mutated": result.mutated,
+                "affectedAuthorityPairs": result.affected_authority_pairs,
+            }
         state.restore_playback_context(playback_context_id, updated_context)
         if device_state is not None:
             state.record_device_playback_state(
@@ -6717,12 +6916,42 @@ class EmoNamespace(Namespace):
         session_info = state.get_session(request.sid)
         current_user_name = None if session_info is None else session_info.get("userName")
         current_client = state.get_client_for_sid(request.sid)
+        unregistered_strict_business = (
+            current_client is None
+            and action in ACTION_SCHEMAS
+            and action not in {"auth.login", "device.register"}
+        )
         strict_request = (
             action == "auth.login"
             or is_strict_registration_request(message)
             or _is_strict_playback_context_v2(current_client)
+            or unregistered_strict_business
+            or action == "playback.context.list"
         )
         g.emo_strict_request = strict_request
+        if unregistered_strict_business:
+            if not _prepare_strict_request_cache(
+                message,
+                session_info,
+                action,
+                request_id,
+            ):
+                return
+            _log_emo_event(
+                logging.WARNING,
+                "unauthorized_action",
+                result="unauthorized",
+                action=action,
+                client_request_id=request_id,
+                reason="register_first",
+                sid=request.sid,
+            )
+            _send_error(
+                "unauthorized",
+                "Register the device before sending business requests",
+                request_id,
+            )
+            return
         if strict_request:
             try:
                 message = validate_strict_request(message)
@@ -6744,69 +6973,13 @@ class EmoNamespace(Namespace):
             action = message["action"]
             request_id = message["requestId"]
 
-        if strict_request:
-            connection_nonce = None if session_info is None else session_info.get("connectionNonce")
-            fingerprint = request_fingerprint(
-                message["type"],
-                action,
-                message["payload"],
-            )
-            try:
-                lookup = strict_request_cache.lookup_or_reserve(
-                    connection_nonce,
-                    request_id,
-                    fingerprint,
-                )
-            except RequestFingerprintConflict as exc:
-                _send_error("conflict", str(exc), request_id)
-                return
-            if lookup.status == "cached":
-                for cached_message in lookup.result["messages"]:
-                    _emit_message(
-                        cached_message,
-                        request.sid,
-                        record_settlement=False,
-                    )
-                return
-            if lookup.status == "in_flight":
-                _log_emo_event(
-                    logging.INFO,
-                    "strict_v2_duplicate_in_flight",
-                    action=action,
-                    client_request_id=request_id,
-                    sid=request.sid,
-                )
-                return
-            g.emo_request_cache_context = {
-                "connectionNonce": connection_nonce,
-                "requestId": request_id,
-                "fingerprint": fingerprint,
-            }
-            g.emo_suppress_success_ack = action in EVENT_CONFIRMED_ACTIONS
-
-            retry_after_ms = strict_v2_safety.check_rate_limit(
-                connection_nonce,
-                action,
-            )
-            if retry_after_ms is not None:
-                _log_emo_event(
-                    logging.WARNING,
-                    "strict_v2_rate_limit",
-                    result="rate_limited",
-                    action=action,
-                    client_request_id=request_id,
-                    user=current_user_name,
-                    source_client_id=None
-                    if current_client is None
-                    else current_client.get("clientId"),
-                )
-                _send_error(
-                    "rate_limited",
-                    "Strict-v2 request rate limit exceeded",
-                    request_id,
-                    retryAfterMs=retry_after_ms,
-                )
-                return
+        if strict_request and not _prepare_strict_request_cache(
+            message,
+            session_info,
+            action,
+            request_id,
+        ):
+            return
 
         payload = message.get("payload")
         if payload is None:
@@ -6976,6 +7149,25 @@ class EmoNamespace(Namespace):
                         },
                         requestId=request_id,
                     ),
+                )
+            elif action == "playback.context.list":
+                bindings = _handle_playback_context_list(
+                    current_user_name,
+                    current_client,
+                    payload,
+                    request_id,
+                )
+                _log_emo_event(
+                    logging.INFO,
+                    "playback_context_list",
+                    result="success",
+                    user=current_user_name,
+                    client_request_id=request_id,
+                    source_client_id=None
+                    if current_client is None
+                    else current_client.get("clientId"),
+                    authority_client_id=payload.get("authorityClientId"),
+                    context_count=len(bindings),
                 )
             elif action in SESSION_ACTIONS:
                 if current_client is None:
@@ -7165,6 +7357,22 @@ class EmoNamespace(Namespace):
                                 ),
                             ),
                         )
+                        binding_mutation = handoff.get(
+                            "_bindingMutation"
+                        ) or {}
+                        if binding_mutation.get("mutated"):
+                            _run_post_commit_push(
+                                action,
+                                request_id,
+                                lambda: (
+                                    _broadcast_playback_context_bindings_changed(
+                                        current_user_name,
+                                        binding_mutation.get(
+                                            "affectedAuthorityPairs"
+                                        ) or (),
+                                    )
+                                ),
+                            )
                 else:
                     handoff = _handle_handoff_cancel(
                         current_user_name,
@@ -8049,6 +8257,23 @@ class EmoNamespace(Namespace):
                 playbackContextId=playback_context.get("playbackContextId"),
                 currentControlVersion=playback_context.get("controlVersion"),
                 currentQueueRevision=playback_context.get("queueRevision"),
+                currentVersion=playback_context.get("version"),
+            )
+        except PlaybackContextAuthorityAmbiguousError as exc:
+            playback_context = exc.playback_context or {}
+            _send_error(
+                "conflict",
+                str(exc),
+                request_id,
+                playbackContextId=playback_context.get(
+                    "playbackContextId"
+                ) or payload.get("playbackContextId"),
+                currentControlVersion=playback_context.get(
+                    "controlVersion"
+                ),
+                currentQueueRevision=playback_context.get(
+                    "queueRevision"
+                ),
                 currentVersion=playback_context.get("version"),
             )
         except QueueConflictError as exc:

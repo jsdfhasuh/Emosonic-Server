@@ -12,6 +12,7 @@ const ROOT = path.resolve(__dirname, '..', '..');
 const PORT = Number(process.env.EMO_BROWSER_PORT || 5081);
 const BASE_URL = `http://127.0.0.1:${PORT}`;
 const PYTHON = process.env.PYTHON || 'python';
+const TEST_SERVER_BUILD_COMMIT = 'e'.repeat(40);
 const STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'emosonic-web-strict-v2-'));
 const serverLogs = [];
 
@@ -40,7 +41,12 @@ function startServer() {
     String(PORT),
   ], {
     cwd: ROOT,
-    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    env: {
+      ...process.env,
+      PYTHONUNBUFFERED: '1',
+      EMO_SERVER_BUILD_COMMIT: process.env.EMO_SERVER_BUILD_COMMIT
+        || TEST_SERVER_BUILD_COMMIT,
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   for (const stream of [child.stdout, child.stderr]) {

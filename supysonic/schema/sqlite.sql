@@ -365,6 +365,14 @@ CREATE TABLE IF NOT EXISTS emo_playback_context (
     updated_at DATETIME NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_emo_playback_context_binding
+ON emo_playback_context (
+    user_name,
+    lifecycle,
+    authority_client_id,
+    authority_device_session_id
+);
+
 CREATE TABLE IF NOT EXISTS emo_device_playback_state (
     id CHAR(36) PRIMARY KEY,
     playback_context_id VARCHAR(128) NOT NULL,

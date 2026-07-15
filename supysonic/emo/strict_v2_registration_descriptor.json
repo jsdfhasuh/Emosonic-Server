@@ -1,6 +1,6 @@
 {
   "protocolName": "emosonic-playback-context-v2-registration",
-  "protocolVersion": "2.1.0",
+  "protocolVersion": "2.2.0",
   "coveredActions": {
     "clientToServer": [
       "device.register"

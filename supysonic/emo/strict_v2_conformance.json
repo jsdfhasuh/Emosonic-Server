@@ -1,30 +1,22 @@
 {
   "schemaVersion": 1,
-  "contractSha256": "ca069c6ad52447ea4f7ace7d795460c5ec759e5708b2f45acfbe50903aa4b3a3",
+  "contractSha256": "7e5402a4c32fb366c3755239e4993ef5634177e7db9748bff83b32926cbd2b1f",
   "profiles": {
     "core": {
-      "codeConformanceReady": true,
-      "evidence": [
-        "local-test-only:test_supysonic:2026-07-13:serverBuildCommit=7f0015b2c5fb4657e4e2f120aa674e55e8164d01"
-      ]
+      "codeConformanceReady": false,
+      "evidence": []
     },
     "follow": {
-      "codeConformanceReady": true,
-      "evidence": [
-        "local-test-only:test_supysonic:2026-07-13:serverBuildCommit=7f0015b2c5fb4657e4e2f120aa674e55e8164d01"
-      ]
+      "codeConformanceReady": false,
+      "evidence": []
     },
     "handoff": {
-      "codeConformanceReady": true,
-      "evidence": [
-        "local-test-only:test_supysonic:2026-07-13:serverBuildCommit=7f0015b2c5fb4657e4e2f120aa674e55e8164d01"
-      ]
+      "codeConformanceReady": false,
+      "evidence": []
     },
     "broadcast": {
-      "codeConformanceReady": true,
-      "evidence": [
-        "local-test-only:test_supysonic:2026-07-13:serverBuildCommit=7f0015b2c5fb4657e4e2f120aa674e55e8164d01"
-      ]
+      "codeConformanceReady": false,
+      "evidence": []
     }
   }
 }

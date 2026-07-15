@@ -10,6 +10,14 @@ from supysonic import db
 
 
 class EmoSchemaMigrationTestCase(unittest.TestCase):
+    DISCOVERY_INDEX_NAME = "idx_emo_playback_context_binding"
+    DISCOVERY_INDEX_COLUMNS = (
+        "user_name",
+        "lifecycle",
+        "authority_client_id",
+        "authority_device_session_id",
+    )
+
     @staticmethod
     def _record_external_evidence(
         provider: str,
@@ -134,7 +142,8 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 ).fetchall()
             }
             self.assertTrue(required_fields.issubset(columns))
-            self.assertEqual(db.Meta["schema_version"].value, "20260712")
+            self._assert_external_discovery_index(provider)
+            self.assertEqual(db.Meta["schema_version"].value, "20260715")
             self._record_external_evidence(
                 provider,
                 "clean",
@@ -162,7 +171,8 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             self.assertEqual(row[4], "stopped")
             self.assertEqual(row[5:9], (1, 1, 1, 1))
             self.assertIsNotNone(row[9])
-            self.assertEqual(db.Meta["schema_version"].value, "20260712")
+            self._assert_external_discovery_index(provider)
+            self.assertEqual(db.Meta["schema_version"].value, "20260715")
             self._record_external_evidence(
                 provider,
                 "upgrade_from_20260708",
@@ -173,6 +183,31 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 db.release_database()
             if database_available:
                 self._reset_external_database(provider, database_uri)
+
+    def _assert_external_discovery_index(self, provider: str) -> None:
+        if provider == "postgres":
+            row = db.db.execute_sql(
+                "SELECT indexdef FROM pg_indexes "
+                "WHERE tablename = 'emo_playback_context' "
+                "AND indexname = %s",
+                (self.DISCOVERY_INDEX_NAME,),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            for column_name in self.DISCOVERY_INDEX_COLUMNS:
+                self.assertIn(column_name, row[0])
+            return
+
+        rows = db.db.execute_sql(
+            "SELECT column_name FROM information_schema.statistics "
+            "WHERE table_schema = DATABASE() "
+            "AND table_name = 'emo_playback_context' "
+            "AND index_name = %s ORDER BY seq_in_index",
+            (self.DISCOVERY_INDEX_NAME,),
+        ).fetchall()
+        self.assertEqual(
+            tuple(row[0] for row in rows),
+            self.DISCOVERY_INDEX_COLUMNS,
+        )
 
     def test_sqlite_20260708_upgrade_preserves_context_and_normalizes_cursors(self):
         handle, path = tempfile.mkstemp()
@@ -233,7 +268,14 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             self.assertEqual(row[4], "stopped")
             self.assertEqual(row[5:9], (1, 1, 1, 1))
             self.assertIsNotNone(row[9])
-            self.assertEqual(db.Meta["schema_version"].value, "20260712")
+            index_columns = tuple(
+                row[2]
+                for row in db.db.execute_sql(
+                    "PRAGMA index_info('%s')" % self.DISCOVERY_INDEX_NAME
+                ).fetchall()
+            )
+            self.assertEqual(index_columns, self.DISCOVERY_INDEX_COLUMNS)
+            self.assertEqual(db.Meta["schema_version"].value, "20260715")
         finally:
             db.release_database()
             os.remove(path)
@@ -254,6 +296,9 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 migration = (
                     root / "migration" / provider / "20260712.sql"
                 ).read_text("utf-8")
+                discovery_migration = (
+                    root / "migration" / provider / "20260715.sql"
+                ).read_text("utf-8")
                 for field_name in required_fields:
                     self.assertIn(field_name, base_schema)
                     self.assertIn(field_name, migration)
@@ -261,6 +306,13 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 self.assertIn("control_version", migration)
                 self.assertIn("version", migration)
                 self.assertIn("epoch", migration)
+                self.assertIn(self.DISCOVERY_INDEX_NAME, base_schema)
+                self.assertIn(
+                    self.DISCOVERY_INDEX_NAME,
+                    discovery_migration,
+                )
+                for column_name in self.DISCOVERY_INDEX_COLUMNS:
+                    self.assertIn(column_name, discovery_migration)
 
     def test_postgres_runtime_clean_schema_and_20260708_upgrade(self):
         database_uri = os.environ.get("SUPYSONIC_TEST_POSTGRES_URI")

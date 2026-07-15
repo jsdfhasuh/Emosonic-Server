@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from supysonic.emo.strict_v2_readiness import (
     CoreProfileNotReady,
@@ -88,23 +89,29 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
         )
         self.assertTrue(is_local_test_evidence_allowed({}, app_testing=True))
 
-    def test_development_gate_loads_packaged_local_test_evidence(self):
+    def test_development_gate_allows_local_test_evidence(self):
         deployment = dict(
             self.deployment_enabled,
             emo_development_mode=True,
             emo_strict_v2_allow_local_test_evidence=True,
         )
 
-        self.assertEqual(
-            get_effective_profile_readiness(deployment),
-            self.code_ready,
-        )
+        with mock.patch(
+            "supysonic.emo.strict_v2_readiness.get_code_conformance_readiness",
+            return_value=self.code_ready,
+        ) as readiness:
+            self.assertEqual(
+                get_effective_profile_readiness(deployment),
+                self.code_ready,
+            )
 
-        negotiated = negotiate_capabilities(
-            self.capabilities,
-            ["player", "controller"],
-            deployment,
-        )
+            negotiated = negotiate_capabilities(
+                self.capabilities,
+                ["player", "controller"],
+                deployment,
+            )
+
+        readiness.assert_called_with(True)
         self.assertTrue(negotiated["playbackContextV2"])
         self.assertTrue(negotiated["supportsFollow"])
         self.assertTrue(negotiated["playbackPrepare"])

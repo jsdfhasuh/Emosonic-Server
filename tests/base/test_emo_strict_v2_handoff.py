@@ -202,6 +202,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         )
         target_complete_messages = self.get_messages(target)
         source_complete_messages = self.get_messages(source)
+        controller_complete_messages = self.get_messages(controller)
 
         self.assertFalse(
             any(
@@ -227,6 +228,25 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
                 "controlVersion": 2,
                 "newAuthorityClientId": "target-1",
             },
+        )
+        binding_events = [
+            message
+            for message in controller_complete_messages
+            if message.get("action")
+            == "playback.context.bindings.changed"
+        ]
+        self.assertEqual(
+            [message["payload"] for message in binding_events],
+            [
+                {
+                    "authorityClientId": "source-1",
+                    "authorityDeviceSessionId": "device:source-1",
+                },
+                {
+                    "authorityClientId": "target-1",
+                    "authorityDeviceSessionId": "device:target-1",
+                },
+            ],
         )
 
         context = getPlaybackContextState("context-handoff-1")
@@ -269,6 +289,13 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
             ["playback.handoff.status", "playback.context.status"],
         )
         self.assertEqual(self.get_messages(source), [])
+        self.assertFalse(
+            any(
+                message.get("action")
+                == "playback.context.bindings.changed"
+                for message in self.get_messages(controller)
+            )
+        )
         replayed_context = getPlaybackContextState("context-handoff-1")
         self.assertEqual(replayed_context["version"], 2)
         self.assertEqual(replayed_context["epoch"], 2)

@@ -1,6 +1,6 @@
 # Goal: EmoSonic strict-v2 Socket.IO r5 服务端适配
 
-> 状态：Planned
+> 状态：Historical（已由 r7 / `2.2.0` Goal 取代，不再作为 wire 权威）
 >
 > 制定日期：2026-07-12
 >

@@ -508,7 +508,7 @@ test('registration evidence requires closed metadata, provenance, and paired han
       deviceSessionId: 'web-player-device:1',
       negotiatedCapabilities: HANDOFF_CAPABILITIES,
       strictV2: {
-        protocolVersion: '2.1.0',
+        protocolVersion: '2.2.0',
         schemaHash: SCHEMA_HASH,
         serverBuildCommit: BUILD_COMMIT,
         connectionNonce: 'nonce-1',
@@ -522,6 +522,9 @@ test('registration evidence requires closed metadata, provenance, and paired han
   const unpaired = JSON.parse(JSON.stringify(message));
   unpaired.payload.negotiatedCapabilities.effectiveAtPlayback = false;
   assert.throws(() => client._acceptRegistration(unpaired), /negotiated together/);
+  const lowerMinor = JSON.parse(JSON.stringify(message));
+  lowerMinor.payload.strictV2.protocolVersion = '2.1.0';
+  assert.throws(() => client._acceptRegistration(lowerMinor), /Unsupported/);
   const wrongMajor = JSON.parse(JSON.stringify(message));
   wrongMajor.payload.strictV2.protocolVersion = '3.0.0';
   assert.throws(() => client._acceptRegistration(wrongMajor), /Unsupported/);
@@ -601,7 +604,7 @@ test('bootstrap fetches a fresh browser OTP and reaches ready with exact registr
       deviceSessionId: 'web-player-device:1',
       negotiatedCapabilities: PLAYER_CAPABILITIES,
       strictV2: {
-        protocolVersion: '2.1.0',
+        protocolVersion: '2.2.0',
         schemaHash: SCHEMA_HASH,
         serverBuildCommit: BUILD_COMMIT,
         connectionNonce: 'nonce-1',
@@ -670,7 +673,7 @@ test('bootstrap fetches a fresh browser OTP and reaches ready with exact registr
       deviceSessionId: 'web-player-device:1',
       negotiatedCapabilities: PLAYER_CAPABILITIES,
       strictV2: {
-        protocolVersion: '2.1.0',
+        protocolVersion: '2.2.0',
         schemaHash: 'c'.repeat(64),
         serverBuildCommit: 'd'.repeat(40),
         connectionNonce: 'nonce-2',

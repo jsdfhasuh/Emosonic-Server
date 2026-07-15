@@ -25,6 +25,7 @@
     'device.register': 'device',
     'device.list': 'state',
     'system.ping': 'system',
+    'playback.context.list': 'state',
     'playback.context.create': 'command',
     'playback.context.subscribe': 'state',
     'playback.context.unsubscribe': 'state',
@@ -57,6 +58,7 @@
   const DIRECT_RESPONSE_ACTIONS = new Set([
     'device.list',
     'system.ping',
+    'playback.context.list',
     'playback.context.create',
     'playback.context.status',
   ]);
@@ -455,7 +457,14 @@
         throw new StrictProtocolError('Registration ACK strictV2 metadata shape is not closed');
       }
       const version = metadata.protocolVersion;
-      if (typeof version !== 'string' || !/^2\./.test(version)) {
+      const versionMatch = typeof version === 'string'
+        ? /^(\d+)\.(\d+)\.(\d+)$/.exec(version)
+        : null;
+      if (
+        !versionMatch
+        || Number(versionMatch[1]) !== 2
+        || Number(versionMatch[2]) < 2
+      ) {
         throw new StrictProtocolError(`Unsupported strict-v2 protocol version: ${String(version)}`);
       }
       if (typeof metadata.schemaHash !== 'string' || !/^[0-9a-f]{64}$/.test(metadata.schemaHash)) {

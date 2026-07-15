@@ -77,7 +77,7 @@ class WebStrictV2FrontendTestCase(FrontendTestBase):
             response = self.client.get(path)
             self.assertEqual(response.status_code, 200)
             self.assertIn("emo_strict_v2_client.js", response.data)
-            self.assertIn("PlaybackContext strict-v2 2.1.0", response.data)
+            self.assertIn("PlaybackContext strict-v2 2.2.0", response.data)
             for action in FORBIDDEN_STRICT_ACTIONS:
                 self.assertNotIn(action, response.data)
             self.assertNotIn('"sessionId"', response.data)

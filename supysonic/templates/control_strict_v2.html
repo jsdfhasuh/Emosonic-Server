@@ -12,12 +12,12 @@
 <main class="strict-control-workspace" id="strict-control-root" data-meta-url="{{ url_for('frontend.control_track_meta') }}">
   <div class="strict-control-toolbar mb-3">
     <div class="d-flex flex-wrap align-items-center gap-2">
-      <span class="console-scope-badge scope-device">PlaybackContext strict-v2 2.1.0</span>
+      <span class="console-scope-badge scope-device">PlaybackContext strict-v2 2.2.0</span>
       <span class="strict-control-state-pill" id="strict-control-context">no context</span>
       <span class="strict-control-state-pill" id="strict-control-broadcast">no broadcast</span>
       <span class="strict-control-state-pill" id="strict-control-handoff">no handoff</span>
     </div>
-    <span class="console-muted" data-i18n-en="Remote volume and full remote queue replacement are unavailable in strict-v2 2.1.0." data-i18n-zh="strict-v2 2.1.0 不支持远程音量和全量远端队列改写。">Remote volume and full remote queue replacement are unavailable in strict-v2 2.1.0.</span>
+    <span class="console-muted" data-i18n-en="Remote volume and full remote queue replacement are unavailable in strict-v2 2.2.0." data-i18n-zh="strict-v2 2.2.0 不支持远程音量和全量远端队列改写。">Remote volume and full remote queue replacement are unavailable in strict-v2 2.2.0.</span>
   </div>
 
   <section class="strict-control-metrics mb-3" aria-label="Control status overview">
@@ -103,7 +103,7 @@
               <button class="btn btn-outline-secondary control-command" id="strict-seek-back" type="button">-15s</button>
               <button class="btn btn-outline-secondary control-command" id="strict-seek-forward" type="button">+15s</button>
             </div>
-            <div class="console-control-hint mb-3" id="strict-control-disabled-reason"><span data-i18n-en="Remote volume is unavailable in strict-v2 2.1.0." data-i18n-zh="远程音量不可用：strict-v2 2.1.0 没有远程音量 action。">Remote volume is unavailable in strict-v2 2.1.0.</span></div>
+            <div class="console-control-hint mb-3" id="strict-control-disabled-reason"><span data-i18n-en="Remote volume is unavailable in strict-v2 2.2.0." data-i18n-zh="远程音量不可用：strict-v2 2.2.0 没有远程音量 action。">Remote volume is unavailable in strict-v2 2.2.0.</span></div>
 
             <div class="console-signal-grid strict-context-signals mb-3">
               <div class="console-signal-cell">
@@ -364,8 +364,8 @@
     document.getElementById('strict-handoff-cancel').disabled = !state.handoff || terminalHandoff;
 
     let reason = i18n(
-      'Remote volume is unavailable in strict-v2 2.1.0.',
-      '远程音量不可用：strict-v2 2.1.0 没有远程音量 action。'
+      'Remote volume is unavailable in strict-v2 2.2.0.',
+      '远程音量不可用：strict-v2 2.2.0 没有远程音量 action。'
     );
     if (!selected) {
       reason = i18n('Select an online player to enable controls.', '请选择在线播放器以启用控制。');

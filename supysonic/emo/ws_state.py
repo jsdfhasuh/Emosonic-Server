@@ -397,6 +397,35 @@ class WebSocketState:
                 items.append((sid, dict(client)))
             return items
 
+    def list_strict_controller_sids(self, user_name):
+        with self._lock:
+            items = []
+            for sid, session_info in self._sessions.items():
+                if (
+                    not session_info.get("authenticated")
+                    or session_info.get("userName") != user_name
+                ):
+                    continue
+                client_id = session_info.get("clientId")
+                if not client_id:
+                    continue
+                client_key = self._client_key(user_name, client_id)
+                if self._client_to_sid.get(client_key) != sid:
+                    continue
+                client = self._clients.get(client_key)
+                if client is None:
+                    continue
+                if "controller" not in (client.get("roles") or []):
+                    continue
+                capabilities = client.get("capabilities")
+                if (
+                    not isinstance(capabilities, dict)
+                    or capabilities.get("playbackContextV2") is not True
+                ):
+                    continue
+                items.append(sid)
+            return sorted(items)
+
     def subscribe_session(self, sid, session_id):
         if not session_id:
             return []

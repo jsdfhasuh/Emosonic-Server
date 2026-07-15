@@ -24,9 +24,9 @@ def _mapped_test_methods() -> List[str]:
     if not isinstance(requirements, dict):
         raise ValueError("strict-v2 manifest requirements must be an object")
 
-    expected = {"REQ-%03d" % number for number in range(1, 23)}
+    expected = {"REQ-%03d" % number for number in range(1, 26)}
     if set(requirements) != expected:
-        raise ValueError("strict-v2 manifest must map REQ-001 through REQ-022")
+        raise ValueError("strict-v2 manifest must map REQ-001 through REQ-025")
 
     methods = set()
     for requirement, mapping in requirements.items():

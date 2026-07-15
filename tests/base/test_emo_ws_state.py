@@ -124,6 +124,60 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
             "phone-1",
         )
 
+    def test_strict_controller_recipient_filter_is_user_role_and_capability_scoped(self):
+        clients = (
+            (
+                "sid-alice-controller",
+                "alice",
+                "alice-controller",
+                ["controller"],
+                True,
+            ),
+            (
+                "sid-alice-player",
+                "alice",
+                "alice-player",
+                ["player"],
+                True,
+            ),
+            (
+                "sid-alice-legacy",
+                "alice",
+                "alice-legacy",
+                ["controller"],
+                False,
+            ),
+            (
+                "sid-bob-controller",
+                "bob",
+                "bob-controller",
+                ["controller"],
+                True,
+            ),
+        )
+        for sid, user_name, client_id, roles, strict in clients:
+            self.state.register_session(sid, now=100)
+            self.state.authenticate_session(sid, user_name)
+            self.state.register_client(
+                sid,
+                client_id,
+                {
+                    "userName": user_name,
+                    "roles": roles,
+                    "capabilities": {"playbackContextV2": strict},
+                },
+                now=100,
+            )
+
+        self.assertEqual(
+            self.state.list_strict_controller_sids("alice"),
+            ["sid-alice-controller"],
+        )
+        self.assertEqual(
+            self.state.list_strict_controller_sids("bob"),
+            ["sid-bob-controller"],
+        )
+
     def test_each_registered_session_has_unique_connection_evidence(self):
         self.state.register_session("sid-1", now=100)
         self.state.register_session("sid-2", now=100)

@@ -4,7 +4,7 @@ import threading
 import time
 from contextlib import contextmanager
 from functools import wraps
-from typing import Dict, Iterator, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 from peewee import IntegrityError, SqliteDatabase
 
@@ -41,8 +41,87 @@ class PlaybackContextStaleVersionError(Exception):
         self.cursor_name = cursor_name
 
 
+class PlaybackContextAuthorityAmbiguousError(Exception):
+    def __init__(self, playback_context):
+        super().__init__(
+            "Playback context authority/device pair is ambiguous"
+        )
+        self.playback_context = playback_context
+
+
+AuthorityPair = Tuple[str, str, str]
+
+
+def _distinct_authority_pairs(
+    authority_pairs: Iterable[AuthorityPair],
+) -> Tuple[AuthorityPair, ...]:
+    return tuple(sorted(set(authority_pairs)))
+
+
+class PlaybackContextCreateResult(tuple):
+    def __new__(
+        cls,
+        playback_context: Dict[str, object],
+        mutated: bool,
+        affected_authority_pairs: Iterable[AuthorityPair],
+    ):
+        result = super().__new__(
+            cls,
+            (playback_context, bool(mutated)),
+        )
+        result.mutated = bool(mutated)
+        result.affected_authority_pairs = _distinct_authority_pairs(
+            affected_authority_pairs
+        )
+        result.canonical_context = dict(playback_context)
+        return result
+
+
+class PlaybackContextCloseResult(dict):
+    def __init__(
+        self,
+        playback_context: Dict[str, object],
+        mutated: bool,
+        affected_authority_pairs: Iterable[AuthorityPair],
+    ) -> None:
+        super().__init__(playback_context)
+        self.mutated = bool(mutated)
+        self.affected_authority_pairs = _distinct_authority_pairs(
+            affected_authority_pairs
+        )
+        self.canonical_context = dict(playback_context)
+
+
+class PlaybackHandoffCompleteResult(tuple):
+    def __new__(
+        cls,
+        playback_context: Dict[str, object],
+        handoff: Dict[str, object],
+        device_state: Optional[Dict[str, object]],
+        mutated: bool,
+        affected_authority_pairs: Iterable[AuthorityPair],
+    ):
+        result = super().__new__(
+            cls,
+            (
+                playback_context,
+                handoff,
+                device_state,
+                bool(mutated),
+            ),
+        )
+        result.mutated = bool(mutated)
+        result.affected_authority_pairs = _distinct_authority_pairs(
+            affected_authority_pairs
+        )
+        result.canonical_context = dict(playback_context)
+        return result
+
+
 _strict_playback_context_locks = {}
 _strict_playback_context_locks_guard = threading.Lock()
+_strict_authority_pair_locks = {}
+_strict_authority_pair_locks_guard = threading.Lock()
 
 
 @contextmanager
@@ -65,6 +144,57 @@ def _serialize_strict_playback_context_mutation(function):
     return serialized
 
 
+def _strict_authority_pair_key(
+    user_name,
+    authority_client_id,
+    authority_device_session_id,
+):
+    if not isinstance(user_name, str) or not user_name:
+        raise ValueError("Authority pair userName must be non-empty")
+    if authority_client_id is None:
+        authority_client_id = ""
+    if authority_device_session_id is None:
+        authority_device_session_id = ""
+    if not isinstance(authority_client_id, str):
+        raise ValueError("Authority pair clientId must be a string")
+    if not isinstance(authority_device_session_id, str):
+        raise ValueError("Authority pair deviceSessionId must be a string")
+    return (
+        user_name,
+        authority_client_id,
+        authority_device_session_id,
+    )
+
+
+def _record_authority_pair(record):
+    return _strict_authority_pair_key(
+        record.user_name,
+        record.authority_client_id,
+        record.authority_device_session_id,
+    )
+
+
+@contextmanager
+def _strict_authority_pair_lock(authority_pairs):
+    normalized_pairs = sorted(set(authority_pairs))
+    locks = []
+    with _strict_authority_pair_locks_guard:
+        for authority_pair in normalized_pairs:
+            locks.append(
+                _strict_authority_pair_locks.setdefault(
+                    authority_pair,
+                    threading.RLock(),
+                )
+            )
+    for pair_lock in locks:
+        pair_lock.acquire()
+    try:
+        yield
+    finally:
+        for pair_lock in reversed(locks):
+            pair_lock.release()
+
+
 @contextmanager
 def _strict_playback_context_transaction() -> Iterator[None]:
     if isinstance(db.obj, SqliteDatabase):
@@ -73,6 +203,13 @@ def _strict_playback_context_transaction() -> Iterator[None]:
         return
     with db.atomic():
         yield
+
+
+@contextmanager
+def _strict_authority_pair_transaction(authority_pairs) -> Iterator[None]:
+    with _strict_authority_pair_lock(authority_pairs):
+        with _strict_playback_context_transaction():
+            yield
 
 
 def _strip_transient_playback_fields(payload):
@@ -110,6 +247,18 @@ def serializePlaybackContextV2(playback_context):
         if value is not None:
             payload[field_name] = value
     return payload
+
+
+def serializePlaybackContextBindingV2(playback_context):
+    if playback_context is None:
+        return None
+    return {
+        "playbackContextId": playback_context.get("playbackContextId"),
+        "authorityClientId": playback_context.get("authorityClientId"),
+        "authorityDeviceSessionId": playback_context.get(
+            "authorityDeviceSessionId"
+        ),
+    }
 
 
 def serializeDevicePlaybackStateV2(device_state):
@@ -432,7 +581,11 @@ def playbackContextCreationFingerprint(
     return hashlib.sha256(canonical).hexdigest()
 
 
-def _resolveStrictPlaybackContextCreate(record, user_name, creation_fingerprint):
+def _resolveStrictPlaybackContextCreate(
+    record,
+    user_name,
+    creation_fingerprint,
+) -> PlaybackContextCreateResult:
     playback_context = _playback_context_payload(record)
     if record.user_name != user_name:
         raise PermissionError("Playback context belongs to another user")
@@ -440,7 +593,7 @@ def _resolveStrictPlaybackContextCreate(record, user_name, creation_fingerprint)
         raise PlaybackContextClosedError(playback_context)
     if record.creation_fingerprint != creation_fingerprint:
         raise PlaybackContextIntentConflictError(playback_context)
-    return playback_context, False
+    return PlaybackContextCreateResult(playback_context, False, ())
 
 
 @_serialize_strict_playback_context_mutation
@@ -454,7 +607,7 @@ def createStrictPlaybackContextState(
     position_ms,
     state_name,
     timeline_id=None,
-):
+) -> PlaybackContextCreateResult:
     queue_song_ids = list(queue_song_ids)
     track_id = queue_song_ids[current_index]
     timeline_id = timeline_id or "playback:%s" % playback_context_id
@@ -467,9 +620,14 @@ def createStrictPlaybackContextState(
         position_ms,
         state_name,
     )
+    authority_pair = _strict_authority_pair_key(
+        user_name,
+        authority_client_id,
+        authority_device_session_id,
+    )
     open_connection(reuse=True)
     try:
-        with _strict_playback_context_transaction():
+        with _strict_authority_pair_transaction((authority_pair,)):
             record = EmoPlaybackContext.get_or_none(
                 EmoPlaybackContext.playback_context_id == playback_context_id
             )
@@ -510,16 +668,32 @@ def createStrictPlaybackContextState(
                     user_name,
                     fingerprint,
                 )
-            return _playback_context_payload(record), True
+            playback_context = _playback_context_payload(record)
+            return PlaybackContextCreateResult(
+                playback_context,
+                True,
+                (authority_pair,),
+            )
     finally:
         close_connection()
 
 
 @_serialize_strict_playback_context_mutation
-def closeStrictPlaybackContextState(playback_context_id, user_name):
+def closeStrictPlaybackContextState(
+    playback_context_id,
+    user_name,
+) -> Optional[PlaybackContextCloseResult]:
     open_connection(reuse=True)
     try:
-        with _strict_playback_context_transaction():
+        initial_record = EmoPlaybackContext.get_or_none(
+            EmoPlaybackContext.playback_context_id == playback_context_id
+        )
+        if initial_record is None:
+            return None
+        if initial_record.user_name != user_name:
+            raise PermissionError("Playback context belongs to another user")
+        authority_pair = _record_authority_pair(initial_record)
+        with _strict_authority_pair_transaction((authority_pair,)):
             record = EmoPlaybackContext.get_or_none(
                 EmoPlaybackContext.playback_context_id == playback_context_id
             )
@@ -527,7 +701,8 @@ def closeStrictPlaybackContextState(playback_context_id, user_name):
                 return None
             if record.user_name != user_name:
                 raise PermissionError("Playback context belongs to another user")
-            if record.lifecycle != "closed":
+            mutated = record.lifecycle != "closed"
+            if mutated:
                 closed_at = now()
                 record.lifecycle = "closed"
                 record.closed_at = closed_at
@@ -559,7 +734,12 @@ def closeStrictPlaybackContextState(playback_context_id, user_name):
                     )
                     .execute()
                 )
-            return _playback_context_payload(record)
+            playback_context = _playback_context_payload(record)
+            return PlaybackContextCloseResult(
+                playback_context,
+                mutated,
+                (authority_pair,) if mutated else (),
+            )
     finally:
         close_connection()
 
@@ -654,11 +834,44 @@ def mutateStrictPlaybackContextControl(
 ):
     open_connection(reuse=True)
     try:
-        with _strict_playback_context_transaction():
+        initial_record = _getStrictPlaybackContextRecord(
+            playback_context_id,
+            user_name,
+        )
+        if initial_record is None:
+            return None
+        authority_pair = _record_authority_pair(initial_record)
+        with _strict_authority_pair_transaction((authority_pair,)):
             record = _getStrictPlaybackContextRecord(playback_context_id, user_name)
             if record is None:
                 return None
             current = _playback_context_payload(record)
+            active_context_ids = [
+                active_record.playback_context_id
+                for active_record in (
+                    EmoPlaybackContext.select(
+                        EmoPlaybackContext.playback_context_id
+                    )
+                    .where(
+                        (EmoPlaybackContext.user_name == user_name)
+                        & (EmoPlaybackContext.lifecycle == "active")
+                        & (
+                            EmoPlaybackContext.authority_client_id
+                            == record.authority_client_id
+                        )
+                        & (
+                            EmoPlaybackContext.authority_device_session_id
+                            == record.authority_device_session_id
+                        )
+                    )
+                    .order_by(
+                        EmoPlaybackContext.playback_context_id.asc()
+                    )
+                    .limit(2)
+                )
+            ]
+            if active_context_ids != [playback_context_id]:
+                raise PlaybackContextAuthorityAmbiguousError(current)
             if base_control_version != record.control_version:
                 raise PlaybackContextStaleVersionError(current, "controlVersion")
             if (
@@ -668,6 +881,17 @@ def mutateStrictPlaybackContextControl(
                 raise PlaybackContextStaleVersionError(current, "queueRevision")
 
             queue_song_ids = json.loads(record.queue_json)
+            if action == "queue.playItem":
+                if current_index is None or current_index >= len(queue_song_ids):
+                    raise ValueError("queue.playItem queueIndex is out of bounds")
+            elif action == "player.next":
+                current_index = record.current_index + 1
+                if current_index >= len(queue_song_ids):
+                    raise ValueError("player.next queueIndex is out of bounds")
+            elif action == "player.prev":
+                if record.current_index <= 0:
+                    raise ValueError("player.prev queueIndex is out of bounds")
+                current_index = record.current_index - 1
             if current_index is not None:
                 record.current_index = current_index
                 record.track_id = queue_song_ids[current_index]
@@ -810,17 +1034,25 @@ def completeStrictPlaybackHandoff(
     target_client_id: str,
     target_device_session_id: str,
     position_ms: Optional[int] = None,
-) -> Optional[
-    Tuple[
-        Dict[str, object],
-        Dict[str, object],
-        Optional[Dict[str, object]],
-        bool,
-    ]
-]:
+) -> Optional[PlaybackHandoffCompleteResult]:
     open_connection(reuse=True)
     try:
-        with _strict_playback_context_transaction():
+        initial_context_record = EmoPlaybackContext.get_or_none(
+            EmoPlaybackContext.playback_context_id == playback_context_id
+        )
+        if initial_context_record is None:
+            return None
+        old_authority_pair = _record_authority_pair(
+            initial_context_record
+        )
+        new_authority_pair = _strict_authority_pair_key(
+            user_name,
+            target_client_id,
+            target_device_session_id,
+        )
+        with _strict_authority_pair_transaction(
+            (old_authority_pair, new_authority_pair)
+        ):
             context_record = EmoPlaybackContext.get_or_none(
                 EmoPlaybackContext.playback_context_id == playback_context_id
             )
@@ -873,13 +1105,14 @@ def completeStrictPlaybackHandoff(
                     "prepareId": snapshot.get("prepareId"),
                     "snapshot": snapshot,
                 }
-                return (
+                return PlaybackHandoffCompleteResult(
                     _playback_context_payload(context_record),
                     handoff_payload,
                     None
                     if target_record is None
                     else _device_playback_state_payload(target_record),
                     False,
+                    (),
                 )
             if handoff_record.status not in ("committed", "committing"):
                 raise ValueError("Playback handoff is not committing")
@@ -987,11 +1220,12 @@ def completeStrictPlaybackHandoff(
                 "prepareId": snapshot.get("prepareId"),
                 "snapshot": snapshot,
             }
-            return (
+            return PlaybackHandoffCompleteResult(
                 context_payload,
                 handoff_payload,
                 _device_playback_state_payload(target_record),
                 True,
+                (old_authority_pair, new_authority_pair),
             )
     finally:
         close_connection()
@@ -1110,6 +1344,49 @@ def listUserPlaybackContexts(user_name):
             .order_by(EmoPlaybackContext.updated_at.desc())
         )
         return [_playback_context_payload(record) for record in query]
+    finally:
+        close_connection()
+
+
+def listActivePlaybackContextBindings(
+    user_name: str,
+    authority_client_id: str,
+    authority_device_session_id: str,
+) -> List[Dict[str, object]]:
+    open_connection(reuse=True)
+    try:
+        query = (
+            EmoPlaybackContext.select(
+                EmoPlaybackContext.playback_context_id,
+                EmoPlaybackContext.authority_client_id,
+                EmoPlaybackContext.authority_device_session_id,
+            )
+            .where(
+                (EmoPlaybackContext.user_name == user_name)
+                & (EmoPlaybackContext.lifecycle == "active")
+                & (
+                    EmoPlaybackContext.authority_client_id
+                    == authority_client_id
+                )
+                & (
+                    EmoPlaybackContext.authority_device_session_id
+                    == authority_device_session_id
+                )
+            )
+            .order_by(EmoPlaybackContext.playback_context_id.asc())
+        )
+        return [
+            serializePlaybackContextBindingV2(
+                {
+                    "playbackContextId": record.playback_context_id,
+                    "authorityClientId": record.authority_client_id,
+                    "authorityDeviceSessionId": (
+                        record.authority_device_session_id
+                    ),
+                }
+            )
+            for record in query
+        ]
     finally:
         close_connection()
 

@@ -35,7 +35,7 @@ class EmoProtocolMetadataTestCase(unittest.TestCase):
             descriptor["protocolName"],
             "emosonic-playback-context-v2-registration",
         )
-        self.assertEqual(descriptor["protocolVersion"], "2.1.0")
+        self.assertEqual(descriptor["protocolVersion"], "2.2.0")
         self.assertEqual(
             descriptor["coveredActions"]["clientToServer"],
             ["device.register"],
@@ -215,7 +215,7 @@ class EmoProtocolMetadataTestCase(unittest.TestCase):
             metadata["protocolVersion"] = "changed"
             current_metadata = protocol_metadata.get_strict_v2_metadata()
 
-        self.assertEqual(current_metadata["protocolVersion"], "2.1.0")
+        self.assertEqual(current_metadata["protocolVersion"], "2.2.0")
         self.assertEqual(current_metadata["serverBuildCommit"], commit)
         self.assertRegex(current_metadata["schemaHash"], r"^[0-9a-f]{64}$")
 

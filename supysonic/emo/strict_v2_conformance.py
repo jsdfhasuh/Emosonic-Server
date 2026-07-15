@@ -8,7 +8,7 @@ from typing import Dict, Mapping, Tuple
 logger = logging.getLogger(__name__)
 
 STRICT_V2_CONTRACT_SHA256 = (
-    "ca069c6ad52447ea4f7ace7d795460c5ec759e5708b2f45acfbe50903aa4b3a3"
+    "7e5402a4c32fb366c3755239e4993ef5634177e7db9748bff83b32926cbd2b1f"
 )
 STRICT_V2_PROFILES = ("core", "follow", "handoff", "broadcast")  # type: Tuple[str, ...]
 

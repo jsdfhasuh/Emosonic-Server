@@ -286,6 +286,32 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(error["requestId"], "auth-type-1")
         self.assertEqual(error["payload"]["code"], "bad_request")
 
+    def test_pre_register_context_list_is_unauthorized_without_provenance(self):
+        client = self.connect()
+        self.authenticate(client)
+        request_message = {
+            "type": "state",
+            "action": "playback.context.list",
+            "requestId": "context-list-before-register",
+            "payload": {},
+        }
+
+        client.emit("message", request_message, namespace="/emo")
+        error = self.messages(client)[0]
+
+        self.assertEqual(error["payload"]["action"], "playback.context.list")
+        self.assertEqual(error["payload"]["code"], "unauthorized")
+        self.assertNotIn("connectionNonce", error)
+        self.assertNotIn("connectionEpoch", error)
+        self.assertEqual(
+            validate_strict_output(error, registered=False),
+            error,
+        )
+
+        client.emit("message", request_message, namespace="/emo")
+        replay = self.messages(client)
+        self.assertEqual(replay, [error])
+
     def test_core_disabled_returns_not_supported_without_registering(self):
         client = self.connect()
         self.authenticate(client)
@@ -322,41 +348,51 @@ class StrictV2CoreTestCase(unittest.TestCase):
             }
         )
 
-        try:
-            rejected = self.register(
-                client,
-                "register-local-evidence-rejected",
-                self.strict_registration_payload(),
-            )
-            error = next(
-                message
-                for message in rejected
-                if message.get("requestId")
-                == "register-local-evidence-rejected"
-            )
-            self.assertEqual(error["action"], "system.error")
-            self.assertEqual(error["payload"]["code"], "not_supported")
+        def local_evidence_readiness(allow_local_test_evidence=False):
+            return {
+                profile: bool(allow_local_test_evidence)
+                for profile in ("core", "follow", "handoff", "broadcast")
+            }
 
-            self.app.config["WEBAPP"]["emo_development_mode"] = True
-            accepted = self.register(
-                client,
-                "register-local-evidence-accepted",
-                self.strict_registration_payload(),
-            )
-            ack = next(
-                message
-                for message in accepted
-                if message.get("requestId")
-                == "register-local-evidence-accepted"
-            )
-            self.assertEqual(ack["action"], "system.ack")
-            self.assertTrue(
-                ack["payload"]["negotiatedCapabilities"][
-                    "playbackContextV2"
-                ]
-            )
-        finally:
-            self.app.testing = True
+        with mock.patch(
+            "supysonic.emo.strict_v2_readiness.get_code_conformance_readiness",
+            side_effect=local_evidence_readiness,
+        ):
+            try:
+                rejected = self.register(
+                    client,
+                    "register-local-evidence-rejected",
+                    self.strict_registration_payload(),
+                )
+                error = next(
+                    message
+                    for message in rejected
+                    if message.get("requestId")
+                    == "register-local-evidence-rejected"
+                )
+                self.assertEqual(error["action"], "system.error")
+                self.assertEqual(error["payload"]["code"], "not_supported")
+
+                self.app.config["WEBAPP"]["emo_development_mode"] = True
+                accepted = self.register(
+                    client,
+                    "register-local-evidence-accepted",
+                    self.strict_registration_payload(),
+                )
+                ack = next(
+                    message
+                    for message in accepted
+                    if message.get("requestId")
+                    == "register-local-evidence-accepted"
+                )
+                self.assertEqual(ack["action"], "system.ack")
+                self.assertTrue(
+                    ack["payload"]["negotiatedCapabilities"][
+                        "playbackContextV2"
+                    ]
+                )
+            finally:
+                self.app.testing = True
 
     def test_ready_core_registers_single_role_and_returns_full_negotiation(self):
         client = self.connect()
@@ -1142,6 +1178,643 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(
             len(get_state().list_playback_context_subscribers("context-1")),
             1,
+        )
+
+    def test_context_list_discovers_exact_persisted_pair_and_replays_by_request_id(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-1",
+            device_session_id="device:controller-1",
+        )
+        payload = {
+            "authorityClientId": "phone-1",
+            "authorityDeviceSessionId": "device:phone-1",
+        }
+
+        with mock.patch.object(
+            emo_ws,
+            "listActivePlaybackContextBindings",
+            wraps=emo_ws.listActivePlaybackContextBindings,
+        ) as list_bindings:
+            first = self.emit_strict(
+                controller,
+                "state",
+                "playback.context.list",
+                "context-list-1",
+                payload,
+            )
+            self.emit_strict(
+                player,
+                "command",
+                "playback.context.create",
+                "context-create-2",
+                {
+                    "playbackContextId": "context-2",
+                    "deviceSessionId": "device:phone-1",
+                    "queueSongIds": ["song-3"],
+                    "currentIndex": 0,
+                    "positionMs": 0,
+                    "state": "paused",
+                },
+            )
+            invalidations = self.messages(controller)
+            self.assertTrue(
+                any(
+                    message.get("action")
+                    == "playback.context.bindings.changed"
+                    for message in invalidations
+                )
+            )
+            replay = self.emit_strict(
+                controller,
+                "state",
+                "playback.context.list",
+                "context-list-1",
+                payload,
+            )
+            refreshed = self.emit_strict(
+                controller,
+                "state",
+                "playback.context.list",
+                "context-list-2",
+                payload,
+            )
+
+        self.assertEqual(
+            first[0]["payload"]["contexts"],
+            [
+                {
+                    "playbackContextId": "context-1",
+                    "authorityClientId": "phone-1",
+                    "authorityDeviceSessionId": "device:phone-1",
+                }
+            ],
+        )
+        self.assertEqual(replay, first)
+        self.assertEqual(
+            [
+                binding["playbackContextId"]
+                for binding in refreshed[0]["payload"]["contexts"]
+            ],
+            ["context-1", "context-2"],
+        )
+        self.assertEqual(list_bindings.call_count, 2)
+        self.assertEqual(
+            get_state().list_playback_context_subscribers("context-1"),
+            [get_state().get_sid_for_client("phone-1", user_name="alice")],
+        )
+
+    def test_context_list_is_controller_only_and_hides_other_scopes(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+
+        forbidden = self.emit_strict(
+            player,
+            "state",
+            "playback.context.list",
+            "context-list-player-only",
+            {
+                "authorityClientId": "phone-1",
+                "authorityDeviceSessionId": "device:phone-1",
+            },
+        )[0]
+        self.assertEqual(forbidden["payload"]["code"], "forbidden")
+
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-1",
+            device_session_id="device:controller-1",
+        )
+        wrong_device = self.emit_strict(
+            controller,
+            "state",
+            "playback.context.list",
+            "context-list-wrong-device",
+            {
+                "authorityClientId": "phone-1",
+                "authorityDeviceSessionId": "device:phone-replaced",
+            },
+        )
+        self.assertEqual(wrong_device[0]["payload"], {"contexts": []})
+
+        other = self.connect()
+        self.authenticate(other, "bob", "B0b", "auth-bob-list")
+        with self.enable_all_profiles():
+            self.register(
+                other,
+                "register-bob-list",
+                self.strict_registration_payload(
+                    roles=["controller"],
+                    client_id="bob-controller",
+                    device_session_id="device:bob-controller",
+                ),
+            )
+        self.messages(other)
+        cross_user = self.emit_strict(
+            other,
+            "state",
+            "playback.context.list",
+            "context-list-cross-user",
+            {
+                "authorityClientId": "phone-1",
+                "authorityDeviceSessionId": "device:phone-1",
+            },
+        )
+        self.assertEqual(cross_user[0]["payload"], {"contexts": []})
+
+    def test_context_list_returns_persisted_binding_when_authority_is_offline(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        player.disconnect(namespace="/emo")
+
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-offline-discovery",
+            device_session_id="device:controller-offline-discovery",
+        )
+        response = self.emit_strict(
+            controller,
+            "state",
+            "playback.context.list",
+            "context-list-offline-authority",
+            {
+                "authorityClientId": "phone-1",
+                "authorityDeviceSessionId": "device:phone-1",
+            },
+        )
+
+        self.assertEqual(
+            response[0]["payload"]["contexts"],
+            [
+                {
+                    "playbackContextId": "context-1",
+                    "authorityClientId": "phone-1",
+                    "authorityDeviceSessionId": "device:phone-1",
+                }
+            ],
+        )
+        self.assertEqual(
+            getPlaybackContextState("context-1")["lifecycle"],
+            "active",
+        )
+
+    def test_context_list_requires_negotiated_playback_context_capability(self):
+        client = self.connect()
+        self.authenticate(client)
+        self.register(
+            client,
+            "register-legacy-controller",
+            {
+                "clientId": "legacy-controller",
+                "sessionId": "legacy:controller",
+                "deviceName": "Legacy Controller",
+                "roles": ["controller"],
+                "capabilities": {},
+            },
+        )
+
+        response = self.emit_strict(
+            client,
+            "state",
+            "playback.context.list",
+            "context-list-legacy",
+            {
+                "authorityClientId": "phone-1",
+                "authorityDeviceSessionId": "device:phone-1",
+            },
+        )
+
+        self.assertEqual(response[0]["payload"]["code"], "capability_required")
+        self.assertNotIn("connectionNonce", response[0])
+
+    def test_binding_events_fan_out_to_same_user_strict_controllers_only(self):
+        player = self.ready_strict_client()
+        first_controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-1",
+            device_session_id="device:controller-1",
+        )
+        second_controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-2",
+            device_session_id="device:controller-2",
+        )
+        legacy = self.connect()
+        self.authenticate(legacy, request_id="auth-legacy-bindings")
+        self.register(
+            legacy,
+            "register-legacy-bindings",
+            {
+                "clientId": "legacy-controller",
+                "sessionId": "legacy:controller",
+                "deviceName": "Legacy Controller",
+                "roles": ["controller"],
+                "capabilities": {},
+            },
+        )
+        other_user = self.connect()
+        self.authenticate(
+            other_user,
+            "bob",
+            "B0b",
+            "auth-bob-bindings",
+        )
+        with self.enable_all_profiles():
+            self.register(
+                other_user,
+                "register-bob-bindings",
+                self.strict_registration_payload(
+                    roles=["controller"],
+                    client_id="bob-controller",
+                    device_session_id="device:bob-controller",
+                ),
+            )
+        for client in self.clients:
+            self.messages(client)
+
+        self.create_context(player)
+        first_events = [
+            message
+            for message in self.messages(first_controller)
+            if message.get("action")
+            == "playback.context.bindings.changed"
+        ]
+        second_events = [
+            message
+            for message in self.messages(second_controller)
+            if message.get("action")
+            == "playback.context.bindings.changed"
+        ]
+
+        self.assertEqual(len(first_events), 1)
+        self.assertEqual(len(second_events), 1)
+        for event in first_events + second_events:
+            self.assertEqual(
+                event["payload"],
+                {
+                    "authorityClientId": "phone-1",
+                    "authorityDeviceSessionId": "device:phone-1",
+                },
+            )
+            self.assertNotIn("requestId", event)
+            self.assertNotIn("playbackContextId", event["payload"])
+        self.assertNotEqual(
+            first_events[0]["connectionNonce"],
+            second_events[0]["connectionNonce"],
+        )
+        self.assertFalse(
+            any(
+                message.get("action")
+                == "playback.context.bindings.changed"
+                for message in self.messages(player)
+            )
+        )
+        self.assertFalse(
+            any(
+                message.get("action")
+                == "playback.context.bindings.changed"
+                for message in self.messages(legacy)
+            )
+        )
+        self.assertFalse(
+            any(
+                message.get("action")
+                == "playback.context.bindings.changed"
+                for message in self.messages(other_user)
+            )
+        )
+        self.assertEqual(
+            get_state().list_playback_context_subscribers("context-1"),
+            [get_state().get_sid_for_client("phone-1", user_name="alice")],
+        )
+
+        self.create_context(
+            player,
+            request_id="context-create-idempotent-replay",
+        )
+        self.assertFalse(
+            any(
+                message.get("action")
+                == "playback.context.bindings.changed"
+                for message in self.messages(first_controller)
+                + self.messages(second_controller)
+            )
+        )
+
+        close_messages = self.emit_strict(
+            first_controller,
+            "command",
+            "playback.context.close",
+            "context-close-bindings",
+            {"playbackContextId": "context-1"},
+        )
+        self.assertEqual(
+            len(
+                [
+                    message
+                    for message in close_messages
+                    if message.get("action")
+                    == "playback.context.bindings.changed"
+                ]
+            ),
+            1,
+        )
+        self.assertTrue(
+            any(
+                message.get("action")
+                == "playback.context.bindings.changed"
+                for message in self.messages(second_controller)
+            )
+        )
+
+        repeat_close = self.emit_strict(
+            first_controller,
+            "command",
+            "playback.context.close",
+            "context-close-bindings-repeat",
+            {"playbackContextId": "context-1"},
+        )
+        self.assertFalse(
+            any(
+                message.get("action")
+                == "playback.context.bindings.changed"
+                for message in repeat_close
+            )
+        )
+
+    def test_binding_event_backpressure_disconnects_only_stale_controller(self):
+        player = self.ready_strict_client()
+        stale_controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-stale",
+            device_session_id="device:controller-stale",
+        )
+        healthy_controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-healthy",
+            device_session_id="device:controller-healthy",
+        )
+        for client in self.clients:
+            self.messages(client)
+        stale_sid = get_state().get_sid_for_client(
+            "controller-stale",
+            user_name="alice",
+        )
+        real_reserve = strict_v2_safety.reserve_emit
+
+        def reserve_except_stale(target_sid):
+            if target_sid == stale_sid:
+                return False
+            return real_reserve(target_sid)
+
+        with mock.patch.object(
+            strict_v2_safety,
+            "reserve_emit",
+            side_effect=reserve_except_stale,
+        ):
+            self.create_context(player)
+
+        self.assertEqual(
+            getPlaybackContextState("context-1")["lifecycle"],
+            "active",
+        )
+        self.assertFalse(stale_controller.is_connected(namespace="/emo"))
+        self.assertTrue(healthy_controller.is_connected(namespace="/emo"))
+        self.assertTrue(
+            any(
+                message.get("action")
+                == "playback.context.bindings.changed"
+                for message in self.messages(healthy_controller)
+            )
+        )
+
+    def test_binding_event_emit_failure_disconnects_only_stale_controller(self):
+        player = self.ready_strict_client()
+        stale_controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-emit-failure",
+            device_session_id="device:controller-emit-failure",
+        )
+        healthy_controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-emit-healthy",
+            device_session_id="device:controller-emit-healthy",
+        )
+        for client in self.clients:
+            self.messages(client)
+        stale_sid = get_state().get_sid_for_client(
+            "controller-emit-failure",
+            user_name="alice",
+        )
+        real_emit = socketio.emit
+
+        def emit_except_stale(event, message, *args, **kwargs):
+            if (
+                kwargs.get("to") == stale_sid
+                and message.get("action")
+                == "playback.context.bindings.changed"
+            ):
+                raise RuntimeError("injected binding invalidation emit failure")
+            return real_emit(event, message, *args, **kwargs)
+
+        with mock.patch.object(
+            socketio,
+            "emit",
+            side_effect=emit_except_stale,
+        ):
+            self.create_context(player)
+
+        self.assertEqual(
+            getPlaybackContextState("context-1")["lifecycle"],
+            "active",
+        )
+        self.assertFalse(stale_controller.is_connected(namespace="/emo"))
+        self.assertTrue(healthy_controller.is_connected(namespace="/emo"))
+        self.assertTrue(
+            any(
+                message.get("action")
+                == "playback.context.bindings.changed"
+                for message in self.messages(healthy_controller)
+            )
+        )
+
+        reconnected_controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-emit-failure",
+            device_session_id="device:controller-emit-failure",
+        )
+        self.messages(reconnected_controller)
+        recovered = self.emit_strict(
+            reconnected_controller,
+            "state",
+            "playback.context.list",
+            "context-list-after-invalidation-reconnect",
+            {
+                "authorityClientId": "phone-1",
+                "authorityDeviceSessionId": "device:phone-1",
+            },
+        )
+        response = next(
+            message
+            for message in recovered
+            if message.get("action") == "playback.context.list"
+        )
+        self.assertEqual(
+            response["payload"]["contexts"],
+            [
+                {
+                    "playbackContextId": "context-1",
+                    "authorityClientId": "phone-1",
+                    "authorityDeviceSessionId": "device:phone-1",
+                }
+            ],
+        )
+
+    def test_multi_context_controls_conflict_without_authority_side_effects(self):
+        player = self.ready_strict_client()
+        self.create_context(
+            player,
+            queue_song_ids=["song-1", "song-2"],
+        )
+        self.emit_strict(
+            player,
+            "command",
+            "playback.context.create",
+            "context-create-ambiguous-2",
+            {
+                "playbackContextId": "context-2",
+                "deviceSessionId": "device:phone-1",
+                "queueSongIds": ["song-1", "song-2"],
+                "currentIndex": 0,
+                "positionMs": 1200,
+                "state": "playing",
+            },
+        )
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-1",
+            device_session_id="device:controller-1",
+        )
+        self.messages(player)
+        self.messages(controller)
+        controls = {
+            "player.play": {"baseControlVersion": 1},
+            "player.pause": {"baseControlVersion": 1},
+            "player.seek": {
+                "baseControlVersion": 1,
+                "positionMs": 500,
+            },
+            "player.next": {"baseControlVersion": 1},
+            "player.prev": {"baseControlVersion": 1},
+            "queue.playItem": {
+                "queueIndex": 1,
+                "baseQueueRevision": 1,
+                "baseControlVersion": 1,
+            },
+        }
+
+        for action, action_payload in controls.items():
+            with self.subTest(action=action):
+                response = self.emit_strict(
+                    controller,
+                    "command",
+                    action,
+                    "ambiguous-%s" % action,
+                    dict(
+                        action_payload,
+                        playbackContextId="context-1",
+                    ),
+                )
+                error = response[0]
+                self.assertEqual(error["payload"]["code"], "conflict")
+                self.assertEqual(
+                    {
+                        field_name: error["payload"][field_name]
+                        for field_name in (
+                            "playbackContextId",
+                            "currentControlVersion",
+                            "currentQueueRevision",
+                            "currentVersion",
+                        )
+                    },
+                    {
+                        "playbackContextId": "context-1",
+                        "currentControlVersion": 1,
+                        "currentQueueRevision": 1,
+                        "currentVersion": 1,
+                    },
+                )
+                self.assertFalse(
+                    any(
+                        message.get("action") == action
+                        for message in self.messages(player)
+                    )
+                )
+                canonical = getPlaybackContextState("context-1")
+                self.assertEqual(canonical["state"], "playing")
+                self.assertEqual(canonical["controlVersion"], 1)
+                self.assertEqual(canonical["queueRevision"], 1)
+                self.assertEqual(canonical["version"], 1)
+
+        self.emit_strict(
+            controller,
+            "command",
+            "playback.context.close",
+            "close-ambiguous-context-2",
+            {"playbackContextId": "context-2"},
+        )
+        self.messages(player)
+        bindings = self.emit_strict(
+            controller,
+            "state",
+            "playback.context.list",
+            "list-after-ambiguity-resolved",
+            {
+                "authorityClientId": "phone-1",
+                "authorityDeviceSessionId": "device:phone-1",
+            },
+        )
+        self.assertEqual(
+            bindings[0]["payload"]["contexts"],
+            [
+                {
+                    "playbackContextId": "context-1",
+                    "authorityClientId": "phone-1",
+                    "authorityDeviceSessionId": "device:phone-1",
+                }
+            ],
+        )
+        status = self.emit_strict(
+            controller,
+            "state",
+            "playback.context.status",
+            "status-after-ambiguity-resolved",
+            {"playbackContextId": "context-1"},
+        )
+        self.assertEqual(
+            status[0]["payload"]["playbackContext"]["playbackContextId"],
+            "context-1",
+        )
+        recovered = self.emit_strict(
+            controller,
+            "command",
+            "player.pause",
+            "pause-after-ambiguity-resolved",
+            {
+                "playbackContextId": "context-1",
+                "baseControlVersion": 1,
+            },
+        )
+        self.assertTrue(
+            any(message.get("action") == "system.ack" for message in recovered)
+        )
+        self.assertTrue(
+            any(
+                message.get("action") == "player.pause"
+                for message in self.messages(player)
+            )
         )
 
     def test_context_create_response_emit_failure_replays_persisted_response(self):

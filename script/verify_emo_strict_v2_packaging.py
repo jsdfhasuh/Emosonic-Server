@@ -14,8 +14,9 @@ from typing import Dict, Mapping, Sequence
 
 
 FROZEN_CONTRACT_SHA256 = (
-    "ca069c6ad52447ea4f7ace7d795460c5ec759e5708b2f45acfbe50903aa4b3a3"
+    "7e5402a4c32fb366c3755239e4993ef5634177e7db9748bff83b32926cbd2b1f"
 )
+FROZEN_PROTOCOL_VERSION = "2.2.0"
 PACKAGE_FILES = (
     "supysonic/emo/strict_v2_conformance.json",
     "supysonic/emo/strict_v2_registration_descriptor.json",
@@ -157,6 +158,22 @@ def _assert_readiness_disabled(probe: Mapping[str, object], case: str) -> None:
         )
 
 
+def _assert_protocol_identity(probe: Mapping[str, object], case: str) -> None:
+    if probe.get("runtimeContractSha256") != FROZEN_CONTRACT_SHA256:
+        raise VerificationError(
+            "%s runtime contract SHA-256 does not match the frozen contract" % case
+        )
+    if probe.get("manifestContractSha256") != FROZEN_CONTRACT_SHA256:
+        raise VerificationError(
+            "%s installed manifest does not match the frozen contract" % case
+        )
+    if probe.get("protocolVersion") != FROZEN_PROTOCOL_VERSION:
+        raise VerificationError(
+            "%s protocol version does not match %s"
+            % (case, FROZEN_PROTOCOL_VERSION)
+        )
+
+
 def _verify_installed_artifact(
     artifact: Path,
     work_dir: Path,
@@ -191,15 +208,7 @@ def _verify_installed_artifact(
         raise VerificationError(
             "%s did not install the registration descriptor" % artifact_label
         )
-    if probe.get("runtimeContractSha256") != FROZEN_CONTRACT_SHA256:
-        raise VerificationError(
-            "%s runtime contract SHA-256 does not match the frozen contract"
-            % artifact_label
-        )
-    if probe.get("manifestContractSha256") != FROZEN_CONTRACT_SHA256:
-        raise VerificationError(
-            "%s installed manifest does not match the frozen contract" % artifact_label
-        )
+    _assert_protocol_identity(probe, artifact_label)
     if probe.get("schemaHash") != expected_schema_hash:
         raise VerificationError(
             "%s installed descriptor schema hash differs from the source descriptor"

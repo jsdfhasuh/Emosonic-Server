@@ -4,6 +4,7 @@ import argparse
 import logging
 import math
 import os
+import re
 import struct
 import sys
 import wave
@@ -13,10 +14,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 os.environ.setdefault("EMO_SOCKETIO_ASYNC_MODE", "threading")
-os.environ.setdefault(
-    "EMO_SERVER_BUILD_COMMIT",
-    "7f0015b2c5fb4657e4e2f120aa674e55e8164d01",
-)
+server_build_commit = os.environ.get("EMO_SERVER_BUILD_COMMIT", "")
+if re.fullmatch(r"[0-9a-f]{40}", server_build_commit) is None:
+    raise RuntimeError(
+        "EMO_SERVER_BUILD_COMMIT must identify the exact 40-character acceptance build"
+    )
 
 from supysonic.db import Album, Artist, Folder, Track, User, close_connection
 from supysonic.managers.user import UserManager

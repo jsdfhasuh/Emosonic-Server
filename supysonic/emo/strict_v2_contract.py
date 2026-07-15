@@ -47,6 +47,10 @@ ACTION_SCHEMAS = {
     ),
     "device.list": ActionSchema("state", ()),
     "system.ping": ActionSchema("system", ()),
+    "playback.context.list": ActionSchema(
+        "state",
+        ("authorityClientId", "authorityDeviceSessionId"),
+    ),
     "playback.context.create": ActionSchema(
         "command",
         (
@@ -137,6 +141,8 @@ ACTION_SCHEMAS = {
 _ID_FIELDS = {
     "clientId",
     "deviceSessionId",
+    "authorityClientId",
+    "authorityDeviceSessionId",
     "playbackContextId",
     "sourcePlaybackContextId",
     "handoffId",
@@ -349,9 +355,11 @@ STRICT_OUTPUT_ACTIONS = {
     "system.error",
     "system.pong",
     "device.list",
+    "playback.context.list",
     "playback.context.create",
     "playback.context.status",
     "playback.context.closed",
+    "playback.context.bindings.changed",
     "queue.context.sync",
     "playback.update",
     "queue.playItem",
@@ -378,9 +386,11 @@ _OUTPUT_ACTION_TYPES = {
     "system.error": "system",
     "system.pong": "system",
     "device.list": "state",
+    "playback.context.list": "state",
     "playback.context.create": "state",
     "playback.context.status": "state",
     "playback.context.closed": "event",
+    "playback.context.bindings.changed": "event",
     "queue.context.sync": "state",
     "playback.update": "event",
     "queue.playItem": "command",
@@ -404,6 +414,7 @@ _OUTPUT_ACTION_TYPES = {
 
 _DIRECT_RESPONSE_ACTIONS = {
     "system.pong",
+    "playback.context.list",
     "playback.context.create",
 }
 
@@ -556,6 +567,27 @@ def _validate_output_device(value: object, label: str) -> None:
     _validate_output_capabilities(device["capabilities"], label + ".capabilities")
     if "alias" in device:
         _output_string(device["alias"], label + ".alias")
+
+
+def _validate_context_binding(value: object, label: str) -> Tuple[str, str, str]:
+    binding = _output_object(
+        value,
+        {
+            "playbackContextId",
+            "authorityClientId",
+            "authorityDeviceSessionId",
+        },
+        set(),
+        label,
+    )
+    return tuple(
+        _output_string(binding[field_name], "%s.%s" % (label, field_name))
+        for field_name in (
+            "playbackContextId",
+            "authorityClientId",
+            "authorityDeviceSessionId",
+        )
+    )
 
 
 def _validate_context_snapshot(
@@ -918,6 +950,33 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
         if client_ids != sorted(client_ids) or len(set(client_ids)) != len(client_ids):
             _output_error("device.list devices must be uniquely sorted by clientId")
         return None
+    if action == "playback.context.list":
+        response = _output_object(
+            payload,
+            {"contexts"},
+            set(),
+            "playback.context.list payload",
+        )
+        if not isinstance(response["contexts"], list):
+            _output_error("playback.context.list contexts must be an array")
+        bindings = [
+            _validate_context_binding(
+                binding,
+                "playback.context.list contexts[%d]" % index,
+            )
+            for index, binding in enumerate(response["contexts"])
+        ]
+        context_ids = [binding[0] for binding in bindings]
+        if context_ids != sorted(context_ids) or len(set(context_ids)) != len(context_ids):
+            _output_error(
+                "playback.context.list contexts must be uniquely sorted by playbackContextId"
+            )
+        authority_pairs = {(binding[1], binding[2]) for binding in bindings}
+        if len(authority_pairs) > 1:
+            _output_error(
+                "playback.context.list contexts must use one authority/device pair"
+            )
+        return None
     if action == "playback.context.create":
         _validate_context_snapshot(payload, "playback.context.create payload")
         return None
@@ -953,6 +1012,22 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
             "playback.context.closed payload",
         )
         _output_string(closed["playbackContextId"], "closed playbackContextId")
+        return None
+    if action == "playback.context.bindings.changed":
+        changed = _output_object(
+            payload,
+            {"authorityClientId", "authorityDeviceSessionId"},
+            set(),
+            "playback.context.bindings.changed payload",
+        )
+        _output_string(
+            changed["authorityClientId"],
+            "bindings changed authorityClientId",
+        )
+        _output_string(
+            changed["authorityDeviceSessionId"],
+            "bindings changed authorityDeviceSessionId",
+        )
         return None
     if action == "queue.context.sync":
         queue = _output_object(
@@ -1202,7 +1277,10 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
     return None
 
 
-def validate_strict_output(message: object) -> Dict[str, object]:
+def validate_strict_output(
+    message: object,
+    registered: Optional[bool] = None,
+) -> Dict[str, object]:
     envelope = _output_object(
         message,
         {"type", "action", "payload", "timestamp"},
@@ -1227,16 +1305,21 @@ def validate_strict_output(message: object) -> Dict[str, object]:
     elif "requestId" in envelope:
         _output_error("strict business push must omit requestId")
 
-    bootstrap = action in {"system.ack", "system.error"} and request_action in {
-        "auth.login",
-        "device.register",
-    }
     has_nonce = "connectionNonce" in envelope
     has_epoch = "connectionEpoch" in envelope
     if has_nonce != has_epoch:
         _output_error("connectionNonce and connectionEpoch must appear together")
-    if not bootstrap and not has_nonce:
+    if registered is True and not has_nonce:
         _output_error("registered strict output requires connection provenance")
+    if registered is False and has_nonce:
+        _output_error("pre-register strict output must omit connection provenance")
+    if registered is None:
+        bootstrap = action in {"system.ack", "system.error"} and request_action in {
+            "auth.login",
+            "device.register",
+        }
+        if not bootstrap and not has_nonce:
+            _output_error("registered strict output requires connection provenance")
     if has_nonce:
         _output_string(envelope["connectionNonce"], "strict output connectionNonce")
         if envelope["connectionEpoch"] != 1 or isinstance(envelope["connectionEpoch"], bool):
