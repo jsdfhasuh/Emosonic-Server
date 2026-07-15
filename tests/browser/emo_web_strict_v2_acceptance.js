@@ -347,6 +347,23 @@ async function run() {
     );
     completedSteps.push('chromium-firefox-mobile-bootstrap');
 
+    logStep('select an online player without a Context and verify diagnostics');
+    await control.waitForFunction((clientId) => (
+      document.querySelector('#strict-device-list')?.textContent.includes(clientId)
+    ), playerOneIdentity.clientId, { timeout: 20000 });
+    const contextlessDevice = control.locator('#strict-device-list .strict-device')
+      .filter({ hasText: playerOneIdentity.clientId });
+    await contextlessDevice.evaluate((button) => button.click());
+    await control.waitForFunction((clientId) => {
+      const snapshot = window.__emoStrictV2Acceptance.snapshot();
+      return snapshot.selectedClientId === clientId && snapshot.selectedContextId === null;
+    }, playerOneIdentity.clientId, { timeout: 10000 });
+    assert.match(await control.textContent('#strict-context-empty-message'), /PlaybackContext/);
+    assert.equal(await control.locator('#strict-context-empty').isVisible(), true);
+    assert.equal(await control.locator('#strict-context-active').isVisible(), false);
+    assert.equal(await control.locator('[data-control="player.play"]').isDisabled(), true);
+    completedSteps.push('contextless-player-diagnostics');
+
     logStep('create source Context and verify duplicate-queue UI');
     await addTracks(playerOne, 2);
     const sourceContextId = (await acceptanceSnapshot(playerOne)).contextId;

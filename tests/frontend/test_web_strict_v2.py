@@ -152,6 +152,32 @@ class WebStrictV2FrontendTestCase(FrontendTestBase):
             self.assertIn(evidence, response.data)
         self.assertIn('"broadcast": false', response.data)
 
+    def test_strict_control_renders_professional_workspace_and_contextless_diagnostics(self):
+        self.set_protocol("strict_v2")
+        response = self.client.get("/control")
+
+        self.assertEqual(response.status_code, 200)
+        for evidence in (
+            'class="strict-control-workspace"',
+            'class="strict-control-metrics mb-3"',
+            'id="strict-player-count"',
+            'id="strict-context-empty"',
+            'id="strict-context-active"',
+            'id="strict-now-cover"',
+            'id="strict-broadcast-participants"',
+            'id="strict-broadcast-tab"',
+            'id="strict-handoff-tab"',
+            'id="strict-follow-tab"',
+            'class="card strict-control-diagnostics mt-3"',
+            "设备在线，但客户端尚未创建 PlaybackContext",
+            "if (!nextContextId)",
+            "state.selectedClientId = nextClientId",
+            "updatePlaybackProgress()",
+        ):
+            self.assertIn(evidence, response.data)
+        self.assertNotIn("<style>", response.data)
+        self.assertIn('aria-current="page"', response.data)
+
     def test_optional_web_profiles_require_explicit_configuration(self):
         self.set_protocol("strict_v2")
         self.set_optional_profiles(True)
