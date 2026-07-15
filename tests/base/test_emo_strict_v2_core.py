@@ -8,6 +8,10 @@ from unittest import mock
 
 from supysonic.db import release_database
 from supysonic.emo import ws as emo_ws
+from supysonic.emo.strict_v2_acceptance import (
+    FAULT_DIRECTORY_ENV,
+    arm_binding_emit_failure,
+)
 from supysonic.emo.strict_v2_contract import (
     StrictOutputValidationError,
     validate_strict_output,
@@ -348,51 +352,39 @@ class StrictV2CoreTestCase(unittest.TestCase):
             }
         )
 
-        def local_evidence_readiness(allow_local_test_evidence=False):
-            return {
-                profile: bool(allow_local_test_evidence)
-                for profile in ("core", "follow", "handoff", "broadcast")
-            }
+        try:
+            rejected = self.register(
+                client,
+                "register-local-evidence-rejected",
+                self.strict_registration_payload(),
+            )
+            error = next(
+                message
+                for message in rejected
+                if message.get("requestId")
+                == "register-local-evidence-rejected"
+            )
+            self.assertEqual(error["action"], "system.error")
+            self.assertEqual(error["payload"]["code"], "not_supported")
 
-        with mock.patch(
-            "supysonic.emo.strict_v2_readiness.get_code_conformance_readiness",
-            side_effect=local_evidence_readiness,
-        ):
-            try:
-                rejected = self.register(
-                    client,
-                    "register-local-evidence-rejected",
-                    self.strict_registration_payload(),
-                )
-                error = next(
-                    message
-                    for message in rejected
-                    if message.get("requestId")
-                    == "register-local-evidence-rejected"
-                )
-                self.assertEqual(error["action"], "system.error")
-                self.assertEqual(error["payload"]["code"], "not_supported")
-
-                self.app.config["WEBAPP"]["emo_development_mode"] = True
-                accepted = self.register(
-                    client,
-                    "register-local-evidence-accepted",
-                    self.strict_registration_payload(),
-                )
-                ack = next(
-                    message
-                    for message in accepted
-                    if message.get("requestId")
-                    == "register-local-evidence-accepted"
-                )
-                self.assertEqual(ack["action"], "system.ack")
-                self.assertTrue(
-                    ack["payload"]["negotiatedCapabilities"][
-                        "playbackContextV2"
-                    ]
-                )
-            finally:
-                self.app.testing = True
+            self.app.config["WEBAPP"]["emo_development_mode"] = True
+            accepted = self.register(
+                client,
+                "register-local-evidence-accepted",
+                self.strict_registration_payload(),
+            )
+            ack = next(
+                message
+                for message in accepted
+                if message.get("requestId")
+                == "register-local-evidence-accepted"
+            )
+            self.assertEqual(ack["action"], "system.ack")
+            self.assertTrue(
+                all(ack["payload"]["negotiatedCapabilities"].values())
+            )
+        finally:
+            self.app.testing = True
 
     def test_ready_core_registers_single_role_and_returns_full_negotiation(self):
         client = self.connect()
@@ -1670,6 +1662,90 @@ class StrictV2CoreTestCase(unittest.TestCase):
                     "authorityDeviceSessionId": "device:phone-1",
                 }
             ],
+        )
+
+    def test_acceptance_fault_marker_disconnects_only_target_controller(self):
+        player = self.ready_strict_client()
+        target_controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-acceptance-fault",
+            device_session_id="device:controller-acceptance-fault",
+        )
+        healthy_controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-acceptance-healthy",
+            device_session_id="device:controller-acceptance-healthy",
+        )
+        for client in self.clients:
+            self.messages(client)
+
+        with tempfile.TemporaryDirectory() as fault_directory, mock.patch.dict(
+            os.environ,
+            {FAULT_DIRECTORY_ENV: fault_directory},
+        ):
+            marker = arm_binding_emit_failure(
+                "alice",
+                "controller-acceptance-fault",
+                "device:controller-acceptance-fault",
+            )
+            self.create_context(player)
+
+            self.assertFalse(marker.exists())
+
+        self.assertEqual(
+            getPlaybackContextState("context-1")["lifecycle"],
+            "active",
+        )
+        self.assertFalse(target_controller.is_connected(namespace="/emo"))
+        self.assertTrue(healthy_controller.is_connected(namespace="/emo"))
+        self.assertTrue(
+            any(
+                message.get("action")
+                == "playback.context.bindings.changed"
+                for message in self.messages(healthy_controller)
+            )
+        )
+
+    def test_acceptance_fault_marker_is_ignored_outside_local_test_mode(self):
+        player = self.ready_strict_client()
+        target_controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-production-safe",
+            device_session_id="device:controller-production-safe",
+        )
+        for client in self.clients:
+            self.messages(client)
+
+        self.app.testing = False
+        self.app.config["WEBAPP"].update(
+            {
+                "emo_development_mode": False,
+                "emo_strict_v2_allow_local_test_evidence": True,
+            }
+        )
+        try:
+            with tempfile.TemporaryDirectory() as fault_directory, mock.patch.dict(
+                os.environ,
+                {FAULT_DIRECTORY_ENV: fault_directory},
+            ):
+                marker = arm_binding_emit_failure(
+                    "alice",
+                    "controller-production-safe",
+                    "device:controller-production-safe",
+                )
+                self.create_context(player)
+
+                self.assertTrue(marker.exists())
+        finally:
+            self.app.testing = True
+
+        self.assertTrue(target_controller.is_connected(namespace="/emo"))
+        self.assertTrue(
+            any(
+                message.get("action")
+                == "playback.context.bindings.changed"
+                for message in self.messages(target_controller)
+            )
         )
 
     def test_multi_context_controls_conflict_without_authority_side_effects(self):

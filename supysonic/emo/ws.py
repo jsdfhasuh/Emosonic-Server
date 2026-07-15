@@ -4,7 +4,14 @@ import time
 import uuid
 from typing import Dict, Optional
 
-from flask import current_app, g, has_request_context, request, session
+from flask import (
+    current_app,
+    g,
+    has_app_context,
+    has_request_context,
+    request,
+    session,
+)
 from flask_socketio import Namespace, SocketIO, disconnect
 
 from ..db import User, close_connection, open_connection
@@ -15,6 +22,7 @@ from .protocol_metadata import (
     get_strict_v2_metadata,
     get_strict_v2_registration_metadata,
 )
+from .strict_v2_acceptance import consume_binding_emit_failure
 from .strict_v2_contract import (
     ACTION_SCHEMAS,
     StrictRequestValidationError,
@@ -952,6 +960,38 @@ def _disconnect_strict_recipient(target_sid):
         )
 
 
+def _consume_acceptance_binding_emit_failure(user_name, target_sid):
+    if not has_app_context() or not is_local_test_evidence_allowed(
+        current_app.config["WEBAPP"],
+        current_app.testing,
+    ):
+        return False
+    target_client = state.get_client_for_sid(target_sid)
+    if not isinstance(target_client, dict):
+        return False
+    client_id = target_client.get("clientId")
+    device_session_id = target_client.get("deviceSessionId")
+    if not isinstance(client_id, str) or not isinstance(device_session_id, str):
+        return False
+    if not consume_binding_emit_failure(
+        user_name,
+        client_id,
+        device_session_id,
+    ):
+        return False
+    _log_emo_event(
+        logging.WARNING,
+        "strict_v2_acceptance_fault",
+        result="injected",
+        fault="binding_emit_failure",
+        user=user_name,
+        client_id=client_id,
+        device_session_id=device_session_id,
+        sid=target_sid,
+    )
+    return True
+
+
 def _broadcast_playback_context_bindings_changed(
     user_name,
     affected_authority_pairs,
@@ -976,6 +1016,13 @@ def _broadcast_playback_context_bindings_changed(
                 _disconnect_strict_recipient(target_sid)
                 continue
             try:
+                if _consume_acceptance_binding_emit_failure(
+                    user_name,
+                    target_sid,
+                ):
+                    raise RuntimeError(
+                        "injected strict-v2 acceptance binding emit failure"
+                    )
                 _emit_message(
                     _build_message(
                         "event",

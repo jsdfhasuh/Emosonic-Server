@@ -24,6 +24,11 @@ Normal deployments reject conformance evidence prefixed with
 enabled. This prevents test results from silently becoming production
 readiness.
 
+The packaged manifest may contain these local-test candidates so a personal
+development deployment can be started using configuration alone. They remain
+fail-closed in an ordinary or production deployment and do not make a profile
+ready unless the explicit development settings below are both enabled.
+
 An isolated development deployment may explicitly enable external Strict V2
 client integration with both settings:
 
@@ -36,8 +41,9 @@ client integration with both settings:
 The local-evidence switch is ignored unless development mode is also enabled,
 and enabling it emits a startup warning. It affects code-readiness evaluation
 only; the required ``emo_strict_v2_*_enabled`` profile switches must still be
-enabled independently. Disable the local-evidence switch after collecting the
-fixed-build evidence, and never use it for a production rollout.
+enabled independently. No external evidence manifest is needed for this local
+integration mode. Disable the local-evidence switch after testing, and never
+use it for a production rollout.
 
 Runtime limits
 --------------

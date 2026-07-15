@@ -82,11 +82,17 @@
     "capabilities": {
       "playbackContextV2": true,           // ★ 声明走 v2 严格协议（关键）
       "playbackPrepare": true,             // handoff/两阶段目标必备
-      "effectiveAtPlayback": true          // handoff/两阶段目标必备
+      "effectiveAtPlayback": true,         // handoff/两阶段目标必备
+      "canPlay": true,
+      "canPause": true,
+      "canSeek": true,
+      "canSetVolume": true,
+      "supportsFollow": true,
+      "supportsBroadcast": true
     }
   }
 }
-// strict-v2 ack: { "payload": { "client": { ... }, "strictV2": { protocolVersion, schemaHash, serverBuildCommit, connectionNonce, connectionEpoch } } }
+// strict-v2 ack payload: { action, clientId, deviceSessionId, negotiatedCapabilities, strictV2 }
 ```
 
 要点：
@@ -98,12 +104,26 @@
 
 ### 1.1.1 strictV2 注册握手元数据
 
-当且仅当注册 payload 声明 capabilities.playbackContextV2=true 时，成功 ACK 会额外包含：
+当且仅当注册 payload 声明 `capabilities.playbackContextV2=true` 时，成功 ACK 为：
 
 ~~~json5
 {
+  "action": "device.register",
+  "clientId": "phone-1",
+  "deviceSessionId": "device:phone-1",
+  "negotiatedCapabilities": {
+    "playbackContextV2": true,
+    "playbackPrepare": true,
+    "effectiveAtPlayback": true,
+    "canPlay": true,
+    "canPause": true,
+    "canSeek": true,
+    "canSetVolume": true,
+    "supportsFollow": true,
+    "supportsBroadcast": true
+  },
   "strictV2": {
-    "protocolVersion": "2.1.0",
+    "protocolVersion": "2.2.0",
     "schemaHash": "<64位小写 SHA-256>",
     "serverBuildCommit": "<40位小写 Git SHA 或 unknown>",
     "connectionNonce": "<本次 Socket.IO 连接的随机字符串>",
@@ -112,16 +132,16 @@
 }
 ~~~
 
-前三项是可复现的**注册握手 profile / 部署身份**；后两项是当前连接的动态证据。它们都不是所有 realtime action 的完整 schema：
+`protocolVersion` 用于判断 R7 兼容性；`schemaHash` 和 `serverBuildCommit` 是观测/诊断值；
+后两项是当前连接的动态 provenance。它们都不是所有 realtime action 的完整 schema：
 
 - schemaHash 只覆盖 strict-v2 device.register 请求、对应的 system.ack/system.error 以及必要消息信封；
 - 它不保证 playback.update、player.*、follow.*、broadcast.* 或 handoff.* 的 payload 形状；
-- Flutter lab 的预期值必须来自部署 manifest、CI 输出或测试环境配置，不能用 Flutter commit、fixture 或刚收到的 ACK 推测；
-- serverBuildCommit=unknown 只允许本地开发。正式部署验证必须拒绝 unknown、短 SHA 或非法 SHA；
-- connectionNonce 由服务端在每次 Socket.IO 连接建立时随机生成；lab 必须拒绝缺失或空 nonce，并在重连后确认它已变化。它不是部署 manifest 中的预设值；
-- connectionEpoch 当前固定为整数 1；lab 必须精确校验该值，未来变更代表动态连接证据语义升级；
-- 普通客户端可将 serverBuildCommit 用于诊断；协议兼容应以支持的 protocolVersion 与 schemaHash 为准。
-- 非 Docker 的源码、wheel 或 systemd 部署必须在启动服务前显式设置完整 SHA 格式的 `EMO_SERVER_BUILD_COMMIT`；未设置时服务端会报告 `unknown`。
+- 客户端只校验 schemaHash/serverBuildCommit 的字段类型和格式并记录变化，**不得要求它们等于客户端打包时固定的值**；
+- 调试注册不需要部署 manifest。`serverBuildCommit=unknown` 是合法的本地开发观测值，不得仅因此关闭 strict-v2；
+- 正式部署应设置完整 SHA 格式的 `EMO_SERVER_BUILD_COMMIT`，用于定位构建和回滚，但该值仍不是协议兼容 pin；
+- connectionNonce 必须非空，重连后应变化；connectionEpoch 当前为整数 1；
+- 协议兼容以 `protocolVersion` 的 numeric major/minor（major=2、minor>=2）和 ACK 返回的完整 `negotiatedCapabilities` 为准。
 
 ### 1.2 device.list（拉当前在线设备）
 ```json5
@@ -562,7 +582,7 @@ participant 用 **`playback.update`** 且 payload 带 `broadcastId`（strict-v2 
 ## 7. Flutter 客户端接入清单
 
 ### 7.1 连接层
-- [ ] 正式 Flutter lab 从受信任的部署 manifest/CI 读取 strictV2 三项静态预期值，并在注册 ACK 后校验；同时拒绝空 connectionNonce、重连后确认其变化，并要求 connectionEpoch=1。
+- [ ] 注册 ACK 校验 protocolVersion 的 numeric major/minor（major=2、minor>=2）、metadata 字段格式、非空 connectionNonce 和 connectionEpoch=1；schemaHash/serverBuildCommit 只记录观测变化，不做精确 pin，也不要求调试环境提供部署 manifest。
 - [ ] Socket.IO 连接到 namespace `/emo`，路径 `/emo/ws`；所有业务消息用 `message` 事件收发。
 - [ ] 统一的请求封装：每条请求生成 `requestId`，用 `Completer`/`Future` 按 `requestId` 匹配 `system.ack` / `system.error`，带超时。
 - [ ] 统一错误处理：把 §0.3 的 9 个 code 映射成业务异常；`conflict` 时读取 `currentControlVersion` 等做重试。

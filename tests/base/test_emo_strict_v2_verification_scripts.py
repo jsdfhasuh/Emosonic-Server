@@ -18,6 +18,39 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class StrictV2VerificationScriptsTestCase(unittest.TestCase):
+    def _metadata_documents(self):
+        contract_path = (
+            ROOT / "specs" / "emosonic_strict_v2_socketio_server_contract.md"
+        )
+        descriptor = json.loads(
+            (
+                ROOT
+                / "supysonic"
+                / "emo"
+                / "strict_v2_registration_descriptor.json"
+            ).read_text(encoding="utf-8")
+        )
+        conformance = json.loads(
+            (
+                ROOT / "supysonic" / "emo" / "strict_v2_conformance.json"
+            ).read_text(encoding="utf-8")
+        )
+        manifest = json.loads(
+            (
+                ROOT
+                / "tests"
+                / "fixtures"
+                / "emo_strict_v2"
+                / "manifest.json"
+            ).read_text(encoding="utf-8")
+        )
+        return (
+            hashlib.sha256(contract_path.read_bytes()).hexdigest(),
+            descriptor,
+            conformance,
+            manifest,
+        )
+
     def test_evidence_collector_binds_clean_tree_to_exact_commit(self):
         build_commit = "a" * 40
         with mock.patch.object(
@@ -62,6 +95,35 @@ class StrictV2VerificationScriptsTestCase(unittest.TestCase):
             collect_emo_strict_v2_r7_evidence.collect_identity(
                 ROOT,
                 "b" * 40,
+            )
+
+    def test_evidence_collector_accepts_local_test_only_candidates(self):
+        metadata = self._metadata_documents()
+
+        identity = collect_emo_strict_v2_r7_evidence._validate_metadata(
+            *metadata
+        )
+
+        self.assertFalse(any(identity["readiness"].values()))
+
+    def test_evidence_collector_rejects_premature_formal_readiness(self):
+        contract_hash, descriptor, conformance, manifest = (
+            self._metadata_documents()
+        )
+        conformance["profiles"]["core"] = {
+            "codeConformanceReady": True,
+            "evidence": ["ci:premature-formal-readiness"],
+        }
+
+        with self.assertRaisesRegex(
+            collect_emo_strict_v2_r7_evidence.EvidenceError,
+            "disabled or use only local-test-only evidence",
+        ):
+            collect_emo_strict_v2_r7_evidence._validate_metadata(
+                contract_hash,
+                descriptor,
+                conformance,
+                manifest,
             )
 
     def test_evidence_collector_writes_machine_and_human_summaries(self):

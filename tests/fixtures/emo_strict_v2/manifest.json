@@ -634,6 +634,8 @@
         "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_binding_events_fan_out_to_same_user_strict_controllers_only",
         "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_binding_event_backpressure_disconnects_only_stale_controller",
         "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_binding_event_emit_failure_disconnects_only_stale_controller",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_acceptance_fault_marker_disconnects_only_target_controller",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_acceptance_fault_marker_is_ignored_outside_local_test_mode",
         "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_success_uses_strict_settlement_schema_and_atomic_authority_switch"
       ]
     },

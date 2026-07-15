@@ -96,9 +96,29 @@ def _validate_metadata(
         raise EvidenceError("Conformance profiles are not closed")
     for profile in PROFILES:
         value = profiles.get(profile)
-        if value != {"codeConformanceReady": False, "evidence": []}:
+        if not isinstance(value, dict) or set(value) != {
+            "codeConformanceReady",
+            "evidence",
+        }:
             raise EvidenceError(
-                "%s readiness must remain false during evidence collection" % profile
+                "%s conformance profile is not closed" % profile
+            )
+        evidence = value.get("evidence")
+        local_test_candidate = bool(
+            value.get("codeConformanceReady") is True
+            and isinstance(evidence, list)
+            and evidence
+            and all(
+                isinstance(item, str)
+                and item.strip().casefold().startswith("local-test-only:")
+                for item in evidence
+            )
+        )
+        disabled = value == {"codeConformanceReady": False, "evidence": []}
+        if not (disabled or local_test_candidate):
+            raise EvidenceError(
+                "%s must remain disabled or use only local-test-only evidence"
+                % profile
             )
 
     return {

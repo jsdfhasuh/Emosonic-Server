@@ -3,20 +3,28 @@
   "contractSha256": "7e5402a4c32fb366c3755239e4993ef5634177e7db9748bff83b32926cbd2b1f",
   "profiles": {
     "core": {
-      "codeConformanceReady": false,
-      "evidence": []
+      "codeConformanceReady": true,
+      "evidence": [
+        "local-test-only:test_supysonic:r7:core"
+      ]
     },
     "follow": {
-      "codeConformanceReady": false,
-      "evidence": []
+      "codeConformanceReady": true,
+      "evidence": [
+        "local-test-only:test_supysonic:r7:follow"
+      ]
     },
     "handoff": {
-      "codeConformanceReady": false,
-      "evidence": []
+      "codeConformanceReady": true,
+      "evidence": [
+        "local-test-only:test_supysonic:r7:handoff"
+      ]
     },
     "broadcast": {
-      "codeConformanceReady": false,
-      "evidence": []
+      "codeConformanceReady": true,
+      "evidence": [
+        "local-test-only:test_supysonic:r7:broadcast"
+      ]
     }
   }
 }

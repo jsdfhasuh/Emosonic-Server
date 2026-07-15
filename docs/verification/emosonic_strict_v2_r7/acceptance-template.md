@@ -79,6 +79,36 @@ For every step, preserve the relevant client and server log lines with `requestI
 
 ## Scenario E: invalidation failure and recovery
 
+This fault is available only when the server is running with both
+`emo_development_mode=on` and
+`emo_strict_v2_allow_local_test_evidence=on`. It is a one-shot local marker,
+not a Socket.IO action or remote debug endpoint.
+
+With the target controller already registered, arm the next binding
+invalidation emit inside the server container/process environment:
+
+```bash
+python -m supysonic.emo.strict_v2_acceptance arm-binding-emit \
+  --user <user> \
+  --client-id <target-controller-client-id> \
+  --device-session-id <target-controller-device-session-id>
+```
+
+Keep a second controller connected, then create, close, or hand off a Context
+so its authority binding changes. The marker is consumed once: the target
+controller is disconnected, the mutation remains committed, and the healthy
+controller still receives `playback.context.bindings.changed`. Reconnect the
+target and run `playback.context.list` to verify canonical recovery.
+
+If the run is aborted before the mutation, clear the marker explicitly:
+
+```bash
+python -m supysonic.emo.strict_v2_acceptance clear-binding-emit \
+  --user <user> \
+  --client-id <target-controller-client-id> \
+  --device-session-id <target-controller-device-session-id>
+```
+
 | Step | Expected evidence | Result/log reference |
 | --- | --- | --- |
 | Inject one controller send-buffer/emit failure | Failure is isolated to that sid | |
