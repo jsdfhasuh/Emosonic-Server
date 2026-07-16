@@ -74,7 +74,7 @@ class StrictV2ContractTestCase(unittest.TestCase):
         with self.assertRaisesRegex(StrictRequestValidationError, "sessionId"):
             validate_strict_request(request)
 
-    def test_handoff_target_is_the_only_payload_target(self):
+    def test_target_fields_are_closed_to_handoff_and_device_volume(self):
         request = {
             "type": "command",
             "action": "playback.handoff.start",
@@ -95,6 +95,28 @@ class StrictV2ContractTestCase(unittest.TestCase):
         other_action["action"] = "player.play"
         with self.assertRaises(StrictRequestValidationError):
             validate_strict_request(other_action)
+
+        volume = {
+            "type": "command",
+            "action": "device.setVolume",
+            "requestId": "volume-1",
+            "payload": {
+                "targetClientId": "phone-2",
+                "targetDeviceSessionId": "device:phone-2",
+                "volume": 65,
+            },
+        }
+        self.assertEqual(validate_strict_request(volume), volume)
+
+    def test_accepts_optional_remote_volume_capability(self):
+        request = self._register_request()
+        request["payload"]["capabilities"]["remoteVolumeControl"] = True
+
+        normalized = validate_strict_request(request)
+
+        self.assertTrue(
+            normalized["payload"]["capabilities"]["remoteVolumeControl"]
+        )
 
     def test_rejects_business_and_transport_limits(self):
         request = {
@@ -155,7 +177,7 @@ class StrictV2ContractTestCase(unittest.TestCase):
     def test_unknown_action_is_correlated_not_supported(self):
         request = {
             "type": "command",
-            "action": "player.setVolume",
+            "action": "device.setBalance",
             "requestId": "unsupported-1",
             "payload": {},
         }
@@ -165,6 +187,38 @@ class StrictV2ContractTestCase(unittest.TestCase):
 
         self.assertTrue(context.exception.correlatable)
         self.assertEqual(context.exception.code, "not_supported")
+
+    def test_validates_device_volume_request_and_feedback(self):
+        command = {
+            "type": "command",
+            "action": "device.setVolume",
+            "requestId": "volume-command-1",
+            "payload": {
+                "targetClientId": "player-1",
+                "targetDeviceSessionId": "device:player-1",
+                "volume": 100,
+            },
+        }
+        feedback = {
+            "type": "event",
+            "action": "device.volume.update",
+            "requestId": "volume-feedback-1",
+            "payload": {
+                "deviceSessionId": "device:player-1",
+                "volume": 0,
+                "clientSeq": 1,
+            },
+        }
+
+        self.assertEqual(validate_strict_request(command), command)
+        self.assertEqual(validate_strict_request(feedback), feedback)
+
+        for invalid_volume in (-1, 101, True, "65"):
+            invalid = copy.deepcopy(command)
+            invalid["payload"]["volume"] = invalid_volume
+            with self.subTest(invalid_volume=invalid_volume):
+                with self.assertRaises(StrictRequestValidationError):
+                    validate_strict_request(invalid)
 
     def test_validates_closed_context_list_request_schema(self):
         request = {
@@ -302,6 +356,51 @@ class StrictV2ContractTestCase(unittest.TestCase):
 
         self.assertEqual(validate_strict_output(status), status)
         self.assertEqual(validate_strict_output(feedback), feedback)
+
+    def test_validates_device_volume_outputs_and_extended_device_list(self):
+        command = self._output(
+            "command",
+            "device.setVolume",
+            {"sourceClientId": "controller-1", "volume": 65},
+        )
+        feedback = self._output(
+            "event",
+            "device.volume.update",
+            {
+                "sourceClientId": "player-1",
+                "deviceSessionId": "device:player-1",
+                "volume": 65,
+                "clientSeq": 1,
+                "serverUpdatedAtMs": 1000,
+            },
+        )
+        capabilities = self._register_request()["payload"]["capabilities"]
+        capabilities["remoteVolumeControl"] = True
+        device_list = self._output(
+            "state",
+            "device.list",
+            {
+                "devices": [
+                    {
+                        "clientId": "player-1",
+                        "deviceSessionId": "device:player-1",
+                        "deviceName": "Player",
+                        "roles": ["player"],
+                        "capabilities": capabilities,
+                        "volumeState": {
+                            "volume": 65,
+                            "clientSeq": 1,
+                            "serverUpdatedAtMs": 1000,
+                        },
+                    }
+                ]
+            },
+            "device-list-1",
+        )
+
+        self.assertEqual(validate_strict_output(command), command)
+        self.assertEqual(validate_strict_output(feedback), feedback)
+        self.assertEqual(validate_strict_output(device_list), device_list)
 
     def test_validates_context_list_and_binding_event_outputs(self):
         response = self._output(
@@ -586,8 +685,10 @@ class StrictV2ContractTestCase(unittest.TestCase):
             validate_strict_output(missing_provenance)
 
     def test_output_action_inventory_is_closed(self):
-        self.assertEqual(len(STRICT_OUTPUT_ACTIONS), 28)
+        self.assertEqual(len(STRICT_OUTPUT_ACTIONS), 30)
         self.assertIn("system.ack", STRICT_OUTPUT_ACTIONS)
+        self.assertIn("device.setVolume", STRICT_OUTPUT_ACTIONS)
+        self.assertIn("device.volume.update", STRICT_OUTPUT_ACTIONS)
         self.assertIn("playback.context.list", STRICT_OUTPUT_ACTIONS)
         self.assertIn(
             "playback.context.bindings.changed",

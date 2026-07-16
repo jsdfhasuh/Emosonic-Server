@@ -77,7 +77,7 @@ class WebStrictV2FrontendTestCase(FrontendTestBase):
             response = self.client.get(path)
             self.assertEqual(response.status_code, 200)
             self.assertIn("emo_strict_v2_client.js", response.data)
-            self.assertIn("PlaybackContext strict-v2 2.2.0", response.data)
+            self.assertIn("PlaybackContext strict-v2 2.3.0", response.data)
             for action in FORBIDDEN_STRICT_ACTIONS:
                 self.assertNotIn(action, response.data)
             self.assertNotIn('"sessionId"', response.data)
@@ -147,7 +147,9 @@ class WebStrictV2FrontendTestCase(FrontendTestBase):
             "broadcast.start",
             "playback.handoff.start",
             "Follow 必须由实际 follower player 发起",
-            "远程音量不可用",
+            "device.setVolume",
+            "device.volume.update",
+            "远程音量可直接控制所选在线设备",
         ):
             self.assertIn(evidence, response.data)
         self.assertIn('"broadcast": false', response.data)

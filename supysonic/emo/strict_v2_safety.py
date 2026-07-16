@@ -29,6 +29,7 @@ _CONFIG_KEYS = {
 }
 
 _CONTROL_ACTIONS = {
+    "device.setVolume",
     "queue.playItem",
     "player.play",
     "player.pause",

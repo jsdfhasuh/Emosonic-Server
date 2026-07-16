@@ -1,7 +1,7 @@
 from typing import Dict, Mapping, Optional, Sequence
 
 from .strict_v2_conformance import get_code_conformance_readiness
-from .strict_v2_contract import STRICT_CAPABILITIES
+from .strict_v2_contract import BASE_STRICT_CAPABILITIES, STRICT_CAPABILITIES
 
 
 PROFILE_CONFIG_KEYS = {
@@ -82,10 +82,18 @@ def negotiate_capabilities(
     code_readiness: Optional[Mapping[str, bool]] = None,
     allow_local_test_evidence: Optional[bool] = None,
 ) -> Dict[str, bool]:
-    if set(client_capabilities) != set(STRICT_CAPABILITIES) or not all(
-        isinstance(client_capabilities[name], bool) for name in STRICT_CAPABILITIES
+    capability_fields = set(client_capabilities)
+    if capability_fields not in (
+        set(BASE_STRICT_CAPABILITIES),
+        set(STRICT_CAPABILITIES),
+    ) or not all(
+        isinstance(client_capabilities[name], bool)
+        for name in capability_fields
     ):
-        raise ValueError("client capabilities must contain exactly 9 booleans")
+        raise ValueError(
+            "client capabilities must contain the 9 base booleans "
+            "with optional remoteVolumeControl"
+        )
 
     role_set = set(roles)
     readiness = get_effective_profile_readiness(
@@ -99,6 +107,7 @@ def negotiate_capabilities(
     negotiated = {
         capability: bool(client_capabilities[capability])
         for capability in STRICT_CAPABILITIES
+        if capability in client_capabilities
     }
     negotiated["playbackContextV2"] = True
 
@@ -126,4 +135,12 @@ def negotiate_capabilities(
         and negotiated["supportsBroadcast"]
         and can_use_broadcast
     )
+    if "remoteVolumeControl" in negotiated:
+        can_use_remote_volume = bool(
+            "controller" in role_set
+            or ("player" in role_set and negotiated["canSetVolume"])
+        )
+        negotiated["remoteVolumeControl"] = bool(
+            negotiated["remoteVolumeControl"] and can_use_remote_volume
+        )
     return negotiated

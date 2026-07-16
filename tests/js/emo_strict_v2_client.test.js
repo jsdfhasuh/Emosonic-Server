@@ -36,6 +36,10 @@ const HANDOFF_CAPABILITIES = {
   playbackPrepare: true,
   effectiveAtPlayback: true,
 };
+const REMOTE_VOLUME_CAPABILITIES = {
+  ...PLAYER_CAPABILITIES,
+  remoteVolumeControl: true,
+};
 const SCHEMA_HASH = 'a'.repeat(64);
 const BUILD_COMMIT = 'b'.repeat(40);
 
@@ -309,6 +313,47 @@ test('event-confirmed playback feedback settles by context and clientSeq', async
   assert.equal(response.action, 'playback.update');
 });
 
+test('device volume commands and event confirmation use device identity', async () => {
+  const { client, socket } = readyClient({
+    registration: {
+      clientId: 'web-player-1',
+      deviceSessionId: 'web-player-device:1',
+      capabilities: REMOTE_VOLUME_CAPABILITIES,
+    },
+  });
+  const command = client.request('device.setVolume', {
+    targetClientId: 'web-player-1',
+    targetDeviceSessionId: 'web-player-device:1',
+    volume: 65,
+  });
+  assert.equal(socket.sent[0].type, 'command');
+  client._onMessage(ack(socket.sent[0]));
+  await command;
+
+  const feedback = client.request('device.volume.update', {
+    deviceSessionId: 'web-player-device:1',
+    volume: 64,
+    clientSeq: 1,
+  });
+  assert.equal(socket.sent[1].type, 'event');
+  client._onMessage({
+    type: 'event',
+    action: 'device.volume.update',
+    payload: {
+      sourceClientId: 'web-player-1',
+      deviceSessionId: 'web-player-device:1',
+      volume: 64,
+      clientSeq: 1,
+      serverUpdatedAtMs: 1000,
+    },
+    timestamp: 1,
+    connectionNonce: 'nonce-1',
+    connectionEpoch: 1,
+  });
+  const response = await feedback;
+  assert.equal(response.payload.volume, 64);
+});
+
 test('playback feedback settles only for the sending player identity', async () => {
   const { client } = readyClient();
   const pending = client.request('playback.update', {
@@ -542,6 +587,48 @@ test('registration evidence requires closed metadata, provenance, and paired han
   elevated.payload.negotiatedCapabilities.playbackPrepare = false;
   elevated.payload.negotiatedCapabilities.effectiveAtPlayback = false;
   assert.throws(() => client._acceptRegistration(elevated), /elevated unrequested capability/);
+});
+
+test('registration accepts remote volume only when the client requested the extension', () => {
+  const extendedClient = new StrictV2Client({
+    registration: {
+      clientId: 'web-player-1',
+      deviceSessionId: 'web-player-device:1',
+      capabilities: REMOTE_VOLUME_CAPABILITIES,
+    },
+  });
+  const message = {
+    action: 'system.ack',
+    payload: {
+      action: 'device.register',
+      clientId: 'web-player-1',
+      deviceSessionId: 'web-player-device:1',
+      negotiatedCapabilities: REMOTE_VOLUME_CAPABILITIES,
+      strictV2: {
+        protocolVersion: '2.3.0',
+        schemaHash: SCHEMA_HASH,
+        serverBuildCommit: BUILD_COMMIT,
+        connectionNonce: 'nonce-1',
+        connectionEpoch: 1,
+      },
+    },
+    connectionNonce: 'nonce-1',
+    connectionEpoch: 1,
+  };
+
+  assert.doesNotThrow(() => extendedClient._acceptRegistration(message));
+
+  const baseClient = new StrictV2Client({
+    registration: {
+      clientId: 'web-player-1',
+      deviceSessionId: 'web-player-device:1',
+      capabilities: PLAYER_CAPABILITIES,
+    },
+  });
+  assert.throws(
+    () => baseClient._acceptRegistration(message),
+    /exactly the strict-v2 capabilities/,
+  );
 });
 
 test('bootstrap fetches a fresh browser OTP and reaches ready with exact registration', async () => {

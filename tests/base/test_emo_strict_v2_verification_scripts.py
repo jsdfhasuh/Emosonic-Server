@@ -64,9 +64,9 @@ class StrictV2VerificationScriptsTestCase(unittest.TestCase):
             )
 
         self.assertEqual(identity["serverBuildCommit"], build_commit)
-        self.assertEqual(identity["protocolVersion"], "2.2.0")
+        self.assertEqual(identity["protocolVersion"], "2.3.0")
         self.assertEqual(identity["contractSha256"], STRICT_V2_CONTRACT_SHA256)
-        self.assertEqual(len(identity["requirements"]), 25)
+        self.assertEqual(len(identity["requirements"]), 26)
         self.assertFalse(any(identity["readiness"].values()))
 
     def test_evidence_collector_rejects_dirty_or_mismatched_build(self):
@@ -129,7 +129,7 @@ class StrictV2VerificationScriptsTestCase(unittest.TestCase):
     def test_evidence_collector_writes_machine_and_human_summaries(self):
         identity = {
             "serverBuildCommit": "a" * 40,
-            "protocolVersion": "2.2.0",
+            "protocolVersion": "2.3.0",
             "contractSha256": STRICT_V2_CONTRACT_SHA256,
             "schemaHash": "b" * 64,
         }
@@ -179,7 +179,7 @@ class StrictV2VerificationScriptsTestCase(unittest.TestCase):
         manifest = json.loads(
             verify_emo_strict_v2_ears.MANIFEST_PATH.read_text(encoding="utf-8")
         )
-        manifest["requirements"].pop("REQ-025")
+        manifest["requirements"].pop("REQ-026")
 
         with tempfile.TemporaryDirectory() as directory:
             manifest_path = Path(directory) / "manifest.json"
@@ -188,7 +188,7 @@ class StrictV2VerificationScriptsTestCase(unittest.TestCase):
                 verify_emo_strict_v2_ears,
                 "MANIFEST_PATH",
                 manifest_path,
-            ), self.assertRaisesRegex(ValueError, "REQ-001 through REQ-025"):
+        ), self.assertRaisesRegex(ValueError, "REQ-001 through REQ-026"):
                 verify_emo_strict_v2_ears._mapped_test_methods()
 
     def test_packaging_verifier_is_bound_to_r7_protocol_identity(self):
@@ -211,15 +211,15 @@ class StrictV2VerificationScriptsTestCase(unittest.TestCase):
         self.assertEqual(observed_hash, STRICT_V2_CONTRACT_SHA256)
         self.assertEqual(
             verify_emo_strict_v2_packaging.FROZEN_PROTOCOL_VERSION,
-            "2.2.0",
+            "2.3.0",
         )
-        self.assertEqual(descriptor["protocolVersion"], "2.2.0")
+        self.assertEqual(descriptor["protocolVersion"], "2.3.0")
 
     def test_packaging_verifier_rejects_protocol_identity_mismatch(self):
         canonical = {
             "runtimeContractSha256": STRICT_V2_CONTRACT_SHA256,
             "manifestContractSha256": STRICT_V2_CONTRACT_SHA256,
-            "protocolVersion": "2.2.0",
+            "protocolVersion": "2.3.0",
         }
         verify_emo_strict_v2_packaging._assert_protocol_identity(
             canonical,

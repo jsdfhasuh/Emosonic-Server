@@ -8,7 +8,7 @@
 }(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  const CAPABILITY_NAMES = Object.freeze([
+  const BASE_CAPABILITY_NAMES = Object.freeze([
     'playbackContextV2',
     'playbackPrepare',
     'effectiveAtPlayback',
@@ -19,11 +19,18 @@
     'supportsFollow',
     'supportsBroadcast',
   ]);
+  const OPTIONAL_CAPABILITY_NAMES = Object.freeze(['remoteVolumeControl']);
+  const CAPABILITY_NAMES = Object.freeze([
+    ...BASE_CAPABILITY_NAMES,
+    ...OPTIONAL_CAPABILITY_NAMES,
+  ]);
 
   const ACTION_TYPES = Object.freeze({
     'auth.login': 'auth',
     'device.register': 'device',
     'device.list': 'state',
+    'device.setVolume': 'command',
+    'device.volume.update': 'event',
     'system.ping': 'system',
     'playback.context.list': 'state',
     'playback.context.create': 'command',
@@ -64,6 +71,7 @@
   ]);
 
   const EVENT_CONFIRMED_ACTIONS = Object.freeze({
+    'device.volume.update': 'device.volume.update',
     'playback.update': 'playback.update',
     'playback.ready': 'playback.handoff.status',
     'playback.handoff.complete': 'playback.handoff.status',
@@ -145,16 +153,18 @@
     return `${action}-${Date.now()}-${uuid()}`;
   }
 
-  function requireClosedCapabilities(value, label) {
+  function requireClosedCapabilities(value, label, includeExtensions) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       throw new StrictProtocolError(`${label} must be an object`);
     }
     const fields = Object.keys(value).sort();
-    const expected = CAPABILITY_NAMES.slice().sort();
+    const expected = (includeExtensions ? CAPABILITY_NAMES : BASE_CAPABILITY_NAMES)
+      .slice()
+      .sort();
     if (fields.length !== expected.length || fields.some((field, index) => field !== expected[index])) {
       throw new StrictProtocolError(`${label} must contain exactly the strict-v2 capabilities`);
     }
-    CAPABILITY_NAMES.forEach((capability) => {
+    expected.forEach((capability) => {
       if (typeof value[capability] !== 'boolean') {
         throw new StrictProtocolError(`${label}.${capability} must be boolean`);
       }
@@ -425,12 +435,17 @@
       if (payload.deviceSessionId !== this.registration.deviceSessionId) {
         throw new StrictProtocolError('Registration ACK deviceSessionId does not match');
       }
+      const requestedCapabilities = this.registration.capabilities || {};
+      const includeCapabilityExtensions = Object.prototype.hasOwnProperty.call(
+        requestedCapabilities,
+        'remoteVolumeControl',
+      );
       this.negotiatedCapabilities = requireClosedCapabilities(
         payload.negotiatedCapabilities,
         'negotiatedCapabilities',
+        includeCapabilityExtensions,
       );
-      const requestedCapabilities = this.registration.capabilities || {};
-      CAPABILITY_NAMES.forEach((capability) => {
+      Object.keys(this.negotiatedCapabilities).forEach((capability) => {
         if (this.negotiatedCapabilities[capability] && requestedCapabilities[capability] !== true) {
           throw new StrictProtocolError(`Server elevated unrequested capability: ${capability}`);
         }
@@ -679,6 +694,17 @@
           pending.payload.playbackContextId
           && message.payload
           && message.payload.playbackContextId !== pending.payload.playbackContextId
+        ) {
+          continue;
+        }
+        if (
+          pending.action === 'device.volume.update'
+          && (
+            !message.payload
+            || message.payload.clientSeq !== pending.payload.clientSeq
+            || message.payload.sourceClientId !== this.registration.clientId
+            || message.payload.deviceSessionId !== pending.payload.deviceSessionId
+          )
         ) {
           continue;
         }

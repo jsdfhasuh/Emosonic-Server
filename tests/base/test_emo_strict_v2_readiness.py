@@ -172,6 +172,39 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
         self.assertFalse(negotiated["playbackPrepare"])
         self.assertFalse(negotiated["effectiveAtPlayback"])
 
+    def test_remote_volume_extension_preserves_base_shape_and_role_gates(self):
+        base = negotiate_capabilities(
+            self.capabilities,
+            ["player"],
+            self.deployment_enabled,
+            self.code_ready,
+        )
+        self.assertNotIn("remoteVolumeControl", base)
+
+        extended = dict(self.capabilities, remoteVolumeControl=True)
+        player = negotiate_capabilities(
+            extended,
+            ["player"],
+            self.deployment_enabled,
+            self.code_ready,
+        )
+        controller = negotiate_capabilities(
+            dict(extended, canSetVolume=False),
+            ["controller"],
+            self.deployment_enabled,
+            self.code_ready,
+        )
+        incapable_player = negotiate_capabilities(
+            dict(extended, canSetVolume=False),
+            ["player"],
+            self.deployment_enabled,
+            self.code_ready,
+        )
+
+        self.assertTrue(player["remoteVolumeControl"])
+        self.assertTrue(controller["remoteVolumeControl"])
+        self.assertFalse(incapable_player["remoteVolumeControl"])
+
 
 if __name__ == "__main__":
     unittest.main()

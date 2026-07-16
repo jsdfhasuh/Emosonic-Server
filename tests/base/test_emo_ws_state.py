@@ -526,6 +526,65 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
         self.assertTrue(authoritative)
         self.assertEqual(logical_context["volume"], 40)
 
+    def test_online_device_volume_state_is_sequence_checked_and_cleared(self):
+        self.state.register_session("sid-1")
+        self.state.authenticate_session("sid-1", "alice")
+        self.state.register_client(
+            "sid-1",
+            "phone-1",
+            {
+                "userName": "alice",
+                "deviceSessionId": "device:phone-1",
+                "deviceName": "Phone",
+                "roles": ["player"],
+            },
+        )
+        nonce = self.state.get_session("sid-1")["connectionNonce"]
+
+        first, created = self.state.record_strict_device_volume_state(
+            "alice",
+            "phone-1",
+            "device:phone-1",
+            {"volume": 65, "clientSeq": 1},
+            nonce,
+            now=10,
+        )
+        replay, replay_created = self.state.record_strict_device_volume_state(
+            "alice",
+            "phone-1",
+            "device:phone-1",
+            {"volume": 65, "clientSeq": 1},
+            nonce,
+            now=11,
+        )
+
+        self.assertTrue(created)
+        self.assertFalse(replay_created)
+        self.assertEqual(replay, first)
+        self.assertEqual(first["serverUpdatedAtMs"], 10000)
+        self.assertEqual(
+            self.state.get_device_volume_state(
+                "alice", "phone-1", "device:phone-1"
+            )["volume"],
+            65,
+        )
+
+        with self.assertRaises(ClientSeqStaleError):
+            self.state.record_strict_device_volume_state(
+                "alice",
+                "phone-1",
+                "device:phone-1",
+                {"volume": 70, "clientSeq": 1},
+                nonce,
+            )
+
+        self.state.unregister_session("sid-1")
+        self.assertIsNone(
+            self.state.get_device_volume_state(
+                "alice", "phone-1", "device:phone-1"
+            )
+        )
+
     def test_authority_playback_update_can_require_existing_context(self):
         context, authoritative = self.state.apply_authority_playback_update(
             "playback:alice:missing",

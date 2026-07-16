@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "protocolVersion": "2.2.0",
-  "contractSha256": "7e5402a4c32fb366c3755239e4993ef5634177e7db9748bff83b32926cbd2b1f",
+  "protocolVersion": "2.3.0",
+  "contractSha256": "5269b53a615ca97f820d3624510acb459e3d3031667a742bd50d1185af8d1e37",
   "sharedErrorConditionFields": [
     "playbackContextId",
     "currentControlVersion",
@@ -26,7 +26,7 @@
       "profile": "core",
       "type": "device",
       "contractSection": "3.3",
-      "payloadSchema": {"closed": true, "required": ["clientId:string", "deviceSessionId:string", "deviceName:string", "roles:player|controller[]", "capabilities:9-bool-object"], "optional": ["alias:string"]},
+      "payloadSchema": {"closed": true, "required": ["clientId:string", "deviceSessionId:string", "deviceName:string", "roles:player|controller[]", "capabilities:9-or-10-bool-object"], "optional": ["alias:string"]},
       "settlement": "correlated_ack",
       "serverPushes": ["device.list"],
       "roleCapabilityGate": "authenticated; Core must be ready",
@@ -43,6 +43,28 @@
       "roleCapabilityGate": "registered strict connection",
       "cursorMutation": "none",
       "errorConditionFields": ["retryAfterMs"]
+    },
+    "device.setVolume": {
+      "profile": "core",
+      "type": "command",
+      "contractSection": "5.2/6.0",
+      "payloadSchema": {"closed": true, "required": ["targetClientId:string", "targetDeviceSessionId:string", "volume:int:0..100"], "optional": []},
+      "settlement": "correlated_ack",
+      "serverPushes": ["device.setVolume"],
+      "roleCapabilityGate": "same-user remoteVolumeControl controller; online target player with remoteVolumeControl and canSetVolume",
+      "cursorMutation": "none; PlaybackContext is not accessed",
+      "errorConditionFields": ["retryAfterMs"]
+    },
+    "device.volume.update": {
+      "profile": "core",
+      "type": "event",
+      "contractSection": "5.2/6.0",
+      "payloadSchema": {"closed": true, "required": ["deviceSessionId:string", "volume:int:0..100", "clientSeq:int>=1"], "optional": []},
+      "settlement": "event_confirmed",
+      "serverPushes": ["device.volume.update"],
+      "roleCapabilityGate": "registered source player with matching device, remoteVolumeControl and canSetVolume",
+      "cursorMutation": "online device state clientSeq advances; Context unchanged",
+      "errorConditionFields": ["currentClientSeq", "retryAfterMs"]
     },
     "playback.context.list": {
       "profile": "core",
@@ -650,6 +672,20 @@
         "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_close_and_complete_handoff_are_linearized_by_context_tombstone",
         "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_multi_context_controls_conflict_without_authority_side_effects",
         "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_success_uses_strict_settlement_schema_and_atomic_authority_switch"
+      ]
+    },
+    "REQ-026": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_contract", "tests.base.test_emo_ws_state", "tests.base.test_emo_strict_v2_core", "tests.base.test_emo_web_strict_v2"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_contract.StrictV2ContractTestCase.test_validates_device_volume_request_and_feedback",
+        "tests.base.test_emo_strict_v2_contract.StrictV2ContractTestCase.test_validates_device_volume_outputs_and_extended_device_list",
+        "tests.base.test_emo_ws_state.EmoWebSocketStateTestCase.test_online_device_volume_state_is_sequence_checked_and_cleared",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_device_volume_controls_online_idle_player_and_reports_actual_state",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_device_volume_requires_extended_capability_and_exact_live_pair",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_device_volume_does_not_mutate_active_playback_context",
+        "tests.base.test_emo_web_strict_v2.EmoWebStrictV2TestCase.test_web_remote_volume_controls_online_player_without_context",
+        "tests.base.test_emo_web_strict_v2.EmoWebStrictV2TestCase.test_strict_pages_render_device_volume_controls"
       ]
     }
   }

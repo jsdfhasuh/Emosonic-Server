@@ -8,7 +8,7 @@ MAX_ACTION_BYTES = 64
 MAX_QUEUE_ITEMS = 1000
 MAX_PARTICIPANTS = 100
 
-STRICT_CAPABILITIES = (
+BASE_STRICT_CAPABILITIES = (
     "playbackContextV2",
     "playbackPrepare",
     "effectiveAtPlayback",
@@ -19,6 +19,8 @@ STRICT_CAPABILITIES = (
     "supportsFollow",
     "supportsBroadcast",
 )
+OPTIONAL_STRICT_CAPABILITIES = ("remoteVolumeControl",)
+STRICT_CAPABILITIES = BASE_STRICT_CAPABILITIES + OPTIONAL_STRICT_CAPABILITIES
 
 
 class ActionSchema(NamedTuple):
@@ -46,6 +48,12 @@ ACTION_SCHEMAS = {
         ("alias",),
     ),
     "device.list": ActionSchema("state", ()),
+    "device.setVolume": ActionSchema(
+        "command", ("targetClientId", "targetDeviceSessionId", "volume")
+    ),
+    "device.volume.update": ActionSchema(
+        "event", ("deviceSessionId", "volume", "clientSeq")
+    ),
     "system.ping": ActionSchema("system", ()),
     "playback.context.list": ActionSchema(
         "state",
@@ -149,6 +157,7 @@ _ID_FIELDS = {
     "prepareId",
     "broadcastId",
     "targetClientId",
+    "targetDeviceSessionId",
     "trackId",
 }
 _NON_NEGATIVE_INT_FIELDS = {
@@ -200,12 +209,20 @@ def _contains_key(value: object, forbidden: Set[str]) -> bool:
 
 
 def _validate_capabilities(value: object) -> Dict[str, bool]:
-    if not isinstance(value, dict) or set(value) != set(STRICT_CAPABILITIES):
+    fields = set(value) if isinstance(value, dict) else set()
+    allowed_fields = (
+        set(BASE_STRICT_CAPABILITIES),
+        set(STRICT_CAPABILITIES),
+    )
+    if not isinstance(value, dict) or fields not in allowed_fields:
         raise StrictRequestValidationError(
-            "capabilities must contain exactly the 9 strict-v2 boolean fields"
+            "capabilities must contain the 9 base strict-v2 booleans "
+            "with optional remoteVolumeControl"
         )
     normalized = {}  # type: Dict[str, bool]
     for capability in STRICT_CAPABILITIES:
+        if capability not in value:
+            continue
         capability_value = value[capability]
         if not isinstance(capability_value, bool):
             raise StrictRequestValidationError("capabilities.%s must be a boolean" % capability)
@@ -355,6 +372,8 @@ STRICT_OUTPUT_ACTIONS = {
     "system.error",
     "system.pong",
     "device.list",
+    "device.setVolume",
+    "device.volume.update",
     "playback.context.list",
     "playback.context.create",
     "playback.context.status",
@@ -386,6 +405,8 @@ _OUTPUT_ACTION_TYPES = {
     "system.error": "system",
     "system.pong": "system",
     "device.list": "state",
+    "device.setVolume": "command",
+    "device.volume.update": "event",
     "playback.context.list": "state",
     "playback.context.create": "state",
     "playback.context.status": "state",
@@ -422,6 +443,7 @@ _ACK_ONLY_REQUEST_ACTIONS = {
     "playback.context.subscribe",
     "playback.context.unsubscribe",
     "playback.context.close",
+    "device.setVolume",
     "queue.context.sync",
     "queue.playItem",
     "player.play",
@@ -538,13 +560,16 @@ def _output_string_array(
 
 
 def _validate_output_capabilities(value: object, label: str) -> None:
-    capabilities = _output_object(
-        value,
-        set(STRICT_CAPABILITIES),
-        set(),
-        label,
-    )
+    fields = set(value) if isinstance(value, dict) else set()
+    if fields not in (set(BASE_STRICT_CAPABILITIES), set(STRICT_CAPABILITIES)):
+        _output_error(
+            "%s must contain the 9 base capabilities with optional "
+            "remoteVolumeControl" % label
+        )
+    capabilities = _output_object(value, fields, set(), label)
     for capability in STRICT_CAPABILITIES:
+        if capability not in capabilities:
+            continue
         _output_bool(capabilities[capability], "%s.%s" % (label, capability))
 
 
@@ -558,7 +583,7 @@ def _validate_output_device(value: object, label: str) -> None:
     device = _output_object(
         value,
         {"clientId", "deviceSessionId", "deviceName", "roles", "capabilities"},
-        {"alias"},
+        {"alias", "volumeState"},
         label,
     )
     for field_name in ("clientId", "deviceSessionId", "deviceName"):
@@ -567,6 +592,21 @@ def _validate_output_device(value: object, label: str) -> None:
     _validate_output_capabilities(device["capabilities"], label + ".capabilities")
     if "alias" in device:
         _output_string(device["alias"], label + ".alias")
+    if "volumeState" in device:
+        volume_state = _output_object(
+            device["volumeState"],
+            {"volume", "clientSeq", "serverUpdatedAtMs"},
+            set(),
+            label + ".volumeState",
+        )
+        volume = _output_int(volume_state["volume"], label + ".volumeState.volume")
+        if volume > 100:
+            _output_error("%s.volumeState.volume must be <= 100" % label)
+        _output_int(volume_state["clientSeq"], label + ".volumeState.clientSeq", 1)
+        _output_int(
+            volume_state["serverUpdatedAtMs"],
+            label + ".volumeState.serverUpdatedAtMs",
+        )
 
 
 def _validate_context_binding(value: object, label: str) -> Tuple[str, str, str]:
@@ -949,6 +989,48 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
             client_ids.append(device["clientId"])
         if client_ids != sorted(client_ids) or len(set(client_ids)) != len(client_ids):
             _output_error("device.list devices must be uniquely sorted by clientId")
+        return None
+    if action == "device.setVolume":
+        command = _output_object(
+            payload,
+            {"sourceClientId", "volume"},
+            set(),
+            "device.setVolume payload",
+        )
+        _output_string(command["sourceClientId"], "device.setVolume sourceClientId")
+        volume = _output_int(command["volume"], "device.setVolume volume")
+        if volume > 100:
+            _output_error("device.setVolume volume must be <= 100")
+        return None
+    if action == "device.volume.update":
+        update = _output_object(
+            payload,
+            {
+                "sourceClientId",
+                "deviceSessionId",
+                "volume",
+                "clientSeq",
+                "serverUpdatedAtMs",
+            },
+            set(),
+            "device.volume.update payload",
+        )
+        _output_string(
+            update["sourceClientId"],
+            "device.volume.update sourceClientId",
+        )
+        _output_string(
+            update["deviceSessionId"],
+            "device.volume.update deviceSessionId",
+        )
+        volume = _output_int(update["volume"], "device.volume.update volume")
+        if volume > 100:
+            _output_error("device.volume.update volume must be <= 100")
+        _output_int(update["clientSeq"], "device.volume.update clientSeq", 1)
+        _output_int(
+            update["serverUpdatedAtMs"],
+            "device.volume.update serverUpdatedAtMs",
+        )
         return None
     if action == "playback.context.list":
         response = _output_object(

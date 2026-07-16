@@ -72,6 +72,8 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
         state._clients.clear()
         state._playback_contexts.clear()
         state._device_playback_states.clear()
+        state._device_volume_states.clear()
+        state._strict_device_volume_sequences.clear()
         state._playback_context_subscriptions.clear()
         self.socket_clients = []
 
@@ -717,6 +719,83 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
             + control_feedback
         ):
             self.assert_no_session_fields(message)
+
+    def test_web_remote_volume_controls_online_player_without_context(self):
+        self.login()
+        player = self.register_web_player(
+            "web-player-1",
+            "web-player-device:1",
+        )
+        control = self.register_web_control()
+        self.messages(player)
+        self.messages(control)
+
+        command = self.fixture_message("device.setVolume")
+        control.emit("message", command, namespace="/emo")
+        control_messages = self.messages(control)
+        player_messages = self.messages(player)
+        self.assertTrue(
+            any(
+                message["action"] == "system.ack"
+                and message.get("requestId") == command["requestId"]
+                for message in control_messages
+            )
+        )
+        forwarded = next(
+            message
+            for message in player_messages
+            if message["action"] == "device.setVolume"
+        )
+        self.assertEqual(
+            forwarded["payload"],
+            {"sourceClientId": "web-control-1", "volume": 65},
+        )
+        self.assertEqual(get_state()._playback_contexts, {})
+
+        feedback = self.fixture_message("device.volume.update")
+        player.emit("message", feedback, namespace="/emo")
+        self.assertTrue(
+            any(
+                message["action"] == "device.volume.update"
+                for message in self.messages(player)
+            )
+        )
+        controller_update = next(
+            message
+            for message in self.messages(control)
+            if message["action"] == "device.volume.update"
+        )
+        self.assertEqual(controller_update["payload"]["volume"], 65)
+
+        device_list_request = self.fixture_message("device.list")
+        device_list_request["requestId"] = "device-list-volume-state-1"
+        control.emit("message", device_list_request, namespace="/emo")
+        response = next(
+            message
+            for message in self.messages(control)
+            if message.get("requestId") == "device-list-volume-state-1"
+        )
+        listed_player = next(
+            device
+            for device in response["payload"]["devices"]
+            if device["clientId"] == "web-player-1"
+        )
+        self.assertEqual(listed_player["volumeState"]["volume"], 65)
+
+    def test_strict_pages_render_device_volume_controls(self):
+        self.login()
+        self.app.config["WEBAPP"]["emo_web_realtime_protocol"] = "strict_v2"
+
+        player_page = self.http.get("/player")
+        control_page = self.http.get("/control")
+
+        self.assertEqual(player_page.status_code, 200)
+        self.assertEqual(control_page.status_code, 200)
+        self.assertIn(b"remoteVolumeControl: true", player_page.data)
+        self.assertIn(b"device.volume.update", player_page.data)
+        self.assertIn(b'id="strict-device-volume"', control_page.data)
+        self.assertIn(b"device.setVolume", control_page.data)
+        self.assertIn(b"PlaybackContext strict-v2 2.3.0", control_page.data)
 
     def test_exact_web_broadcast_uses_two_players_and_participant_feedback(self):
         self.login()

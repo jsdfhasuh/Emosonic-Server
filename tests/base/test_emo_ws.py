@@ -133,7 +133,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
 
   def test_socketio_initialization_logs_strict_v2_static_metadata(self):
     metadata = {
-      "protocolVersion": "2.2.0",
+      "protocolVersion": "2.3.0",
       "schemaHash": "a" * 64,
       "serverBuildCommit": "b" * 40,
     }
@@ -156,7 +156,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
       [
         "WARNING:supysonic.emo.ws:"
         "emo event=strict_v2_registration_metadata "
-        "protocol_version=2.2.0 "
+        "protocol_version=2.3.0 "
         f"schema_hash={'a' * 64} "
         f"server_build_commit={'b' * 40}",
       ],
@@ -525,7 +525,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.assertEqual(strict_v2["serverBuildCommit"], commit)
     self.assertRegex(strict_v2["schemaHash"], r"^[0-9a-f]{64}$")
-    self.assertEqual(strict_v2["protocolVersion"], "2.2.0")
+    self.assertEqual(strict_v2["protocolVersion"], "2.3.0")
     self.assertIsInstance(strict_v2["connectionNonce"], str)
     self.assertTrue(strict_v2["connectionNonce"])
     self.assertEqual(strict_v2["connectionEpoch"], 1)

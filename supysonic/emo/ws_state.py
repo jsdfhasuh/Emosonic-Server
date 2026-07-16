@@ -1,7 +1,7 @@
 import secrets
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 DEFAULT_CLIENT_STALE_SECONDS = 90
@@ -139,6 +139,10 @@ class WebSocketState:
         self._device_playback_states = {}
         # (playbackContextId, clientId, connectionNonce, connectionEpoch) -> sequence record
         self._strict_feedback_sequences = {}
+        # (userName, clientId, deviceSessionId) -> live device volume state
+        self._device_volume_states = {}
+        # (userName, clientId, deviceSessionId, connectionNonce, connectionEpoch) -> sequence record
+        self._strict_device_volume_sequences = {}
         # handoffId -> playback authority handoff state
         self._handoffs = {}
         # (userName, requestId) -> handoffId for idempotent start requests
@@ -156,6 +160,19 @@ class WebSocketState:
             return key if key in self._clients else None
         matches = [key for key in self._clients if key[1] == client_id]
         return matches[0] if len(matches) == 1 else None
+
+    def _clear_device_volume_state_locked(
+        self,
+        user_name,
+        client_id,
+        device_session_id=None,
+    ):
+        for key in list(self._device_volume_states):
+            if key[0] != user_name or key[1] != client_id:
+                continue
+            if device_session_id is not None and key[2] != device_session_id:
+                continue
+            self._device_volume_states.pop(key, None)
 
     def register_session(self, sid, remote_address=None, now=None):
         now = time.time() if now is None else now
@@ -268,6 +285,12 @@ class WebSocketState:
             client_key = self._client_key(client_info.get("userName"), client_id)
             previous_sid = self._client_to_sid.get(client_key)
             if previous_sid is not None and previous_sid != sid:
+                previous_client = self._clients.get(client_key) or {}
+                self._clear_device_volume_state_locked(
+                    client_info.get("userName"),
+                    client_id,
+                    previous_client.get("deviceSessionId"),
+                )
                 previous_session = self._sessions.get(previous_sid)
                 if previous_session is not None:
                     previous_session["clientId"] = None
@@ -317,6 +340,11 @@ class WebSocketState:
                         session_info["clientId"] = None
                 self._client_to_sid.pop(client_key, None)
                 removed_client = self._clients.pop(client_key)
+                self._clear_device_volume_state_locked(
+                    removed_client.get("userName"),
+                    client_id,
+                    removed_client.get("deviceSessionId"),
+                )
                 self._mark_broadcast_participant_offline_locked(client_id, now=now)
                 self._deactivate_follow_relationships_for_client_locked(client_id, now=now)
                 removed.append(removed_client)
@@ -337,6 +365,12 @@ class WebSocketState:
                 if current_sid == sid:
                     self._client_to_sid.pop(client_key, None)
                     client_info = self._clients.pop(client_key, None)
+                    if client_info is not None:
+                        self._clear_device_volume_state_locked(
+                            client_info.get("userName"),
+                            client_id,
+                            client_info.get("deviceSessionId"),
+                        )
                     self._mark_broadcast_participant_offline_locked(client_id)
                     self._deactivate_follow_relationships_for_client_locked(client_id)
             return session_info, client_info
@@ -1289,11 +1323,78 @@ class WebSocketState:
             }
             return dict(payload), True
 
+    def get_device_volume_state(
+        self,
+        user_name: str,
+        client_id: str,
+        device_session_id: str,
+    ) -> Optional[Dict[str, object]]:
+        with self._lock:
+            volume_state = self._device_volume_states.get(
+                (user_name, client_id, device_session_id)
+            )
+            return dict(volume_state) if volume_state is not None else None
+
+    def record_strict_device_volume_state(
+        self,
+        user_name: str,
+        client_id: str,
+        device_session_id: str,
+        volume_state: Dict[str, object],
+        connection_nonce: str,
+        connection_epoch: int = 1,
+        now: Optional[float] = None,
+    ) -> Tuple[Dict[str, object], bool]:
+        client_seq = volume_state.get("clientSeq")
+        sequence_key = (
+            user_name,
+            client_id,
+            device_session_id,
+            connection_nonce,
+            connection_epoch,
+        )
+        fingerprint = {
+            "deviceSessionId": device_session_id,
+            "volume": volume_state.get("volume"),
+            "clientSeq": client_seq,
+        }
+        server_updated_at_ms = _timestamp_ms(now)
+        with self._lock:
+            previous = self._strict_device_volume_sequences.get(sequence_key)
+            if previous is not None:
+                previous_seq = previous["clientSeq"]
+                if client_seq < previous_seq:
+                    raise ClientSeqStaleError(previous_seq)
+                if client_seq == previous_seq:
+                    if previous["fingerprint"] != fingerprint:
+                        raise ClientSeqStaleError(previous_seq)
+                    return dict(previous["volumeState"]), False
+
+            payload = {
+                "sourceClientId": client_id,
+                "deviceSessionId": device_session_id,
+                "volume": volume_state["volume"],
+                "clientSeq": client_seq,
+                "serverUpdatedAtMs": server_updated_at_ms,
+            }
+            self._device_volume_states[
+                (user_name, client_id, device_session_id)
+            ] = payload
+            self._strict_device_volume_sequences[sequence_key] = {
+                "clientSeq": client_seq,
+                "fingerprint": fingerprint,
+                "volumeState": dict(payload),
+            }
+            return dict(payload), True
+
     def clear_strict_feedback_connection(self, connection_nonce):
         with self._lock:
             for key in list(self._strict_feedback_sequences):
                 if key[2] == connection_nonce:
                     self._strict_feedback_sequences.pop(key, None)
+            for key in list(self._strict_device_volume_sequences):
+                if key[3] == connection_nonce:
+                    self._strict_device_volume_sequences.pop(key, None)
 
     def restore_strict_playback_contexts(self, playback_contexts):
         with self._lock:
@@ -1304,6 +1405,8 @@ class WebSocketState:
             self._playback_contexts.clear()
             self._device_playback_states.clear()
             self._strict_feedback_sequences.clear()
+            self._device_volume_states.clear()
+            self._strict_device_volume_sequences.clear()
             self._playback_context_subscriptions.clear()
             self._follow_relationships.clear()
             self._pending_prepares.clear()

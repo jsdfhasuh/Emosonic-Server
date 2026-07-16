@@ -10,7 +10,7 @@ from typing import Optional, Sequence
 
 
 FAULT_DIRECTORY_ENV = "EMO_STRICT_V2_ACCEPTANCE_FAULT_DIR"
-DEFAULT_FAULT_DIRECTORY = Path("/tmp/emosonic-strict-v2-r7-faults")
+DEFAULT_FAULT_DIRECTORY = Path("/tmp/emosonic-strict-v2-r8-faults")
 FAULT_BINDING_EMIT = "binding_emit_failure"
 
 _FAULT_LOCK = threading.RLock()

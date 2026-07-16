@@ -25,13 +25,15 @@ class StrictV2ManifestTestCase(unittest.TestCase):
 
         self.assertEqual(contract_hash, STRICT_V2_CONTRACT_SHA256)
         self.assertEqual(self.manifest["contractSha256"], contract_hash)
-        self.assertEqual(self.manifest["protocolVersion"], "2.2.0")
+        self.assertEqual(self.manifest["protocolVersion"], "2.3.0")
 
     def test_manifest_covers_every_strict_client_action(self):
         expected_actions = {
             "auth.login",
             "device.register",
             "device.list",
+            "device.setVolume",
+            "device.volume.update",
             "system.ping",
             "playback.context.list",
             "playback.context.create",
@@ -113,7 +115,7 @@ class StrictV2ManifestTestCase(unittest.TestCase):
                 self.assertEqual(validator.optional, optional)
 
     def test_manifest_maps_every_ears_requirement(self):
-        expected_requirements = {"REQ-%03d" % number for number in range(1, 26)}
+        expected_requirements = {"REQ-%03d" % number for number in range(1, 27)}
 
         self.assertEqual(set(self.manifest["requirements"]), expected_requirements)
         for requirement, mapping in self.manifest["requirements"].items():

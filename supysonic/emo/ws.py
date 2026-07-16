@@ -110,6 +110,7 @@ strict_request_cache = StrictRequestCache()
 
 ALLOWED_PRE_AUTH = {"auth.login"}
 EVENT_CONFIRMED_ACTIONS = {
+    "device.volume.update",
     "playback.update",
     "playback.ready",
     "playback.handoff.complete",
@@ -144,6 +145,8 @@ BROADCAST_ACTIONS = {
 ACTION_EVENT_NAMES = {
     "auth.login": "auth_login",
     "device.register": "device_register",
+    "device.setVolume": "device_set_volume",
+    "device.volume.update": "device_volume_update",
     "session.subscribe": "session_subscribe",
     "session.unsubscribe": "session_unsubscribe",
     "follow.start": "follow_start",
@@ -188,6 +191,7 @@ CAPABILITY_CAN_PLAY = "canPlay"
 CAPABILITY_CAN_PAUSE = "canPause"
 CAPABILITY_CAN_SEEK = "canSeek"
 CAPABILITY_CAN_SET_VOLUME = "canSetVolume"
+CAPABILITY_REMOTE_VOLUME_CONTROL = "remoteVolumeControl"
 CAPABILITY_SUPPORTS_FOLLOW = "supportsFollow"
 CAPABILITY_SUPPORTS_BROADCAST = "supportsBroadcast"
 STRICT_BROADCAST_PARTICIPANT_CAPABILITIES = (
@@ -207,6 +211,7 @@ STRICT_V2_REQUIRED_CAPABILITIES = (
     CAPABILITY_SUPPORTS_FOLLOW,
     CAPABILITY_SUPPORTS_BROADCAST,
 )
+STRICT_V2_OPTIONAL_CAPABILITIES = (CAPABILITY_REMOTE_VOLUME_CONTROL,)
 PROTOCOL_LEGACY = "legacy"
 PROTOCOL_SINGLE_FUTURE = "single_future"
 PROTOCOL_TWO_PHASE = "two_phase"
@@ -331,17 +336,21 @@ def _list_clients(user_name=None, session_id=None):
     )
 
 
-def _serialize_client_info_v2(client):
+def _serialize_client_info_v2(client, target_client=None):
     client_capabilities = client.get("capabilities")
     if not isinstance(client_capabilities, dict):
         client_capabilities = {}
+    target_capabilities = _client_capabilities(target_client)
+    capability_names = list(STRICT_V2_REQUIRED_CAPABILITIES)
+    if CAPABILITY_REMOTE_VOLUME_CONTROL in target_capabilities:
+        capability_names.extend(STRICT_V2_OPTIONAL_CAPABILITIES)
     capabilities = {
         capability: (
             client_capabilities[capability]
             if type(client_capabilities.get(capability)) is bool
             else False
         )
-        for capability in STRICT_V2_REQUIRED_CAPABILITIES
+        for capability in capability_names
     }
     payload = {
         "clientId": client.get("clientId"),
@@ -352,13 +361,25 @@ def _serialize_client_info_v2(client):
     }
     if isinstance(client.get("alias"), str) and client.get("alias"):
         payload["alias"] = client["alias"]
+    if CAPABILITY_REMOTE_VOLUME_CONTROL in target_capabilities:
+        volume_state = state.get_device_volume_state(
+            client.get("userName"),
+            client.get("clientId"),
+            client.get("deviceSessionId"),
+        )
+        if volume_state is not None:
+            payload["volumeState"] = {
+                "volume": volume_state["volume"],
+                "clientSeq": volume_state["clientSeq"],
+                "serverUpdatedAtMs": volume_state["serverUpdatedAtMs"],
+            }
     return payload
 
 
 def _serialize_clients_for_target(clients, target_client):
     if _is_strict_playback_context_v2(target_client):
         return [
-            _serialize_client_info_v2(client)
+            _serialize_client_info_v2(client, target_client)
             for client in sorted(clients, key=lambda item: item.get("clientId") or "")
         ]
     return clients
@@ -2001,6 +2022,154 @@ def _update_active_broadcast_state(
 
 def _has_role(client, role):
     return role in (client.get("roles") or [])
+
+
+def _handle_device_set_volume(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+):
+    if current_client is None or not _has_role(current_client, "controller"):
+        raise PermissionError("Device volume control requires the controller role")
+    if not _client_supports(
+        current_client,
+        CAPABILITY_REMOTE_VOLUME_CONTROL,
+    ):
+        raise CapabilityRequiredError(
+            "Controller did not negotiate remoteVolumeControl"
+        )
+
+    target_client_id = payload["targetClientId"]
+    target_device_session_id = payload["targetDeviceSessionId"]
+    target_client = state.get_client(
+        target_client_id,
+        user_name=current_user_name,
+    )
+    target_sid = state.get_sid_for_client(
+        target_client_id,
+        user_name=current_user_name,
+    )
+    if target_client is None or target_sid is None:
+        raise LookupError("Target device is not online")
+    if target_client.get("deviceSessionId") != target_device_session_id:
+        raise LookupError("Target device session is not online")
+    if not _has_role(target_client, "player"):
+        raise PermissionError("Target device is not a player")
+    if not _client_supports(
+        target_client,
+        CAPABILITY_REMOTE_VOLUME_CONTROL,
+    ):
+        raise CapabilityRequiredError(
+            "Target device did not negotiate remoteVolumeControl"
+        )
+    if not _client_supports(target_client, CAPABILITY_CAN_SET_VOLUME):
+        raise CapabilityRequiredError("Target device cannot set volume")
+    if not socketio.server.manager.is_connected(target_sid, namespace="/emo"):
+        raise LookupError("Target device socket is not online")
+    if not strict_v2_safety.reserve_emit(target_sid):
+        raise LookupError("Target device send buffer is unavailable")
+    try:
+        _emit_message(
+            _build_message(
+                "command",
+                "device.setVolume",
+                {
+                    "sourceClientId": current_client.get("clientId"),
+                    "volume": payload["volume"],
+                },
+            ),
+            target_sid,
+            emit_reserved=True,
+        )
+    finally:
+        strict_v2_safety.release_emit(target_sid)
+    _send_ack(request_id)
+
+
+def _build_device_volume_update_message(volume_state):
+    if not isinstance(volume_state, dict):
+        return None
+    return _build_message(
+        "event",
+        "device.volume.update",
+        {
+            "sourceClientId": volume_state.get("sourceClientId"),
+            "deviceSessionId": volume_state.get("deviceSessionId"),
+            "volume": volume_state.get("volume"),
+            "clientSeq": volume_state.get("clientSeq"),
+            "serverUpdatedAtMs": volume_state.get("serverUpdatedAtMs"),
+        },
+    )
+
+
+def _broadcast_device_volume_update(user_name, source_sid, volume_state):
+    message = _build_device_volume_update_message(volume_state)
+    if message is None:
+        return None
+    target_sids = {source_sid}
+    for target_sid, target_client in state.list_sids(user_name=user_name):
+        if (
+            _has_role(target_client, "controller")
+            and _client_supports(
+                target_client,
+                CAPABILITY_REMOTE_VOLUME_CONTROL,
+            )
+        ):
+            target_sids.add(target_sid)
+    for target_sid in sorted(target_sids):
+        _emit_message(message, target_sid)
+    return message
+
+
+def _handle_device_volume_update(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+):
+    if current_client is None or not _has_role(current_client, "player"):
+        raise PermissionError("Device volume feedback requires the player role")
+    if not _client_supports(
+        current_client,
+        CAPABILITY_REMOTE_VOLUME_CONTROL,
+    ) or not _client_supports(current_client, CAPABILITY_CAN_SET_VOLUME):
+        raise CapabilityRequiredError(
+            "Device did not negotiate remote volume feedback"
+        )
+    if payload["deviceSessionId"] != current_client.get("deviceSessionId"):
+        raise PermissionError("deviceSessionId does not match the registered device")
+    session_info = state.get_session(request.sid) or {}
+    connection_nonce = session_info.get("connectionNonce")
+    if not isinstance(connection_nonce, str) or not connection_nonce:
+        raise PermissionError("Registered connection provenance is missing")
+
+    volume_state, created = state.record_strict_device_volume_state(
+        current_user_name,
+        current_client.get("clientId"),
+        current_client.get("deviceSessionId"),
+        payload,
+        connection_nonce,
+    )
+    update_message = _build_device_volume_update_message(volume_state)
+    _store_event_confirmations([update_message])
+    if created:
+        _run_post_commit_push(
+            "device.volume.update",
+            request_id,
+            lambda: _broadcast_device_volume_update(
+                current_user_name,
+                request.sid,
+                volume_state,
+            ),
+        )
+    else:
+        _run_post_commit_push(
+            "device.volume.update",
+            request_id,
+            lambda: _emit_message(update_message, request.sid),
+        )
+    return volume_state
 
 
 def _can_control_broadcast(client, broadcast):
@@ -7196,6 +7365,50 @@ class EmoNamespace(Namespace):
                         },
                         requestId=request_id,
                     ),
+                )
+            elif action == "device.setVolume":
+                _handle_device_set_volume(
+                    current_user_name,
+                    current_client,
+                    payload,
+                    request_id,
+                )
+                _log_emo_event(
+                    logging.INFO,
+                    "device_set_volume",
+                    result="success",
+                    user=current_user_name,
+                    client_request_id=request_id,
+                    source_client_id=None
+                    if current_client is None
+                    else current_client.get("clientId"),
+                    target_client_id=payload.get("targetClientId"),
+                    target_device_session_id=payload.get(
+                        "targetDeviceSessionId"
+                    ),
+                    volume=payload.get("volume"),
+                )
+            elif action == "device.volume.update":
+                volume_state = _handle_device_volume_update(
+                    current_user_name,
+                    current_client,
+                    payload,
+                    request_id,
+                )
+                _log_emo_event(
+                    logging.INFO,
+                    "device_volume_update",
+                    result="success",
+                    user=current_user_name,
+                    client_request_id=request_id,
+                    source_client_id=None
+                    if current_client is None
+                    else current_client.get("clientId"),
+                    device_session_id=payload.get("deviceSessionId"),
+                    volume=None
+                    if volume_state is None
+                    else volume_state.get("volume"),
+                    client_seq=payload.get("clientSeq"),
                 )
             elif action == "playback.context.list":
                 bindings = _handle_playback_context_list(

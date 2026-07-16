@@ -12,12 +12,12 @@
 <main class="strict-control-workspace" id="strict-control-root" data-meta-url="{{ url_for('frontend.control_track_meta') }}">
   <div class="strict-control-toolbar mb-3">
     <div class="d-flex flex-wrap align-items-center gap-2">
-      <span class="console-scope-badge scope-device">PlaybackContext strict-v2 2.2.0</span>
+      <span class="console-scope-badge scope-device">PlaybackContext strict-v2 2.3.0</span>
       <span class="strict-control-state-pill" id="strict-control-context">no context</span>
       <span class="strict-control-state-pill" id="strict-control-broadcast">no broadcast</span>
       <span class="strict-control-state-pill" id="strict-control-handoff">no handoff</span>
     </div>
-    <span class="console-muted" data-i18n-en="Remote volume and full remote queue replacement are unavailable in strict-v2 2.2.0." data-i18n-zh="strict-v2 2.2.0 不支持远程音量和全量远端队列改写。">Remote volume and full remote queue replacement are unavailable in strict-v2 2.2.0.</span>
+    <span class="console-muted" data-i18n-en="Remote volume targets the selected online device and does not require a PlaybackContext. Full remote queue replacement remains unavailable." data-i18n-zh="远程音量直接控制所选在线设备，不要求 PlaybackContext；全量远端队列改写仍不可用。">Remote volume targets the selected online device and does not require a PlaybackContext. Full remote queue replacement remains unavailable.</span>
   </div>
 
   <section class="strict-control-metrics mb-3" aria-label="Control status overview">
@@ -75,6 +75,15 @@
             </div>
           </div>
 
+          <div class="strict-device-volume border rounded p-3 mb-3">
+            <div class="d-flex justify-content-between align-items-center gap-3 mb-2">
+              <label class="form-label mb-0" for="strict-device-volume"><span data-i18n-en="Device volume" data-i18n-zh="设备音量">Device volume</span></label>
+              <strong id="strict-device-volume-value">-</strong>
+            </div>
+            <input class="form-range" id="strict-device-volume" type="range" min="0" max="100" value="70" disabled>
+            <div class="console-control-hint" id="strict-control-disabled-reason"><span data-i18n-en="Select an online player that supports remote volume." data-i18n-zh="请选择支持远程音量的在线播放器。">Select an online player that supports remote volume.</span></div>
+          </div>
+
           <div class="d-none" id="strict-context-active">
             <div class="strict-now-playing mb-3">
               <div class="strict-now-cover">
@@ -103,8 +112,6 @@
               <button class="btn btn-outline-secondary control-command" id="strict-seek-back" type="button">-15s</button>
               <button class="btn btn-outline-secondary control-command" id="strict-seek-forward" type="button">+15s</button>
             </div>
-            <div class="console-control-hint mb-3" id="strict-control-disabled-reason"><span data-i18n-en="Remote volume is unavailable in strict-v2 2.2.0." data-i18n-zh="远程音量不可用：strict-v2 2.2.0 没有远程音量 action。">Remote volume is unavailable in strict-v2 2.2.0.</span></div>
-
             <div class="console-signal-grid strict-context-signals mb-3">
               <div class="console-signal-cell">
                 <span class="console-signal-label">playbackContextId</span>
@@ -235,6 +242,10 @@
     contextRenderGeneration: 0,
     context: null,
     controlBusy: false,
+    volumeTimer: null,
+    volumeInFlight: false,
+    pendingVolume: null,
+    volumePreview: null,
     deviceStates: [],
     trackMeta: {},
     activeBroadcast: null,
@@ -251,6 +262,7 @@
     canPause: false,
     canSeek: false,
     canSetVolume: false,
+    remoteVolumeControl: true,
     supportsFollow: false,
     supportsBroadcast: optionalProfiles.broadcast === true,
   };
@@ -289,6 +301,24 @@
 
   function selectedDevice() {
     return state.devices.find((device) => device.clientId === state.selectedClientId) || null;
+  }
+
+  function selectedVolume() {
+    const volume = selectedDevice()?.volumeState?.volume;
+    return Number.isInteger(volume) ? volume : null;
+  }
+
+  function syncVolumeUi() {
+    const volume = selectedVolume();
+    const slider = document.getElementById('strict-device-volume');
+    if (state.volumePreview !== null) slider.value = String(state.volumePreview);
+    else if (volume !== null) slider.value = String(volume);
+    text(
+      'strict-device-volume-value',
+      state.volumePreview !== null
+        ? `${state.volumePreview}%`
+        : (volume === null ? '-' : `${volume}%`),
+    );
   }
 
   function currentTrackId() {
@@ -363,21 +393,28 @@
     );
     document.getElementById('strict-handoff-cancel').disabled = !state.handoff || terminalHandoff;
 
+    const volumeEnabled = Boolean(
+      selected
+      && state.client?.capability('remoteVolumeControl')
+      && targetCapabilities.remoteVolumeControl
+      && targetCapabilities.canSetVolume
+      && !state.volumeInFlight
+    );
+    document.getElementById('strict-device-volume').disabled = !volumeEnabled;
+    syncVolumeUi();
+
     let reason = i18n(
-      'Remote volume is unavailable in strict-v2 2.2.0.',
-      '远程音量不可用：strict-v2 2.2.0 没有远程音量 action。'
+      'Remote volume is available for the selected online device, with or without a PlaybackContext.',
+      '远程音量可直接控制所选在线设备，无论是否存在 PlaybackContext。'
     );
     if (!selected) {
       reason = i18n('Select an online player to enable controls.', '请选择在线播放器以启用控制。');
-    } else if (!state.context) {
-      reason = i18n(
-        'This player is online but has not created a PlaybackContext.',
-        '设备在线，但客户端尚未创建 PlaybackContext。'
-      );
-    } else if (state.controlBusy) {
-      reason = i18n('A control command is being processed.', '正在处理控制命令。');
-    } else if (!targetCapabilities.canPlay && !targetCapabilities.canPause && !targetCapabilities.canSeek) {
-      reason = i18n('The selected player did not advertise remote transport capabilities.', '所选播放器未声明远程播放控制能力。');
+    } else if (!state.client?.capability('remoteVolumeControl')) {
+      reason = i18n('This controller did not negotiate remote volume.', '当前控制端未协商远程音量能力。');
+    } else if (!targetCapabilities.remoteVolumeControl || !targetCapabilities.canSetVolume) {
+      reason = i18n('The selected player does not support remote volume.', '所选播放器不支持远程音量。');
+    } else if (state.volumeInFlight) {
+      reason = i18n('Applying device volume…', '正在设置设备音量…');
     }
     text('strict-control-disabled-reason', reason);
   }
@@ -459,6 +496,7 @@
       capabilityList.className = 'strict-device-card-meta';
       const capabilityBadges = [
         [device.capabilities?.canPlay, 'remote'],
+        [device.capabilities?.remoteVolumeControl && device.capabilities?.canSetVolume, 'volume'],
         [device.capabilities?.supportsBroadcast, 'broadcast'],
         [device.capabilities?.playbackPrepare && device.capabilities?.effectiveAtPlayback, 'handoff'],
       ];
@@ -709,6 +747,9 @@
   async function selectPlayer(nextClientId) {
     const nextDevice = state.devices.find((device) => device.clientId === nextClientId);
     if (!nextDevice) throw new Error(i18n('The selected player is no longer online.', '所选 player 已离线。'));
+    clearTimeout(state.volumeTimer);
+    state.pendingVolume = null;
+    state.volumePreview = null;
     const binding = bindingFor(nextClientId);
     const nextContextId = binding?.playbackContextId || null;
     const previousContextId = state.selectedContextId;
@@ -838,6 +879,48 @@
       if (['authority_offline', 'capability_required'].includes(error.code)) showError(`${error.code}: ${error.message}`);
       throw error;
     }
+  }
+
+  async function flushDeviceVolume() {
+    if (state.volumeInFlight || state.pendingVolume === null) return;
+    const target = selectedDevice();
+    if (!target) {
+      state.pendingVolume = null;
+      updateCapabilityUi();
+      return;
+    }
+    const volume = state.pendingVolume;
+    state.pendingVolume = null;
+    state.volumeInFlight = true;
+    updateCapabilityUi();
+    try {
+      await state.client.request('device.setVolume', {
+        targetClientId: target.clientId,
+        targetDeviceSessionId: target.deviceSessionId,
+        volume,
+      });
+      clearError();
+      log(`device.setVolume accepted: ${target.clientId} -> ${volume}`);
+    } catch (error) {
+      state.volumePreview = null;
+      showError(`${error.code || 'device_volume_failed'}: ${error.message}`);
+    } finally {
+      state.volumeInFlight = false;
+      updateCapabilityUi();
+      if (state.pendingVolume !== null) {
+        clearTimeout(state.volumeTimer);
+        state.volumeTimer = setTimeout(flushDeviceVolume, 0);
+      }
+    }
+  }
+
+  function scheduleDeviceVolume(value, immediate = false) {
+    const volume = Math.max(0, Math.min(100, Math.round(Number(value) || 0)));
+    state.pendingVolume = volume;
+    state.volumePreview = volume;
+    syncVolumeUi();
+    clearTimeout(state.volumeTimer);
+    state.volumeTimer = setTimeout(flushDeviceVolume, immediate ? 0 : 150);
   }
 
   async function runControlOperation(operation) {
@@ -1023,6 +1106,21 @@
     if (action === 'device.list') {
       state.devices = message.payload.devices;
       refreshBindings().catch((error) => showError(error.message));
+    } else if (action === 'device.volume.update') {
+      const device = state.devices.find((item) => (
+        item.clientId === message.payload.sourceClientId
+        && item.deviceSessionId === message.payload.deviceSessionId
+      ));
+      if (device) {
+        device.volumeState = {
+          volume: message.payload.volume,
+          clientSeq: message.payload.clientSeq,
+          serverUpdatedAtMs: message.payload.serverUpdatedAtMs,
+        };
+        if (device.clientId === state.selectedClientId) state.volumePreview = null;
+        renderDevices();
+        renderContext().catch((error) => showError(error.message));
+      }
     } else if (action === 'playback.context.status' && message.payload.playbackContext.playbackContextId === state.selectedContextId) {
       applyStatus(message.payload);
     } else if (action === 'queue.context.sync' && message.payload.playbackContextId === state.selectedContextId) {
@@ -1062,6 +1160,12 @@
   function bindUi() {
     text('strict-control-client-id', clientId);
     text('strict-control-device-id', deviceSessionId);
+    document.getElementById('strict-device-volume').addEventListener('input', (event) => {
+      scheduleDeviceVolume(event.target.value);
+    });
+    document.getElementById('strict-device-volume').addEventListener('change', (event) => {
+      scheduleDeviceVolume(event.target.value, true);
+    });
     document.querySelectorAll('[data-control]').forEach((button) => {
       button.addEventListener('click', () => {
         runControlOperation(() => sendControl(button.dataset.control))

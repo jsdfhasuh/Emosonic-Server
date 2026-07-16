@@ -2,7 +2,7 @@ EmoSonic strict-v2 web player and control console
 ==================================================
 
 The ``/player`` and ``/control`` pages can use the PlaybackContext strict-v2
-``2.2.0`` protocol. Both pages are switched together with:
+``2.3.0`` protocol. Both pages are switched together with:
 
 .. code-block:: ini
 
@@ -60,10 +60,12 @@ uses ``queue.context.sync`` with canonical cursors, reports device feedback via
 ``playback.update`` and closes the Context when the queue is cleared. A later
 queue receives a new Context ID.
 
-The control console subscribes and requests status before sending player
-controls. It retries a still-valid user intent after ``stale_version`` only
-with a new request ID and refreshed cursor. Remote volume and full remote queue
-replacement are disabled because strict-v2 ``2.2.0`` defines neither action.
+The control console subscribes and requests status before sending
+PlaybackContext player controls. Device volume is independent: the console can
+send ``device.setVolume`` to an online player by its exact client/device pair
+even when that player has no Context. The player confirms the actual value via
+``device.volume.update``; online volume state is cleared on disconnect and is
+not persisted. Full remote queue replacement remains unavailable.
 
 Broadcast uses strict snapshots and participant feedback. Follow is initiated
 by the actual follower player and uses a 1500 ms drift threshold. Handoff is

@@ -26,7 +26,7 @@
   <div class="d-flex justify-content-between align-items-start gap-3 mb-3">
     <div>
       <h1 class="h3 mb-1">EmoSonic Web Player</h1>
-      <div class="strict-muted">PlaybackContext strict-v2 2.2.0</div>
+      <div class="strict-muted">PlaybackContext strict-v2 2.3.0</div>
     </div>
     <button class="btn btn-outline-danger btn-sm" id="strict-reset-device" type="button">重置网页设备</button>
   </div>
@@ -153,6 +153,7 @@
     contextSnapshots: new Map(),
     queueMutation: Promise.resolve(),
     feedbackMutation: Promise.resolve(),
+    volumeMutation: Promise.resolve(),
     logLines: [],
   };
 
@@ -164,6 +165,7 @@
     canPause: true,
     canSeek: true,
     canSetVolume: true,
+    remoteVolumeControl: true,
     supportsFollow: optionalProfiles.follow === true,
     supportsBroadcast: optionalProfiles.broadcast === true,
   };
@@ -370,6 +372,26 @@
       .catch(() => {})
       .then(() => sendFeedback(playbackContextId));
     state.feedbackMutation = operation;
+    return operation;
+  }
+
+  async function sendDeviceVolume() {
+    if (!state.client || state.client.state !== 'ready') return;
+    await state.client.request('device.volume.update', {
+      deviceSessionId,
+      volume: Math.round(audio.volume * 100),
+      clientSeq: state.client.nextClientSeq(),
+    }).catch((error) => {
+      if (error.code === 'client_sequence_conflict') showError(error.message);
+      else log(error.message, 'error');
+    });
+  }
+
+  function reportDeviceVolume() {
+    const operation = state.volumeMutation
+      .catch(() => {})
+      .then(sendDeviceVolume);
+    state.volumeMutation = operation;
     return operation;
   }
 
@@ -595,6 +617,13 @@
   async function applyControl(message) {
     if (alreadyProcessed(message.action, message.payload)) return;
     const payload = message.payload || {};
+    if (message.action === 'device.setVolume') {
+      audio.volume = Math.max(0, Math.min(100, payload.volume)) / 100;
+      document.getElementById('strict-volume').value = String(Math.round(audio.volume * 100));
+      await reportDeviceVolume();
+      if (activeFeedbackContextId()) await reportFeedback();
+      return;
+    }
     const handoffCommit = message.action === 'player.play' && payload.handoffId;
     if (
       !handoffCommit
@@ -815,8 +844,13 @@
       else if (context.playbackContextId === state.contextId) applyContext(context).catch((error) => showError(error.message));
     } else if (action === 'queue.context.sync' && message.payload.playbackContextId === state.contextId) {
       applyContext(message.payload).catch((error) => showError(error.message));
-    } else if (['player.play', 'player.pause', 'player.seek', 'player.next', 'player.prev', 'queue.playItem'].includes(action)) {
+    } else if (['device.setVolume', 'player.play', 'player.pause', 'player.seek', 'player.next', 'player.prev', 'queue.playItem'].includes(action)) {
       applyControl(message).catch((error) => showError(error.message));
+    } else if (
+      action === 'device.volume.update'
+      && message.payload.sourceClientId === clientId
+    ) {
+      document.getElementById('strict-volume').value = String(message.payload.volume);
     } else if (action === 'playback.prepare') {
       handlePrepare(message.payload).catch((error) => showError(error.message));
     } else if (action === 'playback.handoff.release') {
@@ -930,7 +964,13 @@
       state.userGestureSeen = true;
       playIndex((state.index - 1 + state.queue.length) % state.queue.length, 0, true).catch((error) => showError(error.message));
     });
-    document.getElementById('strict-volume').addEventListener('input', (event) => { audio.volume = Number(event.target.value) / 100; });
+    document.getElementById('strict-volume').addEventListener('input', (event) => {
+      audio.volume = Number(event.target.value) / 100;
+    });
+    document.getElementById('strict-volume').addEventListener('change', () => {
+      reportDeviceVolume();
+      if (activeFeedbackContextId()) reportFeedback();
+    });
     document.getElementById('strict-progress').addEventListener('change', (event) => {
       const target = (Number(event.target.value) / 1000) * durationMs();
       try { audio.currentTime = target / 1000; } catch (error) { /* ignored */ }
@@ -1007,6 +1047,7 @@
       onReady() {
         restoreContext()
           .then(refreshBindings)
+          .then(reportDeviceVolume)
           .then(async () => {
             if (!state.activeBroadcastId || !state.broadcastContextId) return;
             const response = await state.client.request('broadcast.status', {

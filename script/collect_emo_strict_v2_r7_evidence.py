@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect fail-closed automated evidence for one committed strict-v2 r7 build."""
+"""Collect fail-closed automated evidence for one committed strict-v2 r8 build."""
 
 import argparse
 import hashlib
@@ -14,9 +14,9 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 FROZEN_CONTRACT_SHA256 = (
-    "7e5402a4c32fb366c3755239e4993ef5634177e7db9748bff83b32926cbd2b1f"
+    "5269b53a615ca97f820d3624510acb459e3d3031667a742bd50d1185af8d1e37"
 )
-FROZEN_PROTOCOL_VERSION = "2.2.0"
+FROZEN_PROTOCOL_VERSION = "2.3.0"
 PROFILES = ("core", "follow", "handoff", "broadcast")
 PROVIDER_ENVIRONMENT = (
     "SUPYSONIC_TEST_POSTGRES_URI",
@@ -72,9 +72,9 @@ def _validate_metadata(
     manifest: Mapping[str, object],
 ) -> Dict[str, object]:
     if contract_hash != FROZEN_CONTRACT_SHA256:
-        raise EvidenceError("Contract SHA-256 does not match frozen r7")
+        raise EvidenceError("Contract SHA-256 does not match frozen r8")
     if descriptor.get("protocolVersion") != FROZEN_PROTOCOL_VERSION:
-        raise EvidenceError("Registration descriptor is not protocol 2.2.0")
+        raise EvidenceError("Registration descriptor is not protocol 2.3.0")
     for label, value in (
         ("conformance", conformance.get("contractSha256")),
         ("manifest", manifest.get("contractSha256")),
@@ -82,14 +82,14 @@ def _validate_metadata(
         if value != FROZEN_CONTRACT_SHA256:
             raise EvidenceError("%s is bound to a different contract" % label)
     if manifest.get("protocolVersion") != FROZEN_PROTOCOL_VERSION:
-        raise EvidenceError("Executable manifest is not protocol 2.2.0")
+        raise EvidenceError("Executable manifest is not protocol 2.3.0")
 
     requirements = manifest.get("requirements")
     expected_requirements = {
-        "REQ-%03d" % number for number in range(1, 26)
+        "REQ-%03d" % number for number in range(1, 27)
     }
     if not isinstance(requirements, dict) or set(requirements) != expected_requirements:
-        raise EvidenceError("Executable manifest must map REQ-001 through REQ-025")
+        raise EvidenceError("Executable manifest must map REQ-001 through REQ-026")
 
     profiles = conformance.get("profiles")
     if not isinstance(profiles, dict) or set(profiles) != set(PROFILES):
@@ -264,7 +264,7 @@ def _write_summary(
         encoding="utf-8",
     )
     lines = [
-        "# EmoSonic strict-v2 r7 automated evidence",
+        "# EmoSonic strict-v2 r8 automated evidence",
         "",
         "- Server build commit: `%s`" % identity["serverBuildCommit"],
         "- Protocol version: `%s`" % identity["protocolVersion"],
@@ -309,7 +309,7 @@ def main() -> int:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=Path("docs/verification/emosonic_strict_v2_r7"),
+        default=Path("docs/verification/emosonic_strict_v2_r8"),
     )
     parser.add_argument(
         "--server-build-commit",
@@ -361,7 +361,7 @@ def main() -> int:
         _write_summary(output_directory, identity, results)
         return 0 if all(result["exitCode"] == 0 for result in results) else 1
     except (EvidenceError, OSError, subprocess.CalledProcessError) as exc:
-        print("Strict-v2 r7 evidence collection failed: %s" % exc, file=sys.stderr)
+        print("Strict-v2 r8 evidence collection failed: %s" % exc, file=sys.stderr)
         return 1
 
 

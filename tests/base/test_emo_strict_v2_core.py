@@ -51,6 +51,8 @@ class StrictV2CoreTestCase(unittest.TestCase):
         state._playback_contexts.clear()
         state._device_playback_states.clear()
         state._strict_feedback_sequences.clear()
+        state._device_volume_states.clear()
+        state._strict_device_volume_sequences.clear()
         state._playback_context_subscriptions.clear()
         state._handoffs.clear()
         state._pending_prepares.clear()
@@ -271,6 +273,236 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(errors[0]["payload"]["action"], "auth.login")
         self.assertEqual(errors[0]["payload"]["code"], "bad_request")
         self.assertTrue(client.is_connected(namespace="/emo"))
+
+    def test_device_volume_controls_online_idle_player_and_reports_actual_state(self):
+        player = self.ready_strict_client(
+            client_id="player-1",
+            device_session_id="device:player-1",
+            capability_overrides={"remoteVolumeControl": True},
+        )
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-1",
+            device_session_id="device:controller-1",
+            capability_overrides={
+                "canSetVolume": False,
+                "remoteVolumeControl": True,
+            },
+        )
+        self.messages(player)
+        self.messages(controller)
+
+        controller_messages = self.emit_strict(
+            controller,
+            "command",
+            "device.setVolume",
+            "device-volume-command-1",
+            {
+                "targetClientId": "player-1",
+                "targetDeviceSessionId": "device:player-1",
+                "volume": 65,
+            },
+        )
+        player_messages = self.messages(player)
+
+        self.assertEqual(
+            [message["action"] for message in controller_messages],
+            ["system.ack"],
+        )
+        command = next(
+            message
+            for message in player_messages
+            if message["action"] == "device.setVolume"
+        )
+        self.assertEqual(
+            command["payload"],
+            {"sourceClientId": "controller-1", "volume": 65},
+        )
+        self.assertNotIn("requestId", command)
+        self.assertEqual(get_state()._playback_contexts, {})
+
+        replay_messages = self.emit_strict(
+            controller,
+            "command",
+            "device.setVolume",
+            "device-volume-command-1",
+            {
+                "targetClientId": "player-1",
+                "targetDeviceSessionId": "device:player-1",
+                "volume": 65,
+            },
+        )
+        self.assertEqual(
+            [message["action"] for message in replay_messages],
+            ["system.ack"],
+        )
+        self.assertFalse(
+            any(
+                message["action"] == "device.setVolume"
+                for message in self.messages(player)
+            )
+        )
+
+        player_messages = self.emit_strict(
+            player,
+            "event",
+            "device.volume.update",
+            "device-volume-feedback-1",
+            {
+                "deviceSessionId": "device:player-1",
+                "volume": 64,
+                "clientSeq": 1,
+            },
+        )
+        controller_pushes = self.messages(controller)
+        confirmation = next(
+            message
+            for message in player_messages
+            if message["action"] == "device.volume.update"
+        )
+        controller_update = next(
+            message
+            for message in controller_pushes
+            if message["action"] == "device.volume.update"
+        )
+        self.assertNotIn("requestId", confirmation)
+        self.assertEqual(confirmation["payload"]["volume"], 64)
+        self.assertEqual(controller_update["payload"], confirmation["payload"])
+        self.assertEqual(
+            get_state().get_device_volume_state(
+                "alice", "player-1", "device:player-1"
+            )["volume"],
+            64,
+        )
+
+        device_list = self.emit_strict(
+            controller,
+            "state",
+            "device.list",
+            "device-list-volume-1",
+            {},
+        )[0]
+        listed_player = next(
+            device
+            for device in device_list["payload"]["devices"]
+            if device["clientId"] == "player-1"
+        )
+        self.assertEqual(listed_player["volumeState"]["volume"], 64)
+        self.assertIn(
+            "remoteVolumeControl",
+            listed_player["capabilities"],
+        )
+
+    def test_device_volume_requires_extended_capability_and_exact_live_pair(self):
+        base_player = self.ready_strict_client(
+            client_id="player-1",
+            device_session_id="device:player-1",
+        )
+        base_controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-1",
+            device_session_id="device:controller-1",
+        )
+        self.messages(base_player)
+        self.messages(base_controller)
+
+        missing_requester_capability = self.emit_strict(
+            base_controller,
+            "command",
+            "device.setVolume",
+            "device-volume-base-1",
+            {
+                "targetClientId": "player-1",
+                "targetDeviceSessionId": "device:player-1",
+                "volume": 50,
+            },
+        )[0]
+        self.assertEqual(
+            missing_requester_capability["payload"]["code"],
+            "capability_required",
+        )
+
+        extended_controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-2",
+            device_session_id="device:controller-2",
+            capability_overrides={
+                "canSetVolume": False,
+                "remoteVolumeControl": True,
+            },
+        )
+        self.messages(extended_controller)
+        missing_target_capability = self.emit_strict(
+            extended_controller,
+            "command",
+            "device.setVolume",
+            "device-volume-target-cap-1",
+            {
+                "targetClientId": "player-1",
+                "targetDeviceSessionId": "device:player-1",
+                "volume": 50,
+            },
+        )[0]
+        wrong_device = self.emit_strict(
+            extended_controller,
+            "command",
+            "device.setVolume",
+            "device-volume-wrong-pair-1",
+            {
+                "targetClientId": "player-1",
+                "targetDeviceSessionId": "device:other",
+                "volume": 50,
+            },
+        )[0]
+
+        self.assertEqual(
+            missing_target_capability["payload"]["code"],
+            "capability_required",
+        )
+        self.assertEqual(wrong_device["payload"]["code"], "not_found")
+
+    def test_device_volume_does_not_mutate_active_playback_context(self):
+        player = self.ready_strict_client(
+            capability_overrides={"remoteVolumeControl": True},
+        )
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-1",
+            device_session_id="device:controller-1",
+            capability_overrides={
+                "canSetVolume": False,
+                "remoteVolumeControl": True,
+            },
+        )
+        self.messages(player)
+        self.messages(controller)
+        before = getPlaybackContextState("context-1")
+
+        self.emit_strict(
+            controller,
+            "command",
+            "device.setVolume",
+            "device-volume-active-1",
+            {
+                "targetClientId": "phone-1",
+                "targetDeviceSessionId": "device:phone-1",
+                "volume": 40,
+            },
+        )
+        self.messages(player)
+        after = getPlaybackContextState("context-1")
+
+        for field_name in (
+            "volume",
+            "version",
+            "controlVersion",
+            "queueRevision",
+            "epoch",
+            "state",
+            "positionMs",
+        ):
+            self.assertEqual(after[field_name], before[field_name])
 
     def test_bootstrap_type_action_mismatch_returns_bad_request(self):
         client = self.connect()
