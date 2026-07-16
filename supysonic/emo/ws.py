@@ -959,10 +959,11 @@ def _authenticate(payload: Dict[str, object]) -> Optional[User]:
         close_connection()
 
 
-def _broadcast_clients(user_name):
+def _broadcast_clients(user_name: str) -> None:
+    """Broadcast topology snapshots only to legacy clients."""
     clients = _list_clients(user_name=user_name)
     for target_sid, target_client in state.list_sids(user_name=user_name):
-        if target_client is None:
+        if target_client is None or _is_strict_playback_context_v2(target_client):
             continue
         message = _build_message(
             "state",

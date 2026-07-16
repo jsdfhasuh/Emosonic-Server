@@ -536,16 +536,21 @@ class EmoWebSocketTestCase(unittest.TestCase):
 
   def test_strict_replies_echo_action_and_include_connection_provenance(self):
     client = self.connect_authenticated_client("alice", "Alic3", "auth-strict-replies")
+    registration_messages = self.register_device(
+      client,
+      "register-strict-replies",
+      {
+        "clientId": "strict-replies",
+        "deviceSessionId": "device:strict-replies",
+        "capabilities": {CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+      },
+    )
+    self.assertEqual(
+      [message["action"] for message in registration_messages],
+      ["system.ack"],
+    )
     registration = self.get_ack(
-      self.register_device(
-        client,
-        "register-strict-replies",
-        {
-          "clientId": "strict-replies",
-          "deviceSessionId": "device:strict-replies",
-          "capabilities": {CAPABILITY_PLAYBACK_CONTEXT_V2: True},
-        },
-      ),
+      registration_messages,
       "register-strict-replies",
     )
     strict_v2 = registration["payload"]["strictV2"]
@@ -912,7 +917,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.assertFalse(any(legacy_device["capabilities"].values()))
 
-  def test_v2_device_list_broadcast_omits_session_id_aliases(self):
+  def test_v2_device_list_is_only_sent_as_a_correlated_response(self):
     v2 = self.connect_device(
       "alice",
       "Alic3",
@@ -921,7 +926,6 @@ class EmoWebSocketTestCase(unittest.TestCase):
       ["player"],
       capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
     )
-    self.get_messages(v2)
     legacy = self.connect_authenticated_client("alice", "Alic3", "auth-legacy-player-1")
 
     self.register_device(
@@ -934,8 +938,21 @@ class EmoWebSocketTestCase(unittest.TestCase):
         "sessionId": "legacy-room",
       },
     )
+    self.assertEqual(self.get_messages(v2), [])
+
+    v2.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "device.list",
+        "requestId": "v2-device-list-after-register-1",
+        "payload": {},
+      },
+      namespace="/emo",
+    )
 
     device_list = next(message for message in self.get_messages(v2) if message["action"] == "device.list")
+    self.assertEqual(device_list["requestId"], "v2-device-list-after-register-1")
     legacy_device = next(
       device for device in device_list["payload"]["devices"] if device["clientId"] == "legacy-player-1"
     )

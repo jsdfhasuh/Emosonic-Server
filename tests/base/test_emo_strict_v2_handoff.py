@@ -1206,7 +1206,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         self.assertEqual(context["authorityClientId"], "source-1")
         self.assertEqual(
             [message["action"] for message in source_messages],
-            ["playback.handoff.cancel", "playback.handoff.status", "device.list"],
+            ["playback.handoff.cancel", "playback.handoff.status"],
         )
         self.assertEqual(
             source_messages[1]["payload"]["status"],
@@ -1235,7 +1235,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         source_messages = self.get_messages(source)
         self.assertEqual(
             [message["action"] for message in source_messages],
-            ["playback.handoff.status", "device.list"],
+            ["playback.handoff.status"],
         )
         self.assertEqual(source_messages[0]["payload"]["status"], "failed")
 
@@ -1259,7 +1259,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         self.assertEqual(context["authorityClientId"], "source-1")
         self.assertEqual(
             [message["action"] for message in target_messages],
-            ["playback.handoff.cancel", "playback.handoff.status", "device.list"],
+            ["playback.handoff.cancel", "playback.handoff.status"],
         )
         self.assertEqual(
             target_messages[1]["payload"]["status"],

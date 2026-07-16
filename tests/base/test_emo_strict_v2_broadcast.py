@@ -1321,7 +1321,7 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
                 message["action"]
                 for message in self.get_messages(participant)
             ],
-            ["device.list"],
+            [],
         )
 
         stopped = _expire_strict_broadcast_authority_disconnect(

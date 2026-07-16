@@ -28,7 +28,7 @@
       "contractSection": "3.3",
       "payloadSchema": {"closed": true, "required": ["clientId:string", "deviceSessionId:string", "deviceName:string", "roles:player|controller[]", "capabilities:9-or-10-bool-object"], "optional": ["alias:string"]},
       "settlement": "correlated_ack",
-      "serverPushes": ["device.list"],
+      "serverPushes": [],
       "roleCapabilityGate": "authenticated; Core must be ready",
       "cursorMutation": "none",
       "errorConditionFields": ["retryAfterMs"]

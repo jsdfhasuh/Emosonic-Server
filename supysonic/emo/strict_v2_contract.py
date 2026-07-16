@@ -435,6 +435,7 @@ _OUTPUT_ACTION_TYPES = {
 
 _DIRECT_RESPONSE_ACTIONS = {
     "system.pong",
+    "device.list",
     "playback.context.list",
     "playback.context.create",
 }
@@ -1378,7 +1379,7 @@ def validate_strict_output(
     request_action = _validate_output_payload(action, envelope["payload"])
 
     correlated = action in {"system.ack", "system.error"} or action in _DIRECT_RESPONSE_ACTIONS
-    if action in {"device.list", "playback.context.status"}:
+    if action == "playback.context.status":
         correlated = "requestId" in envelope
     if correlated:
         if "requestId" not in envelope:

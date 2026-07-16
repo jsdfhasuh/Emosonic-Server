@@ -402,6 +402,19 @@ class StrictV2ContractTestCase(unittest.TestCase):
         self.assertEqual(validate_strict_output(feedback), feedback)
         self.assertEqual(validate_strict_output(device_list), device_list)
 
+    def test_device_list_output_requires_request_id(self):
+        device_list = self._output(
+            "state",
+            "device.list",
+            {"devices": []},
+        )
+
+        with self.assertRaisesRegex(
+            StrictOutputValidationError,
+            "requires requestId",
+        ):
+            validate_strict_output(device_list)
+
     def test_validates_context_list_and_binding_event_outputs(self):
         response = self._output(
             "state",
