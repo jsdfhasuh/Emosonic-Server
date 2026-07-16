@@ -92,13 +92,13 @@ jobs:
           (
             cd "$RUNNER_TEMP"
             EMO_SERVER_BUILD_COMMIT="${{ github.sha }}" PYTHONPATH="$wheel_target" \
-              python -c 'import os, re; from supysonic.emo.protocol_metadata import get_strict_v2_metadata; metadata = get_strict_v2_metadata(); expected = os.environ["EMO_SERVER_BUILD_COMMIT"]; assert metadata["protocolVersion"] == "2.2.0", metadata; assert metadata["serverBuildCommit"] == expected, metadata; assert re.fullmatch(r"[0-9a-f]{64}", metadata["schemaHash"]), metadata; print(metadata)'
+              python -c 'import os, re; from supysonic.emo.protocol_metadata import get_strict_v2_metadata; metadata = get_strict_v2_metadata(); expected = os.environ["EMO_SERVER_BUILD_COMMIT"]; assert metadata["serverBuildCommit"] == expected, metadata; assert re.fullmatch(r"[0-9a-f]{64}", metadata["schemaHash"]), metadata; print(metadata)'
           )
           python -m pip install --no-deps --target "$sdist_target" dist/*.tar.gz
           (
             cd "$RUNNER_TEMP"
             EMO_SERVER_BUILD_COMMIT="${{ github.sha }}" PYTHONPATH="$sdist_target" \
-              python -c 'import os, re; from supysonic.emo.protocol_metadata import get_strict_v2_metadata; metadata = get_strict_v2_metadata(); expected = os.environ["EMO_SERVER_BUILD_COMMIT"]; assert metadata["protocolVersion"] == "2.2.0", metadata; assert metadata["serverBuildCommit"] == expected, metadata; assert re.fullmatch(r"[0-9a-f]{64}", metadata["schemaHash"]), metadata; print(metadata)'
+              python -c 'import os, re; from supysonic.emo.protocol_metadata import get_strict_v2_metadata; metadata = get_strict_v2_metadata(); expected = os.environ["EMO_SERVER_BUILD_COMMIT"]; assert metadata["serverBuildCommit"] == expected, metadata; assert re.fullmatch(r"[0-9a-f]{64}", metadata["schemaHash"]), metadata; print(metadata)'
           )
 
   docker-publish:
@@ -149,7 +149,7 @@ jobs:
           docker run --rm --entrypoint python \
             -e "EMO_EXPECTED_SERVER_BUILD_COMMIT=${{ github.sha }}" \
             emosonic-server:verify \
-            -c 'import os, re; from supysonic.emo.protocol_metadata import get_strict_v2_metadata; metadata = get_strict_v2_metadata(); expected = os.environ["EMO_EXPECTED_SERVER_BUILD_COMMIT"]; assert metadata["protocolVersion"] == "2.2.0", metadata; assert metadata["serverBuildCommit"] == expected, metadata; assert re.fullmatch(r"[0-9a-f]{40}", metadata["serverBuildCommit"]), metadata; assert re.fullmatch(r"[0-9a-f]{64}", metadata["schemaHash"]), metadata; print(metadata)'
+            -c 'import os, re; from supysonic.emo.protocol_metadata import get_strict_v2_metadata; metadata = get_strict_v2_metadata(); expected = os.environ["EMO_EXPECTED_SERVER_BUILD_COMMIT"]; assert metadata["serverBuildCommit"] == expected, metadata; assert re.fullmatch(r"[0-9a-f]{40}", metadata["serverBuildCommit"]), metadata; assert re.fullmatch(r"[0-9a-f]{64}", metadata["schemaHash"]), metadata; print(metadata)'
           test "$(docker image inspect emosonic-server:verify --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = "${{ github.sha }}"
 
       - name: Build and push Docker image
