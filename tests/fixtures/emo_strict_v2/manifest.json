@@ -521,7 +521,7 @@
         "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_reused_register_request_id_with_different_payload_conflicts",
         "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_disconnect_clears_request_cache_for_connection_nonce",
         "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_duplicate_playback_update_replays_only_canonical_confirmation",
-        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_context_create_response_emit_failure_replays_persisted_response",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_context_ensure_response_emit_failure_replays_persisted_response",
         "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_queue_sync_ack_backpressure_replays_without_second_mutation",
         "tests.base.test_emo_strict_v2_follow.StrictV2FollowTestCase.test_start_retry_and_stop_use_ack_only_settlement",
         "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_same_source_target_retry_reuses_handoff_and_prepare",
@@ -579,7 +579,7 @@
       "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_state", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast", "tests.base.test_emo_schema_migration"],
       "testMethods": [
         "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_closed_context_is_a_terminal_tombstone",
-        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_context_create_retry_after_runtime_reset_uses_persisted_intent",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_context_ensure_retry_after_runtime_reset_uses_persisted_context",
         "tests.base.test_emo_ws_state.EmoWebSocketStateTestCase.test_restart_restore_discards_all_transient_profile_state",
         "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_restart_fails_nonterminal_handoff_with_server_restart",
         "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_disconnect_cancel_push_failure_still_emits_terminal_status",
@@ -595,7 +595,7 @@
       "testMethods": [
         "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_control_does_not_mutate_when_authority_emit_capacity_is_unavailable",
         "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_register_post_ack_push_failure_does_not_emit_second_settlement",
-        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_context_create_response_emit_failure_replays_persisted_response",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_context_ensure_response_emit_failure_replays_persisted_response",
         "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_playback_update_push_failure_replays_persisted_confirmation",
         "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_queue_sync_ack_backpressure_replays_without_second_mutation",
         "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_queue_sync_commits_before_emit_and_recovers_after_push_failure",
@@ -642,7 +642,7 @@
         "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_prepare_timeout_is_terminal_and_keeps_source_authority",
         "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_prepare_timeout_cancel_push_failure_still_emits_status",
         "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_commit_timeout_cancel_push_failure_still_emits_status",
-        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_participant_feedback_adds_paired_status_fields_and_cannot_control"
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_non_authority_feedback_is_rejected_and_participant_cannot_control"
       ]
     },
     "REQ-022": {
@@ -692,7 +692,7 @@
         "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_close_and_control_are_linearized_by_context_and_authority_pair",
         "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_handoff_and_control_are_linearized_by_authority_pair",
         "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_close_and_complete_handoff_are_linearized_by_context_tombstone",
-        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_multi_context_controls_conflict_without_authority_side_effects",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_ensure_keeps_one_context_per_authority_pair",
         "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_success_uses_strict_settlement_schema_and_atomic_authority_switch"
       ]
     },
@@ -708,6 +708,166 @@
         "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_device_volume_does_not_mutate_active_playback_context",
         "tests.base.test_emo_web_strict_v2.EmoWebStrictV2TestCase.test_web_remote_volume_controls_online_player_without_context",
         "tests.base.test_emo_web_strict_v2.EmoWebStrictV2TestCase.test_strict_pages_render_device_volume_controls"
+      ]
+    },
+    "REQ-027": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_contract", "tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store", "tests.base.test_emo_web_strict_v2"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_contract.StrictV2ContractTestCase.test_validates_ensure_idle_and_queue_backed_shapes",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_context_ensure_creates_idle_initializes_and_rebinds_same_id",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_ensure_creates_idle_initializes_same_context_and_rebinds",
+        "tests.base.test_emo_web_strict_v2.EmoWebStrictV2TestCase.test_exact_web_player_and_control_payloads_complete_core_round_trip"
+      ]
+    },
+    "REQ-028": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_contract", "tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_contract.StrictV2ContractTestCase.test_validates_idle_context_prepare_and_settled_outputs",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_context_ensure_creates_idle_initializes_and_rebinds_same_id",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_queue_sync_crosses_idle_boundary_with_closed_snapshot"
+      ]
+    },
+    "REQ-029": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_contract", "tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_contract.StrictV2ContractTestCase.test_validates_prepare_and_prepared_request_shapes",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_context_prepare_routes_once_and_prepared_ready_is_event_confirmed",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_prepare_transaction_enforces_one_active_intent_and_terminal_replay"
+      ]
+    },
+    "REQ-030": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_idle_context_control_fails_with_queue_required_without_routing"
+      ]
+    },
+    "REQ-031": {
+      "profiles": ["handoff"],
+      "testModules": ["tests.base.test_emo_ws_store", "tests.base.test_emo_strict_v2_handoff"],
+      "testMethods": [
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_handoff_start_rejects_non_idle_or_preparing_target_context",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_success_uses_strict_settlement_schema_and_atomic_authority_switch",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_start_rejects_target_context_that_is_no_longer_idle"
+      ]
+    },
+    "REQ-032": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_remote_control_persists_pending_deadline_and_watchdog_settles_unknown",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_r11_passive_and_remote_committed_updates_advance_applied_cursor",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_control_transaction_is_persistent_ordered_and_terminal_idempotent"
+      ]
+    },
+    "REQ-033": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_r11_passive_and_remote_committed_updates_advance_applied_cursor",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_strict_playback_update_commits_pending_and_advances_applied_cursor"
+      ]
+    },
+    "REQ-034": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_stale_applied_update_returns_passive_correction_only_to_source",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_stale_applied_feedback_returns_source_only_correction_without_mutation"
+      ]
+    },
+    "REQ-035": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_local_user_update_allocates_server_version_and_supersedes_pending",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_local_user_update_allocates_version_and_supersedes_pending"
+      ]
+    },
+    "REQ-036": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_local_user_update_allocates_server_version_and_supersedes_pending",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_local_intent_replays_first_canonical_result_and_rejects_conflict"
+      ]
+    },
+    "REQ-037": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_r11_failed_track_change_emits_one_settled_per_dependent_version",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_failed_track_change_cascades_dependency_terminals_in_version_order"
+      ]
+    },
+    "REQ-038": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_local_user_update_allocates_server_version_and_supersedes_pending",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_local_user_update_allocates_version_and_supersedes_pending"
+      ]
+    },
+    "REQ-039": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_r11_failed_track_change_emits_one_settled_per_dependent_version",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_failed_track_change_cascades_dependency_terminals_in_version_order"
+      ]
+    },
+    "REQ-040": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_remote_control_persists_pending_deadline_and_watchdog_settles_unknown",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_windows_execution_timeout_is_feedback_not_server_settled"
+      ]
+    },
+    "REQ-041": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_authority_disconnect_settles_pending_unknown_without_playback_update",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_socket_replacement_settles_old_pending_and_never_replays_command",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_restart_marks_pending_unknown_without_replaying_to_reconnected_player"
+      ]
+    },
+    "REQ-042": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_stale_applied_update_returns_passive_correction_only_to_source",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_stale_applied_feedback_returns_source_only_correction_without_mutation"
+      ]
+    },
+    "REQ-043": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_contract", "tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_contract.StrictV2ContractTestCase.test_validates_idle_context_prepare_and_settled_outputs",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_remote_control_persists_pending_deadline_and_watchdog_settles_unknown",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_r11_failed_track_change_emits_one_settled_per_dependent_version",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_control_transaction_is_persistent_ordered_and_terminal_idempotent"
+      ]
+    },
+    "REQ-044": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_conformance"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_windows_execution_timeout_is_feedback_not_server_settled",
+        "tests.base.test_emo_strict_v2_conformance.StrictV2ConformanceTestCase.test_packaged_r11_manifest_stays_disabled_until_evidence_is_complete"
+      ]
+    },
+    "REQ-045": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_web_strict_v2"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_remote_control_persists_pending_deadline_and_watchdog_settles_unknown",
+        "tests.base.test_emo_web_strict_v2.EmoWebStrictV2TestCase.test_exact_web_player_and_control_payloads_complete_core_round_trip"
       ]
     }
   }

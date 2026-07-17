@@ -117,7 +117,7 @@ class StrictV2ManifestTestCase(unittest.TestCase):
                 self.assertEqual(validator.optional, optional)
 
     def test_manifest_maps_every_ears_requirement(self):
-        expected_requirements = {"REQ-%03d" % number for number in range(1, 27)}
+        expected_requirements = {"REQ-%03d" % number for number in range(1, 46)}
 
         self.assertEqual(set(self.manifest["requirements"]), expected_requirements)
         for requirement, mapping in self.manifest["requirements"].items():

@@ -64,9 +64,9 @@ class StrictV2VerificationScriptsTestCase(unittest.TestCase):
             )
 
         self.assertEqual(identity["serverBuildCommit"], build_commit)
-        self.assertEqual(identity["protocolVersion"], "2.3.0")
+        self.assertEqual(identity["protocolVersion"], "2.4.0")
         self.assertEqual(identity["contractSha256"], STRICT_V2_CONTRACT_SHA256)
-        self.assertEqual(len(identity["requirements"]), 26)
+        self.assertEqual(len(identity["requirements"]), 45)
         self.assertFalse(any(identity["readiness"].values()))
 
     def test_evidence_collector_rejects_dirty_or_mismatched_build(self):
@@ -129,7 +129,7 @@ class StrictV2VerificationScriptsTestCase(unittest.TestCase):
     def test_evidence_collector_writes_machine_and_human_summaries(self):
         identity = {
             "serverBuildCommit": "a" * 40,
-            "protocolVersion": "2.3.0",
+            "protocolVersion": "2.4.0",
             "contractSha256": STRICT_V2_CONTRACT_SHA256,
             "schemaHash": "b" * 64,
         }
@@ -161,7 +161,7 @@ class StrictV2VerificationScriptsTestCase(unittest.TestCase):
         self.assertIn("Overall result: **PASS**", markdown)
         self.assertIn("Android/Windows acceptance", markdown)
 
-    def test_ears_runner_uses_complete_r7_requirement_inventory(self):
+    def test_ears_runner_uses_complete_r11_requirement_inventory(self):
         methods = verify_emo_strict_v2_ears._mapped_test_methods()
 
         self.assertIn(
@@ -174,12 +174,17 @@ class StrictV2VerificationScriptsTestCase(unittest.TestCase):
             "test_handoff_and_control_are_linearized_by_authority_pair",
             methods,
         )
+        self.assertIn(
+            "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase."
+            "test_remote_control_persists_pending_deadline_and_watchdog_settles_unknown",
+            methods,
+        )
 
-    def test_ears_runner_rejects_pre_r7_requirement_inventory(self):
+    def test_ears_runner_rejects_pre_r11_requirement_inventory(self):
         manifest = json.loads(
             verify_emo_strict_v2_ears.MANIFEST_PATH.read_text(encoding="utf-8")
         )
-        manifest["requirements"].pop("REQ-026")
+        manifest["requirements"].pop("REQ-045")
 
         with tempfile.TemporaryDirectory() as directory:
             manifest_path = Path(directory) / "manifest.json"
@@ -188,10 +193,10 @@ class StrictV2VerificationScriptsTestCase(unittest.TestCase):
                 verify_emo_strict_v2_ears,
                 "MANIFEST_PATH",
                 manifest_path,
-        ), self.assertRaisesRegex(ValueError, "REQ-001 through REQ-026"):
+        ), self.assertRaisesRegex(ValueError, "REQ-001 through REQ-045"):
                 verify_emo_strict_v2_ears._mapped_test_methods()
 
-    def test_packaging_verifier_is_bound_to_r7_protocol_identity(self):
+    def test_packaging_verifier_is_bound_to_r11_protocol_identity(self):
         contract_path = (
             ROOT / "specs" / "emosonic_strict_v2_socketio_server_contract.md"
         )
@@ -211,15 +216,15 @@ class StrictV2VerificationScriptsTestCase(unittest.TestCase):
         self.assertEqual(observed_hash, STRICT_V2_CONTRACT_SHA256)
         self.assertEqual(
             verify_emo_strict_v2_packaging.FROZEN_PROTOCOL_VERSION,
-            "2.3.0",
+            "2.4.0",
         )
-        self.assertEqual(descriptor["protocolVersion"], "2.3.0")
+        self.assertEqual(descriptor["protocolVersion"], "2.4.0")
 
     def test_packaging_verifier_rejects_protocol_identity_mismatch(self):
         canonical = {
             "runtimeContractSha256": STRICT_V2_CONTRACT_SHA256,
             "manifestContractSha256": STRICT_V2_CONTRACT_SHA256,
-            "protocolVersion": "2.3.0",
+            "protocolVersion": "2.4.0",
         }
         verify_emo_strict_v2_packaging._assert_protocol_identity(
             canonical,
