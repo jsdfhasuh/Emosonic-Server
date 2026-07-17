@@ -622,6 +622,7 @@ def createPlaybackPrepareTransaction(
     request_payload,
     control_version,
     deadline_at_ms,
+    validate_context=False,
 ):
     request_fingerprint = _json_fingerprint(request_payload)
     initial_queue = request_payload.get("initialQueue")
@@ -642,6 +643,57 @@ def createPlaybackPrepareTransaction(
                         "Prepare intent content conflict"
                     )
                 return serializePlaybackPrepareTransaction(existing), False
+            context_ready = False
+            if validate_context:
+                context_record = _getStrictPlaybackContextRecord(
+                    playback_context_id,
+                    user_name,
+                )
+                if context_record is None:
+                    return None, False
+                current = _playback_context_payload(context_record)
+                if context_record.epoch != epoch:
+                    raise PlaybackPrepareTransactionConflictError(
+                        "Prepare Context epoch changed"
+                    )
+                if (
+                    context_record.authority_client_id != authority_client_id
+                    or context_record.authority_device_session_id
+                    != authority_device_session_id
+                ):
+                    raise PlaybackPrepareTransactionConflictError(
+                        "Prepare authority binding changed"
+                    )
+                active_context_ids = [
+                    item.playback_context_id
+                    for item in (
+                        EmoPlaybackContext.select(
+                            EmoPlaybackContext.playback_context_id
+                        )
+                        .where(
+                            (EmoPlaybackContext.user_name == user_name)
+                            & (EmoPlaybackContext.lifecycle == "active")
+                            & (
+                                EmoPlaybackContext.authority_client_id
+                                == authority_client_id
+                            )
+                            & (
+                                EmoPlaybackContext.authority_device_session_id
+                                == authority_device_session_id
+                            )
+                        )
+                        .order_by(EmoPlaybackContext.playback_context_id)
+                        .limit(2)
+                    )
+                ]
+                if active_context_ids != [playback_context_id]:
+                    raise PlaybackContextAuthorityAmbiguousError(current)
+                if context_record.control_version != control_version:
+                    raise PlaybackContextStaleVersionError(
+                        current,
+                        "controlVersion",
+                    )
+                context_ready = bool(json.loads(context_record.queue_json))
             active = EmoPlaybackPrepareTransaction.get_or_none(
                 (EmoPlaybackPrepareTransaction.playback_context_id == playback_context_id)
                 & (EmoPlaybackPrepareTransaction.epoch == epoch)
@@ -651,6 +703,18 @@ def createPlaybackPrepareTransaction(
                 raise PlaybackPrepareAlreadyActiveError(
                     "Another prepare transaction is active"
                 )
+            canonical_result = None
+            status = "preparing"
+            terminal_at_ms = None
+            if context_ready:
+                status = "ready"
+                terminal_at_ms = max(0, deadline_at_ms - 10000)
+                canonical_result = {
+                    "playbackContextId": playback_context_id,
+                    "intentId": intent_id,
+                    "ready": True,
+                    "controlVersion": control_version,
+                }
             record = EmoPlaybackPrepareTransaction.create(
                 playback_context_id=playback_context_id,
                 user_name=user_name,
@@ -664,8 +728,14 @@ def createPlaybackPrepareTransaction(
                 request_fingerprint=request_fingerprint,
                 initial_queue_json=initial_queue_json,
                 control_version=control_version,
-                status="preparing",
+                status=status,
                 deadline_at_ms=deadline_at_ms,
+                canonical_result_json=(
+                    _canonical_json(canonical_result)
+                    if canonical_result is not None
+                    else None
+                ),
+                terminal_at_ms=terminal_at_ms,
             )
             return serializePlaybackPrepareTransaction(record), True
     finally:
@@ -681,6 +751,28 @@ def getPlaybackPrepareTransaction(playback_context_id, epoch, intent_id):
             & (EmoPlaybackPrepareTransaction.intent_id == intent_id)
         )
         return serializePlaybackPrepareTransaction(record)
+    finally:
+        close_connection()
+
+
+def listActivePlaybackPrepareTransactions(playback_context_id, epoch=None):
+    open_connection(reuse=True)
+    try:
+        expression = (
+            EmoPlaybackPrepareTransaction.playback_context_id
+            == playback_context_id
+        ) & (EmoPlaybackPrepareTransaction.status == "preparing")
+        if epoch is not None:
+            expression &= EmoPlaybackPrepareTransaction.epoch == epoch
+        query = (
+            EmoPlaybackPrepareTransaction.select()
+            .where(expression)
+            .order_by(
+                EmoPlaybackPrepareTransaction.epoch,
+                EmoPlaybackPrepareTransaction.intent_id,
+            )
+        )
+        return [serializePlaybackPrepareTransaction(record) for record in query]
     finally:
         close_connection()
 

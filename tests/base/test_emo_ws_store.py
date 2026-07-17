@@ -1766,6 +1766,22 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertFalse(created)
         self.assertEqual(replay, prepare)
 
+        with self.assertRaises(PlaybackPrepareTransactionConflictError):
+            createPlaybackPrepareTransaction(
+                "context-1",
+                "alice",
+                1,
+                "intent-1",
+                "controller-1",
+                "player-1",
+                "device:player-1",
+                "nonce-1",
+                1,
+                {},
+                1,
+                11000,
+            )
+
         with self.assertRaises(PlaybackPrepareAlreadyActiveError):
             createPlaybackPrepareTransaction(
                 "context-1",

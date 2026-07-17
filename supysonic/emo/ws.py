@@ -48,12 +48,15 @@ from .ws_store import (
     PlaybackContextEnsureConflictError,
     PlaybackContextIntentConflictError,
     PlaybackContextQueueRequiredError,
+    PlaybackPrepareAlreadyActiveError,
+    PlaybackPrepareTransactionConflictError,
     PlaybackContextStaleVersionError,
     closeStrictPlaybackContextState,
     commitStrictPlaybackHandoff,
     completeStrictPlaybackHandoff,
     createPlaybackContextState,
     ensureStrictPlaybackContextState,
+    createPlaybackPrepareTransaction,
     failActivePlaybackHandoffsForRestart,
     getActivePlaybackHandoffs,
     getLocalQueueState,
@@ -62,10 +65,12 @@ from .ws_store import (
     getPlaybackContextState,
     getPlaybackHandoff,
     getPlaybackHandoffByRequest,
+    getPlaybackPrepareTransaction,
     getPlaybackState,
     getPlaybackStates,
     getQueueState,
     listActivePlaybackContextBindings,
+    listActivePlaybackPrepareTransactions,
     listPlaybackContexts,
     mutateStrictPlaybackContextControl,
     mutateStrictPlaybackContextQueue,
@@ -77,6 +82,7 @@ from .ws_store import (
     saveQueueState,
     serializeDevicePlaybackStateV2,
     serializePlaybackContextV2,
+    settlePlaybackPrepareTransaction,
     terminateStrictPlaybackHandoff,
     updatePlaybackContextState,
 )
@@ -155,6 +161,8 @@ ACTION_EVENT_NAMES = {
     "follow.stop": "follow_stop",
     "playback.ready": "playback_ready",
     "playback.context.ensure": "playback_context_ensure",
+    "playback.context.prepare": "playback_context_prepare",
+    "playback.context.prepared": "playback_context_prepared",
     "playback.context.list": "playback_context_list",
     "playback.context.status": "playback_context_status",
     "playback.context.subscribe": "playback_context_subscribe",
@@ -220,6 +228,7 @@ PROTOCOL_TWO_PHASE = "two_phase"
 TWO_PHASE_COMMIT_LEAD_MS = 350
 SINGLE_PHASE_COMMIT_LEAD_MS = 700
 PREPARE_TIMEOUT_MS = 1200
+CONTEXT_PREPARE_TIMEOUT_MS = 10000
 HANDOFF_PREPARE_TIMEOUT_MS = 8000
 HANDOFF_COMPLETE_TIMEOUT_MS = 5000
 BROADCAST_AUTHORITY_DISCONNECT_TIMEOUT_MS = 30000
@@ -5699,6 +5708,24 @@ def _handle_playback_context_ensure(
         request_id,
         serializePlaybackContextV2(playback_context),
     )
+    if len(ensure_result.affected_authority_pairs) > 1:
+        settled_prepares = (
+            _settle_active_context_prepares_for_authority_change(
+                playback_context_id,
+                playback_context["controlVersion"],
+            )
+        )
+        for canonical_result in settled_prepares:
+            _run_post_commit_push(
+                "playback.context.ensure",
+                request_id,
+                lambda result=canonical_result: _broadcast_context_prepared(
+                    current_user_name,
+                    playback_context_id,
+                    result,
+                    include_sids=(sid,),
+                ),
+            )
     if ensure_result.binding_mutated:
         _run_post_commit_push(
             "playback.context.ensure",
@@ -5709,6 +5736,406 @@ def _handle_playback_context_ensure(
             ),
         )
     return playback_context
+
+
+def _build_context_prepared_message(canonical_result):
+    return _build_message(
+        "event",
+        "playback.context.prepared",
+        canonical_result,
+    )
+
+
+def _broadcast_context_prepared(
+    user_name,
+    playback_context_id,
+    canonical_result,
+    include_sids=(),
+):
+    message = _build_context_prepared_message(canonical_result)
+    target_sids = set(
+        state.list_playback_context_subscribers(
+            playback_context_id,
+            user_name=user_name,
+        )
+    )
+    target_sids.update(include_sids)
+    for target_sid in sorted(target_sids):
+        try:
+            _emit_message(message, target_sid)
+        except Exception:
+            logger.exception(
+                "Failed to emit playback.context.prepared context=%s sid=%s",
+                playback_context_id,
+                target_sid,
+            )
+
+
+def _settle_active_context_prepares_for_authority_change(
+    playback_context_id,
+    control_version,
+):
+    settled_results = []
+    for prepare in listActivePlaybackPrepareTransactions(playback_context_id):
+        canonical_result = {
+            "playbackContextId": playback_context_id,
+            "intentId": prepare["intentId"],
+            "ready": False,
+            "errorCode": "authority_changed",
+            "controlVersion": control_version,
+        }
+        try:
+            settled, changed = settlePlaybackPrepareTransaction(
+                playback_context_id,
+                prepare["epoch"],
+                prepare["intentId"],
+                "failed",
+                canonical_result,
+                _server_time_ms(),
+                error_code="authority_changed",
+            )
+        except PlaybackPrepareTransactionConflictError:
+            continue
+        if changed:
+            settled_results.append(settled["canonicalResult"])
+    return settled_results
+
+
+def _settle_active_context_prepares_ready(
+    playback_context_id,
+    epoch,
+    control_version,
+):
+    settled_results = []
+    for prepare in listActivePlaybackPrepareTransactions(
+        playback_context_id,
+        epoch=epoch,
+    ):
+        canonical_result = {
+            "playbackContextId": playback_context_id,
+            "intentId": prepare["intentId"],
+            "ready": True,
+            "controlVersion": control_version,
+        }
+        try:
+            settled, changed = settlePlaybackPrepareTransaction(
+                playback_context_id,
+                epoch,
+                prepare["intentId"],
+                "ready",
+                canonical_result,
+                _server_time_ms(),
+            )
+        except PlaybackPrepareTransactionConflictError:
+            continue
+        if changed:
+            settled_results.append(settled["canonicalResult"])
+    return settled_results
+
+
+def _context_prepare_request_record(payload):
+    record = {"baseControlVersion": payload["baseControlVersion"]}
+    if "initialQueueSongIds" in payload:
+        record["initialQueue"] = {
+            "queueSongIds": list(payload["initialQueueSongIds"]),
+            "currentIndex": payload["currentIndex"],
+            "positionMs": payload["positionMs"],
+        }
+    return record
+
+
+def _handle_playback_context_prepare(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+):
+    if current_client is None:
+        raise PermissionError("Register before preparing a playback context")
+    if not _has_role(current_client, "controller"):
+        raise PermissionError("Only a controller can prepare a playback context")
+    playback_context_id = payload["playbackContextId"]
+    context = _get_existing_playback_context(playback_context_id)
+    if context is None:
+        raise LookupError("Playback context not found")
+    _ensure_playback_context_for_user(context, current_user_name)
+    _ensure_playback_context_active(context)
+
+    authority_client_id = context.get("authorityClientId")
+    authority_sid = state.get_sid_for_client(
+        authority_client_id,
+        user_name=current_user_name,
+    )
+    authority_client = state.get_client(
+        authority_client_id,
+        user_name=current_user_name,
+    )
+    if authority_sid is None or authority_client is None:
+        raise PlaybackAuthorityOfflineError("Playback context authority is offline")
+    if (
+        authority_client.get("deviceSessionId")
+        != context.get("authorityDeviceSessionId")
+    ):
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority device is not connected"
+        )
+    if not _has_role(authority_client, "player"):
+        raise PlaybackAuthorityOfflineError("Playback context authority is not a player")
+    if not _client_supports(authority_client, CAPABILITY_PLAYBACK_PREPARE):
+        raise CapabilityRequiredError(
+            "Playback authority lacks playbackPrepare"
+        )
+    if not _client_supports(authority_client, CAPABILITY_CAN_PLAY):
+        raise CapabilityRequiredError("Playback authority lacks canPlay")
+
+    authority_session = state.get_session(authority_sid) or {}
+    routed_nonce = authority_session.get("connectionNonce")
+    if not isinstance(routed_nonce, str) or not routed_nonce:
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority connection is unavailable"
+        )
+    should_reserve = not context.get("queueSongIds")
+    if should_reserve and not strict_v2_safety.reserve_emit(authority_sid):
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority send buffer is unavailable"
+        )
+    try:
+        now_ms = _server_time_ms()
+        prepare, created = createPlaybackPrepareTransaction(
+            playback_context_id,
+            current_user_name,
+            context["epoch"],
+            payload["intentId"],
+            current_client.get("clientId"),
+            authority_client_id,
+            context.get("authorityDeviceSessionId"),
+            routed_nonce,
+            authority_session.get("connectionEpoch") or 1,
+            _context_prepare_request_record(payload),
+            payload["baseControlVersion"],
+            now_ms + CONTEXT_PREPARE_TIMEOUT_MS,
+            validate_context=True,
+        )
+        if prepare is None:
+            raise LookupError("Playback context not found")
+        if created and prepare["status"] == "preparing":
+            command_payload = {
+                "playbackContextId": playback_context_id,
+                "intentId": prepare["intentId"],
+                "controlVersion": prepare["controlVersion"],
+                "sourceClientId": current_client.get("clientId"),
+            }
+            if "initialQueueSongIds" in payload:
+                command_payload.update(
+                    {
+                        "initialQueueSongIds": list(
+                            payload["initialQueueSongIds"]
+                        ),
+                        "currentIndex": payload["currentIndex"],
+                        "positionMs": payload["positionMs"],
+                    }
+                )
+            _emit_message(
+                _build_message(
+                    "command",
+                    "playback.context.prepare",
+                    command_payload,
+                ),
+                authority_sid,
+                emit_reserved=should_reserve,
+            )
+            socketio.start_background_task(
+                _expire_context_prepare_later,
+                playback_context_id,
+                prepare["epoch"],
+                prepare["intentId"],
+            )
+    finally:
+        if should_reserve:
+            strict_v2_safety.release_emit(authority_sid)
+
+    ack_status = "ready" if prepare["status"] == "ready" else "preparing"
+    _send_ack(
+        request_id,
+        {
+            "intentId": prepare["intentId"],
+            "status": ack_status,
+            "controlVersion": prepare["controlVersion"],
+        },
+    )
+    if not created and prepare.get("canonicalResult") is not None:
+        _run_post_commit_push(
+            "playback.context.prepare",
+            request_id,
+            lambda: _broadcast_context_prepared(
+                current_user_name,
+                playback_context_id,
+                prepare["canonicalResult"],
+                include_sids=(request.sid,),
+            ),
+        )
+    return prepare
+
+
+def _handle_playback_context_prepared(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+):
+    if current_client is None or not _has_role(current_client, "player"):
+        raise PermissionError("Only the authority player can settle prepare")
+    playback_context_id = payload["playbackContextId"]
+    context = _get_existing_playback_context(playback_context_id)
+    if context is None:
+        raise LookupError("Playback context not found")
+    _ensure_playback_context_for_user(context, current_user_name)
+    _ensure_playback_context_active(context)
+    if (
+        context.get("authorityClientId") != current_client.get("clientId")
+        or context.get("authorityDeviceSessionId") != payload["deviceSessionId"]
+        or payload["deviceSessionId"] != current_client.get("deviceSessionId")
+    ):
+        raise PermissionError("Prepare feedback authority binding mismatch")
+
+    prepare = getPlaybackPrepareTransaction(
+        playback_context_id,
+        context["epoch"],
+        payload["intentId"],
+    )
+    if prepare is None:
+        raise PlaybackPrepareTransactionConflictError(
+            "Prepare transaction not found"
+        )
+    session_info = state.get_session(request.sid) or {}
+    if (
+        prepare["authorityClientId"] != current_client.get("clientId")
+        or prepare["authorityDeviceSessionId"] != payload["deviceSessionId"]
+        or prepare["routedConnectionNonce"]
+        != session_info.get("connectionNonce")
+    ):
+        raise PermissionError("Prepare feedback came from a replaced Socket")
+
+    if prepare["status"] != "preparing":
+        canonical_result = prepare.get("canonicalResult")
+        if canonical_result is None:
+            raise PlaybackPrepareTransactionConflictError(
+                "Prepare terminal has no canonical result"
+            )
+        same_result = canonical_result.get("ready") == payload["ready"]
+        if not payload["ready"]:
+            same_result = same_result and canonical_result.get(
+                "errorCode"
+            ) == payload.get("errorCode")
+        if not same_result and prepare["status"] != "ready":
+            raise PlaybackPrepareTransactionConflictError(
+                "Prepare terminal conflict"
+            )
+    else:
+        if payload["ready"] and not context.get("queueSongIds"):
+            raise PlaybackPrepareTransactionConflictError(
+                "Prepare cannot be ready while Context is idle"
+            )
+        canonical_result = {
+            "playbackContextId": playback_context_id,
+            "intentId": payload["intentId"],
+            "ready": payload["ready"],
+            "controlVersion": context["controlVersion"],
+        }
+        status = "ready" if payload["ready"] else "failed"
+        if not payload["ready"]:
+            canonical_result["errorCode"] = payload["errorCode"]
+            if "errorMessage" in payload:
+                canonical_result["errorMessage"] = payload["errorMessage"]
+        prepare, _changed = settlePlaybackPrepareTransaction(
+            playback_context_id,
+            context["epoch"],
+            payload["intentId"],
+            status,
+            canonical_result,
+            _server_time_ms(),
+            error_code=canonical_result.get("errorCode"),
+            error_message=canonical_result.get("errorMessage"),
+        )
+        canonical_result = prepare["canonicalResult"]
+
+    confirmation = _build_context_prepared_message(canonical_result)
+    _store_event_confirmations([confirmation])
+    _run_post_commit_push(
+        "playback.context.prepared",
+        request_id,
+        lambda: _broadcast_context_prepared(
+            current_user_name,
+            playback_context_id,
+            canonical_result,
+            include_sids=(request.sid,),
+        ),
+    )
+    return prepare
+
+
+def _expire_context_prepare_later(playback_context_id, epoch, intent_id):
+    socketio.sleep(CONTEXT_PREPARE_TIMEOUT_MS / 1000)
+    prepare = getPlaybackPrepareTransaction(
+        playback_context_id,
+        epoch,
+        intent_id,
+    )
+    if prepare is None or prepare["status"] != "preparing":
+        return
+    context = getPlaybackContextState(playback_context_id)
+    ready = bool(
+        context is not None
+        and context.get("lifecycle") == "active"
+        and context.get("epoch") == epoch
+        and context.get("authorityClientId") == prepare["authorityClientId"]
+        and context.get("authorityDeviceSessionId")
+        == prepare["authorityDeviceSessionId"]
+        and context.get("queueSongIds")
+    )
+    error_code = None
+    if not ready:
+        if (
+            context is None
+            or context.get("lifecycle") != "active"
+            or context.get("epoch") != epoch
+            or context.get("authorityClientId") != prepare["authorityClientId"]
+            or context.get("authorityDeviceSessionId")
+            != prepare["authorityDeviceSessionId"]
+        ):
+            error_code = "authority_changed"
+        else:
+            error_code = "prepare_timeout"
+    canonical_result = {
+        "playbackContextId": playback_context_id,
+        "intentId": intent_id,
+        "ready": ready,
+        "controlVersion": (
+            prepare["controlVersion"]
+            if context is None
+            else context.get("controlVersion", prepare["controlVersion"])
+        ),
+    }
+    if error_code is not None:
+        canonical_result["errorCode"] = error_code
+    try:
+        settled, changed = settlePlaybackPrepareTransaction(
+            playback_context_id,
+            epoch,
+            intent_id,
+            "ready" if ready else "failed",
+            canonical_result,
+            _server_time_ms(),
+            error_code=error_code,
+        )
+    except PlaybackPrepareTransactionConflictError:
+        return
+    if changed:
+        _broadcast_context_prepared(
+            prepare["userName"],
+            playback_context_id,
+            settled["canonicalResult"],
+        )
 
 
 def _handle_playback_context_list(
@@ -5849,6 +6276,10 @@ def _handle_playback_context_close(current_user_name, current_client, payload, r
     )
     if closed_context is None:
         raise LookupError("Playback context not found")
+    settled_prepares = _settle_active_context_prepares_for_authority_change(
+        playback_context_id,
+        closed_context.get("controlVersion", 1),
+    )
     state.restore_playback_context(playback_context_id, closed_context)
     for active_handoff in active_handoffs:
         handoff = getPlaybackHandoff(active_handoff.get("handoffId"))
@@ -5861,6 +6292,16 @@ def _handle_playback_context_close(current_user_name, current_client, payload, r
             error_message=handoff.get("errorMessage"),
         )
     _send_ack(request_id)
+    for canonical_result in settled_prepares:
+        _run_post_commit_push(
+            "playback.context.close",
+            request_id,
+            lambda result=canonical_result: _broadcast_context_prepared(
+                current_user_name,
+                playback_context_id,
+                result,
+            ),
+        )
     _run_post_commit_push(
         "playback.context.close",
         request_id,
@@ -5928,8 +6369,26 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
     if updated_context is None:
         raise LookupError("Playback context not found")
 
+    settled_prepares = []
+    if updated_context.get("queueSongIds"):
+        settled_prepares = _settle_active_context_prepares_ready(
+            playback_context_id,
+            updated_context["epoch"],
+            updated_context["controlVersion"],
+        )
+
     state.restore_playback_context(playback_context_id, updated_context)
     _send_ack(request_id)
+    for canonical_result in settled_prepares:
+        _run_post_commit_push(
+            "queue.context.sync",
+            request_id,
+            lambda result=canonical_result: _broadcast_context_prepared(
+                current_user_name,
+                playback_context_id,
+                result,
+            ),
+        )
     _run_post_commit_push(
         "queue.context.sync",
         request_id,
@@ -7725,6 +8184,42 @@ class EmoNamespace(Namespace):
                     if playback_context is None
                     else playback_context.get("playbackContextId"),
                 )
+            elif action == "playback.context.prepare":
+                prepare = _handle_playback_context_prepare(
+                    current_user_name,
+                    current_client,
+                    payload,
+                    request_id,
+                )
+                _log_emo_event(
+                    logging.INFO,
+                    "playback_context_prepare",
+                    result=prepare.get("status"),
+                    user=current_user_name,
+                    client_request_id=request_id,
+                    source_client_id=None
+                    if current_client is None
+                    else current_client.get("clientId"),
+                    playback_context_id=prepare.get("playbackContextId"),
+                )
+            elif action == "playback.context.prepared":
+                prepare = _handle_playback_context_prepared(
+                    current_user_name,
+                    current_client,
+                    payload,
+                    request_id,
+                )
+                _log_emo_event(
+                    logging.INFO,
+                    "playback_context_prepared",
+                    result=prepare.get("status"),
+                    user=current_user_name,
+                    client_request_id=request_id,
+                    source_client_id=None
+                    if current_client is None
+                    else current_client.get("clientId"),
+                    playback_context_id=prepare.get("playbackContextId"),
+                )
             elif action == "playback.context.status":
                 playback_context = _handle_playback_context_status(
                     current_user_name,
@@ -8542,6 +9037,23 @@ class EmoNamespace(Namespace):
             playback_context = exc.playback_context or {}
             _send_error(
                 "queue_required",
+                str(exc),
+                request_id,
+                playbackContextId=playback_context.get("playbackContextId")
+                or payload.get("playbackContextId"),
+                currentControlVersion=playback_context.get("controlVersion"),
+                currentQueueRevision=playback_context.get("queueRevision"),
+                currentVersion=playback_context.get("version"),
+            )
+        except (
+            PlaybackPrepareAlreadyActiveError,
+            PlaybackPrepareTransactionConflictError,
+        ) as exc:
+            playback_context = getPlaybackContextState(
+                payload.get("playbackContextId")
+            ) or {}
+            _send_error(
+                "conflict",
                 str(exc),
                 request_id,
                 playbackContextId=playback_context.get("playbackContextId")

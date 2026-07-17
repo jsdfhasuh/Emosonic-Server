@@ -1522,6 +1522,300 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(error["currentVersion"], 1)
         self.assertEqual(self.messages(player), [])
 
+    def test_context_prepare_routes_once_and_prepared_ready_is_event_confirmed(self):
+        player = self.ready_strict_client()
+        with mock.patch(
+            "supysonic.emo.ws_store._new_playback_context_id",
+            return_value="context-prepare-1",
+        ):
+            self.emit_strict(
+                player,
+                "command",
+                "playback.context.ensure",
+                "ensure-prepare-1",
+                {
+                    "deviceSessionId": "device:phone-1",
+                    "queueSongIds": [],
+                    "positionMs": 0,
+                    "state": "idle",
+                },
+            )
+        self.messages(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-1",
+            device_session_id="device:controller-1",
+        )
+        self.emit_strict(
+            controller,
+            "state",
+            "playback.context.subscribe",
+            "subscribe-prepare-1",
+            {"playbackContextId": "context-prepare-1"},
+        )
+
+        with mock.patch.object(socketio, "start_background_task"):
+            response = self.emit_strict(
+                controller,
+                "command",
+                "playback.context.prepare",
+                "prepare-1",
+                {
+                    "playbackContextId": "context-prepare-1",
+                    "intentId": "intent-1",
+                    "baseControlVersion": 1,
+                    "initialQueueSongIds": ["song-1"],
+                    "currentIndex": 0,
+                    "positionMs": 0,
+                },
+            )
+
+        self.assertEqual([message["action"] for message in response], ["system.ack"])
+        self.assertEqual(response[0]["payload"]["status"], "preparing")
+        routed = self.messages(player)
+        self.assertEqual([message["action"] for message in routed], ["playback.context.prepare"])
+        self.assertEqual(routed[0]["payload"]["sourceClientId"], "controller-1")
+
+        with mock.patch.object(socketio, "start_background_task"):
+            replay = self.emit_strict(
+                controller,
+                "command",
+                "playback.context.prepare",
+                "prepare-1-retry",
+                {
+                    "playbackContextId": "context-prepare-1",
+                    "intentId": "intent-1",
+                    "baseControlVersion": 1,
+                    "initialQueueSongIds": ["song-1"],
+                    "currentIndex": 0,
+                    "positionMs": 0,
+                },
+            )
+        self.assertEqual(replay[0]["payload"]["status"], "preparing")
+        self.assertEqual(self.messages(player), [])
+
+        self.emit_strict(
+            player,
+            "state",
+            "queue.context.sync",
+            "queue-prepare-1",
+            {
+                "playbackContextId": "context-prepare-1",
+                "deviceSessionId": "device:phone-1",
+                "queueSongIds": ["song-1"],
+                "currentIndex": 0,
+                "positionMs": 0,
+                "baseQueueRevision": 1,
+                "baseControlVersion": 1,
+            },
+        )
+        self.messages(controller)
+
+        confirmation = self.emit_strict(
+            player,
+            "event",
+            "playback.context.prepared",
+            "prepared-1",
+            {
+                "playbackContextId": "context-prepare-1",
+                "deviceSessionId": "device:phone-1",
+                "intentId": "intent-1",
+                "ready": True,
+            },
+        )
+        self.assertEqual(
+            [message["action"] for message in confirmation],
+            ["playback.context.prepared"],
+        )
+        self.assertTrue(confirmation[0]["payload"]["ready"])
+        self.assertEqual(confirmation[0]["payload"]["controlVersion"], 2)
+        controller_events = self.messages(controller)
+        self.assertTrue(
+            any(
+                message["action"] == "playback.context.prepared"
+                and message["payload"]["ready"] is True
+                for message in controller_events
+            )
+        )
+
+    def test_context_prepare_on_queue_backed_context_acks_ready_without_route(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        self.messages(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-ready",
+            device_session_id="device:controller-ready",
+        )
+
+        response = self.emit_strict(
+            controller,
+            "command",
+            "playback.context.prepare",
+            "prepare-already-ready",
+            {
+                "playbackContextId": "context-1",
+                "intentId": "intent-already-ready",
+                "baseControlVersion": 1,
+            },
+        )
+
+        self.assertEqual(response[0]["action"], "system.ack")
+        self.assertEqual(response[0]["payload"]["status"], "ready")
+        self.assertEqual(self.messages(player), [])
+        terminal = emo_ws.getPlaybackPrepareTransaction(
+            "context-1",
+            1,
+            "intent-already-ready",
+        )
+        self.assertEqual(terminal["status"], "ready")
+
+    def test_context_prepare_timeout_persists_failed_canonical_result(self):
+        player = self.ready_strict_client()
+        with mock.patch(
+            "supysonic.emo.ws_store._new_playback_context_id",
+            return_value="context-prepare-timeout",
+        ):
+            self.emit_strict(
+                player,
+                "command",
+                "playback.context.ensure",
+                "ensure-prepare-timeout",
+                {
+                    "deviceSessionId": "device:phone-1",
+                    "queueSongIds": [],
+                    "positionMs": 0,
+                    "state": "idle",
+                },
+            )
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-timeout",
+            device_session_id="device:controller-timeout",
+        )
+        self.emit_strict(
+            controller,
+            "state",
+            "playback.context.subscribe",
+            "subscribe-timeout",
+            {"playbackContextId": "context-prepare-timeout"},
+        )
+        with mock.patch.object(socketio, "start_background_task"):
+            self.emit_strict(
+                controller,
+                "command",
+                "playback.context.prepare",
+                "prepare-timeout",
+                {
+                    "playbackContextId": "context-prepare-timeout",
+                    "intentId": "intent-timeout",
+                    "baseControlVersion": 1,
+                },
+            )
+        self.messages(player)
+
+        with mock.patch.object(socketio, "sleep"):
+            emo_ws._expire_context_prepare_later(
+                "context-prepare-timeout",
+                1,
+                "intent-timeout",
+            )
+
+        terminal = emo_ws.getPlaybackPrepareTransaction(
+            "context-prepare-timeout",
+            1,
+            "intent-timeout",
+        )
+        self.assertEqual(terminal["status"], "failed")
+        self.assertEqual(terminal["errorCode"], "prepare_timeout")
+        events = self.messages(controller)
+        self.assertTrue(
+            any(
+                message["action"] == "playback.context.prepared"
+                and message["payload"]["errorCode"] == "prepare_timeout"
+                for message in events
+            )
+        )
+
+    def test_context_rebind_settles_pending_prepare_as_authority_changed(self):
+        player = self.ready_strict_client()
+        with mock.patch(
+            "supysonic.emo.ws_store._new_playback_context_id",
+            return_value="context-prepare-rebind",
+        ):
+            self.emit_strict(
+                player,
+                "command",
+                "playback.context.ensure",
+                "ensure-prepare-rebind",
+                {
+                    "deviceSessionId": "device:phone-1",
+                    "queueSongIds": [],
+                    "positionMs": 0,
+                    "state": "idle",
+                },
+            )
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-rebind",
+            device_session_id="device:controller-rebind",
+        )
+        self.emit_strict(
+            controller,
+            "state",
+            "playback.context.subscribe",
+            "subscribe-prepare-rebind",
+            {"playbackContextId": "context-prepare-rebind"},
+        )
+        with mock.patch.object(socketio, "start_background_task"):
+            self.emit_strict(
+                controller,
+                "command",
+                "playback.context.prepare",
+                "prepare-rebind",
+                {
+                    "playbackContextId": "context-prepare-rebind",
+                    "intentId": "intent-rebind",
+                    "baseControlVersion": 1,
+                },
+            )
+        self.messages(player)
+        self.messages(controller)
+        player.disconnect(namespace="/emo")
+
+        replacement = self.ready_strict_client(
+            client_id="phone-1",
+            device_session_id="device:phone-2",
+        )
+        self.emit_strict(
+            replacement,
+            "command",
+            "playback.context.ensure",
+            "ensure-rebind-terminal",
+            {
+                "deviceSessionId": "device:phone-2",
+                "queueSongIds": [],
+                "positionMs": 0,
+                "state": "idle",
+            },
+        )
+
+        terminal = emo_ws.getPlaybackPrepareTransaction(
+            "context-prepare-rebind",
+            1,
+            "intent-rebind",
+        )
+        self.assertEqual(terminal["status"], "failed")
+        self.assertEqual(terminal["errorCode"], "authority_changed")
+        events = self.messages(controller)
+        self.assertTrue(
+            any(
+                message["action"] == "playback.context.prepared"
+                and message["payload"]["errorCode"] == "authority_changed"
+                for message in events
+            )
+        )
+
     def test_context_list_discovers_exact_persisted_pair_and_replays_by_request_id(self):
         player = self.ready_strict_client()
         self.create_context(player)

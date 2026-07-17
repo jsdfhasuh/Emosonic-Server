@@ -1,6 +1,6 @@
 # Goal: EmoSonic strict-v2 Socket.IO r11 服务端适配
 
-> 状态：In Progress（Goal 1—2 已完成；Goal 3 服务端 ensure/idle 已实现，Web 迁移待 Goal 10；Goal 4 实施中）
+> 状态：In Progress（Goal 1—2、Goal 4 已完成；Goal 3 服务端已完成且 Web 迁移待 Goal 10；Goal 5 实施中）
 >
 > 制定日期：2026-07-17
 >
@@ -823,7 +823,7 @@ failed feedback。
 - [x] Goal 1：更新 2.4.0 action inventory 和 closed schema
 - [x] Goal 2：完成三数据库 migration 和 store 原语
 - [ ] Goal 3：用 ensure 替换 create，支持 idle Context
-- [ ] Goal 4：实现 prepare/prepared
+- [x] Goal 4：实现 prepare/prepared
 - [ ] Goal 5：实现 applied cursor、四种 update 和 local intent
 - [ ] Goal 6：实现远程控制事务、期限和精确路由
 - [ ] Goal 7：实现 committed/failed/superseded/dependency 结算
