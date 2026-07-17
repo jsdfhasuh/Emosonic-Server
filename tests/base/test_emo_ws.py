@@ -366,6 +366,46 @@ class EmoWebSocketTestCase(unittest.TestCase):
       request_id,
     )
 
+  def ensure_playback_context(
+    self,
+    client,
+    request_id,
+    playback_context_id="playback:alice:main",
+    device_session_id="root:phone",
+    queue_song_ids=None,
+    current_index=0,
+    position_ms=0,
+    state="stopped",
+  ):
+    queue_song_ids = ["song-1"] if queue_song_ids is None else list(queue_song_ids)
+    payload = {
+      "deviceSessionId": device_session_id,
+      "queueSongIds": queue_song_ids,
+      "positionMs": position_ms,
+      "state": state,
+    }
+    if queue_song_ids:
+      payload["currentIndex"] = current_index
+    with mock.patch(
+      "supysonic.emo.ws_store._new_playback_context_id",
+      return_value=playback_context_id,
+    ):
+      client.emit(
+        "message",
+        {
+          "type": "command",
+          "action": "playback.context.ensure",
+          "requestId": request_id,
+          "payload": payload,
+        },
+        namespace="/emo",
+      )
+    return self.get_direct_response(
+      self.get_messages(client),
+      "playback.context.ensure",
+      request_id,
+    )
+
   def test_build_message_stamps_server_time_without_mutating_payload(self):
     payload = {"serverUpdatedAtMs": 1000, "positionMs": 10}
 

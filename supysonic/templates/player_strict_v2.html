@@ -151,6 +151,8 @@
     pendingPrepare: null,
     processedCommands: new Set(),
     contextSnapshots: new Map(),
+    appliedControlVersions: new Map(),
+    controlLeases: new Map(),
     queueMutation: Promise.resolve(),
     feedbackMutation: Promise.resolve(),
     volumeMutation: Promise.resolve(),
@@ -159,7 +161,7 @@
 
   const capabilities = {
     playbackContextV2: true,
-    playbackPrepare: optionalProfiles.handoff === true,
+    playbackPrepare: true,
     effectiveAtPlayback: optionalProfiles.handoff === true,
     canPlay: true,
     canPause: true,
@@ -333,44 +335,73 @@
     }
   }
 
-  async function playIndex(index, positionMs, autoplay, syncContext = true) {
-    if (!state.queue.length) return;
+  async function playIndex(index, positionMs, autoplay, syncContext = true, sendUpdate = true) {
+    if (!state.queue.length) return false;
     state.index = Math.max(0, Math.min(index, state.queue.length - 1));
     loadRequiredCurrent(positionMs);
-    if (autoplay) await safePlay('需要用户播放手势');
-    else audio.pause();
+    const playbackStarted = autoplay
+      ? await safePlay('需要用户播放手势')
+      : true;
+    if (!autoplay) audio.pause();
     if (syncContext && state.contextId && !state.followingContextId && !state.activeBroadcastId) {
       await syncAuthorityQueue();
     }
-    await reportFeedback();
+    if (sendUpdate) await reportFeedback();
+    return playbackStarted;
   }
 
-  async function sendFeedback(playbackContextId = null) {
+  async function sendFeedback(playbackContextId = null, terminal = null) {
     if (typeof playbackContextId !== 'string') {
       playbackContextId = activeFeedbackContextId();
     }
     if (!playbackContextId || !state.client || state.client.state !== 'ready') return;
     const trackId = state.queue[state.index];
+    const lastApplied = state.appliedControlVersions.get(playbackContextId);
+    if (!Number.isInteger(lastApplied)) {
+      log(`等待 ${playbackContextId} 的 appliedControlVersion 水合`, 'warning');
+      return;
+    }
+    const committed = terminal?.executionStatus === 'committed';
+    const appliedControlVersion = committed
+      ? terminal.commandControlVersion
+      : lastApplied;
     const payload = {
       playbackContextId,
       deviceSessionId,
-      state: audio.paused ? (state.playbackState === 'stopped' ? 'stopped' : 'paused') : 'playing',
-      positionMs: currentPositionMs(),
+      origin: terminal ? 'remoteCommand' : 'passive',
+      appliedControlVersion,
+      state: trackId
+        ? (audio.paused ? (state.playbackState === 'stopped' ? 'stopped' : 'paused') : 'playing')
+        : 'idle',
+      positionMs: trackId ? currentPositionMs() : 0,
       clientSeq: state.client.nextClientSeq(),
       volume: Math.round(audio.volume * 100),
       muted: audio.muted,
     };
     if (trackId) payload.trackId = trackId;
-    await state.client.request('playback.update', payload).catch((error) => {
+    if (terminal) {
+      payload.executionStatus = terminal.executionStatus;
+      payload.commandControlVersion = terminal.commandControlVersion;
+      if (terminal.executionStatus === 'failed') {
+        payload.errorCode = terminal.errorCode || 'playback_failed';
+        if (terminal.errorMessage) payload.errorMessage = terminal.errorMessage;
+      }
+    }
+    await state.client.request('playback.update', payload).then((response) => {
+      const canonicalApplied = response?.payload?.appliedControlVersion;
+      if (Number.isInteger(canonicalApplied)) {
+        state.appliedControlVersions.set(playbackContextId, canonicalApplied);
+      }
+    }).catch((error) => {
       if (error.code === 'client_sequence_conflict') showError(error.message);
       else log(error.message, 'error');
     });
   }
 
-  function reportFeedback(playbackContextId = null) {
+  function reportFeedback(playbackContextId = null, terminal = null) {
     const operation = state.feedbackMutation
       .catch(() => {})
-      .then(() => sendFeedback(playbackContextId));
+      .then(() => sendFeedback(playbackContextId, terminal));
     state.feedbackMutation = operation;
     return operation;
   }
@@ -396,23 +427,31 @@
   }
 
   async function createContext() {
-    api.validateQueue(state.queue, state.index);
-    const playbackContextId = `ctx-${api.uuid()}`;
-    const response = await state.client.request('playback.context.create', {
-      playbackContextId,
+    const queueSongIds = state.queue.slice();
+    const payload = {
       deviceSessionId,
-      queueSongIds: state.queue.slice(),
-      currentIndex: state.index,
-      positionMs: currentPositionMs(),
-      state: audio.paused ? 'paused' : 'playing',
-    });
+      queueSongIds,
+      positionMs: queueSongIds.length ? currentPositionMs() : 0,
+      state: queueSongIds.length
+        ? (audio.paused ? 'paused' : 'playing')
+        : 'idle',
+    };
+    if (queueSongIds.length) {
+      api.validateQueue(queueSongIds, state.index);
+      payload.currentIndex = state.index;
+    }
+    const response = await state.client.request('playback.context.ensure', payload);
+    const playbackContextId = response.payload.playbackContextId;
     setContextId(playbackContextId);
     state.client.rememberSubscription(playbackContextId);
+    state.appliedControlVersions.set(
+      playbackContextId,
+      response.payload.controlVersion,
+    );
     await applyContext(response.payload);
   }
 
   async function ensureContext() {
-    if (!state.queue.length) return;
     if (!state.contextId) await createContext();
   }
 
@@ -528,6 +567,28 @@
       ) return;
     }
     state.queue = context.queueSongIds.slice();
+    const ownDeviceState = Array.isArray(deviceStates)
+      ? deviceStates.find((item) => item.clientId === clientId)
+      : null;
+    if (Number.isInteger(ownDeviceState?.appliedControlVersion)) {
+      state.appliedControlVersions.set(
+        context.playbackContextId,
+        ownDeviceState.appliedControlVersion,
+      );
+    }
+    if (!state.queue.length) {
+      state.index = 0;
+      state.playbackState = 'idle';
+      audio.pause();
+      audio.removeAttribute('src');
+      delete audio.dataset.trackId;
+      audio.load();
+      renderQueue();
+      if (state.appliedControlVersions.has(context.playbackContextId)) {
+        await reportFeedback(context.playbackContextId);
+      }
+      return;
+    }
     const authorityFeedback = follow && Array.isArray(deviceStates)
       ? deviceStates.find((item) => item.clientId === context.authorityClientId)
       : null;
@@ -630,27 +691,126 @@
       && payload.playbackContextId !== state.contextId
       && payload.playbackContextId !== state.followingContextId
     ) return;
-    if (message.action === 'queue.playItem') {
-      await ensureMeta(payload.queueSongIds || []);
-      state.queue = payload.queueSongIds.slice();
-      await playIndex(payload.queueIndex, 0, true, false);
-    } else if (handoffCommit) {
+    if (handoffCommit) {
       await commitHandoff(payload);
-    } else if (message.action === 'player.play') {
-      if (Number.isInteger(payload.positionMs)) loadCurrent(payload.positionMs);
-      await safePlay('远程播放被浏览器阻止');
-    } else if (message.action === 'player.pause') {
-      if (Number.isInteger(payload.positionMs)) loadCurrent(payload.positionMs);
+      return;
+    }
+    const commandControlVersion = payload.controlVersion;
+    const leaseKey = `${payload.playbackContextId}\u0000${commandControlVersion}`;
+    const lease = Symbol(leaseKey);
+    state.controlLeases.set(leaseKey, lease);
+    try {
+      if (message.action === 'queue.playItem') {
+        await ensureMeta(payload.queueSongIds || []);
+        state.queue = payload.queueSongIds.slice();
+        if (!await playIndex(payload.queueIndex, 0, true, false, false)) {
+          throw new Error('track_load_failed');
+        }
+      } else if (message.action === 'player.play') {
+        if (Number.isInteger(payload.positionMs)) loadCurrent(payload.positionMs);
+        if (!await safePlay('远程播放被浏览器阻止')) {
+          throw new Error('playback_failed');
+        }
+      } else if (message.action === 'player.pause') {
+        if (Number.isInteger(payload.positionMs)) loadCurrent(payload.positionMs);
+        audio.pause();
+        state.playbackState = 'paused';
+      } else if (message.action === 'player.seek') {
+        loadCurrent(payload.positionMs);
+      } else if (message.action === 'player.next') {
+        if (!await playIndex((state.index + 1) % state.queue.length, 0, true, false, false)) {
+          throw new Error('track_load_failed');
+        }
+      } else if (message.action === 'player.prev') {
+        if (!await playIndex((state.index - 1 + state.queue.length) % state.queue.length, 0, true, false, false)) {
+          throw new Error('track_load_failed');
+        }
+      }
+    } catch (error) {
+      if (state.controlLeases.get(leaseKey) !== lease) return;
+      const errorCode = message.action === 'player.seek'
+        ? 'seek_failed'
+        : (error.message === 'track_load_failed' ? 'track_load_failed' : 'playback_failed');
+      await reportFeedback(payload.playbackContextId, {
+        executionStatus: 'failed',
+        commandControlVersion,
+        errorCode,
+        errorMessage: error.message,
+      });
+      if (state.controlLeases.get(leaseKey) === lease) {
+        state.controlLeases.delete(leaseKey);
+      }
+      throw error;
+    }
+    if (state.controlLeases.get(leaseKey) !== lease) return;
+    await reportFeedback(payload.playbackContextId, {
+      executionStatus: 'committed',
+      commandControlVersion,
+    });
+    if (state.controlLeases.get(leaseKey) === lease) {
+      state.controlLeases.delete(leaseKey);
+    }
+  }
+
+  async function handleContextPrepare(payload) {
+    if (alreadyProcessed('playback.context.prepare', payload)) return;
+    if (payload.playbackContextId !== state.contextId) return;
+    let queueSongIds = Array.isArray(payload.initialQueueSongIds)
+      ? payload.initialQueueSongIds.slice()
+      : state.queue.slice();
+    if (!queueSongIds.length) {
+      await state.client.request('playback.context.prepared', {
+        playbackContextId: payload.playbackContextId,
+        deviceSessionId,
+        intentId: payload.intentId,
+        ready: false,
+        errorCode: 'queue_required',
+      });
+      return;
+    }
+    const currentIndex = Number.isInteger(payload.currentIndex)
+      ? payload.currentIndex
+      : Math.max(0, Math.min(state.index, queueSongIds.length - 1));
+    const positionMs = Number.isInteger(payload.positionMs)
+      ? payload.positionMs
+      : 0;
+    try {
+      api.validateQueue(queueSongIds, currentIndex);
+      await ensureMeta(queueSongIds);
+      state.queue = queueSongIds;
+      state.index = currentIndex;
+      loadRequiredCurrent(positionMs);
       audio.pause();
       state.playbackState = 'paused';
-    } else if (message.action === 'player.seek') {
-      loadCurrent(payload.positionMs);
-    } else if (message.action === 'player.next') {
-      await playIndex((state.index + 1) % state.queue.length, 0, true, false);
-    } else if (message.action === 'player.prev') {
-      await playIndex((state.index - 1 + state.queue.length) % state.queue.length, 0, true, false);
+      const cursor = state.client.cursor(payload.playbackContextId);
+      if (!cursor) throw new Error('Context cursor is not hydrated');
+      await state.client.request('queue.context.sync', {
+        playbackContextId: payload.playbackContextId,
+        deviceSessionId,
+        queueSongIds: state.queue.slice(),
+        currentIndex: state.index,
+        positionMs,
+        baseQueueRevision: cursor.queueRevision,
+        baseControlVersion: cursor.controlVersion,
+      });
+      await state.client.request('playback.context.prepared', {
+        playbackContextId: payload.playbackContextId,
+        deviceSessionId,
+        intentId: payload.intentId,
+        ready: true,
+      });
+      renderQueue();
+    } catch (error) {
+      await state.client.request('playback.context.prepared', {
+        playbackContextId: payload.playbackContextId,
+        deviceSessionId,
+        intentId: payload.intentId,
+        ready: false,
+        errorCode: 'restore_failed',
+        errorMessage: error.message,
+      }).catch(() => {});
+      throw error;
     }
-    await reportFeedback();
   }
 
   async function handlePrepare(payload) {
@@ -841,7 +1001,7 @@
     } else if (action === 'playback.context.status') {
       const context = message.payload.playbackContext;
       if (context.playbackContextId === state.followingContextId) applyContext(context, true, message.payload.deviceStates).catch((error) => showError(error.message));
-      else if (context.playbackContextId === state.contextId) applyContext(context).catch((error) => showError(error.message));
+      else if (context.playbackContextId === state.contextId) applyContext(context, false, message.payload.deviceStates).catch((error) => showError(error.message));
     } else if (action === 'queue.context.sync' && message.payload.playbackContextId === state.contextId) {
       applyContext(message.payload).catch((error) => showError(error.message));
     } else if (['device.setVolume', 'player.play', 'player.pause', 'player.seek', 'player.next', 'player.prev', 'queue.playItem'].includes(action)) {
@@ -853,6 +1013,19 @@
       document.getElementById('strict-volume').value = String(message.payload.volume);
     } else if (action === 'playback.prepare') {
       handlePrepare(message.payload).catch((error) => showError(error.message));
+    } else if (action === 'playback.context.prepare') {
+      handleContextPrepare(message.payload).catch((error) => showError(error.message));
+    } else if (action === 'playback.control.settled') {
+      const leaseKey = `${message.payload.playbackContextId}\u0000${message.payload.commandControlVersion}`;
+      state.controlLeases.delete(leaseKey);
+      showError(`远程操作未完成：${message.payload.errorCode}`);
+      state.client.refreshContext(message.payload.playbackContextId)
+        .then((response) => applyContext(
+          response.payload.playbackContext,
+          false,
+          response.payload.deviceStates,
+        ))
+        .catch((error) => showError(error.message));
     } else if (action === 'playback.handoff.release') {
       if (alreadyProcessed(action, message.payload)) return;
       if (state.pendingPrepare && state.pendingPrepare.handoffId === message.payload.handoffId) {
@@ -1046,6 +1219,7 @@
       onDebug(summary) { log(JSON.stringify(summary), 'debug'); },
       onReady() {
         restoreContext()
+          .then(ensureContext)
           .then(refreshBindings)
           .then(reportDeviceVolume)
           .then(async () => {

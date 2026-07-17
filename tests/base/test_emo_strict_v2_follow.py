@@ -50,7 +50,7 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
         )
         self.get_messages(owner)
         self.get_messages(follower)
-        self.create_playback_context(
+        self.ensure_playback_context(
             owner,
             "context-create-source-1",
             playback_context_id="context-source-1",
@@ -113,13 +113,13 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
         )
         for client in (first_owner, second_owner, follower):
             self.get_messages(client)
-        self.create_playback_context(
+        self.ensure_playback_context(
             first_owner,
             "context-create-source-1",
             playback_context_id="context-source-1",
             device_session_id="device:owner-1",
         )
-        self.create_playback_context(
+        self.ensure_playback_context(
             second_owner,
             "context-create-source-2",
             playback_context_id="context-source-2",
@@ -181,7 +181,7 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
         )
         for client in (owner, unsupported, controller, bob):
             self.get_messages(client)
-        self.create_playback_context(
+        self.ensure_playback_context(
             owner,
             "context-create-source-1",
             playback_context_id="context-source-1",
@@ -242,7 +242,7 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
         )
         self.get_messages(owner)
         self.get_messages(follower)
-        self.create_playback_context(
+        self.ensure_playback_context(
             owner,
             "context-create-source-1",
             playback_context_id="context-source-1",
@@ -281,7 +281,7 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
             capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
         )
         self.get_messages(second_context_owner)
-        self.create_playback_context(
+        self.ensure_playback_context(
             second_context_owner,
             "context-create-source-2",
             playback_context_id="context-source-2",
@@ -316,7 +316,7 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
         )
         self.get_messages(owner)
         self.get_messages(follower)
-        self.create_playback_context(
+        self.ensure_playback_context(
             owner,
             "context-create-source-1",
             playback_context_id="context-source-1",

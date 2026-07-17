@@ -217,11 +217,14 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
         return client
 
     def create_web_context(self, player, context_id="ctx-1", device_session_id="web-player-device:1"):
-        request_message = self.fixture_message("playback.context.create")
+        request_message = self.fixture_message("playback.context.ensure")
         request_message["requestId"] = "create-%s" % context_id
-        request_message["payload"]["playbackContextId"] = context_id
         request_message["payload"]["deviceSessionId"] = device_session_id
-        player.emit("message", request_message, namespace="/emo")
+        with mock.patch(
+            "supysonic.emo.ws_store._new_playback_context_id",
+            return_value=context_id,
+        ):
+            player.emit("message", request_message, namespace="/emo")
         response = next(
             message
             for message in self.messages(player)
@@ -595,15 +598,19 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
             player_register["payload"]["capabilities"],
         )
 
-        create_request = self.fixture_message("playback.context.create")
-        player.emit("message", create_request, namespace="/emo")
+        create_request = self.fixture_message("playback.context.ensure")
+        with mock.patch(
+            "supysonic.emo.ws_store._new_playback_context_id",
+            return_value="ctx-1",
+        ):
+            player.emit("message", create_request, namespace="/emo")
         create_messages = self.messages(player)
         created = next(
             message
             for message in create_messages
             if message.get("requestId") == create_request["requestId"]
         )
-        self.assertEqual(created["action"], "playback.context.create")
+        self.assertEqual(created["action"], "playback.context.ensure")
 
         control_password = self.issue_credential().json["oneTimePassword"]
         control = self.connect()
@@ -694,11 +701,20 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
                 "playbackContextId": "ctx-1",
                 "controlVersion": context["controlVersion"] + 1,
                 "sourceClientId": "web-control-1",
+                "executionTimeoutMs": 15000,
                 "positionMs": 3000,
             },
         )
 
         feedback_request = self.fixture_message("playback.update")
+        feedback_request["payload"].update(
+            {
+                "origin": "remoteCommand",
+                "executionStatus": "committed",
+                "commandControlVersion": context["controlVersion"] + 1,
+                "appliedControlVersion": context["controlVersion"] + 1,
+            }
+        )
         feedback_request["payload"]["positionMs"] = 3000
         feedback_request["payload"]["trackId"] = "track-1"
         player.emit("message", feedback_request, namespace="/emo")
@@ -797,7 +813,7 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
         self.assertIn(b"device.setVolume", control_page.data)
         self.assertIn(b"PlaybackContext strict-v2 2.3.0", control_page.data)
 
-    def test_exact_web_broadcast_uses_two_players_and_participant_feedback(self):
+    def test_exact_web_broadcast_rejects_non_authority_context_feedback(self):
         self.login()
         player_one = self.register_web_player(
             "web-player-1",
@@ -848,6 +864,8 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
             "payload": {
                 "playbackContextId": "ctx-1",
                 "deviceSessionId": "web-player-device:2",
+                "origin": "passive",
+                "appliedControlVersion": 1,
                 "state": "paused",
                 "positionMs": 12000,
                 "clientSeq": 1,
@@ -859,7 +877,11 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
         player_two.emit("message", feedback, namespace="/emo")
         feedback_messages = self.messages(player_two)
         self.assertTrue(
-            any(message["action"] == "playback.update" for message in feedback_messages)
+            any(
+                message["action"] == "system.error"
+                and message["payload"]["code"] == "forbidden"
+                for message in feedback_messages
+            )
         )
 
         status = self.fixture_message("broadcast.status")
@@ -875,7 +897,8 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
             for item in status_ack["payload"]["participantStates"]
             if item["clientId"] == "web-player-2"
         )
-        self.assertEqual(participant_state["clientSeq"], 1)
+        self.assertNotIn("clientSeq", participant_state)
+        self.assertNotIn("serverUpdatedAtMs", participant_state)
 
         play = self.fixture_message("broadcast.play")
         play["payload"]["broadcastId"] = broadcast_id

@@ -75,7 +75,7 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         )
         for client in (authority, participant, controller):
             self.get_messages(client)
-        self.create_playback_context(
+        self.ensure_playback_context(
             authority,
             "context-create-broadcast-1",
             playback_context_id="context-broadcast-1",
@@ -890,7 +890,7 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         self.assertEqual(broadcast["queueRevision"], 1)
         self.assertEqual(broadcast["controlVersion"], 1)
 
-    def test_participant_feedback_adds_paired_status_fields_and_cannot_control(self):
+    def test_non_authority_feedback_is_rejected_and_participant_cannot_control(self):
         authority, participant, _controller = self.connect_broadcast_devices()
         start_ack = self.get_ack(
             self.start_strict_broadcast(
@@ -912,7 +912,10 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
                 "payload": {
                     "playbackContextId": "context-broadcast-1",
                     "deviceSessionId": "device:participant-1",
+                    "origin": "passive",
+                    "appliedControlVersion": 1,
                     "state": "playing",
+                    "trackId": "context-song-1",
                     "positionMs": 1500,
                     "clientSeq": 1,
                 },
@@ -920,9 +923,11 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             namespace="/emo",
         )
         feedback_messages = self.get_messages(participant)
-        self.assertFalse(
-            any(message["action"] == "system.ack" for message in feedback_messages)
+        feedback_error = self.get_error(
+            feedback_messages,
+            "broadcast-feedback-1",
         )
+        self.assertEqual(feedback_error["payload"]["code"], "forbidden")
 
         participant.emit(
             "message",
@@ -946,9 +951,8 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             for item in status["payload"]["participantStates"]
             if item["clientId"] == "participant-1"
         )
-        self.assertEqual(participant_state["clientSeq"], 1)
-        self.assertGreater(participant_state["serverUpdatedAtMs"], 0)
-        self.assertEqual(participant_state["positionMs"], 1500)
+        self.assertNotIn("clientSeq", participant_state)
+        self.assertNotIn("serverUpdatedAtMs", participant_state)
 
         authority.emit(
             "message",
@@ -959,7 +963,10 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
                 "payload": {
                     "playbackContextId": "context-broadcast-1",
                     "deviceSessionId": "device:authority-1",
+                    "origin": "passive",
+                    "appliedControlVersion": 1,
                     "state": "playing",
+                    "trackId": "context-song-1",
                     "positionMs": 1600,
                     "clientSeq": 1,
                 },
@@ -998,15 +1005,9 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             [item["clientId"] for item in all_participant_states],
             ["authority-1", "participant-1"],
         )
-        self.assertTrue(
-            all(
-                {"clientSeq", "serverUpdatedAtMs"}.issubset(item)
-                for item in all_participant_states
-            )
-        )
         authority_state = all_participant_states[0]
-        self.assertEqual(authority_state["clientSeq"], 1)
-        self.assertEqual(authority_state["positionMs"], 1600)
+        self.assertNotIn("clientSeq", authority_state)
+        self.assertNotIn("serverUpdatedAtMs", authority_state)
 
         participant.emit(
             "message",
@@ -1195,7 +1196,7 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
         )
         self.get_messages(second_authority)
-        self.create_playback_context(
+        self.ensure_playback_context(
             second_authority,
             "context-create-broadcast-2",
             playback_context_id="context-broadcast-2",

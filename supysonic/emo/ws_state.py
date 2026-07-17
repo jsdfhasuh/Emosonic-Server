@@ -1664,6 +1664,20 @@ class WebSocketState:
             handoff = self._handoffs.get(handoff_id)
             return dict(handoff) if handoff is not None else None
 
+    def discard_playback_handoff(self, handoff_id):
+        with self._lock:
+            handoff = self._handoffs.pop(handoff_id, None)
+            if handoff is None:
+                return None
+            request_key = (
+                handoff.get("userName"),
+                handoff.get("originClientId"),
+                handoff.get("requestId"),
+            )
+            if self._handoff_request_index.get(request_key) == handoff_id:
+                self._handoff_request_index.pop(request_key, None)
+            return dict(handoff)
+
     def get_playback_handoff_by_request(self, user_name, origin_client_id, request_id):
         if not user_name or not origin_client_id or not request_id:
             return None
@@ -1684,6 +1698,7 @@ class WebSocketState:
         error_message=None,
         prepare_id=None,
         complete_expires_at_ms=None,
+        snapshot=None,
         now=None,
     ):
         now_ms = _timestamp_ms(now)
@@ -1701,6 +1716,8 @@ class WebSocketState:
                 handoff["prepareId"] = prepare_id
             if complete_expires_at_ms is not None:
                 handoff["completeExpiresAtMs"] = complete_expires_at_ms
+            if snapshot is not None:
+                handoff["snapshot"] = dict(snapshot)
             handoff["updatedAtMs"] = now_ms
             return dict(handoff)
 

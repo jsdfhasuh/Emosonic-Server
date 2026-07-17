@@ -14,6 +14,7 @@ from supysonic.emo.ws_store import (
     PlaybackContextIntentConflictError,
     PlaybackContextStaleVersionError,
     PlaybackControlTransactionConflictError,
+    PlaybackHandoffTargetConflictError,
     PlaybackLocalIntentConflictError,
     PlaybackPrepareAlreadyActiveError,
     PlaybackPrepareTransactionConflictError,
@@ -24,6 +25,7 @@ from supysonic.emo.ws_store import (
     createPlaybackContextState,
     createPlaybackControlTransaction,
     createPlaybackPrepareTransaction,
+    createStrictPlaybackHandoff,
     createStrictPlaybackContextState,
     deletePlaybackContext,
     expirePlaybackContext,
@@ -312,17 +314,21 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 0,
                 "playing",
             )
-            createStrictPlaybackContextState(
-                target_context_id,
-                "alice",
-                target_client_id,
-                target_device_session_id,
-                ["song-target"],
-                0,
-                0,
-                "playing",
-            )
-            savePlaybackHandoff(
+            with mock.patch(
+                "supysonic.emo.ws_store._new_playback_context_id",
+                return_value=target_context_id,
+            ):
+                ensureStrictPlaybackContextState(
+                    "alice",
+                    target_client_id,
+                    target_device_session_id,
+                    [],
+                    None,
+                    0,
+                    "idle",
+                )
+            handoff, created = createStrictPlaybackHandoff(
+                source_context_id,
                 {
                     "handoffId": handoff_id,
                     "requestId": "handoff-control-start-%d" % iteration,
@@ -331,7 +337,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                     "sourceClientId": source_client_id,
                     "targetClientId": target_client_id,
                     "originClientId": "controller-1",
-                    "status": "committed",
+                    "status": "preparing",
                     "baseControlVersion": 1,
                     "controlVersion": 2,
                     "prepareId": "prepare-handoff-control-%d" % iteration,
@@ -339,33 +345,44 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                         "handoffControlVersion": 2,
                         "prepareId": "prepare-handoff-control-%d" % iteration,
                     },
-                }
+                },
+                target_device_session_id,
             )
+            self.assertTrue(created)
+            handoff["status"] = "committed"
+            savePlaybackHandoff(handoff)
             barrier = threading.Barrier(2)
 
             def complete_handoff():
                 barrier.wait()
-                return completeStrictPlaybackHandoff(
-                    source_context_id,
-                    handoff_id,
-                    "alice",
-                    target_client_id,
-                    target_device_session_id,
-                )
+                try:
+                    return completeStrictPlaybackHandoff(
+                        source_context_id,
+                        handoff_id,
+                        "alice",
+                        target_client_id,
+                        target_device_session_id,
+                    )
+                except PlaybackHandoffTargetConflictError:
+                    return "conflict"
 
             def control_target_context():
                 barrier.wait()
                 try:
-                    mutateStrictPlaybackContextControl(
+                    mutateStrictPlaybackContextQueue(
                         target_context_id,
                         "alice",
-                        "controller-1",
-                        "player.pause",
+                        target_client_id,
+                        target_device_session_id,
+                        ["song-target"],
+                        0,
+                        0,
                         1,
+                        base_control_version=1,
                     )
-                    return "controlled"
-                except PlaybackContextAuthorityAmbiguousError:
-                    return "conflict"
+                    return "initialized"
+                except PlaybackContextClosedError:
+                    return "context_closed"
 
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=2
@@ -377,7 +394,23 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
 
             source_context = getPlaybackContextState(source_context_id)
             target_context = getPlaybackContextState(target_context_id)
+            if handoff_result == "conflict":
+                self.assertEqual(control_result, "initialized")
+                self.assertEqual(
+                    source_context["authorityClientId"],
+                    source_client_id,
+                )
+                self.assertEqual(target_context["lifecycle"], "active")
+                self.assertEqual(target_context["state"], "paused")
+                self.assertEqual(target_context["controlVersion"], 2)
+                self.assertEqual(
+                    getPlaybackHandoff(handoff_id)["status"],
+                    "committed",
+                )
+                continue
+
             self.assertTrue(handoff_result.mutated)
+            self.assertEqual(control_result, "context_closed")
             self.assertEqual(
                 handoff_result.affected_authority_pairs,
                 tuple(
@@ -406,13 +439,11 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 source_context,
             )
             self.assertEqual(getPlaybackHandoff(handoff_id)["status"], "completed")
-            if control_result == "controlled":
-                self.assertEqual(target_context["state"], "paused")
-                self.assertEqual(target_context["controlVersion"], 2)
-            else:
-                self.assertEqual(control_result, "conflict")
-                self.assertEqual(target_context["state"], "playing")
-                self.assertEqual(target_context["controlVersion"], 1)
+            self.assertEqual(target_context["lifecycle"], "closed")
+            self.assertEqual(
+                handoff_result.retired_context["playbackContextId"],
+                target_context_id,
+            )
 
             replay_result = completeStrictPlaybackHandoff(
                 source_context_id,
@@ -427,6 +458,90 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 replay_result.canonical_context,
                 getPlaybackContextState(source_context_id),
             )
+
+    def test_handoff_start_rejects_non_idle_or_preparing_target_context(self):
+        createStrictPlaybackContextState(
+            "handoff-start-source",
+            "alice",
+            "source-player",
+            "device:source-player",
+            ["song-source"],
+            0,
+            0,
+            "playing",
+        )
+        createStrictPlaybackContextState(
+            "handoff-start-target",
+            "alice",
+            "target-player",
+            "device:target-player",
+            ["song-target"],
+            0,
+            0,
+            "paused",
+        )
+        handoff = {
+            "handoffId": "handoff-start-conflict",
+            "requestId": "handoff-start-conflict-request",
+            "playbackContextId": "handoff-start-source",
+            "userName": "alice",
+            "sourceClientId": "source-player",
+            "targetClientId": "target-player",
+            "originClientId": "controller-1",
+            "status": "preparing",
+            "baseControlVersion": 1,
+            "controlVersion": 2,
+            "prepareId": "handoff-start-conflict-prepare",
+            "snapshot": {
+                "handoffControlVersion": 2,
+                "prepareId": "handoff-start-conflict-prepare",
+            },
+        }
+
+        with self.assertRaises(PlaybackHandoffTargetConflictError):
+            createStrictPlaybackHandoff(
+                "handoff-start-source",
+                handoff,
+                "device:target-player",
+            )
+        self.assertIsNone(getPlaybackHandoff("handoff-start-conflict"))
+
+        closeStrictPlaybackContextState("handoff-start-target", "alice")
+        with mock.patch(
+            "supysonic.emo.ws_store._new_playback_context_id",
+            return_value="handoff-start-target-idle",
+        ):
+            ensureStrictPlaybackContextState(
+                "alice",
+                "target-player",
+                "device:target-player",
+                [],
+                None,
+                0,
+                "idle",
+            )
+        createPlaybackPrepareTransaction(
+            "handoff-start-target-idle",
+            "alice",
+            1,
+            "target-prepare-intent",
+            "controller-1",
+            "target-player",
+            "device:target-player",
+            "target-nonce",
+            1,
+            {"baseControlVersion": 1},
+            1,
+            10000,
+        )
+
+        with self.assertRaises(PlaybackHandoffTargetConflictError):
+            createStrictPlaybackHandoff(
+                "handoff-start-source",
+                handoff,
+                "device:target-player",
+            )
+        self.assertIsNone(getPlaybackHandoff("handoff-start-conflict"))
 
     def test_strict_context_creates_serialize_sqlite_write_upgrade(self) -> None:
         second_read = threading.Event()

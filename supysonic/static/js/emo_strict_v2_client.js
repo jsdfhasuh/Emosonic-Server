@@ -33,7 +33,9 @@
     'device.volume.update': 'event',
     'system.ping': 'system',
     'playback.context.list': 'state',
-    'playback.context.create': 'command',
+    'playback.context.ensure': 'command',
+    'playback.context.prepare': 'command',
+    'playback.context.prepared': 'event',
     'playback.context.subscribe': 'state',
     'playback.context.unsubscribe': 'state',
     'playback.context.status': 'state',
@@ -66,12 +68,13 @@
     'device.list',
     'system.ping',
     'playback.context.list',
-    'playback.context.create',
+    'playback.context.ensure',
     'playback.context.status',
   ]);
 
   const EVENT_CONFIRMED_ACTIONS = Object.freeze({
     'device.volume.update': 'device.volume.update',
+    'playback.context.prepared': 'playback.context.prepared',
     'playback.update': 'playback.update',
     'playback.ready': 'playback.handoff.status',
     'playback.handoff.complete': 'playback.handoff.status',
@@ -757,7 +760,7 @@
     _ingestContext(message) {
       let context = null;
       let completeSnapshot = false;
-      if (message.action === 'playback.context.create') {
+      if (message.action === 'playback.context.ensure') {
         context = message.payload;
         completeSnapshot = true;
       } else if (message.action === 'playback.context.status') {

@@ -51,6 +51,7 @@ from .ws_store import (
     PlaybackContextQueueRequiredError,
     PlaybackPrepareAlreadyActiveError,
     PlaybackPrepareTransactionConflictError,
+    PlaybackHandoffTargetConflictError,
     PlaybackContextStaleVersionError,
     PlaybackControlTransactionConflictError,
     PlaybackClientSequenceConflictError,
@@ -59,6 +60,7 @@ from .ws_store import (
     commitStrictPlaybackHandoff,
     completeStrictPlaybackHandoff,
     createPlaybackContextState,
+    createStrictPlaybackHandoff,
     ensureStrictPlaybackContextState,
     createPlaybackPrepareTransaction,
     failActivePlaybackHandoffsForRestart,
@@ -7583,9 +7585,21 @@ def _handle_handoff_start(current_user_name, current_client, payload, request_id
             "Playback handoff already in progress",
             current_control_version=context.get("controlVersion", 0),
         )
-    savePlaybackHandoff(handoff)
-
     target_device_session_id = _device_session_id(target_client)
+    try:
+        persisted_handoff, _created = createStrictPlaybackHandoff(
+            playback_context_id,
+            handoff,
+            target_device_session_id,
+        )
+    except Exception:
+        state.discard_playback_handoff(handoff_id)
+        raise
+    handoff = state.update_playback_handoff(
+        handoff_id,
+        snapshot=persisted_handoff.get("snapshot") or {},
+    ) or persisted_handoff
+
     commit_payload = {
         "userName": current_user_name,
         "handoffId": handoff["handoffId"],
@@ -7723,6 +7737,15 @@ def _handle_handoff_complete(
         if result is None:
             raise LookupError("Playback handoff not found")
         updated_context, completed_handoff, device_state, _mutated = result
+        if result.retired_context is not None:
+            retired_context = result.retired_context
+            state.restore_playback_context(
+                retired_context["playbackContextId"],
+                retired_context,
+            )
+            completed_handoff["_retiredStandbyPlaybackContextId"] = (
+                retired_context["playbackContextId"]
+            )
         if result.mutated:
             completed_handoff["_bindingMutation"] = {
                 "mutated": result.mutated,
@@ -8611,6 +8634,18 @@ class EmoNamespace(Namespace):
                                 ),
                             ),
                         )
+                        retired_standby_context_id = handoff.get(
+                            "_retiredStandbyPlaybackContextId"
+                        )
+                        if retired_standby_context_id:
+                            _run_post_commit_push(
+                                action,
+                                request_id,
+                                lambda: _broadcast_playback_context_closed_v2(
+                                    current_user_name,
+                                    retired_standby_context_id,
+                                ),
+                            )
                         binding_mutation = handoff.get(
                             "_bindingMutation"
                         ) or {}
@@ -9599,6 +9634,7 @@ class EmoNamespace(Namespace):
         except (
             PlaybackPrepareAlreadyActiveError,
             PlaybackPrepareTransactionConflictError,
+            PlaybackHandoffTargetConflictError,
             PlaybackControlTransactionConflictError,
             PlaybackLocalIntentConflictError,
         ) as exc:

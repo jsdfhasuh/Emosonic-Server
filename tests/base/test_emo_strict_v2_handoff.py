@@ -61,7 +61,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         )
         for client in (source, target, controller):
             self.get_messages(client)
-        self.create_playback_context(
+        self.ensure_playback_context(
             source,
             "context-create-handoff-1",
             playback_context_id="context-handoff-1",
@@ -69,6 +69,15 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
             queue_song_ids=["song-1", "song-2"],
             position_ms=1200,
             state="playing",
+        )
+        self.ensure_playback_context(
+            target,
+            "context-ensure-handoff-target-idle",
+            playback_context_id="context-handoff-target-idle",
+            device_session_id="device:target-1",
+            queue_song_ids=[],
+            position_ms=0,
+            state="idle",
         )
         for client in (source, target, controller):
             self.get_messages(client)
@@ -262,12 +271,17 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         self.assertEqual(context["epoch"], 2)
         self.assertEqual(handoff["status"], "completed")
         self.assertEqual(handoff["originClientId"], "controller-1")
-        target_device_state = next(
-            device_state
-            for device_state in getDevicePlaybackStates("context-handoff-1")
-            if device_state["sourceClientId"] == "target-1"
+        standby = getPlaybackContextState("context-handoff-target-idle")
+        self.assertEqual(standby["lifecycle"], "closed")
+        self.assertTrue(
+            any(
+                message["action"] == "playback.context.closed"
+                and message["payload"]["playbackContextId"]
+                == "context-handoff-target-idle"
+                for message in target_complete_messages
+            )
         )
-        self.assertTrue(target_device_state["isAuthority"])
+        self.assertEqual(getDevicePlaybackStates("context-handoff-1"), [])
 
         target.emit(
             "message",
@@ -299,6 +313,53 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         replayed_context = getPlaybackContextState("context-handoff-1")
         self.assertEqual(replayed_context["version"], 2)
         self.assertEqual(replayed_context["epoch"], 2)
+
+    def test_start_rejects_target_context_that_is_no_longer_idle(self):
+        source, target, controller = self.connect_handoff_devices()
+        target.emit(
+            "message",
+            {
+                "type": "state",
+                "action": "queue.context.sync",
+                "requestId": "target-queue-before-handoff",
+                "payload": {
+                    "playbackContextId": "context-handoff-target-idle",
+                    "deviceSessionId": "device:target-1",
+                    "queueSongIds": ["target-song-1"],
+                    "currentIndex": 0,
+                    "positionMs": 0,
+                    "baseQueueRevision": 1,
+                    "baseControlVersion": 1,
+                },
+            },
+            namespace="/emo",
+        )
+        self.get_ack(
+            self.get_messages(target),
+            "target-queue-before-handoff",
+        )
+
+        first_error = self.get_error(
+            self.start_handoff(controller, "handoff-target-busy-1"),
+            "handoff-target-busy-1",
+        )
+        second_error = self.get_error(
+            self.start_handoff(controller, "handoff-target-busy-2"),
+            "handoff-target-busy-2",
+        )
+
+        self.assertEqual(first_error["payload"]["code"], "conflict")
+        self.assertEqual(second_error["payload"]["code"], "conflict")
+        self.assertEqual(
+            getPlaybackContextState("context-handoff-1")["authorityClientId"],
+            "source-1",
+        )
+        self.assertEqual(
+            getPlaybackContextState("context-handoff-target-idle")["lifecycle"],
+            "active",
+        )
+        self.assertFalse(get_state()._handoffs)
+        self.get_messages(source)
 
     def test_complete_push_failure_preserves_commit_and_replays_confirmation(self):
         source, target, controller = self.connect_handoff_devices()
@@ -680,7 +741,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         )
         for client in (source, target, controller):
             self.get_messages(client)
-        self.create_playback_context(
+        self.ensure_playback_context(
             source,
             "context-create-no-pause",
             playback_context_id="context-handoff-1",

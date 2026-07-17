@@ -77,6 +77,10 @@ class PlaybackPrepareAlreadyActiveError(Exception):
     pass
 
 
+class PlaybackHandoffTargetConflictError(Exception):
+    pass
+
+
 class PlaybackLocalIntentConflictError(Exception):
     pass
 
@@ -155,6 +159,7 @@ class PlaybackHandoffCompleteResult(tuple):
         device_state: Optional[Dict[str, object]],
         mutated: bool,
         affected_authority_pairs: Iterable[AuthorityPair],
+        retired_context: Optional[Dict[str, object]] = None,
     ):
         result = super().__new__(
             cls,
@@ -170,6 +175,9 @@ class PlaybackHandoffCompleteResult(tuple):
             affected_authority_pairs
         )
         result.canonical_context = dict(playback_context)
+        result.retired_context = (
+            None if retired_context is None else dict(retired_context)
+        )
         return result
 
 
@@ -182,14 +190,34 @@ _strict_stable_client_locks_guard = threading.Lock()
 
 
 @contextmanager
-def _strict_playback_context_lock(playback_context_id):
-    with _strict_playback_context_locks_guard:
-        context_lock = _strict_playback_context_locks.setdefault(
-            playback_context_id,
-            threading.RLock(),
-        )
-    with context_lock:
+def _strict_playback_context_lock(
+    playback_context_id: str,
+) -> Iterator[None]:
+    with _strict_playback_context_lock_set((playback_context_id,)):
         yield
+
+
+@contextmanager
+def _strict_playback_context_lock_set(
+    playback_context_ids: Iterable[str],
+) -> Iterator[None]:
+    normalized_ids = sorted(set(playback_context_ids))
+    locks = []
+    with _strict_playback_context_locks_guard:
+        for playback_context_id in normalized_ids:
+            locks.append(
+                _strict_playback_context_locks.setdefault(
+                    playback_context_id,
+                    threading.RLock(),
+                )
+            )
+    for context_lock in locks:
+        context_lock.acquire()
+    try:
+        yield
+    finally:
+        for context_lock in reversed(locks):
+            context_lock.release()
 
 
 @contextmanager
@@ -2637,8 +2665,207 @@ def updatePlaybackContextState(playback_context_id, user_name, playback_context)
     )
 
 
+def _active_handoff_target_context_records(
+    user_name: str,
+    target_client_id: str,
+) -> List[EmoPlaybackContext]:
+    return list(
+        EmoPlaybackContext.select()
+        .where(
+            (EmoPlaybackContext.user_name == user_name)
+            & (EmoPlaybackContext.lifecycle == "active")
+            & (EmoPlaybackContext.authority_client_id == target_client_id)
+        )
+        .order_by(EmoPlaybackContext.playback_context_id)
+        .limit(3)
+    )
+
+
+def _require_idle_handoff_standby(
+    record: EmoPlaybackContext,
+    target_device_session_id: str,
+) -> None:
+    if record.authority_device_session_id != target_device_session_id:
+        raise PlaybackHandoffTargetConflictError(
+            "Handoff target Context belongs to another device session"
+        )
+    if (
+        json.loads(record.queue_json)
+        or record.state != "idle"
+        or record.position_ms != 0
+        or record.track_id is not None
+    ):
+        raise PlaybackHandoffTargetConflictError(
+            "Handoff target already has a non-idle Context"
+        )
+    active_prepare = EmoPlaybackPrepareTransaction.get_or_none(
+        (EmoPlaybackPrepareTransaction.playback_context_id == record.playback_context_id)
+        & (EmoPlaybackPrepareTransaction.epoch == record.epoch)
+        & (EmoPlaybackPrepareTransaction.status == "preparing")
+    )
+    if active_prepare is not None:
+        raise PlaybackHandoffTargetConflictError(
+            "Handoff target idle Context has an active prepare"
+        )
+
+
 @_serialize_strict_playback_context_mutation
+def createStrictPlaybackHandoff(
+    playback_context_id: str,
+    handoff: Dict[str, object],
+    target_device_session_id: str,
+) -> Tuple[Dict[str, object], bool]:
+    user_name = handoff["userName"]
+    source_client_id = handoff["sourceClientId"]
+    target_client_id = handoff["targetClientId"]
+    open_connection(reuse=True)
+    try:
+        initial_source = EmoPlaybackContext.get_or_none(
+            EmoPlaybackContext.playback_context_id == playback_context_id
+        )
+        if initial_source is None:
+            raise LookupError("Playback context not found")
+        old_authority_pair = _record_authority_pair(initial_source)
+        target_pair = _strict_authority_pair_key(
+            user_name,
+            target_client_id,
+            target_device_session_id,
+        )
+        with _strict_authority_pair_transaction(
+            (old_authority_pair, target_pair)
+        ):
+            source_record = _getStrictPlaybackContextRecord(
+                playback_context_id,
+                user_name,
+            )
+            if source_record is None:
+                raise LookupError("Playback context not found")
+            if source_record.authority_client_id != source_client_id:
+                raise PermissionError(
+                    "Playback handoff source is no longer authority"
+                )
+            if source_record.control_version != handoff["baseControlVersion"]:
+                raise PlaybackContextStaleVersionError(
+                    _playback_context_payload(source_record),
+                    "controlVersion",
+                )
+            active_handoff = EmoPlaybackHandoff.get_or_none(
+                (EmoPlaybackHandoff.playback_context_id == playback_context_id)
+                & EmoPlaybackHandoff.status.in_(
+                    ("preparing", "ready", "committed", "committing")
+                )
+            )
+            if active_handoff is not None:
+                if active_handoff.handoff_id == handoff["handoffId"]:
+                    existing_snapshot = (
+                        json.loads(active_handoff.snapshot_json)
+                        if active_handoff.snapshot_json
+                        else {}
+                    )
+                    existing = dict(handoff)
+                    existing["snapshot"] = existing_snapshot
+                    existing["status"] = active_handoff.status
+                    return existing, False
+                raise PlaybackHandoffTargetConflictError(
+                    "Playback handoff already in progress"
+                )
+
+            target_contexts = _active_handoff_target_context_records(
+                user_name,
+                target_client_id,
+            )
+            if len(target_contexts) > 1:
+                raise PlaybackHandoffTargetConflictError(
+                    "Handoff target has multiple active Contexts"
+                )
+            snapshot = dict(handoff.get("snapshot") or {})
+            for field_name in (
+                "targetStandbyPlaybackContextId",
+                "targetStandbyEpoch",
+                "targetStandbyAuthorityClientId",
+                "targetStandbyAuthorityDeviceSessionId",
+            ):
+                snapshot.pop(field_name, None)
+            if target_contexts:
+                standby = target_contexts[0]
+                _require_idle_handoff_standby(
+                    standby,
+                    target_device_session_id,
+                )
+                snapshot.update(
+                    {
+                        "targetStandbyPlaybackContextId": (
+                            standby.playback_context_id
+                        ),
+                        "targetStandbyEpoch": standby.epoch,
+                        "targetStandbyAuthorityClientId": (
+                            standby.authority_client_id
+                        ),
+                        "targetStandbyAuthorityDeviceSessionId": (
+                            standby.authority_device_session_id
+                        ),
+                    }
+                )
+            record = EmoPlaybackHandoff.create(
+                handoff_id=handoff["handoffId"],
+                request_id=handoff.get("requestId"),
+                playback_context_id=playback_context_id,
+                user_name=user_name,
+                source_client_id=source_client_id,
+                target_client_id=target_client_id,
+                origin_client_id=handoff.get("originClientId"),
+                status="preparing",
+                base_control_version=handoff["baseControlVersion"],
+                snapshot_json=json.dumps(snapshot, ensure_ascii=True),
+            )
+            payload = dict(handoff)
+            payload["snapshot"] = snapshot
+            payload["status"] = record.status
+            return payload, True
+    finally:
+        close_connection()
+
+
 def completeStrictPlaybackHandoff(
+    playback_context_id: str,
+    handoff_id: str,
+    user_name: str,
+    target_client_id: str,
+    target_device_session_id: str,
+    position_ms: Optional[int] = None,
+) -> Optional[PlaybackHandoffCompleteResult]:
+    open_connection(reuse=True)
+    try:
+        handoff_record = EmoPlaybackHandoff.get_or_none(
+            EmoPlaybackHandoff.handoff_id == handoff_id
+        )
+        if handoff_record is None:
+            return None
+        snapshot = (
+            json.loads(handoff_record.snapshot_json)
+            if handoff_record.snapshot_json
+            else {}
+        )
+        standby_context_id = snapshot.get(
+            "targetStandbyPlaybackContextId"
+        )
+    finally:
+        close_connection()
+    context_ids = [playback_context_id]
+    if isinstance(standby_context_id, str) and standby_context_id:
+        context_ids.append(standby_context_id)
+    with _strict_playback_context_lock_set(context_ids):
+        return _completeStrictPlaybackHandoffLocked(
+            playback_context_id,
+            handoff_id,
+            user_name,
+            target_client_id,
+            target_device_session_id,
+            position_ms=position_ms,
+        )
+
+
+def _completeStrictPlaybackHandoffLocked(
     playback_context_id: str,
     handoff_id: str,
     user_name: str,
@@ -2651,8 +2878,27 @@ def completeStrictPlaybackHandoff(
         initial_context_record = EmoPlaybackContext.get_or_none(
             EmoPlaybackContext.playback_context_id == playback_context_id
         )
-        if initial_context_record is None:
+        initial_handoff_record = EmoPlaybackHandoff.get_or_none(
+            EmoPlaybackHandoff.handoff_id == handoff_id
+        )
+        if initial_context_record is None or initial_handoff_record is None:
             return None
+        initial_snapshot = (
+            json.loads(initial_handoff_record.snapshot_json)
+            if initial_handoff_record.snapshot_json
+            else {}
+        )
+        standby_context_id = initial_snapshot.get(
+            "targetStandbyPlaybackContextId"
+        )
+        standby_record = (
+            EmoPlaybackContext.get_or_none(
+                EmoPlaybackContext.playback_context_id
+                == standby_context_id
+            )
+            if isinstance(standby_context_id, str) and standby_context_id
+            else None
+        )
         old_authority_pair = _record_authority_pair(
             initial_context_record
         )
@@ -2661,8 +2907,11 @@ def completeStrictPlaybackHandoff(
             target_client_id,
             target_device_session_id,
         )
+        authority_pairs = [old_authority_pair, new_authority_pair]
+        if standby_record is not None:
+            authority_pairs.append(_record_authority_pair(standby_record))
         with _strict_authority_pair_transaction(
-            (old_authority_pair, new_authority_pair)
+            authority_pairs
         ):
             context_record = EmoPlaybackContext.get_or_none(
                 EmoPlaybackContext.playback_context_id == playback_context_id
@@ -2734,6 +2983,65 @@ def completeStrictPlaybackHandoff(
                     _playback_context_payload(context_record),
                     "controlVersion",
                 )
+
+            expected_standby_id = snapshot.get(
+                "targetStandbyPlaybackContextId"
+            )
+            target_contexts = _active_handoff_target_context_records(
+                user_name,
+                target_client_id,
+            )
+            if len(target_contexts) > 1:
+                raise PlaybackHandoffTargetConflictError(
+                    "Handoff target has multiple active Contexts"
+                )
+            retired_context = None
+            if expected_standby_id is None:
+                if target_contexts:
+                    raise PlaybackHandoffTargetConflictError(
+                        "Handoff target created a Context after prepare started"
+                    )
+            else:
+                if (
+                    len(target_contexts) != 1
+                    or target_contexts[0].playback_context_id
+                    != expected_standby_id
+                ):
+                    raise PlaybackHandoffTargetConflictError(
+                        "Handoff target standby Context changed"
+                    )
+                standby_record = target_contexts[0]
+                if (
+                    standby_record.epoch
+                    != snapshot.get("targetStandbyEpoch")
+                    or standby_record.authority_client_id
+                    != snapshot.get("targetStandbyAuthorityClientId")
+                    or standby_record.authority_device_session_id
+                    != snapshot.get(
+                        "targetStandbyAuthorityDeviceSessionId"
+                    )
+                ):
+                    raise PlaybackHandoffTargetConflictError(
+                        "Handoff target standby binding changed"
+                    )
+                _require_idle_handoff_standby(
+                    standby_record,
+                    target_device_session_id,
+                )
+                closed_at = now()
+                standby_record.lifecycle = "closed"
+                standby_record.closed_at = closed_at
+                standby_record.version = max(1, standby_record.version) + 1
+                standby_record.updated_at = closed_at
+                standby_record.save(
+                    only=(
+                        EmoPlaybackContext.lifecycle,
+                        EmoPlaybackContext.closed_at,
+                        EmoPlaybackContext.version,
+                        EmoPlaybackContext.updated_at,
+                    )
+                )
+                retired_context = _playback_context_payload(standby_record)
 
             next_control_version = snapshot.get("handoffControlVersion")
             if type(next_control_version) is not int or next_control_version < 1:
@@ -2836,7 +3144,8 @@ def completeStrictPlaybackHandoff(
                 handoff_payload,
                 _device_playback_state_payload(target_record),
                 True,
-                (old_authority_pair, new_authority_pair),
+                authority_pairs,
+                retired_context=retired_context,
             )
     finally:
         close_connection()
