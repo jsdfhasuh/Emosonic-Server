@@ -1,9 +1,9 @@
-# Strict-v2 `2.4.0` 服务端更动说明：`playback.update` 控制结算
+# Strict-v2 `2.4.0` r11 服务端更动说明：控制结算
 
 > 日期：2026-07-17
 > 面向：EmoSonic 服务端工程师
-> 状态：最终 r10 服务端实现输入，不表示当前服务端已经完成
-> 完整规范：`specs/emosonic_strict_v2_socketio_server_contract.md` r10
+> 状态：最终 r11 服务端实现输入，不表示当前服务端已经完成
+> 完整规范：`specs/emosonic_strict_v2_socketio_server_contract.md` r11
 
 ## 1. 本次为什么要改
 
@@ -355,12 +355,21 @@ execution_unknown 不证明根命令实际失败，不能自动把更高 pending
 - dependency_failed 必须有 dependsOnControlVersion，execution_unknown 禁止该字段；
 - 不带 requestId、clientSeq、deviceSessionId、track/state/position；
 - 不修改 DevicePlaybackState，不假装 Windows 已确认结果；
-- 发送给当前 Context recipients，使用每个 recipient 当前 nonce/epoch；
+- 发送给当前 Context recipients；最初接收该 transaction 的 authority Windows Socket 若仍在线也必须
+  接收。旧 Socket 断开或被替换后不向新物理连接补发历史 settled；
 - dependency cascade 原子提交后按 commandControlVersion 递增逐条发送。
+
+任一 settled 的固定处理顺序是：先验证事务仍为 pending，再原子写入 failed + errorCode，持久化提交
+成功后才能 emit。不得先推送后落库。多个事务同时结束时先提交全部 terminal，再按版本升序逐条发送，
+一条 command 对应一条 settled。
 
 Flutter 去重主键固定为 `(playbackContextId, epoch, commandControlVersion)`。相同内容重复忽略；同一
 主键不同 status/errorCode 记录协议冲突并刷新 status，不能覆盖首次 terminal。旧 settled 只补齐旧
 pending，不回滚更新版本的实际播放状态。
+
+Windows 收到 settled 后必须按 playbackContextId + epoch + commandControlVersion 使对应 execution lease
+失效、从本地执行队列删除事务，并隔离迟到 callback。settled 自身不得修改实际歌曲、状态、位置或
+DevicePlaybackState；后续实际事实仍由 Windows playback.update 上报。
 
 ## 7. 服务端 → 客户端 canonical update
 
@@ -534,6 +543,9 @@ nonce 变化无条件清除旧 pending。
   保持独立超时。
 - [ ] 服务端 watchdog 固定 executionTimeoutMs + 2000ms，默认 17000ms。
 - [ ] 新增 server-only playback.control.settled schema/发送器/严格输出验证。
+- [ ] settled 必须先持久化 terminal，再按版本升序逐条 emit；禁止先推送后落库。
+- [ ] 原 authority Windows Socket 仍在线时必须收到 settled，并按事务键取消本地 lease/执行队列项；
+  新物理连接不补收旧 settled。
 - [ ] status deviceStates 输出 appliedControlVersion。
 - [ ] playback.update canonical push 同时输出 controlVersion/appliedControlVersion。
 - [ ] ACK 不再被业务逻辑当作实际成功。
@@ -572,12 +584,14 @@ nonce 变化无条件清除旧 pending。
 18. settled 相同键相同内容重复幂等；相同键不同 terminal 记录冲突且不覆盖。
 19. applied 已为 48 时收到旧 passive 47：不写入、不广播，只向源 Windows 返回当前 passive update。
 20. 重启恢复 N/M，不把 N 误报为 applied。
-21. Windows 无法隔离迟到执行时不发送 execution_timeout，部署保持 r10 Core not ready。
-22. 自动下一首不能使用 localUser supersede。
+21. Windows 无法隔离迟到执行时不发送 execution_timeout，部署保持 r11 Core not ready。
+22. settled 发给仍持有该 transaction 的在线 Windows 后，对应 lease 和队列项被移除；第 17 秒以后迟到
+    callback 不切歌、不发 committed、不修改 Context/Queue/系统媒体状态。
+23. 自动下一首不能使用 localUser supersede。
 
 ## 15. 与旧 r9 草案的差异
 
-| r9 草案 | r10 最终方案 |
+| r9 草案 | r11 最终方案 |
 | --- | --- |
 | 本地操作使用 `player.authorityIntent` | 删除该 action，使用 localUser playback.update |
 | playback.update 只是无版本 feedback | 增加 origin、control/applied 和远程结算 |
@@ -593,9 +607,9 @@ nonce 变化无条件清除旧 pending。
 4. 将 executionTimeoutMs 默认 15000ms 和固定 2000ms watchdog grace 接入现有服务端配置/常量体系；
    wire 只发送 executionTimeoutMs，不发送 watchdog 值。
 5. Windows 音频层的 lease 取消证明由 Flutter/Windows 工程师提供；未通过时服务端只使用
-   execution_unknown，部署不得标为完整 r10 Core ready。
+   execution_unknown，部署不得标为完整 r11 Core ready。
 6. 服务端确认存储落点和保留能力后，再开始双方实现。
 
 本文是方便服务端评审的变更摘要。字段冲突或遗漏时，始终以
-`specs/emosonic_strict_v2_socketio_server_contract.md` r10 为准；服务端不应只实现本文摘要而跳过完整
+`specs/emosonic_strict_v2_socketio_server_contract.md` r11 为准；服务端不应只实现本文摘要而跳过完整
 契约的权限、provenance、幂等、资源限制和 fail-closed 要求。

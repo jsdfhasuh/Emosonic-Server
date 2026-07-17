@@ -2,8 +2,12 @@
 
 > 日期：2026-07-17
 > 面向：Flutter Android、Flutter Windows 和共享 realtime 层工程师
-> 状态：最终 r10 客户端改造输入，不表示服务端或 Flutter 已经实现完成
+> 状态：Superseded，禁止继续作为实现输入
 > 权威契约：`specs/emosonic_strict_v2_socketio_server_contract.md` r10
+
+本指南已被 `strict-v2-2.4-r11-flutter-migration-guide.md` 替代。r11 新增并冻结了 Windows 必须接收
+`playback.control.settled`、使 execution lease 失效并删除本地事务的要求；服务端和 Flutter 工程师
+不得继续按本 r10 文件开工。
 
 本文说明 Flutter 客户端从当前 strict-v2 `2.3.0` / contract r8 升级到 `2.4.0` / r10 时需要修改的
 行为。本文是迁移指南，不替代完整 wire contract；字段冲突时以 r10 主契约为准。

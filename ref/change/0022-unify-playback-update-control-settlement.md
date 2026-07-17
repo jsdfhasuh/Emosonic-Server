@@ -2,8 +2,8 @@
 
 ## Status
 
-Accepted for the unreleased personal-lab strict-v2 `2.4.0` Core update. This does not enable production capability or
-complete Android/Windows device validation.
+Accepted for the unreleased personal-lab strict-v2 `2.4.0` contract r11 Core update. This does not enable production
+capability or complete Android/Windows device validation.
 
 ## Context
 
@@ -97,6 +97,13 @@ Watchdog expiry without terminal feedback produces server-only `execution_unknow
 ignored. Different status/error values for the same key are protocol conflicts and cannot overwrite the first
 terminal. Older settlements can close older pending UI but cannot roll back a newer applied playback state.
 
+The server persists every settlement before delivery and sends one event per command in ascending control-version
+order. The authority Windows Socket that originally received the transaction is a required recipient while it remains
+online. Windows consumes the settlement by invalidating the matching audio execution lease and removing the
+transaction from its local queue; late callbacks may not change audio, publish committed feedback, or mutate Context,
+Queue, or system-media projections. A replacement physical connection does not receive historical settlements and
+clears old work by nonce change. Settlement itself does not create a new device playback fact.
+
 Feedback below `lastAppliedControlVersion` cannot be silently dropped because `playback.update` is event-confirmed.
 The server ignores its state side effects and sends the current passive canonical update only to the reporting Socket;
 it does not broadcast the stale report. A contradictory terminal result still returns `conflict`.
@@ -119,6 +126,7 @@ on the existing Queue transition path until a separate automatic-transition cont
 - Stale feedback receives a bounded source-only correction instead of hanging or disturbing other clients.
 - Server-generated transaction terminals no longer impersonate Windows playback feedback or reuse a device sequence.
 - Per-command settlement removes client-side guessing about dependency-failed version ranges.
+- Delivering settlements to Windows closes the gap between a server terminal decision and the local execution queue.
 
 ### Negative
 
@@ -128,6 +136,7 @@ on the existing Queue transition path until a separate automatic-transition cont
 - Status projections must allow the latest Context target and older applied device track to differ while work is pending.
 - The server needs watchdog scheduling, a new server-only event, and per-command settlement delivery.
 - Windows must implement cancellable/isolated audio execution leases before hard timeout can be declared ready.
+- Server settlement delivery and Windows lease invalidation must both be idempotent.
 
 ### Neutral
 
