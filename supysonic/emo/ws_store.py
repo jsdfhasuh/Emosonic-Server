@@ -81,6 +81,12 @@ class PlaybackLocalIntentConflictError(Exception):
     pass
 
 
+class PlaybackClientSequenceConflictError(Exception):
+    def __init__(self, current_client_seq):
+        super().__init__("Playback clientSeq is stale or conflicts")
+        self.current_client_seq = current_client_seq
+
+
 AuthorityPair = Tuple[str, str, str]
 
 
@@ -573,6 +579,557 @@ def settlePlaybackControlTransaction(
                 )
             record = EmoPlaybackControlTransaction.get_by_id(record.id)
             return serializePlaybackControlTransaction(record), True
+    finally:
+        close_connection()
+
+
+def _strict_playback_update_canonical(
+    record,
+    client_id,
+    device_session_id,
+    origin,
+    payload,
+    applied_control_version,
+    client_seq,
+    server_updated_at_ms,
+    command_control_version=None,
+    superseded_through_control_version=None,
+):
+    canonical = {
+        "playbackContextId": record.playback_context_id,
+        "sourceClientId": client_id,
+        "deviceSessionId": device_session_id,
+        "origin": origin,
+        "controlVersion": record.control_version,
+        "appliedControlVersion": applied_control_version,
+        "state": payload["state"],
+        "positionMs": payload["positionMs"],
+        "clientSeq": client_seq,
+        "serverUpdatedAtMs": server_updated_at_ms,
+    }
+    for field_name in ("trackId", "volume", "muted"):
+        if field_name in payload:
+            canonical[field_name] = payload[field_name]
+    if origin == "remoteCommand":
+        canonical["executionStatus"] = payload["executionStatus"]
+        canonical["commandControlVersion"] = command_control_version
+        if payload["executionStatus"] == "failed":
+            canonical["errorCode"] = payload["errorCode"]
+            if "errorMessage" in payload:
+                canonical["errorMessage"] = payload["errorMessage"]
+    elif origin == "localUser":
+        canonical["executionStatus"] = "committed"
+        canonical["intentId"] = payload["intentId"]
+        canonical["supersededThroughControlVersion"] = (
+            superseded_through_control_version
+        )
+        canonical["queueIndex"] = payload["queueIndex"]
+    return canonical
+
+
+def _save_strict_device_state_record(
+    record,
+    existing,
+    client_id,
+    device_session_id,
+    user_name,
+    connection_nonce,
+    request_fingerprint,
+    canonical_update,
+):
+    playback_json = dict(canonical_update)
+    playback_json.update(
+        {
+            "_connectionNonce": connection_nonce,
+            "_requestFingerprint": request_fingerprint,
+            "_canonicalUpdate": canonical_update,
+        }
+    )
+    values = {
+        "device_session_id": device_session_id,
+        "owner_client_id": client_id,
+        "user_name": user_name,
+        "state": canonical_update["state"],
+        "track_id": canonical_update.get("trackId"),
+        "position_ms": canonical_update["positionMs"],
+        "volume": canonical_update.get("volume"),
+        "is_authority": 1,
+        "mode": "normal",
+        "context_epoch": record.epoch,
+        "applied_control_version": canonical_update[
+            "appliedControlVersion"
+        ],
+        "client_seq": canonical_update["clientSeq"],
+        "playback_json": json.dumps(playback_json, ensure_ascii=True),
+        "updated_at": now(),
+    }
+    if existing is None:
+        return EmoDevicePlaybackState.create(
+            playback_context_id=record.playback_context_id,
+            **values,
+        )
+    for field_name, value in values.items():
+        setattr(existing, field_name, value)
+    existing.save()
+    return existing
+
+
+def _passive_correction_from_device(record, device_state):
+    persisted = _device_playback_state_payload(device_state)
+    correction = {
+        "playbackContextId": record.playback_context_id,
+        "sourceClientId": device_state.owner_client_id,
+        "deviceSessionId": device_state.device_session_id,
+        "origin": "passive",
+        "controlVersion": record.control_version,
+        "appliedControlVersion": device_state.applied_control_version,
+        "state": device_state.state,
+        "positionMs": device_state.position_ms,
+        "clientSeq": device_state.client_seq,
+        "serverUpdatedAtMs": persisted["serverUpdatedAtMs"],
+    }
+    for field_name in ("trackId", "volume", "muted"):
+        if persisted.get(field_name) is not None:
+            correction[field_name] = persisted[field_name]
+    return correction
+
+
+@_serialize_strict_playback_context_mutation
+def applyStrictPlaybackUpdate(
+    playback_context_id,
+    user_name,
+    client_id,
+    device_session_id,
+    connection_nonce,
+    payload,
+    server_updated_at_ms,
+):
+    request_payload = dict(payload)
+    request_fingerprint = _json_fingerprint(request_payload)
+    open_connection(reuse=True)
+    try:
+        with _strict_playback_context_transaction():
+            record = _getStrictPlaybackContextRecord(
+                playback_context_id,
+                user_name,
+            )
+            if record is None:
+                return None
+            current = _playback_context_payload(record)
+            if (
+                record.authority_client_id != client_id
+                or record.authority_device_session_id != device_session_id
+            ):
+                raise PermissionError("Playback update authority binding mismatch")
+
+            existing = EmoDevicePlaybackState.get_or_none(
+                (
+                    EmoDevicePlaybackState.playback_context_id
+                    == playback_context_id
+                )
+                & (EmoDevicePlaybackState.owner_client_id == client_id)
+            )
+            existing_json = (
+                json.loads(existing.playback_json)
+                if existing is not None and existing.playback_json
+                else {}
+            )
+            same_scope = bool(
+                existing is not None
+                and existing.context_epoch == record.epoch
+                and existing.device_session_id == device_session_id
+                and existing_json.get("_connectionNonce") == connection_nonce
+            )
+            current_client_seq = existing.client_seq if same_scope else 0
+            incoming_client_seq = payload["clientSeq"]
+            if incoming_client_seq < current_client_seq:
+                raise PlaybackClientSequenceConflictError(current_client_seq)
+            if incoming_client_seq == current_client_seq and current_client_seq > 0:
+                if existing_json.get("_requestFingerprint") != request_fingerprint:
+                    raise PlaybackClientSequenceConflictError(current_client_seq)
+                return {
+                    "playbackContext": current,
+                    "deviceState": _device_playback_state_payload(existing),
+                    "canonicalUpdate": existing_json["_canonicalUpdate"],
+                    "created": False,
+                    "sourceOnly": True,
+                    "dependencySettlements": [],
+                }
+
+            has_applied_baseline = bool(
+                existing is not None
+                and existing.context_epoch == record.epoch
+                and existing.applied_control_version >= 1
+            )
+            last_applied = (
+                existing.applied_control_version
+                if has_applied_baseline
+                else None
+            )
+            origin = payload["origin"]
+            dependency_records = []
+
+            if origin == "passive":
+                applied = payload["appliedControlVersion"]
+                if applied > record.control_version:
+                    raise ValueError(
+                        "appliedControlVersion exceeds canonical controlVersion"
+                    )
+                if last_applied is not None and applied < last_applied:
+                    canonical = _passive_correction_from_device(record, existing)
+                    return {
+                        "playbackContext": current,
+                        "deviceState": _device_playback_state_payload(existing),
+                        "canonicalUpdate": canonical,
+                        "created": False,
+                        "sourceOnly": True,
+                        "dependencySettlements": [],
+                    }
+                if last_applied is not None and applied != last_applied:
+                    raise PlaybackControlTransactionConflictError(
+                        "Passive update cannot advance appliedControlVersion"
+                    )
+                canonical = _strict_playback_update_canonical(
+                    record,
+                    client_id,
+                    device_session_id,
+                    origin,
+                    payload,
+                    applied,
+                    incoming_client_seq,
+                    server_updated_at_ms,
+                )
+
+            elif origin == "remoteCommand":
+                command_version = payload["commandControlVersion"]
+                applied = payload["appliedControlVersion"]
+                if command_version > record.control_version:
+                    raise ValueError(
+                        "commandControlVersion exceeds canonical controlVersion"
+                    )
+                transaction = EmoPlaybackControlTransaction.get_or_none(
+                    (
+                        EmoPlaybackControlTransaction.playback_context_id
+                        == playback_context_id
+                    )
+                    & (EmoPlaybackControlTransaction.epoch == record.epoch)
+                    & (
+                        EmoPlaybackControlTransaction.command_control_version
+                        == command_version
+                    )
+                )
+                if transaction is None:
+                    raise PlaybackControlTransactionConflictError(
+                        "Remote control transaction not found"
+                    )
+                if last_applied is not None and applied < last_applied:
+                    expected_status = (
+                        "committed"
+                        if payload["executionStatus"] == "committed"
+                        else "failed"
+                    )
+                    if (
+                        transaction.status != expected_status
+                        or transaction.error_code != payload.get("errorCode")
+                    ):
+                        raise PlaybackControlTransactionConflictError(
+                            "Stale remote terminal conflicts with persisted result"
+                        )
+                    return {
+                        "playbackContext": current,
+                        "deviceState": _device_playback_state_payload(existing),
+                        "canonicalUpdate": _passive_correction_from_device(
+                            record,
+                            existing,
+                        ),
+                        "created": False,
+                        "sourceOnly": True,
+                        "dependencySettlements": [],
+                    }
+                if (
+                    transaction.authority_client_id != client_id
+                    or transaction.authority_device_session_id
+                    != device_session_id
+                    or transaction.routed_connection_nonce != connection_nonce
+                ):
+                    raise PlaybackControlTransactionConflictError(
+                        "Remote control transaction authority changed"
+                    )
+                lower_pending = EmoPlaybackControlTransaction.get_or_none(
+                    (
+                        EmoPlaybackControlTransaction.playback_context_id
+                        == playback_context_id
+                    )
+                    & (EmoPlaybackControlTransaction.epoch == record.epoch)
+                    & (EmoPlaybackControlTransaction.status == "pending")
+                    & (
+                        EmoPlaybackControlTransaction.command_control_version
+                        < command_version
+                    )
+                )
+                if lower_pending is not None:
+                    raise PlaybackControlTransactionConflictError(
+                        "Lower control transaction is still pending"
+                    )
+                if (
+                    payload["executionStatus"] == "failed"
+                    and last_applied is not None
+                    and applied != last_applied
+                ):
+                    raise PlaybackControlTransactionConflictError(
+                        "Failed control feedback changed appliedControlVersion"
+                    )
+                terminal_status = (
+                    "committed"
+                    if payload["executionStatus"] == "committed"
+                    else "failed"
+                )
+                terminal_error = payload.get("errorCode")
+                terminal_identity = {
+                    "status": terminal_status,
+                    "errorCode": terminal_error,
+                    "appliedControlVersion": applied,
+                    "state": payload["state"],
+                    "trackId": payload.get("trackId"),
+                    "positionMs": payload["positionMs"],
+                }
+                terminal_fingerprint = _json_fingerprint(terminal_identity)
+                if transaction.status != "pending":
+                    if transaction.terminal_fingerprint != terminal_fingerprint:
+                        raise PlaybackControlTransactionConflictError(
+                            "Remote control terminal conflict"
+                        )
+                else:
+                    transaction.status = terminal_status
+                    transaction.error_code = terminal_error
+                    transaction.applied_control_version = applied
+                    transaction.terminal_fingerprint = terminal_fingerprint
+                    transaction.terminal_at_ms = server_updated_at_ms
+                    transaction.updated_at = now()
+                    transaction.save()
+
+                    if terminal_status == "failed":
+                        queue = json.loads(record.queue_json)
+                        actual_index = (
+                            queue.index(payload["trackId"])
+                            if payload.get("trackId") in queue
+                            else record.current_index
+                        )
+                        snapshot_changed = (
+                            record.state != payload["state"]
+                            or record.position_ms != payload["positionMs"]
+                            or record.current_index != actual_index
+                            or record.track_id != payload.get("trackId")
+                        )
+                        if snapshot_changed:
+                            if record.current_index != actual_index:
+                                record.queue_revision += 1
+                            record.current_index = actual_index
+                            record.track_id = payload.get("trackId")
+                            record.state = payload["state"]
+                            record.position_ms = payload["positionMs"]
+                            record.version += 1
+                            record.updated_at = now()
+                            record.save()
+                            current = _playback_context_payload(record)
+
+                        if transaction.action in {
+                            "queue.playItem",
+                            "player.next",
+                            "player.prev",
+                        }:
+                            dependent_query = (
+                                EmoPlaybackControlTransaction.select()
+                                .where(
+                                    (
+                                        EmoPlaybackControlTransaction.playback_context_id
+                                        == playback_context_id
+                                    )
+                                    & (
+                                        EmoPlaybackControlTransaction.epoch
+                                        == record.epoch
+                                    )
+                                    & (
+                                        EmoPlaybackControlTransaction.status
+                                        == "pending"
+                                    )
+                                    & (
+                                        EmoPlaybackControlTransaction.command_control_version
+                                        > command_version
+                                    )
+                                )
+                                .order_by(
+                                    EmoPlaybackControlTransaction.command_control_version
+                                )
+                            )
+                            for dependent in dependent_query:
+                                dependent.status = "failed"
+                                dependent.error_code = "dependency_failed"
+                                dependent.depends_on_control_version = command_version
+                                dependent.applied_control_version = applied
+                                dependent.terminal_fingerprint = _json_fingerprint(
+                                    {
+                                        "status": "failed",
+                                        "errorCode": "dependency_failed",
+                                        "dependsOnControlVersion": command_version,
+                                        "appliedControlVersion": applied,
+                                    }
+                                )
+                                dependent.terminal_at_ms = server_updated_at_ms
+                                dependent.updated_at = now()
+                                dependent.save()
+                                dependency_records.append(
+                                    serializePlaybackControlTransaction(dependent)
+                                )
+
+                canonical = _strict_playback_update_canonical(
+                    record,
+                    client_id,
+                    device_session_id,
+                    origin,
+                    payload,
+                    applied,
+                    incoming_client_seq,
+                    server_updated_at_ms,
+                    command_control_version=command_version,
+                )
+
+            else:
+                if payload["epoch"] != record.epoch:
+                    raise PlaybackControlTransactionConflictError(
+                        "Local intent Context epoch changed"
+                    )
+                if payload["observedControlVersion"] > record.control_version:
+                    raise ValueError(
+                        "observedControlVersion exceeds canonical controlVersion"
+                    )
+                queue = json.loads(record.queue_json)
+                queue_index = payload["queueIndex"]
+                if (
+                    queue_index >= len(queue)
+                    or queue[queue_index] != payload["trackId"]
+                ):
+                    raise PlaybackControlTransactionConflictError(
+                        "Local intent queue item does not match canonical queue"
+                    )
+                intent_payload = dict(payload)
+                intent_payload.pop("clientSeq", None)
+                intent_fingerprint = _json_fingerprint(intent_payload)
+                existing_intent = EmoPlaybackLocalIntent.get_or_none(
+                    (
+                        EmoPlaybackLocalIntent.playback_context_id
+                        == playback_context_id
+                    )
+                    & (EmoPlaybackLocalIntent.epoch == record.epoch)
+                    & (EmoPlaybackLocalIntent.intent_id == payload["intentId"])
+                )
+                if existing_intent is not None:
+                    if (
+                        existing_intent.authority_client_id != client_id
+                        or existing_intent.authority_device_session_id
+                        != device_session_id
+                        or existing_intent.request_fingerprint
+                        != intent_fingerprint
+                    ):
+                        raise PlaybackLocalIntentConflictError(
+                            "Local intent content or binding conflict"
+                        )
+                    return {
+                        "playbackContext": current,
+                        "deviceState": (
+                            _device_playback_state_payload(existing)
+                            if existing is not None
+                            else None
+                        ),
+                        "canonicalUpdate": _load_json_object(
+                            existing_intent.canonical_update_json
+                        ),
+                        "created": False,
+                        "sourceOnly": True,
+                        "dependencySettlements": [],
+                    }
+
+                superseded_through = record.control_version
+                record.control_version += 1
+                record.version += 1
+                if record.current_index != queue_index:
+                    record.queue_revision += 1
+                record.current_index = queue_index
+                record.track_id = payload["trackId"]
+                record.state = payload["state"]
+                record.position_ms = payload["positionMs"]
+                record.updated_at = now()
+                record.save()
+                current = _playback_context_payload(record)
+                applied = record.control_version
+
+                pending_query = EmoPlaybackControlTransaction.select().where(
+                    (
+                        EmoPlaybackControlTransaction.playback_context_id
+                        == playback_context_id
+                    )
+                    & (EmoPlaybackControlTransaction.epoch == record.epoch)
+                    & (EmoPlaybackControlTransaction.status == "pending")
+                    & (
+                        EmoPlaybackControlTransaction.command_control_version
+                        <= superseded_through
+                    )
+                )
+                for pending in pending_query:
+                    pending.status = "superseded"
+                    pending.applied_control_version = applied
+                    pending.terminal_fingerprint = _json_fingerprint(
+                        {
+                            "status": "superseded",
+                            "appliedControlVersion": applied,
+                        }
+                    )
+                    pending.terminal_at_ms = server_updated_at_ms
+                    pending.updated_at = now()
+                    pending.save()
+
+                canonical = _strict_playback_update_canonical(
+                    record,
+                    client_id,
+                    device_session_id,
+                    origin,
+                    payload,
+                    applied,
+                    incoming_client_seq,
+                    server_updated_at_ms,
+                    superseded_through_control_version=superseded_through,
+                )
+                EmoPlaybackLocalIntent.create(
+                    playback_context_id=playback_context_id,
+                    user_name=user_name,
+                    epoch=record.epoch,
+                    intent_id=payload["intentId"],
+                    authority_client_id=client_id,
+                    authority_device_session_id=device_session_id,
+                    request_fingerprint=intent_fingerprint,
+                    canonical_update_json=_canonical_json(canonical),
+                    control_version=record.control_version,
+                    superseded_through_control_version=superseded_through,
+                )
+
+            saved_device = _save_strict_device_state_record(
+                record,
+                existing,
+                client_id,
+                device_session_id,
+                user_name,
+                connection_nonce,
+                request_fingerprint,
+                canonical,
+            )
+            return {
+                "playbackContext": _playback_context_payload(record),
+                "deviceState": _device_playback_state_payload(saved_device),
+                "canonicalUpdate": canonical,
+                "created": True,
+                "sourceOnly": False,
+                "dependencySettlements": dependency_records,
+            }
     finally:
         close_connection()
 
@@ -1759,6 +2316,13 @@ def mutateStrictPlaybackContextControl(
     base_queue_revision=None,
     position_ms=None,
     current_index=None,
+    requesting_client_id=None,
+    authority_client_id=None,
+    authority_device_session_id=None,
+    routed_connection_nonce=None,
+    routed_connection_epoch=1,
+    accepted_at_ms=None,
+    execution_timeout_ms=None,
 ):
     open_connection(reuse=True)
     try:
@@ -1838,7 +2402,56 @@ def mutateStrictPlaybackContextControl(
                 record.queue_revision += 1
             record.updated_at = now()
             record.save()
-            return _playback_context_payload(record)
+            result = _playback_context_payload(record)
+            if requesting_client_id is not None:
+                if (
+                    not authority_client_id
+                    or not authority_device_session_id
+                    or not routed_connection_nonce
+                    or accepted_at_ms is None
+                    or execution_timeout_ms is None
+                    or execution_timeout_ms < 1
+                ):
+                    raise ValueError(
+                        "Strict control transaction routing fields are required"
+                    )
+                accepted_target = {
+                    "action": action,
+                    "state": record.state,
+                    "positionMs": record.position_ms,
+                }
+                if record.track_id is not None:
+                    accepted_target["trackId"] = record.track_id
+                if action in {
+                    "queue.playItem",
+                    "player.next",
+                    "player.prev",
+                }:
+                    accepted_target["queueIndex"] = record.current_index
+                    accepted_target["queueRevision"] = record.queue_revision
+                transaction_record = EmoPlaybackControlTransaction.create(
+                    playback_context_id=playback_context_id,
+                    user_name=user_name,
+                    epoch=record.epoch,
+                    command_control_version=record.control_version,
+                    requesting_client_id=requesting_client_id,
+                    authority_client_id=authority_client_id,
+                    authority_device_session_id=authority_device_session_id,
+                    routed_connection_nonce=routed_connection_nonce,
+                    routed_connection_epoch=routed_connection_epoch,
+                    action=action,
+                    accepted_target_json=_canonical_json(accepted_target),
+                    status="pending",
+                    accepted_at_ms=accepted_at_ms,
+                    execution_timeout_ms=execution_timeout_ms,
+                    watchdog_deadline_at_ms=(
+                        accepted_at_ms + execution_timeout_ms + 2000
+                    ),
+                )
+                result["_controlTransaction"] = (
+                    serializePlaybackControlTransaction(transaction_record)
+                )
+            return result
     finally:
         close_connection()
 

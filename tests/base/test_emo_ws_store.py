@@ -17,7 +17,9 @@ from supysonic.emo.ws_store import (
     PlaybackLocalIntentConflictError,
     PlaybackPrepareAlreadyActiveError,
     PlaybackPrepareTransactionConflictError,
+    PlaybackClientSequenceConflictError,
     closeStrictPlaybackContextState,
+    applyStrictPlaybackUpdate,
     completeStrictPlaybackHandoff,
     createPlaybackContextState,
     createPlaybackControlTransaction,
@@ -1566,6 +1568,353 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 18001,
                 applied_control_version=2,
             )
+
+    def test_strict_playback_update_commits_pending_and_advances_applied_cursor(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            0,
+            "playing",
+        )
+        passive = applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 10,
+                "clientSeq": 1,
+            },
+            1000,
+        )
+        self.assertEqual(passive["canonicalUpdate"]["appliedControlVersion"], 1)
+
+        mutated = mutateStrictPlaybackContextControl(
+            "context-1",
+            "alice",
+            "controller-1",
+            "player.pause",
+            1,
+            requesting_client_id="controller-1",
+            authority_client_id="player-1",
+            authority_device_session_id="device:player-1",
+            routed_connection_nonce="nonce-1",
+            accepted_at_ms=1100,
+            execution_timeout_ms=15000,
+        )
+        self.assertEqual(mutated["controlVersion"], 2)
+
+        committed = applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "remoteCommand",
+                "executionStatus": "committed",
+                "commandControlVersion": 2,
+                "appliedControlVersion": 2,
+                "state": "paused",
+                "trackId": "song-1",
+                "positionMs": 10,
+                "clientSeq": 2,
+            },
+            1200,
+        )
+        transaction = getPlaybackControlTransaction("context-1", 1, 2)
+        self.assertEqual(transaction["status"], "committed")
+        self.assertEqual(committed["canonicalUpdate"]["controlVersion"], 2)
+        self.assertEqual(committed["canonicalUpdate"]["appliedControlVersion"], 2)
+
+        duplicate = applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "remoteCommand",
+                "executionStatus": "committed",
+                "commandControlVersion": 2,
+                "appliedControlVersion": 2,
+                "state": "paused",
+                "trackId": "song-1",
+                "positionMs": 10,
+                "clientSeq": 2,
+            },
+            1300,
+        )
+        self.assertTrue(duplicate["sourceOnly"])
+        self.assertEqual(duplicate["canonicalUpdate"], committed["canonicalUpdate"])
+
+    def test_failed_track_change_cascades_dependency_terminals_in_version_order(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1", "song-2"],
+            0,
+            0,
+            "playing",
+        )
+        applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 0,
+                "clientSeq": 1,
+            },
+            1000,
+        )
+        first = mutateStrictPlaybackContextControl(
+            "context-1",
+            "alice",
+            "controller-1",
+            "player.next",
+            1,
+            requesting_client_id="controller-1",
+            authority_client_id="player-1",
+            authority_device_session_id="device:player-1",
+            routed_connection_nonce="nonce-1",
+            accepted_at_ms=1100,
+            execution_timeout_ms=15000,
+        )
+        mutateStrictPlaybackContextControl(
+            "context-1",
+            "alice",
+            "controller-1",
+            "player.pause",
+            first["controlVersion"],
+            requesting_client_id="controller-1",
+            authority_client_id="player-1",
+            authority_device_session_id="device:player-1",
+            routed_connection_nonce="nonce-1",
+            accepted_at_ms=1200,
+            execution_timeout_ms=15000,
+        )
+
+        failed = applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "remoteCommand",
+                "executionStatus": "failed",
+                "commandControlVersion": 2,
+                "appliedControlVersion": 1,
+                "errorCode": "track_load_failed",
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 0,
+                "clientSeq": 2,
+            },
+            1300,
+        )
+
+        self.assertEqual(
+            [item["commandControlVersion"] for item in failed["dependencySettlements"]],
+            [3],
+        )
+        self.assertEqual(
+            getPlaybackControlTransaction("context-1", 1, 3)["errorCode"],
+            "dependency_failed",
+        )
+        context = getPlaybackContextState("context-1")
+        self.assertEqual(context["controlVersion"], 3)
+        self.assertEqual(context["currentIndex"], 0)
+        self.assertEqual(context["trackId"], "song-1")
+
+    def test_local_user_update_allocates_version_and_supersedes_pending(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1", "song-2"],
+            0,
+            0,
+            "playing",
+        )
+        applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 0,
+                "clientSeq": 1,
+            },
+            1000,
+        )
+        mutateStrictPlaybackContextControl(
+            "context-1",
+            "alice",
+            "controller-1",
+            "player.pause",
+            1,
+            requesting_client_id="controller-1",
+            authority_client_id="player-1",
+            authority_device_session_id="device:player-1",
+            routed_connection_nonce="nonce-1",
+            accepted_at_ms=1100,
+            execution_timeout_ms=15000,
+        )
+
+        local = applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "localUser",
+                "executionStatus": "committed",
+                "intentId": "local-1",
+                "epoch": 1,
+                "observedControlVersion": 2,
+                "queueIndex": 1,
+                "state": "playing",
+                "trackId": "song-2",
+                "positionMs": 0,
+                "clientSeq": 2,
+            },
+            1200,
+        )
+
+        self.assertEqual(local["canonicalUpdate"]["controlVersion"], 3)
+        self.assertEqual(
+            local["canonicalUpdate"]["supersededThroughControlVersion"],
+            2,
+        )
+        self.assertEqual(
+            getPlaybackControlTransaction("context-1", 1, 2)["status"],
+            "superseded",
+        )
+        self.assertEqual(getPlaybackContextState("context-1")["currentIndex"], 1)
+
+    def test_stale_applied_feedback_returns_source_only_correction_without_mutation(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            0,
+            "playing",
+        )
+        applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 100,
+                "clientSeq": 1,
+            },
+            1000,
+        )
+        mutateStrictPlaybackContextControl(
+            "context-1",
+            "alice",
+            "controller-1",
+            "player.pause",
+            1,
+            position_ms=100,
+            requesting_client_id="controller-1",
+            authority_client_id="player-1",
+            authority_device_session_id="device:player-1",
+            routed_connection_nonce="nonce-1",
+            accepted_at_ms=1050,
+            execution_timeout_ms=15000,
+        )
+        applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "remoteCommand",
+                "executionStatus": "committed",
+                "commandControlVersion": 2,
+                "appliedControlVersion": 2,
+                "state": "paused",
+                "trackId": "song-1",
+                "positionMs": 100,
+                "clientSeq": 2,
+            },
+            1075,
+        )
+        correction = applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 0,
+                "clientSeq": 3,
+            },
+            1100,
+        )
+        self.assertTrue(correction["sourceOnly"])
+        self.assertEqual(correction["canonicalUpdate"]["positionMs"], 100)
+        self.assertEqual(correction["canonicalUpdate"]["state"], "paused")
 
     def test_ensure_creates_idle_initializes_same_context_and_rebinds(self):
         idle_result = ensureStrictPlaybackContextState(
