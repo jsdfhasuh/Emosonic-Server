@@ -494,6 +494,60 @@ def listPendingPlaybackControlTransactions(playback_context_id, epoch):
         close_connection()
 
 
+def listPendingPlaybackControlTransactionsForAuthorityConnection(
+    user_name: str,
+    authority_client_id: str,
+    authority_device_session_id: str,
+    routed_connection_nonce: str,
+) -> List[Dict[str, object]]:
+    open_connection(reuse=True)
+    try:
+        query = (
+            EmoPlaybackControlTransaction.select()
+            .where(
+                (EmoPlaybackControlTransaction.user_name == user_name)
+                & (
+                    EmoPlaybackControlTransaction.authority_client_id
+                    == authority_client_id
+                )
+                & (
+                    EmoPlaybackControlTransaction.authority_device_session_id
+                    == authority_device_session_id
+                )
+                & (
+                    EmoPlaybackControlTransaction.routed_connection_nonce
+                    == routed_connection_nonce
+                )
+                & (EmoPlaybackControlTransaction.status == "pending")
+            )
+            .order_by(
+                EmoPlaybackControlTransaction.playback_context_id,
+                EmoPlaybackControlTransaction.epoch,
+                EmoPlaybackControlTransaction.command_control_version,
+            )
+        )
+        return [serializePlaybackControlTransaction(record) for record in query]
+    finally:
+        close_connection()
+
+
+def listAllPendingPlaybackControlTransactions() -> List[Dict[str, object]]:
+    open_connection(reuse=True)
+    try:
+        query = (
+            EmoPlaybackControlTransaction.select()
+            .where(EmoPlaybackControlTransaction.status == "pending")
+            .order_by(
+                EmoPlaybackControlTransaction.playback_context_id,
+                EmoPlaybackControlTransaction.epoch,
+                EmoPlaybackControlTransaction.command_control_version,
+            )
+        )
+        return [serializePlaybackControlTransaction(record) for record in query]
+    finally:
+        close_connection()
+
+
 def listExpiredPlaybackControlTransactions(deadline_at_ms):
     open_connection(reuse=True)
     try:
@@ -754,6 +808,7 @@ def applyStrictPlaybackUpdate(
                     "created": False,
                     "sourceOnly": True,
                     "dependencySettlements": [],
+                    "terminalControlVersions": [],
                 }
 
             has_applied_baseline = bool(
@@ -768,6 +823,7 @@ def applyStrictPlaybackUpdate(
             )
             origin = payload["origin"]
             dependency_records = []
+            terminal_control_versions = []
 
             if origin == "passive":
                 applied = payload["appliedControlVersion"]
@@ -784,6 +840,7 @@ def applyStrictPlaybackUpdate(
                         "created": False,
                         "sourceOnly": True,
                         "dependencySettlements": [],
+                        "terminalControlVersions": [],
                     }
                 if last_applied is not None and applied != last_applied:
                     raise PlaybackControlTransactionConflictError(
@@ -845,6 +902,7 @@ def applyStrictPlaybackUpdate(
                         "created": False,
                         "sourceOnly": True,
                         "dependencySettlements": [],
+                        "terminalControlVersions": [],
                     }
                 if (
                     transaction.authority_client_id != client_id
@@ -899,6 +957,7 @@ def applyStrictPlaybackUpdate(
                         raise PlaybackControlTransactionConflictError(
                             "Remote control terminal conflict"
                         )
+                    terminal_control_versions.append(command_version)
                 else:
                     transaction.status = terminal_status
                     transaction.error_code = terminal_error
@@ -907,6 +966,7 @@ def applyStrictPlaybackUpdate(
                     transaction.terminal_at_ms = server_updated_at_ms
                     transaction.updated_at = now()
                     transaction.save()
+                    terminal_control_versions.append(command_version)
 
                     if terminal_status == "failed":
                         queue = json.loads(record.queue_json)
@@ -981,6 +1041,9 @@ def applyStrictPlaybackUpdate(
                                 dependency_records.append(
                                     serializePlaybackControlTransaction(dependent)
                                 )
+                                terminal_control_versions.append(
+                                    dependent.command_control_version
+                                )
 
                 canonical = _strict_playback_update_canonical(
                     record,
@@ -1047,6 +1110,7 @@ def applyStrictPlaybackUpdate(
                         "created": False,
                         "sourceOnly": True,
                         "dependencySettlements": [],
+                        "terminalControlVersions": [],
                     }
 
                 superseded_through = record.control_version
@@ -1087,6 +1151,9 @@ def applyStrictPlaybackUpdate(
                     pending.terminal_at_ms = server_updated_at_ms
                     pending.updated_at = now()
                     pending.save()
+                    terminal_control_versions.append(
+                        pending.command_control_version
+                    )
 
                 canonical = _strict_playback_update_canonical(
                     record,
@@ -1129,6 +1196,7 @@ def applyStrictPlaybackUpdate(
                 "created": True,
                 "sourceOnly": False,
                 "dependencySettlements": dependency_records,
+                "terminalControlVersions": terminal_control_versions,
             }
     finally:
         close_connection()

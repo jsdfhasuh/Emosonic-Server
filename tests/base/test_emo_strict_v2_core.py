@@ -1865,8 +1865,9 @@ class StrictV2CoreTestCase(unittest.TestCase):
         )
         self.messages(controller)
 
-        with mock.patch.object(socketio, "sleep"):
-            emo_ws._expire_control_transaction_later("context-1", 1, 2)
+        emo_ws._sweep_expired_control_transactions(
+            transaction["watchdogDeadlineAtMs"]
+        )
 
         terminal = emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
         self.assertEqual(terminal["status"], "failed")
@@ -1883,9 +1884,236 @@ class StrictV2CoreTestCase(unittest.TestCase):
         )
         self.assertNotIn("sourceClientId", settled["payload"])
         self.assertNotIn("clientSeq", settled["payload"])
+        authority_events = self.messages(player)
+        self.assertTrue(
+            any(
+                message["action"] == "playback.control.settled"
+                and message["payload"]["commandControlVersion"] == 2
+                for message in authority_events
+            )
+        )
         persisted = getPlaybackContextState("context-1")
         self.assertEqual(persisted["state"], "paused")
         self.assertEqual(persisted["controlVersion"], 2)
+
+    def test_authority_disconnect_settles_pending_unknown_without_playback_update(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-disconnect",
+            device_session_id="device:controller-disconnect",
+        )
+        self.emit_strict(
+            controller,
+            "state",
+            "playback.context.subscribe",
+            "subscribe-disconnect",
+            {"playbackContextId": "context-1"},
+        )
+        with mock.patch.object(socketio, "start_background_task"):
+            self.emit_strict(
+                controller,
+                "command",
+                "player.pause",
+                "pause-disconnect",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                },
+            )
+            self.emit_strict(
+                controller,
+                "command",
+                "player.seek",
+                "seek-disconnect",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 2,
+                    "positionMs": 5000,
+                },
+            )
+            self.emit_strict(
+                controller,
+                "command",
+                "player.play",
+                "play-disconnect",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 3,
+                },
+            )
+        self.messages(player)
+        self.messages(controller)
+
+        statuses_before_emit = []
+        original_broadcast = emo_ws._broadcast_control_settled
+
+        def record_persisted_terminals(transaction, playback_context):
+            statuses_before_emit.append(
+                [
+                    emo_ws.getPlaybackControlTransaction(
+                        "context-1",
+                        1,
+                        version,
+                    )["status"]
+                    for version in (2, 3, 4)
+                ]
+            )
+            return original_broadcast(transaction, playback_context)
+
+        with mock.patch.object(
+            emo_ws,
+            "_broadcast_control_settled",
+            side_effect=record_persisted_terminals,
+        ):
+            player.disconnect(namespace="/emo")
+
+        for version in (2, 3, 4):
+            terminal = emo_ws.getPlaybackControlTransaction(
+                "context-1",
+                1,
+                version,
+            )
+            self.assertEqual(terminal["status"], "failed")
+            self.assertEqual(terminal["errorCode"], "execution_unknown")
+        self.assertEqual(statuses_before_emit[0], ["failed", "failed", "failed"])
+        controller_events = self.messages(controller)
+        settled = [
+            message
+            for message in controller_events
+            if message["action"] == "playback.control.settled"
+        ]
+        self.assertEqual(
+            [message["payload"]["commandControlVersion"] for message in settled],
+            [2, 3, 4],
+        )
+        self.assertFalse(
+            any(message["action"] == "playback.update" for message in controller_events)
+        )
+
+    def test_socket_replacement_settles_old_pending_and_never_replays_command(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-replacement",
+            device_session_id="device:controller-replacement",
+        )
+        self.emit_strict(
+            controller,
+            "state",
+            "playback.context.subscribe",
+            "subscribe-replacement",
+            {"playbackContextId": "context-1"},
+        )
+        with mock.patch.object(socketio, "start_background_task"):
+            self.emit_strict(
+                controller,
+                "command",
+                "player.pause",
+                "pause-before-replacement",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                },
+            )
+        self.messages(player)
+        self.messages(controller)
+
+        replacement = self.ready_strict_client(
+            client_id="phone-1",
+            device_session_id="device:phone-1",
+        )
+
+        self.assertFalse(player.is_connected(namespace="/emo"))
+        terminal = emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        self.assertEqual(terminal["status"], "failed")
+        self.assertEqual(terminal["errorCode"], "execution_unknown")
+        settled = [
+            message
+            for message in self.messages(controller)
+            if message["action"] == "playback.control.settled"
+        ]
+        self.assertEqual(
+            [message["payload"]["commandControlVersion"] for message in settled],
+            [2],
+        )
+
+        ensured = self.emit_strict(
+            replacement,
+            "command",
+            "playback.context.ensure",
+            "ensure-after-replacement",
+            {
+                "deviceSessionId": "device:phone-1",
+                "queueSongIds": ["song-2", "song-1"],
+                "currentIndex": 0,
+                "positionMs": 1200,
+                "state": "paused",
+            },
+        )
+        self.assertFalse(
+            any(message["action"] == "player.pause" for message in ensured)
+        )
+
+    def test_restart_marks_pending_unknown_without_replaying_to_reconnected_player(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-restart",
+            device_session_id="device:controller-restart",
+        )
+        with mock.patch.object(socketio, "start_background_task"):
+            self.emit_strict(
+                controller,
+                "command",
+                "player.pause",
+                "pause-before-restart",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                },
+            )
+        self.messages(player)
+        self.messages(controller)
+        with mock.patch.object(
+            emo_ws,
+            "_settle_authority_connection_controls_unknown",
+            return_value=[],
+        ):
+            player.disconnect(namespace="/emo")
+        self.assertEqual(
+            emo_ws.getPlaybackControlTransaction("context-1", 1, 2)["status"],
+            "pending",
+        )
+
+        emo_ws.init_socketio(self.app)
+
+        terminal = emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        self.assertEqual(terminal["status"], "failed")
+        self.assertEqual(terminal["errorCode"], "execution_unknown")
+        replacement = self.ready_strict_client(
+            client_id="phone-1",
+            device_session_id="device:phone-1",
+        )
+        ensured = self.emit_strict(
+            replacement,
+            "command",
+            "playback.context.ensure",
+            "ensure-after-restart",
+            {
+                "deviceSessionId": "device:phone-1",
+                "queueSongIds": ["song-2", "song-1"],
+                "currentIndex": 0,
+                "positionMs": 1200,
+                "state": "paused",
+            },
+        )
+        self.assertFalse(
+            any(message["action"] == "player.pause" for message in ensured)
+        )
 
     def test_r11_passive_and_remote_committed_updates_advance_applied_cursor(self):
         player = self.ready_strict_client()
@@ -1982,6 +2210,100 @@ class StrictV2CoreTestCase(unittest.TestCase):
         device_state = status_message["payload"]["deviceStates"][0]
         self.assertEqual(device_state["appliedControlVersion"], 2)
 
+    def test_windows_execution_timeout_is_feedback_not_server_settled(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        self.emit_strict(
+            player,
+            "event",
+            "playback.update",
+            "passive-timeout-base",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-2",
+                "positionMs": 1200,
+                "clientSeq": 1,
+            },
+        )
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-timeout",
+            device_session_id="device:controller-timeout",
+        )
+        self.emit_strict(
+            controller,
+            "state",
+            "playback.context.subscribe",
+            "subscribe-timeout",
+            {"playbackContextId": "context-1"},
+        )
+        with mock.patch.object(socketio, "start_background_task"):
+            self.emit_strict(
+                controller,
+                "command",
+                "player.pause",
+                "pause-timeout",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                },
+            )
+        self.messages(player)
+        self.messages(controller)
+
+        failed = self.emit_strict(
+            player,
+            "event",
+            "playback.update",
+            "execution-timeout-feedback",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "origin": "remoteCommand",
+                "executionStatus": "failed",
+                "commandControlVersion": 2,
+                "appliedControlVersion": 1,
+                "errorCode": "execution_timeout",
+                "state": "playing",
+                "trackId": "song-2",
+                "positionMs": 1200,
+                "clientSeq": 2,
+            },
+        )
+
+        update = next(
+            message for message in failed if message["action"] == "playback.update"
+        )
+        self.assertEqual(update["payload"]["errorCode"], "execution_timeout")
+        self.assertFalse(
+            any(
+                message["action"] == "playback.control.settled"
+                for message in failed
+            )
+        )
+        terminal = emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        self.assertEqual(terminal["status"], "failed")
+        self.assertEqual(terminal["errorCode"], "execution_timeout")
+        self.assertEqual(terminal["appliedControlVersion"], 1)
+        controller_events = self.messages(controller)
+        self.assertTrue(
+            any(
+                message["action"] == "playback.update"
+                and message["payload"].get("errorCode") == "execution_timeout"
+                for message in controller_events
+            )
+        )
+        self.assertFalse(
+            any(
+                message["action"] == "playback.control.settled"
+                for message in controller_events
+            )
+        )
+
     def test_r11_failed_track_change_emits_one_settled_per_dependent_version(self):
         player = self.ready_strict_client()
         self.create_context(player)
@@ -2034,6 +2356,17 @@ class StrictV2CoreTestCase(unittest.TestCase):
                     "baseControlVersion": 2,
                 },
             )
+            self.emit_strict(
+                controller,
+                "command",
+                "player.seek",
+                "seek-dependency",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 3,
+                    "positionMs": 5000,
+                },
+            )
         self.messages(player)
         self.messages(controller)
 
@@ -2070,20 +2403,25 @@ class StrictV2CoreTestCase(unittest.TestCase):
         ]
         self.assertEqual(
             [message["payload"]["commandControlVersion"] for message in settled],
-            [3],
+            [3, 4],
         )
-        self.assertEqual(settled[0]["payload"]["errorCode"], "dependency_failed")
-        self.assertEqual(settled[0]["payload"]["dependsOnControlVersion"], 2)
-        self.assertEqual(
-            settled[0]["payload"]["requestingClientId"],
-            "controller-dependency",
-        )
+        for message in settled:
+            self.assertEqual(message["payload"]["errorCode"], "dependency_failed")
+            self.assertEqual(message["payload"]["dependsOnControlVersion"], 2)
+            self.assertEqual(
+                message["payload"]["requestingClientId"],
+                "controller-dependency",
+            )
         self.assertEqual(
             emo_ws.getPlaybackControlTransaction("context-1", 1, 3)["status"],
             "failed",
         )
+        self.assertEqual(
+            emo_ws.getPlaybackControlTransaction("context-1", 1, 4)["status"],
+            "failed",
+        )
         context = getPlaybackContextState("context-1")
-        self.assertEqual(context["controlVersion"], 3)
+        self.assertEqual(context["controlVersion"], 4)
         self.assertEqual(context["trackId"], "song-2")
 
     def test_stale_applied_update_returns_passive_correction_only_to_source(self):

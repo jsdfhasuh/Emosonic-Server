@@ -43,9 +43,11 @@ from supysonic.emo.ws_store import (
     getPlaybackStates,
     getQueueState,
     listActivePlaybackContextBindings,
+    listAllPendingPlaybackControlTransactions,
     listExpiredPlaybackControlTransactions,
     listExpiredPlaybackPrepareTransactions,
     listPendingPlaybackControlTransactions,
+    listPendingPlaybackControlTransactionsForAuthorityConnection,
     listUserPlaybackContexts,
     listPlaybackContexts,
     mutateStrictPlaybackContextControl,
@@ -1527,6 +1529,25 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertEqual(listExpiredPlaybackControlTransactions(17999), [])
         self.assertEqual(
             [item["commandControlVersion"] for item in listPendingPlaybackControlTransactions("context-1", 1)],
+            [2],
+        )
+        self.assertEqual(
+            [
+                item["commandControlVersion"]
+                for item in listPendingPlaybackControlTransactionsForAuthorityConnection(
+                    "alice",
+                    "player-1",
+                    "device:player-1",
+                    "nonce-1",
+                )
+            ],
+            [2],
+        )
+        self.assertEqual(
+            [
+                item["commandControlVersion"]
+                for item in listAllPendingPlaybackControlTransactions()
+            ],
             [2],
         )
         self.assertEqual(

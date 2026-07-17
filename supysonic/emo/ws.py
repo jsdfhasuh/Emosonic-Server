@@ -1,8 +1,9 @@
-import os
 import logging
+import os
+import threading
 import time
 import uuid
-from typing import Dict, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from flask import (
     current_app,
@@ -76,7 +77,10 @@ from .ws_store import (
     getQueueState,
     listActivePlaybackContextBindings,
     listActivePlaybackPrepareTransactions,
+    listAllPendingPlaybackControlTransactions,
+    listExpiredPlaybackControlTransactions,
     listPendingPlaybackControlTransactions,
+    listPendingPlaybackControlTransactionsForAuthorityConnection,
     listPlaybackContexts,
     mutateStrictPlaybackContextControl,
     mutateStrictPlaybackContextQueue,
@@ -123,6 +127,9 @@ if async_mode is not None:
     socketio_kwargs["async_mode"] = async_mode
 socketio = SocketIO(**socketio_kwargs)
 strict_request_cache = StrictRequestCache()
+_control_watchdog_lock = threading.RLock()
+_control_watchdog_generation = 0
+_control_watchdog_tokens = {}
 
 ALLOWED_PRE_AUTH = {"auth.login"}
 EVENT_CONFIRMED_ACTIONS = {
@@ -481,7 +488,17 @@ def init_socketio(app):
     )
     strict_v2_safety.configure(webapp_config)
     strict_request_cache.clear_all()
+    watchdog_generation = _reset_control_watchdog_runtime()
     state.restore_strict_playback_contexts(listPlaybackContexts())
+    recovered_controls = _settle_control_transactions_unknown(
+        listAllPendingPlaybackControlTransactions(),
+        emit=False,
+    )
+    if recovered_controls:
+        logger.warning(
+            "Marked %d pending strict playback controls execution_unknown after restart",
+            len(recovered_controls),
+        )
     failed_handoffs = failActivePlaybackHandoffsForRestart()
     if failed_handoffs:
         logger.warning(
@@ -504,6 +521,14 @@ def init_socketio(app):
             server_build_commit=metadata["serverBuildCommit"],
         )
     )
+    if not app.testing or webapp_config.get(
+        "emo_strict_watchdog_sweep_in_tests",
+        False,
+    ):
+        socketio.start_background_task(
+            _control_watchdog_sweep_later,
+            watchdog_generation,
+        )
     return socketio
 
 
@@ -514,6 +539,11 @@ def begin_strict_v2_shutdown(timeout_seconds=None):
             5,
         )
     drained = strict_v2_safety.begin_shutdown(float(timeout_seconds))
+    _settle_control_transactions_unknown(
+        listAllPendingPlaybackControlTransactions(),
+        emit=True,
+    )
+    _reset_control_watchdog_runtime()
     for sid in state.list_session_sids():
         socketio.server.disconnect(sid, namespace="/emo")
     return drained
@@ -3803,12 +3833,7 @@ def _handle_strict_v2_context_control(
             if changed:
                 _broadcast_control_settled(terminal, updated_context)
             raise
-        socketio.start_background_task(
-            _expire_control_transaction_later,
-            playback_context_id,
-            control_transaction["epoch"],
-            control_transaction["commandControlVersion"],
-        )
+        _start_control_watchdog(control_transaction)
     finally:
         strict_v2_safety.release_emit(authority_sid)
     _send_ack(request_id)
@@ -5931,6 +5956,181 @@ def _last_applied_control_version(playback_context, authority_client_id):
     return 1
 
 
+def _control_watchdog_key(
+    playback_context_id: str,
+    epoch: int,
+    command_control_version: int,
+) -> Tuple[str, int, int]:
+    return (
+        playback_context_id,
+        epoch,
+        command_control_version,
+    )
+
+
+def _reset_control_watchdog_runtime() -> int:
+    global _control_watchdog_generation
+    with _control_watchdog_lock:
+        _control_watchdog_generation += 1
+        _control_watchdog_tokens.clear()
+        return _control_watchdog_generation
+
+
+def _control_watchdog_is_active(
+    key: Optional[Tuple[str, int, int]],
+    generation: int,
+    token: Optional[object] = None,
+) -> bool:
+    with _control_watchdog_lock:
+        if generation != _control_watchdog_generation:
+            return False
+        if token is None:
+            return True
+        return _control_watchdog_tokens.get(key) is token
+
+
+def _cancel_control_watchdog(
+    playback_context_id: str,
+    epoch: int,
+    command_control_version: int,
+) -> None:
+    key = _control_watchdog_key(
+        playback_context_id,
+        epoch,
+        command_control_version,
+    )
+    with _control_watchdog_lock:
+        _control_watchdog_tokens.pop(key, None)
+
+
+def _start_control_watchdog(transaction: Dict[str, object]) -> None:
+    key = _control_watchdog_key(
+        transaction["playbackContextId"],
+        transaction["epoch"],
+        transaction["commandControlVersion"],
+    )
+    token = object()
+    with _control_watchdog_lock:
+        generation = _control_watchdog_generation
+        _control_watchdog_tokens[key] = token
+    socketio.start_background_task(
+        _expire_control_transaction_later,
+        transaction["playbackContextId"],
+        transaction["epoch"],
+        transaction["commandControlVersion"],
+        generation,
+        token,
+    )
+
+
+def _settle_control_transactions_unknown(
+    transactions: Iterable[Dict[str, object]],
+    emit: bool,
+    terminal_at_ms: Optional[int] = None,
+) -> List[Dict[str, object]]:
+    terminal_at_ms = _server_time_ms() if terminal_at_ms is None else terminal_at_ms
+    settled = []
+    ordered = sorted(
+        transactions,
+        key=lambda item: (
+            item["playbackContextId"],
+            item["epoch"],
+            item["commandControlVersion"],
+        ),
+    )
+    for pending in ordered:
+        playback_context = getPlaybackContextState(
+            pending["playbackContextId"]
+        )
+        applied_control_version = pending.get("appliedControlVersion")
+        if applied_control_version is None:
+            applied_control_version = (
+                _last_applied_control_version(
+                    playback_context,
+                    pending["authorityClientId"],
+                )
+                if playback_context is not None
+                else 1
+            )
+        try:
+            transaction, changed = settlePlaybackControlTransaction(
+                pending["playbackContextId"],
+                pending["epoch"],
+                pending["commandControlVersion"],
+                "failed",
+                terminal_at_ms,
+                error_code="execution_unknown",
+                applied_control_version=applied_control_version,
+            )
+        except PlaybackControlTransactionConflictError:
+            _cancel_control_watchdog(
+                pending["playbackContextId"],
+                pending["epoch"],
+                pending["commandControlVersion"],
+            )
+            continue
+        _cancel_control_watchdog(
+            pending["playbackContextId"],
+            pending["epoch"],
+            pending["commandControlVersion"],
+        )
+        if not changed:
+            continue
+        settled.append((transaction, playback_context))
+    if emit:
+        for transaction, playback_context in settled:
+            if playback_context is not None:
+                _broadcast_control_settled(transaction, playback_context)
+    return [transaction for transaction, _playback_context in settled]
+
+
+def _settle_authority_connection_controls_unknown(
+    user_name: Optional[str],
+    authority_client_id: Optional[str],
+    authority_device_session_id: Optional[str],
+    routed_connection_nonce: Optional[str],
+) -> List[Dict[str, object]]:
+    if not all(
+        isinstance(value, str) and value
+        for value in (
+            user_name,
+            authority_client_id,
+            authority_device_session_id,
+            routed_connection_nonce,
+        )
+    ):
+        return []
+    pending = listPendingPlaybackControlTransactionsForAuthorityConnection(
+        user_name,
+        authority_client_id,
+        authority_device_session_id,
+        routed_connection_nonce,
+    )
+    return _settle_control_transactions_unknown(pending, emit=True)
+
+
+def _sweep_expired_control_transactions(
+    now_ms: Optional[int] = None,
+) -> List[Dict[str, object]]:
+    now_ms = _server_time_ms() if now_ms is None else now_ms
+    return _settle_control_transactions_unknown(
+        listExpiredPlaybackControlTransactions(now_ms),
+        emit=True,
+        terminal_at_ms=now_ms,
+    )
+
+
+def _control_watchdog_sweep_later(generation: int) -> None:
+    while _control_watchdog_is_active(None, generation):
+        socketio.sleep(1)
+        if not _control_watchdog_is_active(None, generation):
+            return
+        try:
+            _sweep_expired_control_transactions()
+        except Exception:
+            logger.exception("Strict playback control watchdog sweep failed")
+
+
 def _control_settled_payload(transaction, playback_context):
     payload = {
         "playbackContextId": transaction["playbackContextId"],
@@ -5990,48 +6190,57 @@ def _broadcast_control_settled(transaction, playback_context):
 
 
 def _expire_control_transaction_later(
-    playback_context_id,
-    epoch,
-    command_control_version,
-):
+    playback_context_id: str,
+    epoch: int,
+    command_control_version: int,
+    generation: int,
+    token: object,
+) -> None:
+    key = _control_watchdog_key(
+        playback_context_id,
+        epoch,
+        command_control_version,
+    )
     transaction = getPlaybackControlTransaction(
         playback_context_id,
         epoch,
         command_control_version,
     )
     if transaction is None or transaction["status"] != "pending":
-        return
-    remaining_ms = transaction["watchdogDeadlineAtMs"] - _server_time_ms()
-    if remaining_ms > 0:
-        socketio.sleep(remaining_ms / 1000)
-    transaction = getPlaybackControlTransaction(
-        playback_context_id,
-        epoch,
-        command_control_version,
-    )
-    if transaction is None or transaction["status"] != "pending":
-        return
-    playback_context = getPlaybackContextState(playback_context_id)
-    if playback_context is None:
-        return
-    applied_control_version = _last_applied_control_version(
-        playback_context,
-        transaction["authorityClientId"],
-    )
-    try:
-        transaction, changed = settlePlaybackControlTransaction(
+        _cancel_control_watchdog(
             playback_context_id,
             epoch,
             command_control_version,
-            "failed",
-            max(_server_time_ms(), transaction["watchdogDeadlineAtMs"]),
-            error_code="execution_unknown",
-            applied_control_version=applied_control_version,
         )
-    except PlaybackControlTransactionConflictError:
         return
-    if changed:
-        _broadcast_control_settled(transaction, playback_context)
+    remaining_ms = transaction["watchdogDeadlineAtMs"] - _server_time_ms()
+    while remaining_ms > 0:
+        socketio.sleep(min(remaining_ms / 1000, 1.0))
+        if not _control_watchdog_is_active(key, generation, token):
+            return
+        remaining_ms = transaction["watchdogDeadlineAtMs"] - _server_time_ms()
+    if not _control_watchdog_is_active(key, generation, token):
+        return
+    transaction = getPlaybackControlTransaction(
+        playback_context_id,
+        epoch,
+        command_control_version,
+    )
+    if transaction is None or transaction["status"] != "pending":
+        _cancel_control_watchdog(
+            playback_context_id,
+            epoch,
+            command_control_version,
+        )
+        return
+    _settle_control_transactions_unknown(
+        [transaction],
+        emit=True,
+        terminal_at_ms=max(
+            _server_time_ms(),
+            transaction["watchdogDeadlineAtMs"],
+        ),
+    )
 
 
 def _context_prepare_request_record(payload):
@@ -6628,6 +6837,15 @@ def _handle_strict_v2_playback_update(
     if result is None:
         raise LookupError("Playback context not found")
     playback_context = result["playbackContext"]
+    for command_control_version in result.get(
+        "terminalControlVersions",
+        (),
+    ):
+        _cancel_control_watchdog(
+            playback_context["playbackContextId"],
+            playback_context["epoch"],
+            command_control_version,
+        )
     state.restore_playback_context(
         playback_context["playbackContextId"],
         playback_context,
@@ -7800,6 +8018,12 @@ class EmoNamespace(Namespace):
         _log_socket_access("disconnect")
         _log_emo_event(logging.INFO, "socket_disconnect", sid=request.sid)
         if client_info is not None:
+            _settle_authority_connection_controls_unknown(
+                client_info.get("userName"),
+                client_info.get("clientId"),
+                client_info.get("deviceSessionId"),
+                (session_info or {}).get("connectionNonce"),
+            )
             _suspend_strict_broadcasts_for_authority_disconnect(client_info)
             for handoff in state.fail_playback_handoffs_for_disconnect(
                 client_info.get("clientId")
@@ -8069,7 +8293,25 @@ class EmoNamespace(Namespace):
                     payload.get("clientId"),
                     user_name=current_user_name,
                 )
+                previous_session = (
+                    state.get_session(previous_sid)
+                    if previous_sid is not None
+                    and previous_sid != request.sid
+                    else None
+                )
+                previous_client = (
+                    state.get_client_for_sid(previous_sid)
+                    if previous_session is not None
+                    else None
+                )
                 current_client = _register_device(request.sid, current_user_name, payload)
+                if previous_client is not None:
+                    _settle_authority_connection_controls_unknown(
+                        previous_client.get("userName"),
+                        previous_client.get("clientId"),
+                        previous_client.get("deviceSessionId"),
+                        previous_session.get("connectionNonce"),
+                    )
                 if _is_strict_playback_context_v2(current_client):
                     _resume_strict_broadcast_authority_registration(
                         current_client
