@@ -55,7 +55,10 @@ class EmoWebStrictV2FixtureTestCase(unittest.TestCase):
             capabilities = registration["payload"]["capabilities"]
             self.assertFalse(capabilities["supportsBroadcast"])
             self.assertFalse(capabilities["supportsFollow"])
-            self.assertFalse(capabilities["playbackPrepare"])
+            self.assertEqual(
+                capabilities["playbackPrepare"],
+                registration["payload"]["roles"] == ["player"],
+            )
             self.assertFalse(capabilities["effectiveAtPlayback"])
 
     def test_fixture_has_no_forbidden_session_fields_or_actions(self):

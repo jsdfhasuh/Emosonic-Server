@@ -77,7 +77,7 @@ class WebStrictV2FrontendTestCase(FrontendTestBase):
             response = self.client.get(path)
             self.assertEqual(response.status_code, 200)
             self.assertIn("emo_strict_v2_client.js", response.data)
-            self.assertIn("PlaybackContext strict-v2 2.3.0", response.data)
+            self.assertIn("PlaybackContext strict-v2 2.4.0", response.data)
             for action in FORBIDDEN_STRICT_ACTIONS:
                 self.assertNotIn(action, response.data)
             self.assertNotIn('"sessionId"', response.data)
@@ -89,10 +89,12 @@ class WebStrictV2FrontendTestCase(FrontendTestBase):
         response = self.client.get("/player")
         for evidence in (
             "new api.PlayerOwnerLock",
-            "playback.context.create",
+            "playback.context.ensure",
+            "playback.context.prepare",
             "queue.context.sync",
             "playback.context.close",
             "playback.update",
+            "playback.control.settled",
             "follow.start",
             "follow.stop",
             "playback.ready",
@@ -101,6 +103,7 @@ class WebStrictV2FrontendTestCase(FrontendTestBase):
             "reportFeedback(releasedContextId)",
             "safePlay('播放失败').then(() => reportFeedback())",
             "feedbackMutation: Promise.resolve()",
+            "state.controlLeases.delete(leaseKey)",
             "contextSnapshots: new Map()",
             "state.client.isCurrentContextSnapshot(context)",
             "const canonicalContext = state.client.cursor(context.playbackContextId)",

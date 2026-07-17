@@ -811,7 +811,7 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
         self.assertIn(b"device.volume.update", player_page.data)
         self.assertIn(b'id="strict-device-volume"', control_page.data)
         self.assertIn(b"device.setVolume", control_page.data)
-        self.assertIn(b"PlaybackContext strict-v2 2.3.0", control_page.data)
+        self.assertIn(b"PlaybackContext strict-v2 2.4.0", control_page.data)
 
     def test_exact_web_broadcast_rejects_non_authority_context_feedback(self):
         self.login()

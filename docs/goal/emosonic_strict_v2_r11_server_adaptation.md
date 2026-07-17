@@ -1,6 +1,6 @@
 # Goal: EmoSonic strict-v2 Socket.IO r11 服务端适配
 
-> 状态：In Progress（Goal 1—2、Goal 4 已完成；Goal 3 服务端已完成且 Web 迁移待 Goal 10；Goal 5 实施中）
+> 状态：Server implementation complete（Goal 0—11 已完成；Goal 12 等待 Flutter/Windows 外部验收和最终 build evidence）
 >
 > 制定日期：2026-07-17
 >
@@ -819,17 +819,17 @@ failed feedback。
 
 ## 十二、执行检查表
 
-- [ ] Goal 0：r11 规范提升/readiness 已完成；REQ-027—REQ-045 最终测试映射待 Goal 11
+- [x] Goal 0：r11 规范提升，production readiness 保持 fail-closed
 - [x] Goal 1：更新 2.4.0 action inventory 和 closed schema
 - [x] Goal 2：完成三数据库 migration 和 store 原语
-- [ ] Goal 3：用 ensure 替换 create，支持 idle Context
+- [x] Goal 3：用 ensure 替换 create，支持 idle Context
 - [x] Goal 4：实现 prepare/prepared
-- [ ] Goal 5：实现 applied cursor、四种 update 和 local intent
-- [ ] Goal 6：实现远程控制事务、期限和精确路由
-- [ ] Goal 7：实现 committed/failed/superseded/dependency 结算
-- [ ] Goal 8：实现 server-only settled
-- [ ] Goal 9：实现 watchdog、断线、重启和 source-only correction
-- [ ] Goal 10：完成 Handoff idle retirement 和 Web 适配
-- [ ] Goal 11：完成自动化、并发和三数据库验证
-- [ ] Goal 12：完成 conformance freeze 和真实联调
+- [x] Goal 5：实现 applied cursor、四种 update 和 local intent
+- [x] Goal 6：实现远程控制事务、期限和精确路由
+- [x] Goal 7：实现 committed/failed/superseded/dependency 结算
+- [x] Goal 8：实现 server-only settled
+- [x] Goal 9：实现 watchdog、断线、重启和 source-only correction
+- [x] Goal 10：完成 Handoff idle retirement 和 Web 适配
+- [x] Goal 11：完成自动化、并发和三数据库验证
+- [ ] Goal 12：服务端 conformance freeze 已完成；等待 Flutter/Windows、真实浏览器和最终 build evidence
 - [ ] 确认 Definition of Done 全部满足

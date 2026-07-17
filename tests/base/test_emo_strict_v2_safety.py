@@ -148,7 +148,7 @@ class StrictV2SafetyTestCase(unittest.TestCase):
 
     def test_default_start_rate_limit_boundaries_are_independent(self):
         for nonce, action in (
-            ("nonce-create", "playback.context.create"),
+            ("nonce-ensure", "playback.context.ensure"),
             ("nonce-handoff", "playback.handoff.start"),
             ("nonce-broadcast", "broadcast.start"),
         ):

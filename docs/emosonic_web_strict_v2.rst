@@ -2,7 +2,7 @@ EmoSonic strict-v2 web player and control console
 ==================================================
 
 The ``/player`` and ``/control`` pages can use the PlaybackContext strict-v2
-``2.3.0`` protocol. Both pages are switched together with:
+``2.4.0`` protocol. Both pages are switched together with:
 
 .. code-block:: ini
 
