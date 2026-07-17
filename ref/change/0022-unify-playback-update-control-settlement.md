@@ -46,6 +46,17 @@ Use `playback.update` as a closed discriminated event with these forms:
   queue index, track, state, and position. The server allocates `canonical controlVersion + 1`, advances applied to the
   same value, and supersedes only older remote transactions that are still pending.
 
+Keep all four `playback.update` forms authority-originated and backed by Windows `clientSeq`. Add a separate
+server-only `playback.control.settled` event for transaction terminals that have no new Windows playback fact:
+
+- `dependency_failed`: a prior track-changing command failed, so a later pending command must not execute against the
+  old track;
+- `execution_unknown`: disconnect, Socket replacement, server recovery, or watchdog expiry left the final execution
+  result unprovable.
+
+The server-only event uses `requestingClientId` for the original controller and never uses `sourceClientId`,
+`deviceSessionId`, or `clientSeq` to impersonate authority feedback.
+
 Only the server allocates canonical control versions. Windows sends `observedControlVersion`, which may be less than
 or equal to the current canonical value because a remote command can be accepted before Windows observes it. An
 observed value greater than canonical is invalid.
@@ -70,13 +81,21 @@ after the canonical localUser confirmation it drops transactions not greater tha
 
 If `queue.playItem`, `player.next`, or `player.prev` fails, every higher-version remote transaction that is still
 pending in the same Context epoch also becomes failed with `dependency_failed`. Windows drops those queued commands
-instead of applying them to the previous track. The failed canonical update carries the latest server
-`controlVersion`, allowing controllers to close the affected pending range and refresh status before retrying.
+instead of applying them to the previous track. After atomically persisting the cascade, the server sends one
+`playback.control.settled` per affected command in ascending control-version order. Controllers settle exact versions
+rather than inferring a range.
 
-Every pending remote transaction has a server-side execution deadline. The default is 15 seconds and deployments may
-adjust it without changing the wire shape. Expiry produces `execution_timeout` using the last persisted applied
-snapshot. Authority disconnect, connection replacement, graceful shutdown, or server recovery produces
+Every server-routed control carries `executionTimeoutMs`, default 15 seconds (15000ms). Windows starts an audio execution lease
+when the command enters its local execution queue. It may report `execution_timeout` only after proving that the lease
+is invalid and late callbacks cannot change audio or publish committed feedback. The server starts a watchdog when the
+command is accepted/routed; the watchdog is always `executionTimeoutMs + 2 seconds`, default 17 seconds (17000ms).
+Watchdog expiry without terminal feedback produces server-only `execution_unknown`, never a fabricated Windows
+`playback.update`. Authority disconnect, connection replacement, graceful shutdown, or recovery also produces
 `execution_unknown`. Unknown commands are never replayed automatically after reconnect.
+
+`playback.control.settled` is idempotent by `(playbackContextId, epoch, commandControlVersion)`. Equal duplicates are
+ignored. Different status/error values for the same key are protocol conflicts and cannot overwrite the first
+terminal. Older settlements can close older pending UI but cannot roll back a newer applied playback state.
 
 Feedback below `lastAppliedControlVersion` cannot be silently dropped because `playback.update` is event-confirmed.
 The server ignores its state side effects and sends the current passive canonical update only to the reporting Socket;
@@ -98,6 +117,8 @@ on the existing Queue transition path until a separate automatic-transition cont
 - A failed track change cannot cause later controls to run against the wrong song.
 - Pending work always reaches a terminal result after timeout, disconnect, or restart.
 - Stale feedback receives a bounded source-only correction instead of hanging or disturbing other clients.
+- Server-generated transaction terminals no longer impersonate Windows playback feedback or reuse a device sequence.
+- Per-command settlement removes client-side guessing about dependency-failed version ranges.
 
 ### Negative
 
@@ -105,8 +126,8 @@ on the existing Queue transition path until a separate automatic-transition cont
 - The server must persist control transaction terminal state, local intent dedupe, and per-device applied cursors.
 - Windows needs a local execution barrier for already-delivered remote commands.
 - Status projections must allow the latest Context target and older applied device track to differ while work is pending.
-- The server needs transaction deadline scheduling and must retain the last applied snapshot for timeout settlement.
-- Controllers must clear a failed dependent range and refresh status before retrying.
+- The server needs watchdog scheduling, a new server-only event, and per-command settlement delivery.
+- Windows must implement cancellable/isolated audio execution leases before hard timeout can be declared ready.
 
 ### Neutral
 
@@ -114,10 +135,25 @@ on the existing Queue transition path until a separate automatic-transition cont
   compatibility branch.
 - Full queue replacement continues to use `queue.context.sync`.
 - Android/Windows compilation and real-device validation remain user-owned.
-- The default remote execution deadline is 15 seconds, but the exact deployment value is server configuration rather
-  than a negotiated capability.
+- The default Windows execution lease is 15 seconds and the server watchdog adds a fixed 2-second grace. The command
+  carries the lease duration; the watchdog duration is server-side and not negotiated.
 
 ## Alternatives Considered
+
+### Let the server synthesize failed playback.update
+
+Rejected because playback.update is authority feedback and requires the Windows clientSeq. Reusing a persisted
+clientSeq would make a server transaction decision look like a new device fact.
+
+### Let controllers infer dependency failures from a version range
+
+Rejected because each pending command is a distinct transaction, may belong to a different requesting controller,
+and requires its own idempotent terminal result.
+
+### Let the server watchdog report execution_timeout
+
+Rejected because lack of feedback only proves an unknown result. Only Windows can report execution_timeout after its
+audio layer proves that the execution lease is invalid and late work cannot apply.
 
 ### Keep player.authorityIntent plus playback.update
 

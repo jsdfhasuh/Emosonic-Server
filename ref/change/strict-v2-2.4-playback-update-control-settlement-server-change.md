@@ -2,7 +2,7 @@
 
 > 日期：2026-07-17
 > 面向：EmoSonic 服务端工程师
-> 状态：待服务端评审和实现，不表示当前服务端已经完成
+> 状态：最终 r10 服务端实现输入，不表示当前服务端已经完成
 > 完整规范：`specs/emosonic_strict_v2_socketio_server_contract.md` r10
 
 ## 1. 本次为什么要改
@@ -21,14 +21,18 @@
 
 - 协议版本仍为 strict-v2 `2.4.0`；这是未发布 personal-lab 单一 shape，不保留旧客户端分支。
 - 删除未发布的 `player.authorityIntent`。
-- 所有实际播放结果统一使用 `playback.update`。
+- 所有 Windows 实际播放结果统一使用 `playback.update`；服务端主动结束事务使用
+  `playback.control.settled`，不得伪造 Windows feedback。
 - `playback.update` 根据 `origin` 和 `executionStatus` 分成四种严格 shape。
 - 只有服务端可以分配 canonical `controlVersion`。
 - 手机命令 ACK 只表示 accepted/routed，不表示 Windows 已经执行成功。
 - 服务端必须持久化远程控制事务状态和每台 authority 的 applied cursor。
 - 切歌类命令失败时，所有更高版本且仍 pending 的命令一并 failed，不能继续执行到旧歌曲。
-- 每个远程事务默认 15 秒执行期限，超时明确 failed；部署可以调整期限。
-- authority 断线或服务端重启造成结果不明时 failed，禁止重连后自动重发旧命令。
+- server-routed control 携带 `executionTimeoutMs`，默认 15000ms；Windows 使用该值建立执行租约。
+- 服务端 watchdog 固定为 executionTimeoutMs + 2000ms，默认 17000ms；到期无结果只能
+  execution_unknown，不能伪造 Windows execution_timeout。
+- authority 断线或服务端重启造成结果不明时使用 playback.control.settled 逐条 failed，禁止重连后
+  自动重发旧命令。
 - 迟到旧状态不写入、不广播，只向发送它的 Windows 返回当前实际状态。
 
 ## 3. 必须新增的数据
@@ -41,12 +45,13 @@
 key = playbackContextId + epoch + controlVersion
 
 status = pending | committed | failed | superseded
-sourceClientId
+requestingClientId
 authorityClientId
 authorityDeviceSessionId
 accepted target/action
 acceptedAtMs
-deadlineAtMs
+executionTimeoutMs
+watchdogDeadlineAtMs
 terminalAtMs（terminal 后）
 errorCode（failed 时）
 ```
@@ -127,10 +132,14 @@ Windows 收到的命令继续使用现有 server-routed shape：
     "playbackContextId": "context-1",
     "controlVersion": 47,
     "sourceClientId": "android-1",
+    "executionTimeoutMs": 15000,
     "positionMs": 42000
   }
 }
 ```
+
+服务端在 accepted/routed 后立即启动默认 17000ms watchdog。Windows 收到命令并放入本地执行队列后，
+使用 executionTimeoutMs=15000 建立该 controlVersion 的 audio execution lease。
 
 ## 6. Windows → 服务端的四种 `playback.update`
 
@@ -229,9 +238,10 @@ playback_failed
 track_load_failed
 seek_failed
 execution_timeout
-dependency_failed
-execution_unknown
 ```
+
+这些错误码必须由 Windows remoteCommand failed playback.update 确认。`dependency_failed` 和
+`execution_unknown` 只允许出现在 server-only `playback.control.settled`。
 
 ### 6.3.1 切歌失败后的后续命令
 
@@ -243,26 +253,36 @@ status = failed
 errorCode = dependency_failed
 ```
 
-服务端不回退 controlVersion。原 failed canonical update 的 `controlVersion` 使用当前最高 canonical
-版本，因此手机可以把 `(commandControlVersion, controlVersion]` 内仍在等待的命令全部结束为
-dependency_failed，然后重新请求 status。
+服务端不回退 controlVersion。全部 transaction terminal 在同一原子提交中写入后，服务端必须按
+commandControlVersion 从小到大，为每个受影响版本分别发送 `playback.control.settled`。手机按具体
+版本结束 pending，不能根据 controlVersion 区间自行猜测。
 
 Windows 必须按版本顺序执行。切歌类命令失败后，立即丢弃本地队列中的所有更高版本远程命令，不能把
 后续 pause、seek、play 或切歌执行到旧歌曲。
 
-### 6.3.2 服务端执行超时
+### 6.3.2 Windows 执行租约和服务端 watchdog
 
-每个 pending transaction 必须保存 `acceptedAtMs` 和 `deadlineAtMs`。默认期限是 15000ms，部署可以
-调整，但不增加 capability 或 wire 字段。
+每个 pending transaction 保存 `acceptedAtMs`、`executionTimeoutMs` 和 `watchdogDeadlineAtMs`：
 
-到期仍没有 committed/failed/localUser supersede 时：
+```text
+executionTimeoutMs 默认 15000ms
+server watchdog = executionTimeoutMs + 2000ms
+默认 watchdog = 17000ms
+```
 
-1. 服务端把该事务标记为 failed；
-2. `errorCode="execution_timeout"`；
-3. controlVersion 不增加也不回退；
-4. appliedControlVersion 保持 lastApplied；
-5. 使用最后持久化的实际歌曲、状态、位置和 clientSeq 广播 canonical failed update；
-6. 如果超时的是切歌类命令，同时执行 dependency_failed 规则。
+Windows 在 15 秒内成功时发送 committed；确认实际失败时发送对应 failed。到达 15 秒时，只有 Windows
+能够证明 execution lease 已失效、迟到 callback 不会切歌或发送 committed，才发送
+remoteCommand failed/execution_timeout。
+
+服务端 17 秒 watchdog 到期仍未收到 terminal feedback 时：
+
+1. 把该事务标记为 failed/execution_unknown；
+2. controlVersion 和 appliedControlVersion 不变；
+3. 发送 server-only `playback.control.settled`；
+4. 不生成 playback.update，不使用或伪造 Windows clientSeq。
+
+execution_unknown 不证明根命令实际失败，不能自动把更高 pending 改成 dependency_failed；每条事务按
+自己的 feedback、watchdog 或连接失效独立结算。
 
 ### 6.4 Local committed：Windows 本地人工操作成功
 
@@ -302,6 +322,45 @@ Windows 必须按版本顺序执行。切歌类命令失败后，立即丢弃本
 
 本地 next/previous 必须先转换成绝对 queueIndex/trackId。完整 queueSongIds 改变仍使用
 `queue.context.sync`。自然播放结束后的自动下一首不能使用 `origin:"localUser"`。
+
+### 6.5 Server-only `playback.control.settled`
+
+服务端主动结束事务、但没有新的 Windows 实际 feedback 时发送：
+
+```json
+{
+  "type": "event",
+  "action": "playback.control.settled",
+  "connectionNonce": "<recipient nonce>",
+  "connectionEpoch": 1,
+  "payload": {
+    "playbackContextId": "context-1",
+    "epoch": 1,
+    "commandControlVersion": 48,
+    "status": "failed",
+    "errorCode": "dependency_failed",
+    "dependsOnControlVersion": 47,
+    "controlVersion": 49,
+    "appliedControlVersion": 46,
+    "requestingClientId": "android-1",
+    "serverUpdatedAtMs": 1780000001200
+  }
+}
+```
+
+规则：
+
+- 只允许 `dependency_failed|execution_unknown`；
+- requestingClientId 是最初发送远程命令的 controller，禁止使用 sourceClientId；
+- dependency_failed 必须有 dependsOnControlVersion，execution_unknown 禁止该字段；
+- 不带 requestId、clientSeq、deviceSessionId、track/state/position；
+- 不修改 DevicePlaybackState，不假装 Windows 已确认结果；
+- 发送给当前 Context recipients，使用每个 recipient 当前 nonce/epoch；
+- dependency cascade 原子提交后按 commandControlVersion 递增逐条发送。
+
+Flutter 去重主键固定为 `(playbackContextId, epoch, commandControlVersion)`。相同内容重复忽略；同一
+主键不同 status/errorCode 记录协议冲突并刷新 status，不能覆盖首次 terminal。旧 settled 只补齐旧
+pending，不回滚更新版本的实际播放状态。
 
 ## 7. 服务端 → 客户端 canonical update
 
@@ -452,7 +511,9 @@ errorCode = execution_unknown
 ```
 
 服务端和 Windows 均不得在重连后自动重发这些旧命令。Windows 重新 ensure 并上报实际状态；手机清除
-旧 pending，重新 list/subscribe/status 后才能继续控制。
+旧 pending，重新 list/subscribe/status 后才能继续控制。服务端仍在线且 controller Socket 有效时，为
+每个 pending 事务发送独立 playback.control.settled；完整服务端重启后不要求补发历史事件，客户端因
+nonce 变化无条件清除旧 pending。
 
 ## 12. 幂等与保留时间
 
@@ -467,15 +528,21 @@ errorCode = execution_unknown
 - [ ] 增加四种 playback.update 严格验证。
 - [ ] 增加 pending/committed/failed/superseded control transaction store。
 - [ ] 增加 per-device lastAppliedControlVersion 持久化。
-- [ ] 每个 pending transaction 保存 acceptedAtMs/deadlineAtMs，默认期限 15000ms。
+- [ ] 每个 pending transaction 保存 requestingClientId、acceptedAtMs、executionTimeoutMs 和
+  watchdogDeadlineAtMs。
+- [ ] 普通 server-routed queue.playItem/player.* 增加 executionTimeoutMs，默认 15000ms；Handoff commit
+  保持独立超时。
+- [ ] 服务端 watchdog 固定 executionTimeoutMs + 2000ms，默认 17000ms。
+- [ ] 新增 server-only playback.control.settled schema/发送器/严格输出验证。
 - [ ] status deviceStates 输出 appliedControlVersion。
 - [ ] playback.update canonical push 同时输出 controlVersion/appliedControlVersion。
 - [ ] ACK 不再被业务逻辑当作实际成功。
 - [ ] localUser 原子分配新版本并 supersede pending remote。
 - [ ] 远程失败完成 Context/Queue 对账，但不增加 controlVersion。
-- [ ] 切歌类失败原子终止所有更高 pending，并记录 dependency_failed。
-- [ ] execution_timeout 使用最后 actual snapshot 产生 canonical failure。
-- [ ] authority 断线、连接替换和重启恢复使用 execution_unknown，绝不自动重投。
+- [ ] 切歌类失败原子终止所有更高 pending，并按版本逐条发送 dependency_failed settled。
+- [ ] Windows execution_timeout 只通过 remoteCommand failed playback.update 接收。
+- [ ] watchdog、authority 断线、连接替换和重启恢复使用 execution_unknown settled，绝不自动重投。
+- [ ] 禁止服务端生成 remote failed playback.update 或复用 Windows clientSeq。
 - [ ] trackId 按 applied transaction/snapshot 校验。
 - [ ] local intentId 长期幂等。
 - [ ] 迟到反馈不写入/不广播，只向源 Windows 重放当前 passive canonical update。
@@ -496,12 +563,17 @@ errorCode = execution_unknown
 10. 同 intentId 相同内容重试：仍返回原版本；不同内容：conflict。
 11. remote failed 后主 Context/Queue 使用更新 version/revision 对账，control 保持已分配值。
 12. 首次 ensure 创建版本 1，不产生额外 local 版本。
-13. 切歌 47 failed、48/49 pending：48/49 进入 failed/dependency_failed，Windows 不执行，手机刷新。
-14. pending 超过默认 15000ms：execution_timeout，广播最后 actual，不推进 applied/control。
-15. authority 断线或服务端重启：pending 进入 failed/execution_unknown，不自动重发。
-16. applied 已为 48 时收到旧 passive 47：不写入、不广播，只向源 Windows 返回当前 passive update。
-17. 重启恢复 N/M，不把 N 误报为 applied。
-18. 自动下一首不能使用 localUser supersede。
+13. 切歌 47 failed、48/49 pending：48/49 进入 failed/dependency_failed，按 48、49 分别发送 settled，
+    requestingClientId 正确，Windows 不执行，手机合并刷新。
+14. server-routed command 带 executionTimeoutMs=15000；Windows 能安全取消时发送 execution_timeout。
+15. Windows 15 秒 lease 失效后，第 17 秒迟到 callback 不切歌、不 committed、不覆盖新状态。
+16. 默认 17000ms watchdog 无 terminal：execution_unknown settled，不生成 playback.update/clientSeq。
+17. authority 断线或服务端重启：pending 进入 failed/execution_unknown，不自动重发。
+18. settled 相同键相同内容重复幂等；相同键不同 terminal 记录冲突且不覆盖。
+19. applied 已为 48 时收到旧 passive 47：不写入、不广播，只向源 Windows 返回当前 passive update。
+20. 重启恢复 N/M，不把 N 误报为 applied。
+21. Windows 无法隔离迟到执行时不发送 execution_timeout，部署保持 r10 Core not ready。
+22. 自动下一首不能使用 localUser supersede。
 
 ## 15. 与旧 r9 草案的差异
 
@@ -513,14 +585,16 @@ errorCode = execution_unknown
 | track 必须总等于主 Context 当前项 | pending 时按 applied transaction/snapshot 校验 |
 | status deviceStates 没有 applied cursor | appliedControlVersion 成为必需字段 |
 
-## 16. 评审时需要服务端工程师确认
+## 16. 实现前需要服务端工程师确认的仓库事实
 
 1. 当前服务端在哪个原子存储中保存 Context、Control transaction 和 lastApplied。
 2. 远程命令 accepted 时是否已经修改主 Context state/currentIndex；如果是，failed 对账必须按本文实现。
 3. transaction/intent 的 512 条和 10 分钟默认保留是否满足现有存储条件。
-4. 将 15000ms 默认执行期限接入现有服务端配置体系；具体配置键按项目现有命名方式确定，但不得关闭
-   超时结算。
-5. 服务端能够确认存储落点和保留能力后，再开始 Flutter 客户端实现。
+4. 将 executionTimeoutMs 默认 15000ms 和固定 2000ms watchdog grace 接入现有服务端配置/常量体系；
+   wire 只发送 executionTimeoutMs，不发送 watchdog 值。
+5. Windows 音频层的 lease 取消证明由 Flutter/Windows 工程师提供；未通过时服务端只使用
+   execution_unknown，部署不得标为完整 r10 Core ready。
+6. 服务端确认存储落点和保留能力后，再开始双方实现。
 
 本文是方便服务端评审的变更摘要。字段冲突或遗漏时，始终以
 `specs/emosonic_strict_v2_socketio_server_contract.md` r10 为准；服务端不应只实现本文摘要而跳过完整
