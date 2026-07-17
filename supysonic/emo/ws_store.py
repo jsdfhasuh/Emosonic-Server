@@ -2,6 +2,7 @@ import hashlib
 import json
 import threading
 import time
+from uuid import uuid4
 from contextlib import contextmanager
 from functools import wraps
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
@@ -52,6 +53,18 @@ class PlaybackContextAuthorityAmbiguousError(Exception):
         self.playback_context = playback_context
 
 
+class PlaybackContextEnsureConflictError(Exception):
+    def __init__(self, playback_context=None):
+        super().__init__("Stable client has a conflicting active playback context")
+        self.playback_context = playback_context
+
+
+class PlaybackContextQueueRequiredError(Exception):
+    def __init__(self, playback_context):
+        super().__init__("Playback context requires a non-empty queue")
+        self.playback_context = playback_context
+
+
 class PlaybackControlTransactionConflictError(Exception):
     pass
 
@@ -92,6 +105,23 @@ class PlaybackContextCreateResult(tuple):
         result.affected_authority_pairs = _distinct_authority_pairs(
             affected_authority_pairs
         )
+        result.canonical_context = dict(playback_context)
+        return result
+
+
+class PlaybackContextEnsureResult(tuple):
+    def __new__(
+        cls,
+        playback_context: Dict[str, object],
+        mutated: bool,
+        affected_authority_pairs: Iterable[AuthorityPair],
+    ):
+        result = super().__new__(cls, (playback_context, bool(mutated)))
+        result.mutated = bool(mutated)
+        result.affected_authority_pairs = _distinct_authority_pairs(
+            affected_authority_pairs
+        )
+        result.binding_mutated = bool(result.affected_authority_pairs)
         result.canonical_context = dict(playback_context)
         return result
 
@@ -141,6 +171,8 @@ _strict_playback_context_locks = {}
 _strict_playback_context_locks_guard = threading.Lock()
 _strict_authority_pair_locks = {}
 _strict_authority_pair_locks_guard = threading.Lock()
+_strict_stable_client_locks = {}
+_strict_stable_client_locks_guard = threading.Lock()
 
 
 @contextmanager
@@ -151,6 +183,18 @@ def _strict_playback_context_lock(playback_context_id):
             threading.RLock(),
         )
     with context_lock:
+        yield
+
+
+@contextmanager
+def _strict_stable_client_lock(user_name, client_id):
+    key = (user_name, client_id)
+    with _strict_stable_client_locks_guard:
+        stable_lock = _strict_stable_client_locks.setdefault(
+            key,
+            threading.RLock(),
+        )
+    with stable_lock:
         yield
 
 
@@ -815,17 +859,19 @@ def serializePlaybackContextV2(playback_context):
         "playbackContextId": playback_context.get("playbackContextId"),
         "authorityClientId": playback_context.get("authorityClientId"),
         "queueSongIds": list(playback_context.get("queueSongIds") or []),
-        "currentIndex": playback_context.get("currentIndex", 0),
-        "state": playback_context.get("state") or "stopped",
+        "state": playback_context.get("state") or "idle",
         "positionMs": playback_context.get("positionMs", 0),
         "queueRevision": playback_context.get("queueRevision", 1),
         "controlVersion": playback_context.get("controlVersion", 1),
         "version": playback_context.get("version", 1),
         "epoch": playback_context.get("epoch", 1),
     }
+    queue_song_ids = payload["queueSongIds"]
+    if queue_song_ids:
+        payload["currentIndex"] = playback_context.get("currentIndex", 0)
     for field_name in ("trackId", "timelineId", "serverUpdatedAtMs"):
         value = playback_context.get(field_name)
-        if value is not None:
+        if value is not None and (field_name != "trackId" or queue_song_ids):
             payload[field_name] = value
     return payload
 
@@ -1180,6 +1226,193 @@ def _resolveStrictPlaybackContextCreate(
     return PlaybackContextCreateResult(playback_context, False, ())
 
 
+def _active_context_records_for_stable_client(user_name, client_id):
+    return list(
+        EmoPlaybackContext.select()
+        .where(
+            (EmoPlaybackContext.user_name == user_name)
+            & (EmoPlaybackContext.lifecycle == "active")
+            & (EmoPlaybackContext.authority_client_id == client_id)
+        )
+        .order_by(EmoPlaybackContext.playback_context_id)
+        .limit(3)
+    )
+
+
+def _initialize_idle_context_from_ensure(
+    record,
+    queue_song_ids,
+    current_index,
+    position_ms,
+    state_name,
+):
+    existing_queue = json.loads(record.queue_json)
+    if existing_queue or not queue_song_ids:
+        return False
+    record.queue_json = json.dumps(queue_song_ids, ensure_ascii=True)
+    record.current_index = current_index
+    record.track_id = queue_song_ids[current_index]
+    record.state = state_name
+    record.position_ms = position_ms
+    return True
+
+
+def _new_playback_context_id():
+    return "playback:%s" % uuid4().hex
+
+
+def ensureStrictPlaybackContextState(
+    user_name,
+    authority_client_id,
+    authority_device_session_id,
+    queue_song_ids,
+    current_index,
+    position_ms,
+    state_name,
+    allow_rebind=True,
+):
+    queue_song_ids = list(queue_song_ids or [])
+    if queue_song_ids:
+        if current_index is None or current_index < 0 or current_index >= len(queue_song_ids):
+            raise ValueError("currentIndex is outside queueSongIds")
+        if state_name not in {"playing", "paused", "stopped"}:
+            raise ValueError("Queue-backed ensure state is invalid")
+    else:
+        if current_index is not None or position_ms != 0 or state_name != "idle":
+            raise ValueError("Idle ensure shape is invalid")
+        current_index = 0
+
+    target_pair = _strict_authority_pair_key(
+        user_name,
+        authority_client_id,
+        authority_device_session_id,
+    )
+    generated_context_id = _new_playback_context_id()
+    with _strict_stable_client_lock(user_name, authority_client_id):
+        open_connection(reuse=True)
+        try:
+            while True:
+                candidates = _active_context_records_for_stable_client(
+                    user_name,
+                    authority_client_id,
+                )
+                if len(candidates) > 1:
+                    raise PlaybackContextEnsureConflictError(
+                        _playback_context_payload(candidates[0])
+                    )
+                selected_context_id = (
+                    candidates[0].playback_context_id
+                    if candidates
+                    else generated_context_id
+                )
+                with _strict_playback_context_lock(selected_context_id):
+                    candidates = _active_context_records_for_stable_client(
+                        user_name,
+                        authority_client_id,
+                    )
+                    if len(candidates) > 1:
+                        raise PlaybackContextEnsureConflictError(
+                            _playback_context_payload(candidates[0])
+                        )
+                    if candidates and candidates[0].playback_context_id != selected_context_id:
+                        continue
+                    if not candidates and selected_context_id != generated_context_id:
+                        continue
+                    authority_pairs = [target_pair]
+                    if candidates:
+                        authority_pairs.append(_record_authority_pair(candidates[0]))
+                    with _strict_authority_pair_lock(authority_pairs):
+                        with _strict_playback_context_transaction():
+                            candidates = _active_context_records_for_stable_client(
+                                user_name,
+                                authority_client_id,
+                            )
+                            if len(candidates) > 1:
+                                raise PlaybackContextEnsureConflictError(
+                                    _playback_context_payload(candidates[0])
+                                )
+                            if candidates and candidates[0].playback_context_id != selected_context_id:
+                                continue
+                            if not candidates:
+                                record = EmoPlaybackContext.create(
+                                    playback_context_id=generated_context_id,
+                                    user_name=user_name,
+                                    authority_client_id=authority_client_id,
+                                    authority_device_session_id=(
+                                        authority_device_session_id
+                                    ),
+                                    origin_client_id=authority_client_id,
+                                    timeline_id="timeline:%s" % uuid4().hex,
+                                    lifecycle="active",
+                                    queue_json=json.dumps(
+                                        queue_song_ids,
+                                        ensure_ascii=True,
+                                    ),
+                                    current_index=current_index,
+                                    track_id=(
+                                        queue_song_ids[current_index]
+                                        if queue_song_ids
+                                        else None
+                                    ),
+                                    state=state_name,
+                                    position_ms=position_ms,
+                                    queue_revision=1,
+                                    control_version=1,
+                                    version=1,
+                                    epoch=1,
+                                    playback_json=json.dumps({}, ensure_ascii=True),
+                                )
+                                return PlaybackContextEnsureResult(
+                                    _playback_context_payload(record),
+                                    True,
+                                    (target_pair,),
+                                )
+
+                            record = candidates[0]
+                            old_pair = _record_authority_pair(record)
+                            rebind = (
+                                record.authority_device_session_id
+                                != authority_device_session_id
+                            )
+                            if rebind and not allow_rebind:
+                                raise PlaybackContextEnsureConflictError(
+                                    _playback_context_payload(record)
+                                )
+                            initialized = _initialize_idle_context_from_ensure(
+                                record,
+                                queue_song_ids,
+                                current_index,
+                                position_ms,
+                                state_name,
+                            )
+                            affected_pairs = ()
+                            if rebind:
+                                record.authority_device_session_id = (
+                                    authority_device_session_id
+                                )
+                                record.epoch += 1
+                                record.version += 1
+                                record.control_version += 1
+                                if initialized:
+                                    record.queue_revision += 1
+                                affected_pairs = (old_pair, target_pair)
+                            elif initialized:
+                                record.version += 1
+                                record.queue_revision += 1
+                                record.control_version += 1
+                            if rebind or initialized:
+                                record.origin_client_id = authority_client_id
+                                record.updated_at = now()
+                                record.save()
+                            return PlaybackContextEnsureResult(
+                                _playback_context_payload(record),
+                                rebind or initialized,
+                                affected_pairs,
+                            )
+        finally:
+            close_connection()
+
+
 @_serialize_strict_playback_context_mutation
 def createStrictPlaybackContextState(
     playback_context_id,
@@ -1369,13 +1602,23 @@ def mutateStrictPlaybackContextQueue(
             if base_queue_revision != record.queue_revision:
                 raise PlaybackContextStaleVersionError(current, "queueRevision")
 
-            previous_index = record.current_index
+            previous_queue = json.loads(record.queue_json)
+            previous_index = record.current_index if previous_queue else None
             previous_track = record.track_id
-            next_track = queue_song_ids[current_index]
+            next_index = current_index if queue_song_ids else None
+            next_track = (
+                queue_song_ids[next_index]
+                if queue_song_ids and next_index is not None
+                else None
+            )
+            queue_changed = previous_queue != queue_song_ids
+            index_changed = previous_index != next_index
+            boundary_changed = bool(previous_queue) != bool(queue_song_ids)
             control_changed = (
-                previous_index != current_index
+                index_changed
                 or previous_track != next_track
                 or record.position_ms != position_ms
+                or boundary_changed
             )
             if control_changed:
                 if base_control_version is None:
@@ -1390,12 +1633,21 @@ def mutateStrictPlaybackContextQueue(
             ):
                 raise PlaybackContextStaleVersionError(current, "controlVersion")
 
+            if not queue_changed and not control_changed:
+                return current
+
             record.queue_json = json.dumps(queue_song_ids, ensure_ascii=True)
-            record.current_index = current_index
+            record.current_index = next_index or 0
             record.track_id = next_track
             record.position_ms = position_ms
+            if not queue_song_ids:
+                record.state = "idle"
+                record.position_ms = 0
+            elif not previous_queue or record.state == "idle":
+                record.state = "paused"
             record.version += 1
-            record.queue_revision += 1
+            if queue_changed or index_changed:
+                record.queue_revision += 1
             if control_changed:
                 record.control_version += 1
             record.updated_at = now()
@@ -1456,6 +1708,8 @@ def mutateStrictPlaybackContextControl(
             ]
             if active_context_ids != [playback_context_id]:
                 raise PlaybackContextAuthorityAmbiguousError(current)
+            if not json.loads(record.queue_json):
+                raise PlaybackContextQueueRequiredError(current)
             if base_control_version != record.control_version:
                 raise PlaybackContextStaleVersionError(current, "controlVersion")
             if (
@@ -2051,9 +2305,17 @@ def getDevicePlaybackState(playback_context_id, client_id):
 def getDevicePlaybackStates(playback_context_id):
     open_connection(reuse=True)
     try:
+        context_record = EmoPlaybackContext.get_or_none(
+            EmoPlaybackContext.playback_context_id == playback_context_id
+        )
+        if context_record is None:
+            return []
         payloads = []
         query = EmoDevicePlaybackState.select().where(
-            EmoDevicePlaybackState.playback_context_id == playback_context_id
+            (EmoDevicePlaybackState.playback_context_id == playback_context_id)
+            & (EmoDevicePlaybackState.context_epoch == context_record.epoch)
+            & (EmoDevicePlaybackState.applied_control_version >= 1)
+            & (EmoDevicePlaybackState.client_seq >= 1)
         )
         for record in query:
             payloads.append(_device_playback_state_payload(record))
@@ -2071,7 +2333,10 @@ def getPlaybackContextWithDeviceStates(playback_context_id):
         if context_record is None:
             return None
         device_records = EmoDevicePlaybackState.select().where(
-            EmoDevicePlaybackState.playback_context_id == playback_context_id
+            (EmoDevicePlaybackState.playback_context_id == playback_context_id)
+            & (EmoDevicePlaybackState.context_epoch == context_record.epoch)
+            & (EmoDevicePlaybackState.applied_control_version >= 1)
+            & (EmoDevicePlaybackState.client_seq >= 1)
         )
         return {
             "playbackContext": _playback_context_payload(context_record),

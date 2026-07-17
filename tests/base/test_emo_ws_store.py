@@ -10,6 +10,7 @@ from supysonic import db
 from supysonic.emo.ws_store import (
     PlaybackContextAuthorityAmbiguousError,
     PlaybackContextClosedError,
+    PlaybackContextEnsureConflictError,
     PlaybackContextIntentConflictError,
     PlaybackContextStaleVersionError,
     PlaybackControlTransactionConflictError,
@@ -24,6 +25,7 @@ from supysonic.emo.ws_store import (
     createStrictPlaybackContextState,
     deletePlaybackContext,
     expirePlaybackContext,
+    ensureStrictPlaybackContextState,
     failActivePlaybackHandoffsForRestart,
     getActivePlaybackHandoffs,
     getDevicePlaybackState,
@@ -45,6 +47,7 @@ from supysonic.emo.ws_store import (
     listUserPlaybackContexts,
     listPlaybackContexts,
     mutateStrictPlaybackContextControl,
+    mutateStrictPlaybackContextQueue,
     saveDevicePlaybackState,
     savePlaybackContextState,
     savePlaybackHandoff,
@@ -1185,6 +1188,9 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 "state": "playing",
                 "trackId": "song-1",
                 "positionMs": 100,
+                "epoch": 1,
+                "appliedControlVersion": 1,
+                "clientSeq": 1,
             },
             is_authority=True,
         )
@@ -1560,6 +1566,154 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 18001,
                 applied_control_version=2,
             )
+
+    def test_ensure_creates_idle_initializes_same_context_and_rebinds(self):
+        idle_result = ensureStrictPlaybackContextState(
+            "alice",
+            "player-1",
+            "device:player-1",
+            [],
+            None,
+            0,
+            "idle",
+        )
+        idle_context, mutated = idle_result
+        context_id = idle_context["playbackContextId"]
+
+        self.assertTrue(mutated)
+        self.assertTrue(idle_result.binding_mutated)
+        self.assertEqual(idle_context["state"], "idle")
+        self.assertEqual(idle_context["queueSongIds"], [])
+        self.assertNotIn("currentIndex", serializePlaybackContextV2(idle_context))
+        self.assertNotIn("trackId", serializePlaybackContextV2(idle_context))
+
+        initialized_result = ensureStrictPlaybackContextState(
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            250,
+            "paused",
+        )
+        initialized, mutated = initialized_result
+
+        self.assertTrue(mutated)
+        self.assertFalse(initialized_result.binding_mutated)
+        self.assertEqual(initialized["playbackContextId"], context_id)
+        self.assertEqual(initialized["queueSongIds"], ["song-1"])
+        self.assertEqual(initialized["state"], "paused")
+        self.assertEqual(initialized["version"], 2)
+        self.assertEqual(initialized["queueRevision"], 2)
+        self.assertEqual(initialized["controlVersion"], 2)
+        self.assertEqual(initialized["epoch"], 1)
+
+        canonical_result = ensureStrictPlaybackContextState(
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["different-song"],
+            0,
+            0,
+            "stopped",
+        )
+        canonical, mutated = canonical_result
+        self.assertFalse(mutated)
+        self.assertEqual(canonical["queueSongIds"], ["song-1"])
+        self.assertEqual(canonical["controlVersion"], 2)
+
+        rebound_result = ensureStrictPlaybackContextState(
+            "alice",
+            "player-1",
+            "device:player-2",
+            [],
+            None,
+            0,
+            "idle",
+        )
+        rebound, mutated = rebound_result
+
+        self.assertTrue(mutated)
+        self.assertTrue(rebound_result.binding_mutated)
+        self.assertEqual(rebound["playbackContextId"], context_id)
+        self.assertEqual(rebound["authorityDeviceSessionId"], "device:player-2")
+        self.assertEqual(rebound["queueSongIds"], ["song-1"])
+        self.assertEqual(rebound["epoch"], 2)
+        self.assertEqual(rebound["version"], 3)
+        self.assertEqual(rebound["queueRevision"], 2)
+        self.assertEqual(rebound["controlVersion"], 3)
+        self.assertEqual(len(rebound_result.affected_authority_pairs), 2)
+
+    def test_ensure_fails_closed_when_stable_client_has_multiple_contexts(self):
+        for context_id in ("context-1", "context-2"):
+            createStrictPlaybackContextState(
+                context_id,
+                "alice",
+                "player-1",
+                "device:player-1",
+                ["song-1"],
+                0,
+                0,
+                "paused",
+            )
+
+        with self.assertRaises(PlaybackContextEnsureConflictError):
+            ensureStrictPlaybackContextState(
+                "alice",
+                "player-1",
+                "device:player-1",
+                [],
+                None,
+                0,
+                "idle",
+            )
+
+    def test_queue_sync_crosses_idle_boundary_with_closed_snapshot(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            500,
+            "playing",
+        )
+
+        idle = mutateStrictPlaybackContextQueue(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            [],
+            None,
+            0,
+            1,
+            1,
+        )
+        self.assertEqual(idle["state"], "idle")
+        self.assertEqual(idle["queueSongIds"], [])
+        self.assertIsNone(idle["trackId"])
+        self.assertEqual(idle["version"], 2)
+        self.assertEqual(idle["queueRevision"], 2)
+        self.assertEqual(idle["controlVersion"], 2)
+
+        queue_backed = mutateStrictPlaybackContextQueue(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-2"],
+            0,
+            0,
+            2,
+            2,
+        )
+        self.assertEqual(queue_backed["state"], "paused")
+        self.assertEqual(queue_backed["trackId"], "song-2")
+        self.assertEqual(queue_backed["version"], 3)
+        self.assertEqual(queue_backed["queueRevision"], 3)
+        self.assertEqual(queue_backed["controlVersion"], 3)
 
     def test_prepare_transaction_enforces_one_active_intent_and_terminal_replay(self):
         request_payload = {

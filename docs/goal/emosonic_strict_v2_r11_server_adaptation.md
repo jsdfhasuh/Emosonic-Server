@@ -1,6 +1,6 @@
 # Goal: EmoSonic strict-v2 Socket.IO r11 服务端适配
 
-> 状态：In Progress（Goal 1—2 已完成；Goal 3—4 ensure/prepare 运行时实施中）
+> 状态：In Progress（Goal 1—2 已完成；Goal 3 服务端 ensure/idle 已实现，Web 迁移待 Goal 10；Goal 4 实施中）
 >
 > 制定日期：2026-07-17
 >

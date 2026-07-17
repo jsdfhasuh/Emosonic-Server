@@ -2,6 +2,10 @@ ALTER TABLE emo_device_playback_state ADD COLUMN context_epoch INTEGER NOT NULL 
 ALTER TABLE emo_device_playback_state ADD COLUMN applied_control_version INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE emo_device_playback_state ADD COLUMN client_seq INTEGER NOT NULL DEFAULT 0;
 
+UPDATE emo_playback_context
+SET state = 'idle', position_ms = 0, current_index = 0, track_id = NULL
+WHERE lifecycle = 'active' AND TRIM(queue_json) = '[]';
+
 CREATE TABLE IF NOT EXISTS emo_playback_control_transaction (
     id CHAR(32) PRIMARY KEY,
     playback_context_id VARCHAR(128) NOT NULL,

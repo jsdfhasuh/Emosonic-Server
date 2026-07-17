@@ -651,7 +651,7 @@
       "testMethods": [
         "tests.base.test_emo_strict_v2_safety.StrictV2SafetyTestCase.test_actual_polling_transport_rejects_257_kib_payload",
         "tests.base.test_emo_strict_v2_contract.StrictV2ContractTestCase.test_rejects_business_and_transport_limits",
-        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_context_create_persists_exact_initial_snapshot_and_subscribes",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_context_ensure_persists_exact_initial_snapshot_and_subscribes",
         "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_controller_owner_forces_authority_and_sorts_filtered_participants"
       ]
     },

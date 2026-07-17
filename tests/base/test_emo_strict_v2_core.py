@@ -195,23 +195,26 @@ class StrictV2CoreTestCase(unittest.TestCase):
         state="playing",
         position_ms=1200,
     ):
-        client.emit(
-            "message",
-            {
-                "type": "command",
-                "action": "playback.context.create",
-                "requestId": request_id,
-                "payload": {
-                    "playbackContextId": "context-1",
-                    "deviceSessionId": "device:phone-1",
-                    "queueSongIds": queue_song_ids or ["song-2", "song-1"],
-                    "currentIndex": 0,
-                    "positionMs": position_ms,
-                    "state": state,
+        with mock.patch(
+            "supysonic.emo.ws_store._new_playback_context_id",
+            return_value="context-1",
+        ):
+            client.emit(
+                "message",
+                {
+                    "type": "command",
+                    "action": "playback.context.ensure",
+                    "requestId": request_id,
+                    "payload": {
+                        "deviceSessionId": "device:phone-1",
+                        "queueSongIds": queue_song_ids or ["song-2", "song-1"],
+                        "currentIndex": 0,
+                        "positionMs": position_ms,
+                        "state": state,
+                    },
                 },
-            },
-            namespace="/emo",
-        )
+                namespace="/emo",
+            )
         return self.messages(client)
 
     def emit_strict(self, client, message_type, action, request_id, payload):
@@ -1299,10 +1302,9 @@ class StrictV2CoreTestCase(unittest.TestCase):
         response = self.emit_strict(
             client,
             "command",
-            "playback.context.create",
-            "context-create-rate-limited",
+            "playback.context.ensure",
+            "context-ensure-rate-limited",
             {
-                "playbackContextId": "context-rate-limited",
                 "deviceSessionId": "device:phone-1",
                 "queueSongIds": ["song-1"],
                 "currentIndex": 0,
@@ -1316,7 +1318,10 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(error["payload"]["code"], "rate_limited")
         self.assertTrue(error["payload"]["retryable"])
         self.assertGreater(error["payload"]["retryAfterMs"], 0)
-        self.assertIsNone(getPlaybackContextState("context-rate-limited"))
+        self.assertEqual(
+            getPlaybackContextState("context-1")["controlVersion"],
+            1,
+        )
 
     def test_graceful_shutdown_rejects_new_connections_and_closes_existing(self):
         client = self.ready_strict_client()
@@ -1350,7 +1355,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
 
         with mock.patch.object(
             emo_ws,
-            "_handle_playback_context_create",
+            "_handle_playback_context_ensure",
             side_effect=RuntimeError(exception_text),
         ), self.assertLogs("supysonic.emo.ws", level="ERROR") as captured:
             response = self.create_context(
@@ -1365,14 +1370,14 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertNotIn(exception_text, combined)
         self.assertNotIn("Alic3", combined)
 
-    def test_context_create_persists_exact_initial_snapshot_and_subscribes(self):
+    def test_context_ensure_persists_exact_initial_snapshot_and_subscribes(self):
         client = self.ready_strict_client()
 
         response = self.create_context(client)
 
         self.assertEqual(len(response), 1)
         snapshot = response[0]["payload"]
-        self.assertEqual(response[0]["action"], "playback.context.create")
+        self.assertEqual(response[0]["action"], "playback.context.ensure")
         self.assertEqual(snapshot["queueSongIds"], ["song-2", "song-1"])
         self.assertEqual(snapshot["state"], "playing")
         self.assertEqual(snapshot["positionMs"], 1200)
@@ -1398,11 +1403,124 @@ class StrictV2CoreTestCase(unittest.TestCase):
         )
         persisted = getPlaybackContextState("context-1")
         self.assertEqual(persisted["authorityDeviceSessionId"], "device:phone-1")
-        self.assertRegex(persisted["creationFingerprint"], r"^[0-9a-f]{64}$")
+        self.assertIsNone(persisted["creationFingerprint"])
         self.assertEqual(
             len(get_state().list_playback_context_subscribers("context-1")),
             1,
         )
+
+    def test_context_ensure_creates_idle_initializes_and_rebinds_same_id(self):
+        player = self.ready_strict_client()
+        with mock.patch(
+            "supysonic.emo.ws_store._new_playback_context_id",
+            return_value="context-idle-1",
+        ):
+            idle = self.emit_strict(
+                player,
+                "command",
+                "playback.context.ensure",
+                "ensure-idle-1",
+                {
+                    "deviceSessionId": "device:phone-1",
+                    "queueSongIds": [],
+                    "positionMs": 0,
+                    "state": "idle",
+                },
+            )
+
+        self.assertEqual([message["action"] for message in idle], ["playback.context.ensure"])
+        idle_snapshot = idle[0]["payload"]
+        self.assertEqual(idle_snapshot["playbackContextId"], "context-idle-1")
+        self.assertEqual(idle_snapshot["state"], "idle")
+        self.assertNotIn("currentIndex", idle_snapshot)
+        self.assertNotIn("trackId", idle_snapshot)
+
+        initialized = self.emit_strict(
+            player,
+            "command",
+            "playback.context.ensure",
+            "ensure-initialize-1",
+            {
+                "deviceSessionId": "device:phone-1",
+                "queueSongIds": ["song-1"],
+                "currentIndex": 0,
+                "positionMs": 100,
+                "state": "paused",
+            },
+        )
+        initialized_snapshot = initialized[0]["payload"]
+        self.assertEqual(initialized_snapshot["playbackContextId"], "context-idle-1")
+        self.assertEqual(initialized_snapshot["controlVersion"], 2)
+        self.assertEqual(initialized_snapshot["queueRevision"], 2)
+        self.assertEqual(initialized_snapshot["version"], 2)
+
+        player.disconnect(namespace="/emo")
+        replacement = self.ready_strict_client(
+            client_id="phone-1",
+            device_session_id="device:phone-2",
+        )
+        rebound = self.emit_strict(
+            replacement,
+            "command",
+            "playback.context.ensure",
+            "ensure-rebind-1",
+            {
+                "deviceSessionId": "device:phone-2",
+                "queueSongIds": [],
+                "positionMs": 0,
+                "state": "idle",
+            },
+        )
+        rebound_snapshot = rebound[0]["payload"]
+        self.assertEqual(rebound_snapshot["playbackContextId"], "context-idle-1")
+        self.assertEqual(rebound_snapshot["epoch"], 2)
+        self.assertEqual(rebound_snapshot["controlVersion"], 3)
+        self.assertEqual(rebound_snapshot["queueSongIds"], ["song-1"])
+
+    def test_idle_context_control_fails_with_queue_required_without_routing(self):
+        player = self.ready_strict_client()
+        with mock.patch(
+            "supysonic.emo.ws_store._new_playback_context_id",
+            return_value="context-idle-control",
+        ):
+            self.emit_strict(
+                player,
+                "command",
+                "playback.context.ensure",
+                "ensure-idle-control",
+                {
+                    "deviceSessionId": "device:phone-1",
+                    "queueSongIds": [],
+                    "positionMs": 0,
+                    "state": "idle",
+                },
+            )
+        self.messages(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-1",
+            device_session_id="device:controller-1",
+        )
+
+        response = self.emit_strict(
+            controller,
+            "command",
+            "player.play",
+            "play-idle-1",
+            {
+                "playbackContextId": "context-idle-control",
+                "baseControlVersion": 1,
+            },
+        )
+
+        self.assertEqual([message["action"] for message in response], ["system.error"])
+        error = response[0]["payload"]
+        self.assertEqual(error["code"], "queue_required")
+        self.assertEqual(error["playbackContextId"], "context-idle-control")
+        self.assertEqual(error["currentControlVersion"], 1)
+        self.assertEqual(error["currentQueueRevision"], 1)
+        self.assertEqual(error["currentVersion"], 1)
+        self.assertEqual(self.messages(player), [])
 
     def test_context_list_discovers_exact_persisted_pair_and_replays_by_request_id(self):
         player = self.ready_strict_client()

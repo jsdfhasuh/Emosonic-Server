@@ -181,7 +181,7 @@ class StrictV2Safety:
                 )
             )
         action_limits = {
-            "playback.context.create": (
+            "playback.context.ensure": (
                 "creates",
                 "creates_per_connection_per_minute",
             ),

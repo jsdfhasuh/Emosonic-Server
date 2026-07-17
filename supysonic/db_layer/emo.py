@@ -60,7 +60,7 @@ class EmoPlaybackContext(_Model):
     queue_json = TextField()
     current_index = IntegerField(default=0)
     track_id = CharField(128, null=True)
-    state = CharField(32, default="stopped")
+    state = CharField(32, default="idle")
     position_ms = IntegerField(default=0)
     volume = IntegerField(null=True)
     queue_revision = IntegerField(default=1)

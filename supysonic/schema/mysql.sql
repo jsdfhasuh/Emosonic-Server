@@ -315,7 +315,7 @@ CREATE TABLE IF NOT EXISTS emo_playback_context (
     queue_json TEXT NOT NULL,
     current_index INTEGER NOT NULL DEFAULT 0,
     track_id VARCHAR(128),
-    state VARCHAR(32) NOT NULL DEFAULT 'stopped',
+    state VARCHAR(32) NOT NULL DEFAULT 'idle',
     position_ms INTEGER NOT NULL DEFAULT 0,
     volume INTEGER,
     queue_revision INTEGER NOT NULL DEFAULT 1,
