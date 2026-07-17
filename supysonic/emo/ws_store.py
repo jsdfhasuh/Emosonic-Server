@@ -2079,6 +2079,24 @@ def ensureStrictPlaybackContextState(
                             if candidates and candidates[0].playback_context_id != selected_context_id:
                                 continue
                             if not candidates:
+                                existing = EmoPlaybackContext.get_or_none(
+                                    EmoPlaybackContext.playback_context_id
+                                    == generated_context_id
+                                )
+                                if existing is not None:
+                                    playback_context = _playback_context_payload(
+                                        existing
+                                    )
+                                    if (
+                                        existing.user_name == user_name
+                                        and existing.lifecycle == "closed"
+                                    ):
+                                        raise PlaybackContextClosedError(
+                                            playback_context
+                                        )
+                                    raise PlaybackContextEnsureConflictError(
+                                        playback_context
+                                    )
                                 record = EmoPlaybackContext.create(
                                     playback_context_id=generated_context_id,
                                     user_name=user_name,

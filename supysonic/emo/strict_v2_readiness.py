@@ -64,10 +64,17 @@ def get_effective_profile_readiness(
         allow_local_test_evidence = is_local_test_evidence_allowed(
             webapp_config
         )
-    code = dict(
-        code_readiness
-        or get_code_conformance_readiness(allow_local_test_evidence)
+    local_override = bool(
+        allow_local_test_evidence
+        and is_local_test_evidence_requested(webapp_config)
     )
+    if code_readiness is None and local_override:
+        code = {profile: True for profile in PROFILE_CONFIG_KEYS}
+    else:
+        code = dict(
+            code_readiness
+            or get_code_conformance_readiness(allow_local_test_evidence)
+        )
     deployment = get_deployment_readiness(webapp_config)
     return {
         profile: bool(code.get(profile, False) and deployment[profile])

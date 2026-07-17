@@ -923,22 +923,11 @@ class StrictV2CoreTestCase(unittest.TestCase):
                 "register-update-1",
                 self.strict_registration_payload(),
             )
-        client.emit(
-            "message",
-            {
-                "type": "command",
-                "action": "playback.context.create",
-                "requestId": "context-create-1",
-                "payload": {
-                    "playbackContextId": "context-1",
-                    "deviceSessionId": "device:phone-1",
-                    "queueSongIds": ["song-1"],
-                    "currentIndex": 0,
-                    "positionMs": 0,
-                    "state": "stopped",
-                },
-            },
-            namespace="/emo",
+        self.create_context(
+            client,
+            queue_song_ids=["song-1"],
+            state="stopped",
+            position_ms=0,
         )
         self.messages(client)
         update = {
@@ -948,18 +937,18 @@ class StrictV2CoreTestCase(unittest.TestCase):
             "payload": {
                 "playbackContextId": "context-1",
                 "deviceSessionId": "device:phone-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
                 "state": "playing",
                 "positionMs": 10,
                 "clientSeq": 1,
                 "trackId": "song-1",
             },
         }
-        state = get_state()
-
         with mock.patch.object(
-            state,
-            "record_strict_device_playback_state",
-            wraps=state.record_strict_device_playback_state,
+            emo_ws,
+            "applyStrictPlaybackUpdate",
+            wraps=emo_ws.applyStrictPlaybackUpdate,
         ) as record_feedback:
             client.emit("message", update, namespace="/emo")
             first = self.messages(client)
@@ -988,6 +977,8 @@ class StrictV2CoreTestCase(unittest.TestCase):
             "payload": {
                 "playbackContextId": "context-1",
                 "deviceSessionId": "device:phone-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
                 "state": "playing",
                 "positionMs": 25,
                 "clientSeq": 1,
@@ -1015,7 +1006,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
 
         self.assertEqual(settled_before_push, [True])
         self.assertEqual(self.messages(client), [])
-        feedback = get_state().get_device_playback_state(
+        feedback = emo_ws.getDevicePlaybackState(
             "context-1",
             "phone-1",
         )
@@ -1041,6 +1032,8 @@ class StrictV2CoreTestCase(unittest.TestCase):
             "payload": {
                 "playbackContextId": "context-1",
                 "deviceSessionId": "device:phone-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
                 "state": "playing",
                 "positionMs": 10,
                 "clientSeq": 2,
@@ -1059,7 +1052,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(len(response), 1)
         self.assertEqual(response[0]["payload"]["code"], "client_sequence_conflict")
         self.assertEqual(response[0]["payload"]["currentClientSeq"], 2)
-        feedback = get_state().get_device_playback_state("context-1", "phone-1")
+        feedback = emo_ws.getDevicePlaybackState("context-1", "phone-1")
         self.assertEqual(feedback["positionMs"], 10)
 
         stale = dict(update, requestId="playback-update-seq-stale")
@@ -1074,7 +1067,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
         )
         self.assertEqual(stale_response[0]["payload"]["currentClientSeq"], 2)
         self.assertEqual(
-            get_state().get_device_playback_state("context-1", "phone-1")[
+            emo_ws.getDevicePlaybackState("context-1", "phone-1")[
                 "positionMs"
             ],
             10,
@@ -1086,6 +1079,8 @@ class StrictV2CoreTestCase(unittest.TestCase):
         payload = {
             "playbackContextId": "context-1",
             "deviceSessionId": "device:phone-1",
+            "origin": "passive",
+            "appliedControlVersion": 1,
             "state": "playing",
             "positionMs": 25,
             "clientSeq": 1,
@@ -1099,7 +1094,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
             "playback-update-seq-idempotent-1",
             payload,
         )
-        first_feedback = get_state().get_device_playback_state(
+        first_feedback = emo_ws.getDevicePlaybackState(
             "context-1",
             "phone-1",
         )
@@ -1110,7 +1105,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
             "playback-update-seq-idempotent-2",
             payload,
         )
-        second_feedback = get_state().get_device_playback_state(
+        second_feedback = emo_ws.getDevicePlaybackState(
             "context-1",
             "phone-1",
         )
@@ -1140,6 +1135,8 @@ class StrictV2CoreTestCase(unittest.TestCase):
             {
                 "playbackContextId": "context-1",
                 "deviceSessionId": "device:phone-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
                 "state": "playing",
                 "positionMs": 30,
                 "clientSeq": 7,
@@ -1167,6 +1164,8 @@ class StrictV2CoreTestCase(unittest.TestCase):
             {
                 "playbackContextId": "context-1",
                 "deviceSessionId": "device:phone-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
                 "state": "playing",
                 "positionMs": 40,
                 "clientSeq": 1,
@@ -1178,7 +1177,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
             [message["action"] for message in restarted],
             ["playback.update"],
         )
-        feedback = get_state().get_device_playback_state("context-1", "phone-1")
+        feedback = emo_ws.getDevicePlaybackState("context-1", "phone-1")
         self.assertEqual(feedback["clientSeq"], 1)
         self.assertEqual(feedback["positionMs"], 40)
 
@@ -2632,28 +2631,15 @@ class StrictV2CoreTestCase(unittest.TestCase):
                 "context-list-1",
                 payload,
             )
-            self.emit_strict(
+            self.create_context(
                 player,
-                "command",
-                "playback.context.create",
-                "context-create-2",
-                {
-                    "playbackContextId": "context-2",
-                    "deviceSessionId": "device:phone-1",
-                    "queueSongIds": ["song-3"],
-                    "currentIndex": 0,
-                    "positionMs": 0,
-                    "state": "paused",
-                },
+                request_id="context-ensure-2",
+                queue_song_ids=["song-3"],
+                state="paused",
+                position_ms=0,
             )
             invalidations = self.messages(controller)
-            self.assertTrue(
-                any(
-                    message.get("action")
-                    == "playback.context.bindings.changed"
-                    for message in invalidations
-                )
-            )
+            self.assertEqual(invalidations, [])
             replay = self.emit_strict(
                 controller,
                 "state",
@@ -2681,11 +2667,8 @@ class StrictV2CoreTestCase(unittest.TestCase):
         )
         self.assertEqual(replay, first)
         self.assertEqual(
-            [
-                binding["playbackContextId"]
-                for binding in refreshed[0]["payload"]["contexts"]
-            ],
-            ["context-1", "context-2"],
+            refreshed[0]["payload"]["contexts"],
+            first[0]["payload"]["contexts"],
         )
         self.assertEqual(list_bindings.call_count, 2)
         self.assertEqual(
@@ -3183,26 +3166,35 @@ class StrictV2CoreTestCase(unittest.TestCase):
             )
         )
 
-    def test_multi_context_controls_conflict_without_authority_side_effects(self):
+    def test_ensure_keeps_one_context_per_authority_pair(self):
         player = self.ready_strict_client()
         self.create_context(
             player,
             queue_song_ids=["song-1", "song-2"],
         )
-        self.emit_strict(
-            player,
-            "command",
-            "playback.context.create",
-            "context-create-ambiguous-2",
-            {
-                "playbackContextId": "context-2",
-                "deviceSessionId": "device:phone-1",
-                "queueSongIds": ["song-1", "song-2"],
-                "currentIndex": 0,
-                "positionMs": 1200,
-                "state": "playing",
-            },
-        )
+        with mock.patch(
+            "supysonic.emo.ws_store._new_playback_context_id",
+            return_value="context-2",
+        ):
+            ensured = self.emit_strict(
+                player,
+                "command",
+                "playback.context.ensure",
+                "context-ensure-same-authority",
+                {
+                    "deviceSessionId": "device:phone-1",
+                    "queueSongIds": ["other-song"],
+                    "currentIndex": 0,
+                    "positionMs": 0,
+                    "state": "paused",
+                },
+            )
+        self.assertEqual(ensured[0]["payload"]["playbackContextId"], "context-1")
+        self.assertIsNone(getPlaybackContextState("context-2"))
+        canonical = getPlaybackContextState("context-1")
+        self.assertEqual(canonical["queueSongIds"], ["song-1", "song-2"])
+        self.assertEqual(canonical["controlVersion"], 1)
+
         controller = self.ready_strict_client(
             roles=["controller"],
             client_id="controller-1",
@@ -3210,109 +3202,11 @@ class StrictV2CoreTestCase(unittest.TestCase):
         )
         self.messages(player)
         self.messages(controller)
-        controls = {
-            "player.play": {"baseControlVersion": 1},
-            "player.pause": {"baseControlVersion": 1},
-            "player.seek": {
-                "baseControlVersion": 1,
-                "positionMs": 500,
-            },
-            "player.next": {"baseControlVersion": 1},
-            "player.prev": {"baseControlVersion": 1},
-            "queue.playItem": {
-                "queueIndex": 1,
-                "baseQueueRevision": 1,
-                "baseControlVersion": 1,
-            },
-        }
-
-        for action, action_payload in controls.items():
-            with self.subTest(action=action):
-                response = self.emit_strict(
-                    controller,
-                    "command",
-                    action,
-                    "ambiguous-%s" % action,
-                    dict(
-                        action_payload,
-                        playbackContextId="context-1",
-                    ),
-                )
-                error = response[0]
-                self.assertEqual(error["payload"]["code"], "conflict")
-                self.assertEqual(
-                    {
-                        field_name: error["payload"][field_name]
-                        for field_name in (
-                            "playbackContextId",
-                            "currentControlVersion",
-                            "currentQueueRevision",
-                            "currentVersion",
-                        )
-                    },
-                    {
-                        "playbackContextId": "context-1",
-                        "currentControlVersion": 1,
-                        "currentQueueRevision": 1,
-                        "currentVersion": 1,
-                    },
-                )
-                self.assertFalse(
-                    any(
-                        message.get("action") == action
-                        for message in self.messages(player)
-                    )
-                )
-                canonical = getPlaybackContextState("context-1")
-                self.assertEqual(canonical["state"], "playing")
-                self.assertEqual(canonical["controlVersion"], 1)
-                self.assertEqual(canonical["queueRevision"], 1)
-                self.assertEqual(canonical["version"], 1)
-
-        self.emit_strict(
-            controller,
-            "command",
-            "playback.context.close",
-            "close-ambiguous-context-2",
-            {"playbackContextId": "context-2"},
-        )
-        self.messages(player)
-        bindings = self.emit_strict(
-            controller,
-            "state",
-            "playback.context.list",
-            "list-after-ambiguity-resolved",
-            {
-                "authorityClientId": "phone-1",
-                "authorityDeviceSessionId": "device:phone-1",
-            },
-        )
-        self.assertEqual(
-            bindings[0]["payload"]["contexts"],
-            [
-                {
-                    "playbackContextId": "context-1",
-                    "authorityClientId": "phone-1",
-                    "authorityDeviceSessionId": "device:phone-1",
-                }
-            ],
-        )
-        status = self.emit_strict(
-            controller,
-            "state",
-            "playback.context.status",
-            "status-after-ambiguity-resolved",
-            {"playbackContextId": "context-1"},
-        )
-        self.assertEqual(
-            status[0]["payload"]["playbackContext"]["playbackContextId"],
-            "context-1",
-        )
         recovered = self.emit_strict(
             controller,
             "command",
             "player.pause",
-            "pause-after-ambiguity-resolved",
+            "pause-single-context",
             {
                 "playbackContextId": "context-1",
                 "baseControlVersion": 1,
@@ -3328,14 +3222,13 @@ class StrictV2CoreTestCase(unittest.TestCase):
             )
         )
 
-    def test_context_create_response_emit_failure_replays_persisted_response(self):
+    def test_context_ensure_response_emit_failure_replays_persisted_response(self):
         client = self.ready_strict_client()
         request = {
             "type": "command",
-            "action": "playback.context.create",
-            "requestId": "context-create-response-failure",
+            "action": "playback.context.ensure",
+            "requestId": "context-ensure-response-failure",
             "payload": {
-                "playbackContextId": "context-1",
                 "deviceSessionId": "device:phone-1",
                 "queueSongIds": ["song-2", "song-1"],
                 "currentIndex": 0,
@@ -3346,15 +3239,18 @@ class StrictV2CoreTestCase(unittest.TestCase):
         real_emit = emo_ws.socketio.emit
 
         def fail_direct_response(event, message, **kwargs):
-            if message["action"] == "playback.context.create":
+            if message["action"] == "playback.context.ensure":
                 raise RuntimeError("injected direct response failure")
             return real_emit(event, message, **kwargs)
 
-        with mock.patch.object(
+        with mock.patch(
+            "supysonic.emo.ws_store._new_playback_context_id",
+            return_value="context-1",
+        ), mock.patch.object(
             emo_ws,
-            "createStrictPlaybackContextState",
-            wraps=emo_ws.createStrictPlaybackContextState,
-        ) as create_context, mock.patch.object(
+            "ensureStrictPlaybackContextState",
+            wraps=emo_ws.ensureStrictPlaybackContextState,
+        ) as ensure_context, mock.patch.object(
             emo_ws.socketio,
             "emit",
             side_effect=fail_direct_response,
@@ -3364,17 +3260,17 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(self.messages(client), [])
         persisted = getPlaybackContextState("context-1")
         self.assertEqual(persisted["queueSongIds"], ["song-2", "song-1"])
-        self.assertEqual(create_context.call_count, 1)
+        self.assertEqual(ensure_context.call_count, 1)
 
         client.emit("message", request, namespace="/emo")
         replay = self.messages(client)
         self.assertEqual(
             [message["action"] for message in replay],
-            ["playback.context.create"],
+            ["playback.context.ensure"],
         )
         self.assertEqual(replay[0]["requestId"], request["requestId"])
         self.assertEqual(replay[0]["payload"]["version"], 1)
-        self.assertEqual(create_context.call_count, 1)
+        self.assertEqual(ensure_context.call_count, 1)
 
     def test_queue_sync_ack_backpressure_replays_without_second_mutation(self):
         client = self.ready_strict_client()
@@ -3430,7 +3326,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
         )
         self.assertEqual(mutate_queue.call_count, 1)
 
-    def test_context_create_retry_after_runtime_reset_uses_persisted_intent(self):
+    def test_context_ensure_retry_after_runtime_reset_uses_persisted_context(self):
         client = self.ready_strict_client()
         first = self.create_context(client, request_id="context-create-first")
         get_state()._playback_contexts.clear()
@@ -3439,23 +3335,19 @@ class StrictV2CoreTestCase(unittest.TestCase):
 
         self.assertEqual(replay[0]["payload"], first[0]["payload"])
 
-    def test_context_create_with_same_id_and_different_intent_conflicts(self):
+    def test_context_ensure_keeps_existing_non_idle_context(self):
         client = self.ready_strict_client()
         self.create_context(client, request_id="context-create-first")
 
-        conflict = self.create_context(
+        ensured = self.create_context(
             client,
             request_id="context-create-conflict",
             queue_song_ids=["other-song"],
         )
 
-        self.assertEqual(len(conflict), 1)
-        error = conflict[0]
-        self.assertEqual(error["payload"]["code"], "conflict")
-        self.assertEqual(error["payload"]["playbackContextId"], "context-1")
-        self.assertEqual(error["payload"]["currentVersion"], 1)
-        self.assertEqual(error["payload"]["currentQueueRevision"], 1)
-        self.assertEqual(error["payload"]["currentControlVersion"], 1)
+        self.assertEqual(ensured[0]["payload"]["playbackContextId"], "context-1")
+        self.assertEqual(ensured[0]["payload"]["queueSongIds"], ["song-2", "song-1"])
+        self.assertEqual(ensured[0]["payload"]["version"], 1)
 
     def test_closed_context_is_a_terminal_tombstone(self):
         client = self.ready_strict_client()
@@ -3734,9 +3626,9 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.create_context(client)
         scenarios = (
             ("content", ["song-2", "song-3"], 0, 1200, None, (2, 2, 1)),
-            ("position", ["song-2", "song-3"], 0, 1300, 1, (3, 3, 2)),
-            ("index", ["song-2", "song-3"], 1, 0, 2, (4, 4, 3)),
-            ("no-op", ["song-2", "song-3"], 1, 0, None, (5, 5, 3)),
+            ("position", ["song-2", "song-3"], 0, 1300, 1, (3, 2, 2)),
+            ("index", ["song-2", "song-3"], 1, 0, 2, (4, 3, 3)),
+            ("no-op", ["song-2", "song-3"], 1, 0, None, (4, 3, 3)),
         )
         for name, queue, index, position, base_control, expected in scenarios:
             with self.subTest(name=name):
@@ -3770,6 +3662,8 @@ class StrictV2CoreTestCase(unittest.TestCase):
                         "authorityClientId",
                         "queueSongIds",
                         "currentIndex",
+                        "trackId",
+                        "state",
                         "positionMs",
                         "queueRevision",
                         "controlVersion",

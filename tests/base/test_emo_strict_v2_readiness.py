@@ -111,7 +111,7 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
                 deployment,
             )
 
-        readiness.assert_called_with(True)
+        readiness.assert_not_called()
         self.assertTrue(negotiated["playbackContextV2"])
         self.assertTrue(negotiated["supportsFollow"])
         self.assertTrue(negotiated["playbackPrepare"])

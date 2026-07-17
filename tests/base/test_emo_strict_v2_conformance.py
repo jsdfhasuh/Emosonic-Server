@@ -42,12 +42,12 @@ class StrictV2ConformanceTestCase(unittest.TestCase):
             any(strict_v2_conformance.get_code_conformance_readiness().values())
         )
 
-    def test_packaged_r8_manifest_enables_only_explicit_local_test_mode(self):
+    def test_packaged_r11_manifest_stays_disabled_until_evidence_is_complete(self):
         expected = {
-            "core": True,
-            "follow": True,
-            "handoff": True,
-            "broadcast": True,
+            "core": False,
+            "follow": False,
+            "handoff": False,
+            "broadcast": False,
         }
 
         self.assertEqual(
@@ -57,14 +57,8 @@ class StrictV2ConformanceTestCase(unittest.TestCase):
         manifest = self._read_manifest()
         for profile, value in manifest["profiles"].items():
             with self.subTest(profile=profile):
-                self.assertTrue(value["codeConformanceReady"])
-                self.assertTrue(value["evidence"])
-                self.assertTrue(
-                    all(
-                        item.startswith("local-test-only:test_supysonic:r8:")
-                        for item in value["evidence"]
-                    )
-                )
+                self.assertFalse(value["codeConformanceReady"])
+                self.assertEqual(value["evidence"], [])
 
     def test_local_test_evidence_requires_explicit_test_mode(self):
         manifest = self._read_manifest()

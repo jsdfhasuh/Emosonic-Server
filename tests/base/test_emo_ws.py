@@ -133,7 +133,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
 
   def test_socketio_initialization_logs_strict_v2_static_metadata(self):
     metadata = {
-      "protocolVersion": "2.3.0",
+      "protocolVersion": "2.4.0",
       "schemaHash": "a" * 64,
       "serverBuildCommit": "b" * 40,
     }
@@ -156,7 +156,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
       [
         "WARNING:supysonic.emo.ws:"
         "emo event=strict_v2_registration_metadata "
-        "protocol_version=2.3.0 "
+        "protocol_version=2.4.0 "
         f"schema_hash={'a' * 64} "
         f"server_build_commit={'b' * 40}",
       ],
@@ -330,41 +330,6 @@ class EmoWebSocketTestCase(unittest.TestCase):
       namespace="/emo",
     )
     return self.get_ack(self.get_messages(client), request_id)
-
-  def create_playback_context(
-    self,
-    client,
-    request_id,
-    playback_context_id="playback:alice:main",
-    device_session_id="root:phone",
-    queue_song_ids=None,
-    current_index=0,
-    position_ms=0,
-    state="stopped",
-  ):
-    payload = {
-      "playbackContextId": playback_context_id,
-      "deviceSessionId": device_session_id,
-      "queueSongIds": queue_song_ids or ["song-1"],
-      "currentIndex": current_index,
-      "positionMs": position_ms,
-      "state": state,
-    }
-    client.emit(
-      "message",
-      {
-        "type": "command",
-        "action": "playback.context.create",
-        "requestId": request_id,
-        "payload": payload,
-      },
-      namespace="/emo",
-    )
-    return self.get_direct_response(
-      self.get_messages(client),
-      "playback.context.create",
-      request_id,
-    )
 
   def ensure_playback_context(
     self,
@@ -565,7 +530,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.assertEqual(strict_v2["serverBuildCommit"], commit)
     self.assertRegex(strict_v2["schemaHash"], r"^[0-9a-f]{64}$")
-    self.assertEqual(strict_v2["protocolVersion"], "2.3.0")
+    self.assertEqual(strict_v2["protocolVersion"], "2.4.0")
     self.assertIsInstance(strict_v2["connectionNonce"], str)
     self.assertTrue(strict_v2["connectionNonce"])
     self.assertEqual(strict_v2["connectionEpoch"], 1)
@@ -720,7 +685,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
     self.get_messages(observer)
-    self.create_playback_context(phone, "context-create-feedback-1")
+    self.ensure_playback_context(phone, "context-create-feedback-1")
     self.get_messages(phone)
     self.get_messages(observer)
 
@@ -745,6 +710,8 @@ class EmoWebSocketTestCase(unittest.TestCase):
         "payload": {
           "playbackContextId": "playback:alice:main",
           "deviceSessionId": "root:phone",
+          "origin": "passive",
+          "appliedControlVersion": 1,
           "state": "playing",
           "trackId": "song-1",
           "positionMs": 1200,
@@ -774,6 +741,9 @@ class EmoWebSocketTestCase(unittest.TestCase):
         "playbackContextId": "playback:alice:main",
         "sourceClientId": "phone-1",
         "deviceSessionId": "root:phone",
+        "origin": "passive",
+        "controlVersion": 1,
+        "appliedControlVersion": 1,
         "state": "playing",
         "positionMs": 1200,
         "trackId": "song-1",
@@ -815,7 +785,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(source)
     self.get_messages(unsupported)
-    self.create_playback_context(source, "context-create-capability-1", device_session_id="root:source")
+    self.ensure_playback_context(source, "context-create-capability-1", device_session_id="root:source")
     self.get_messages(source)
     self.get_messages(unsupported)
 
@@ -2693,7 +2663,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertEqual(queue["timelineId"], "session:sess-1:client:player-1")
     self.assertEqual(get_state().get_queue("sess-1")["sourceClientId"], "player-1")
 
-  def test_v2_playback_context_create_sets_current_client_as_authority(self):
+  def test_v2_playback_context_ensure_sets_current_client_as_authority(self):
     phone = self.connect_device(
       "alice",
       "Alic3",
@@ -2704,7 +2674,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
 
-    response = self.create_playback_context(phone, "context-create-1")
+    response = self.ensure_playback_context(phone, "context-create-1")
     context = response["payload"]
     self.assertEqual(context["playbackContextId"], "playback:alice:main")
     self.assertEqual(context["authorityClientId"], "phone-1")
@@ -2726,23 +2696,26 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
 
-    phone.emit(
-      "message",
-      {
-        "type": "command",
-        "action": "playback.context.create",
-        "requestId": "context-create-invalid-queue-1",
-        "payload": {
-          "playbackContextId": "playback:alice:invalid",
-          "deviceSessionId": "root:phone",
-          "queueSongIds": "",
-          "currentIndex": 0,
-          "positionMs": 0,
-          "state": "stopped",
+    with mock.patch(
+      "supysonic.emo.ws_store._new_playback_context_id",
+      return_value="playback:alice:invalid",
+    ):
+      phone.emit(
+        "message",
+        {
+          "type": "command",
+          "action": "playback.context.ensure",
+          "requestId": "context-create-invalid-queue-1",
+          "payload": {
+            "deviceSessionId": "root:phone",
+            "queueSongIds": "",
+            "currentIndex": 0,
+            "positionMs": 0,
+            "state": "stopped",
+          },
         },
-      },
-      namespace="/emo",
-    )
+        namespace="/emo",
+      )
     invalid_queue = self.get_error(
       self.get_messages(phone),
       "context-create-invalid-queue-1",
@@ -2750,7 +2723,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertEqual(invalid_queue["payload"]["code"], "bad_request")
     self.assertIsNone(getPlaybackContextState("playback:alice:invalid"))
 
-    self.create_playback_context(phone, "context-create-valid-1")
+    self.ensure_playback_context(phone, "context-create-valid-1")
     phone.emit(
       "message",
       {
@@ -2785,7 +2758,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
       capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
     )
     self.get_messages(phone)
-    self.create_playback_context(phone, "context-create-1")
+    self.ensure_playback_context(phone, "context-create-1")
 
     invalid_payloads = (
       ("invalid-queue", {"queueSongIds": "bad", "currentIndex": 0}),
@@ -2796,6 +2769,8 @@ class EmoWebSocketTestCase(unittest.TestCase):
       payload = {
         "playbackContextId": "playback:alice:main",
         "deviceSessionId": "root:phone",
+        "origin": "passive",
+        "appliedControlVersion": 1,
         "state": "playing",
         "trackId": "song-1",
         "positionMs": 0,
@@ -2822,7 +2797,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertEqual(persisted["positionMs"], 0)
     self.assertEqual(persisted["trackId"], "song-1")
 
-  def test_v2_playback_context_create_restores_existing_persisted_context(self):
+  def test_v2_playback_context_ensure_restores_existing_persisted_context(self):
     phone = self.connect_device(
       "alice",
       "Alic3",
@@ -2833,7 +2808,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
 
-    first_response = self.create_playback_context(
+    first_response = self.ensure_playback_context(
       phone,
       "context-create-1",
       queue_song_ids=["song-1", "song-2"],
@@ -2843,7 +2818,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     persisted_context = getPlaybackContextState("playback:alice:main")
     get_state()._playback_contexts.clear()
 
-    second_response = self.create_playback_context(
+    second_response = self.ensure_playback_context(
       phone,
       "context-create-2",
       queue_song_ids=["song-1", "song-2"],
@@ -2870,7 +2845,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
 
-    self.create_playback_context(phone, "context-create-1")
+    self.ensure_playback_context(phone, "context-create-1")
 
     phone.emit(
       "message",
@@ -2881,6 +2856,8 @@ class EmoWebSocketTestCase(unittest.TestCase):
         "payload": {
           "playbackContextId": "playback:alice:main",
           "deviceSessionId": "root:phone",
+          "origin": "passive",
+          "appliedControlVersion": 1,
           "state": "playing",
           "trackId": "song-1",
           "positionMs": 500,
@@ -2936,7 +2913,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
     self.get_messages(observer)
-    self.create_playback_context(phone, "context-create-1")
+    self.ensure_playback_context(phone, "context-create-1")
 
     observer.emit(
       "message",
@@ -3000,7 +2977,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.get_messages(phone)
     self.get_messages(observer)
     self.get_messages(bystander)
-    self.create_playback_context(phone, "context-create-1")
+    self.ensure_playback_context(phone, "context-create-1")
     self.get_messages(observer)
     self.get_messages(bystander)
 
@@ -3066,7 +3043,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
     self.get_messages(observer)
-    self.create_playback_context(phone, "context-create-1")
+    self.ensure_playback_context(phone, "context-create-1")
     self.get_messages(observer)
 
     observer.emit(
@@ -3139,7 +3116,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
     self.get_messages(observer)
-    self.create_playback_context(phone, "context-create-1")
+    self.ensure_playback_context(phone, "context-create-1")
     self.get_messages(observer)
 
     observer.emit(
@@ -3211,7 +3188,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
     self.get_messages(controller)
-    self.create_playback_context(phone, "context-create-1")
+    self.ensure_playback_context(phone, "context-create-1")
     self.get_messages(phone)
     self.get_messages(controller)
 
@@ -3261,7 +3238,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
     self.get_messages(controller)
-    self.create_playback_context(phone, "context-create-1")
+    self.ensure_playback_context(phone, "context-create-1")
     self.get_messages(phone)
     self.get_messages(controller)
 
@@ -3274,6 +3251,8 @@ class EmoWebSocketTestCase(unittest.TestCase):
         "payload": {
           "playbackContextId": "playback:alice:main",
           "deviceSessionId": "root:phone",
+          "origin": "passive",
+          "appliedControlVersion": 1,
           "state": "playing",
           "trackId": "song-1",
           "positionMs": 500,
@@ -3332,7 +3311,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
     self.get_messages(controller)
-    self.create_playback_context(phone, "context-create-1")
+    self.ensure_playback_context(phone, "context-create-1")
     self.get_messages(phone)
     self.get_messages(controller)
 
@@ -3345,9 +3324,12 @@ class EmoWebSocketTestCase(unittest.TestCase):
         "payload": {
           "playbackContextId": "playback:alice:main",
           "deviceSessionId": "root:phone",
+          "origin": "passive",
+          "appliedControlVersion": 1,
           "state": "paused",
           "trackId": "song-1",
           "positionMs": 500,
+          "clientSeq": 1,
         },
       },
       namespace="/emo",
@@ -3406,7 +3388,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
     self.get_messages(controller)
-    self.create_playback_context(
+    self.ensure_playback_context(
       phone,
       "context-create-1",
       queue_song_ids=["song-1", "song-2", "song-3"],
@@ -3466,7 +3448,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
     self.get_messages(controller)
-    self.create_playback_context(
+    self.ensure_playback_context(
       phone,
       "context-create-1",
       queue_song_ids=["song-1", "song-2", "song-3"],
@@ -3526,7 +3508,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
     self.get_messages(controller)
-    self.create_playback_context(
+    self.ensure_playback_context(
       phone,
       "context-create-1",
       queue_song_ids=["song-1", "song-2", "song-3"],
@@ -3586,7 +3568,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
     self.get_messages(controller)
-    self.create_playback_context(
+    self.ensure_playback_context(
       phone,
       "context-create-1",
       queue_song_ids=["song-1", "song-2"],
@@ -3637,6 +3619,10 @@ class EmoWebSocketTestCase(unittest.TestCase):
         "payload": {
           "playbackContextId": "playback:alice:main",
           "deviceSessionId": "root:phone",
+          "origin": "remoteCommand",
+          "executionStatus": "committed",
+          "commandControlVersion": context["controlVersion"],
+          "appliedControlVersion": context["controlVersion"],
           "state": "playing",
           "trackId": "song-2",
           "positionMs": 50,
@@ -3706,7 +3692,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.get_messages(phone)
     self.get_messages(pc)
 
-    self.create_playback_context(phone, "context-create-1")
+    self.ensure_playback_context(phone, "context-create-1")
 
     pc.emit(
       "message",
@@ -3740,7 +3726,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
 
-    self.create_playback_context(phone, "context-create-1")
+    self.ensure_playback_context(phone, "context-create-1")
 
     phone.emit(
       "message",
@@ -4218,7 +4204,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
     self.get_messages(pc)
-    self.create_playback_context(phone, "context-create-1")
+    self.ensure_playback_context(phone, "context-create-1")
     self.get_messages(phone)
     self.get_messages(pc)
 
@@ -4544,7 +4530,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
     self.get_messages(pc)
-    self.create_playback_context(phone, "context-create-1")
+    self.ensure_playback_context(phone, "context-create-1")
     self.get_messages(phone)
     self.get_messages(pc)
 
@@ -4640,7 +4626,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
     self.get_messages(pc)
-    self.create_playback_context(phone, "context-create-1")
+    self.ensure_playback_context(phone, "context-create-1")
     self.get_messages(phone)
     self.get_messages(pc)
 
@@ -4728,7 +4714,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
     self.get_messages(pc)
-    self.create_playback_context(phone, "context-create-1")
+    self.ensure_playback_context(phone, "context-create-1")
     self.get_messages(phone)
     self.get_messages(pc)
 
@@ -4795,7 +4781,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
     self.get_messages(pc)
-    self.create_playback_context(
+    self.ensure_playback_context(
       phone,
       "context-create-1",
       queue_song_ids=["song-1", "song-2"],
@@ -4913,7 +4899,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.get_messages(phone)
     self.get_messages(pc)
     self.get_messages(controller)
-    self.create_playback_context(phone, "context-create-1")
+    self.ensure_playback_context(phone, "context-create-1")
     self.get_messages(phone)
     self.get_messages(pc)
     self.get_messages(controller)
@@ -5002,7 +4988,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
     self.get_messages(pc)
-    self.create_playback_context(phone, "context-create-1")
+    self.ensure_playback_context(phone, "context-create-1")
     self.get_messages(phone)
     self.get_messages(pc)
 
@@ -5085,7 +5071,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
       capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
     )
     self.get_messages(phone)
-    self.create_playback_context(phone, "context-create-1")
+    self.ensure_playback_context(phone, "context-create-1")
 
     phone.emit(
       "message",
@@ -5096,6 +5082,8 @@ class EmoWebSocketTestCase(unittest.TestCase):
         "payload": {
           "playbackContextId": "playback:alice:main",
           "deviceSessionId": "root:phone",
+          "origin": "passive",
+          "appliedControlVersion": 1,
           "state": "playing",
           "trackId": "song-1",
           "positionMs": 100,
@@ -5153,7 +5141,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertEqual(status_device["volume"], 65)
     self.assertTrue(status_device["muted"])
 
-  def test_v2_context_status_merges_persisted_and_runtime_device_states(self):
+  def test_v2_context_status_prefers_newer_runtime_authority_state(self):
     phone = self.connect_device(
       "alice",
       "Alic3",
@@ -5162,17 +5150,8 @@ class EmoWebSocketTestCase(unittest.TestCase):
       ["player"],
       capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
     )
-    pc = self.connect_device(
-      "alice",
-      "Alic3",
-      "pc-1",
-      "root:pc",
-      ["player"],
-      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
-    )
     self.get_messages(phone)
-    self.get_messages(pc)
-    self.create_playback_context(phone, "context-create-1")
+    self.ensure_playback_context(phone, "context-create-1")
 
     phone.emit(
       "message",
@@ -5183,6 +5162,8 @@ class EmoWebSocketTestCase(unittest.TestCase):
         "payload": {
           "playbackContextId": "playback:alice:main",
           "deviceSessionId": "root:phone",
+          "origin": "passive",
+          "appliedControlVersion": 1,
           "state": "playing",
           "trackId": "song-1",
           "positionMs": 100,
@@ -5192,29 +5173,6 @@ class EmoWebSocketTestCase(unittest.TestCase):
       namespace="/emo",
     )
     self.get_messages(phone)
-
-    pc.emit(
-      "message",
-      {
-        "type": "event",
-        "action": "playback.update",
-        "requestId": "status-merge-pc-1",
-        "payload": {
-          "playbackContextId": "playback:alice:main",
-          "deviceSessionId": "root:pc",
-          "state": "playing",
-          "trackId": "song-1",
-          "positionMs": 900,
-          "clientSeq": 1,
-        },
-      },
-      namespace="/emo",
-    )
-    self.get_messages(pc)
-    self.assertEqual(
-      getDevicePlaybackState("playback:alice:main", "pc-1")["positionMs"],
-      900,
-    )
 
     get_state()._device_playback_states.clear()
     phone.emit(
@@ -5226,6 +5184,8 @@ class EmoWebSocketTestCase(unittest.TestCase):
         "payload": {
           "playbackContextId": "playback:alice:main",
           "deviceSessionId": "root:phone",
+          "origin": "passive",
+          "appliedControlVersion": 1,
           "state": "playing",
           "trackId": "song-1",
           "positionMs": 200,
@@ -5256,7 +5216,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
       for device_state in status_response["payload"]["deviceStates"]
     }
     self.assertEqual(device_states["phone-1"]["positionMs"], 200)
-    self.assertEqual(device_states["pc-1"]["positionMs"], 900)
+    self.assertEqual(set(device_states), {"phone-1"})
 
   def test_v2_playback_update_serializes_logical_volume_without_volume(self):
     phone = self.connect_device(
@@ -5268,7 +5228,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
       capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
     )
     self.get_messages(phone)
-    self.create_playback_context(phone, "context-create-1")
+    self.ensure_playback_context(phone, "context-create-1")
 
     phone.emit(
       "message",
@@ -5279,6 +5239,8 @@ class EmoWebSocketTestCase(unittest.TestCase):
         "payload": {
           "playbackContextId": "playback:alice:main",
           "deviceSessionId": "root:phone",
+          "origin": "passive",
+          "appliedControlVersion": 1,
           "state": "playing",
           "trackId": "song-1",
           "positionMs": 100,
@@ -5705,7 +5667,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(alice)
     self.get_messages(bob)
-    self.create_playback_context(
+    self.ensure_playback_context(
       alice,
       "alice-context-create-1",
       playback_context_id="shared-context-id",
@@ -6864,7 +6826,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
     self.get_messages(laptop)
-    self.create_playback_context(
+    self.ensure_playback_context(
       phone,
       "v2-follow-context-create-1",
       queue_song_ids=["song-source"],
@@ -6937,7 +6899,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertEqual(stop_ack["payload"], {"action": "follow.stop"})
     self.assertIsNone(get_state().get_follow_relationship("laptop-1"))
 
-  def test_v2_follow_update_is_device_feedback_only(self):
+  def test_v2_follow_participant_cannot_report_context_feedback(self):
     phone = self.connect_device(
       "alice",
       "Alic3",
@@ -6956,7 +6918,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
     self.get_messages(laptop)
-    self.create_playback_context(
+    self.ensure_playback_context(
       phone,
       "v2-follow-feedback-context-create-1",
       queue_song_ids=["song-source"],
@@ -6989,6 +6951,8 @@ class EmoWebSocketTestCase(unittest.TestCase):
         "payload": {
           "playbackContextId": "playback:alice:main",
           "deviceSessionId": "root:laptop",
+          "origin": "passive",
+          "appliedControlVersion": 1,
           "state": "playing",
           "trackId": "song-source",
           "positionMs": 12300,
@@ -6998,18 +6962,16 @@ class EmoWebSocketTestCase(unittest.TestCase):
       namespace="/emo",
     )
 
-    confirmation = next(
-      message
-      for message in self.get_messages(laptop)
-      if message["action"] == "playback.update"
+    error = self.get_error(
+      self.get_messages(laptop),
+      "v2-follow-feedback-1",
     )
-    self.assertNotIn("requestId", confirmation)
+    self.assertEqual(error["payload"]["code"], "forbidden")
     context = get_state().get_playback_context("playback:alice:main")
     device_state = get_state().get_device_playback_state("playback:alice:main", "laptop-1")
     self.assertEqual(context["positionMs"], 12000)
     self.assertEqual(context["authorityClientId"], "phone-1")
-    self.assertFalse(device_state["isAuthority"])
-    self.assertEqual(device_state["positionMs"], 12300)
+    self.assertIsNone(device_state)
 
   def test_v2_follow_participant_cannot_control_source_context(self):
     phone = self.connect_device(
@@ -7030,7 +6992,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.get_messages(phone)
     self.get_messages(laptop)
-    self.create_playback_context(phone, "v2-follow-control-context-create-1")
+    self.ensure_playback_context(phone, "v2-follow-control-context-create-1")
     self.get_messages(phone)
     self.get_messages(laptop)
 
