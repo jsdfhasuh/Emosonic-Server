@@ -112,6 +112,27 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 )
                 """
             )
+            database.execute_sql(
+                """
+                CREATE TABLE emo_device_playback_state (
+                    id %s PRIMARY KEY,
+                    playback_context_id VARCHAR(128) NOT NULL,
+                    device_session_id VARCHAR(128) NOT NULL,
+                    owner_client_id VARCHAR(128) NOT NULL,
+                    user_name VARCHAR(64) NOT NULL,
+                    state VARCHAR(32) NOT NULL,
+                    track_id VARCHAR(128),
+                    position_ms INTEGER NOT NULL DEFAULT 0,
+                    volume INTEGER,
+                    is_authority INTEGER NOT NULL DEFAULT 0,
+                    mode VARCHAR(32) NOT NULL DEFAULT 'normal',
+                    playback_json TEXT,
+                    created_at %s NOT NULL,
+                    updated_at %s NOT NULL,
+                    UNIQUE(playback_context_id, owner_client_id)
+                )
+                """ % (id_type, timestamp_type, timestamp_type)
+            )
         finally:
             database.close()
 
@@ -143,7 +164,8 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             }
             self.assertTrue(required_fields.issubset(columns))
             self._assert_external_discovery_index(provider)
-            self.assertEqual(db.Meta["schema_version"].value, "20260715")
+            self._assert_external_r11_transaction_schema()
+            self.assertEqual(db.Meta["schema_version"].value, "20260717")
             self._record_external_evidence(
                 provider,
                 "clean",
@@ -172,7 +194,8 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             self.assertEqual(row[5:9], (1, 1, 1, 1))
             self.assertIsNotNone(row[9])
             self._assert_external_discovery_index(provider)
-            self.assertEqual(db.Meta["schema_version"].value, "20260715")
+            self._assert_external_r11_transaction_schema()
+            self.assertEqual(db.Meta["schema_version"].value, "20260717")
             self._record_external_evidence(
                 provider,
                 "upgrade_from_20260708",
@@ -206,7 +229,39 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
         ).fetchall()
         self.assertEqual(
             tuple(row[0] for row in rows),
-            self.DISCOVERY_INDEX_COLUMNS,
+                self.DISCOVERY_INDEX_COLUMNS,
+        )
+
+    def _assert_external_r11_transaction_schema(self) -> None:
+        device_columns = {
+            row[0]
+            for row in db.db.execute_sql(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'emo_device_playback_state'"
+            ).fetchall()
+        }
+        self.assertTrue(
+            {"context_epoch", "applied_control_version", "client_seq"}.issubset(
+                device_columns
+            )
+        )
+        tables = {
+            row[0]
+            for row in db.db.execute_sql(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_name IN ("
+                "'emo_playback_control_transaction', "
+                "'emo_playback_prepare_transaction', "
+                "'emo_playback_local_intent')"
+            ).fetchall()
+        }
+        self.assertEqual(
+            tables,
+            {
+                "emo_playback_control_transaction",
+                "emo_playback_prepare_transaction",
+                "emo_playback_local_intent",
+            },
         )
 
     def test_sqlite_20260708_upgrade_preserves_context_and_normalizes_cursors(self):
@@ -249,6 +304,23 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                     'closed', 1200, 0, 0, 0, 0,
                     '2026-07-08 00:00:00', '2026-07-08 00:01:00'
                 );
+                CREATE TABLE emo_device_playback_state (
+                    id CHAR(36) PRIMARY KEY,
+                    playback_context_id VARCHAR(128) NOT NULL,
+                    device_session_id VARCHAR(128) NOT NULL,
+                    owner_client_id VARCHAR(128) NOT NULL,
+                    user_name VARCHAR(64) NOT NULL,
+                    state VARCHAR(32) NOT NULL,
+                    track_id VARCHAR(128),
+                    position_ms INTEGER NOT NULL DEFAULT 0,
+                    volume INTEGER,
+                    is_authority INTEGER NOT NULL DEFAULT 0,
+                    mode VARCHAR(32) NOT NULL DEFAULT 'normal',
+                    playback_json TEXT,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    UNIQUE(playback_context_id, owner_client_id)
+                );
                 """
             )
             connection.close()
@@ -275,7 +347,38 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 ).fetchall()
             )
             self.assertEqual(index_columns, self.DISCOVERY_INDEX_COLUMNS)
-            self.assertEqual(db.Meta["schema_version"].value, "20260715")
+            device_columns = {
+                row[1]
+                for row in db.db.execute_sql(
+                    "PRAGMA table_info('emo_device_playback_state')"
+                ).fetchall()
+            }
+            self.assertTrue(
+                {
+                    "context_epoch",
+                    "applied_control_version",
+                    "client_seq",
+                }.issubset(device_columns)
+            )
+            transaction_tables = {
+                row[0]
+                for row in db.db.execute_sql(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name IN ("
+                    "'emo_playback_control_transaction', "
+                    "'emo_playback_prepare_transaction', "
+                    "'emo_playback_local_intent')"
+                ).fetchall()
+            }
+            self.assertEqual(
+                transaction_tables,
+                {
+                    "emo_playback_control_transaction",
+                    "emo_playback_prepare_transaction",
+                    "emo_playback_local_intent",
+                },
+            )
+            self.assertEqual(db.Meta["schema_version"].value, "20260717")
         finally:
             db.release_database()
             os.remove(path)
@@ -299,6 +402,9 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 discovery_migration = (
                     root / "migration" / provider / "20260715.sql"
                 ).read_text("utf-8")
+                transaction_migration = (
+                    root / "migration" / provider / "20260717.sql"
+                ).read_text("utf-8")
                 for field_name in required_fields:
                     self.assertIn(field_name, base_schema)
                     self.assertIn(field_name, migration)
@@ -313,6 +419,20 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 )
                 for column_name in self.DISCOVERY_INDEX_COLUMNS:
                     self.assertIn(column_name, discovery_migration)
+                for field_name in (
+                    "context_epoch",
+                    "applied_control_version",
+                    "client_seq",
+                    "emo_playback_control_transaction",
+                    "emo_playback_prepare_transaction",
+                    "emo_playback_local_intent",
+                    "requesting_client_id",
+                    "watchdog_deadline_at_ms",
+                    "request_fingerprint",
+                    "superseded_through_control_version",
+                ):
+                    self.assertIn(field_name, base_schema)
+                    self.assertIn(field_name, transaction_migration)
 
     def test_postgres_runtime_clean_schema_and_20260708_upgrade(self):
         database_uri = os.environ.get("SUPYSONIC_TEST_POSTGRES_URI")

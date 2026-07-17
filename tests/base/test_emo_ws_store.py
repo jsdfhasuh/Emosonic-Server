@@ -12,9 +12,15 @@ from supysonic.emo.ws_store import (
     PlaybackContextClosedError,
     PlaybackContextIntentConflictError,
     PlaybackContextStaleVersionError,
+    PlaybackControlTransactionConflictError,
+    PlaybackLocalIntentConflictError,
+    PlaybackPrepareAlreadyActiveError,
+    PlaybackPrepareTransactionConflictError,
     closeStrictPlaybackContextState,
     completeStrictPlaybackHandoff,
     createPlaybackContextState,
+    createPlaybackControlTransaction,
+    createPlaybackPrepareTransaction,
     createStrictPlaybackContextState,
     deletePlaybackContext,
     expirePlaybackContext,
@@ -24,24 +30,32 @@ from supysonic.emo.ws_store import (
     getDevicePlaybackStates,
     getPlaybackContextState,
     getPlaybackContextWithDeviceStates,
+    getPlaybackControlTransaction,
     getPlaybackHandoff,
     getPlaybackHandoffByRequest,
+    getPlaybackPrepareTransaction,
     getLocalQueueState,
     getPlaybackState,
     getPlaybackStates,
     getQueueState,
     listActivePlaybackContextBindings,
+    listExpiredPlaybackControlTransactions,
+    listExpiredPlaybackPrepareTransactions,
+    listPendingPlaybackControlTransactions,
     listUserPlaybackContexts,
     listPlaybackContexts,
     mutateStrictPlaybackContextControl,
     saveDevicePlaybackState,
     savePlaybackContextState,
     savePlaybackHandoff,
+    savePlaybackLocalIntent,
     saveLocalQueueState,
     savePlaybackState,
     saveQueueState,
     serializeDevicePlaybackStateV2,
     serializePlaybackContextV2,
+    settlePlaybackControlTransaction,
+    settlePlaybackPrepareTransaction,
     terminateStrictPlaybackHandoff,
     updatePlaybackContextState,
 )
@@ -1316,6 +1330,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 "state": "playing",
                 "trackId": "song-1",
                 "positionMs": 999,
+                "appliedControlVersion": 1,
                 "clientSeq": 1,
                 "muted": True,
                 "outputDeviceId": "dac-1",
@@ -1346,6 +1361,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 "state": "playing",
                 "trackId": "song-1",
                 "positionMs": 999,
+                "appliedControlVersion": 1,
                 "clientSeq": 1,
                 "muted": True,
                 "outputDeviceId": "dac-1",
@@ -1366,6 +1382,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertEqual(v2_feedback["deviceSessionId"], "root:pc")
         self.assertTrue(v2_feedback["muted"])
         self.assertEqual(v2_feedback["clientSeq"], 1)
+        self.assertEqual(v2_feedback["appliedControlVersion"], 1)
         self.assertNotIn("outputDeviceId", v2_feedback)
         self.assertNotIn("audioDeviceName", v2_feedback)
 
@@ -1474,3 +1491,232 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertEqual(queue_state["currentIndex"], 1)
         self.assertEqual(queue_state["queueSongIds"][1], "songId4")
         self.assertIn("serverUpdatedAtMs", queue_state)
+
+    def test_control_transaction_is_persistent_ordered_and_terminal_idempotent(self):
+        transaction, created = createPlaybackControlTransaction(
+            "context-1",
+            "alice",
+            1,
+            2,
+            "controller-1",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            1,
+            "player.next",
+            {"queueIndex": 1, "trackId": "song-2"},
+            1000,
+            15000,
+        )
+
+        self.assertTrue(created)
+        self.assertEqual(transaction["status"], "pending")
+        self.assertEqual(transaction["watchdogDeadlineAtMs"], 18000)
+        self.assertEqual(
+            getPlaybackControlTransaction("context-1", 1, 2),
+            transaction,
+        )
+        self.assertEqual(listExpiredPlaybackControlTransactions(17999), [])
+        self.assertEqual(
+            [item["commandControlVersion"] for item in listPendingPlaybackControlTransactions("context-1", 1)],
+            [2],
+        )
+        self.assertEqual(
+            [item["commandControlVersion"] for item in listExpiredPlaybackControlTransactions(18000)],
+            [2],
+        )
+
+        terminal, changed = settlePlaybackControlTransaction(
+            "context-1",
+            1,
+            2,
+            "failed",
+            18000,
+            error_code="execution_unknown",
+            applied_control_version=1,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(terminal["status"], "failed")
+        self.assertEqual(listPendingPlaybackControlTransactions("context-1", 1), [])
+
+        replay, changed = settlePlaybackControlTransaction(
+            "context-1",
+            1,
+            2,
+            "failed",
+            18000,
+            error_code="execution_unknown",
+            applied_control_version=1,
+        )
+        self.assertFalse(changed)
+        self.assertEqual(replay, terminal)
+
+        with self.assertRaises(PlaybackControlTransactionConflictError):
+            settlePlaybackControlTransaction(
+                "context-1",
+                1,
+                2,
+                "committed",
+                18001,
+                applied_control_version=2,
+            )
+
+    def test_prepare_transaction_enforces_one_active_intent_and_terminal_replay(self):
+        request_payload = {
+            "initialQueue": {
+                "queueSongIds": ["song-1"],
+                "currentIndex": 0,
+                "positionMs": 0,
+            }
+        }
+        prepare, created = createPlaybackPrepareTransaction(
+            "context-1",
+            "alice",
+            1,
+            "intent-1",
+            "controller-1",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            1,
+            request_payload,
+            1,
+            11000,
+        )
+        self.assertTrue(created)
+        self.assertEqual(prepare["status"], "preparing")
+        self.assertEqual(
+            getPlaybackPrepareTransaction("context-1", 1, "intent-1"),
+            prepare,
+        )
+        self.assertEqual(listExpiredPlaybackPrepareTransactions(10999), [])
+        self.assertEqual(
+            [item["intentId"] for item in listExpiredPlaybackPrepareTransactions(11000)],
+            ["intent-1"],
+        )
+
+        replay, created = createPlaybackPrepareTransaction(
+            "context-1",
+            "alice",
+            1,
+            "intent-1",
+            "controller-1",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            1,
+            request_payload,
+            1,
+            11000,
+        )
+        self.assertFalse(created)
+        self.assertEqual(replay, prepare)
+
+        with self.assertRaises(PlaybackPrepareAlreadyActiveError):
+            createPlaybackPrepareTransaction(
+                "context-1",
+                "alice",
+                1,
+                "intent-2",
+                "controller-1",
+                "player-1",
+                "device:player-1",
+                "nonce-1",
+                1,
+                {},
+                1,
+                11000,
+            )
+
+        terminal, changed = settlePlaybackPrepareTransaction(
+            "context-1",
+            1,
+            "intent-1",
+            "ready",
+            {
+                "playbackContextId": "context-1",
+                "intentId": "intent-1",
+                "ready": True,
+                "controlVersion": 1,
+            },
+            10500,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(terminal["status"], "ready")
+
+        replay, changed = settlePlaybackPrepareTransaction(
+            "context-1",
+            1,
+            "intent-1",
+            "ready",
+            terminal["canonicalResult"],
+            10500,
+        )
+        self.assertFalse(changed)
+        self.assertEqual(replay, terminal)
+
+        with self.assertRaises(PlaybackPrepareTransactionConflictError):
+            settlePlaybackPrepareTransaction(
+                "context-1",
+                1,
+                "intent-1",
+                "failed",
+                {"ready": False},
+                10501,
+                error_code="prepare_timeout",
+            )
+
+    def test_local_intent_replays_first_canonical_result_and_rejects_conflict(self):
+        request_payload = {
+            "intentId": "local-1",
+            "queueIndex": 1,
+            "trackId": "song-2",
+        }
+        canonical_update = {
+            "origin": "localUser",
+            "controlVersion": 3,
+            "appliedControlVersion": 3,
+        }
+        intent, created = savePlaybackLocalIntent(
+            "context-1",
+            "alice",
+            1,
+            "local-1",
+            "player-1",
+            "device:player-1",
+            request_payload,
+            canonical_update,
+            3,
+            2,
+        )
+        self.assertTrue(created)
+        self.assertEqual(intent["canonicalUpdate"], canonical_update)
+
+        replay, created = savePlaybackLocalIntent(
+            "context-1",
+            "alice",
+            1,
+            "local-1",
+            "player-1",
+            "device:player-1",
+            request_payload,
+            {"ignored": "later-result"},
+            4,
+            3,
+        )
+        self.assertFalse(created)
+        self.assertEqual(replay, intent)
+
+        with self.assertRaises(PlaybackLocalIntentConflictError):
+            savePlaybackLocalIntent(
+                "context-1",
+                "alice",
+                1,
+                "local-1",
+                "player-1",
+                "device:player-1",
+                dict(request_payload, queueIndex=0),
+                canonical_update,
+                3,
+                2,
+            )

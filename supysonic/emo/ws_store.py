@@ -11,8 +11,11 @@ from peewee import IntegrityError, SqliteDatabase
 from ..db import (
     EmoDevicePlaybackState,
     EmoLocalQueue,
+    EmoPlaybackControlTransaction,
     EmoPlaybackContext,
     EmoPlaybackHandoff,
+    EmoPlaybackLocalIntent,
+    EmoPlaybackPrepareTransaction,
     EmoPlaybackState,
     EmoSessionQueue,
     close_connection,
@@ -47,6 +50,22 @@ class PlaybackContextAuthorityAmbiguousError(Exception):
             "Playback context authority/device pair is ambiguous"
         )
         self.playback_context = playback_context
+
+
+class PlaybackControlTransactionConflictError(Exception):
+    pass
+
+
+class PlaybackPrepareTransactionConflictError(Exception):
+    pass
+
+
+class PlaybackPrepareAlreadyActiveError(Exception):
+    pass
+
+
+class PlaybackLocalIntentConflictError(Exception):
+    pass
 
 
 AuthorityPair = Tuple[str, str, str]
@@ -227,6 +246,568 @@ def _payload_value_or_default(payload, key, default):
     return default if value is None else value
 
 
+def _canonical_json(value):
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _json_fingerprint(value):
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _load_json_object(value):
+    if not value:
+        return None
+    loaded = json.loads(value)
+    if not isinstance(loaded, dict):
+        raise ValueError("Persisted transaction JSON must be an object")
+    return loaded
+
+
+def serializePlaybackControlTransaction(record):
+    if record is None:
+        return None
+    payload = {
+        "playbackContextId": record.playback_context_id,
+        "userName": record.user_name,
+        "epoch": record.epoch,
+        "commandControlVersion": record.command_control_version,
+        "requestingClientId": record.requesting_client_id,
+        "authorityClientId": record.authority_client_id,
+        "authorityDeviceSessionId": record.authority_device_session_id,
+        "routedConnectionNonce": record.routed_connection_nonce,
+        "routedConnectionEpoch": record.routed_connection_epoch,
+        "action": record.action,
+        "acceptedTarget": _load_json_object(record.accepted_target_json),
+        "status": record.status,
+        "acceptedAtMs": record.accepted_at_ms,
+        "executionTimeoutMs": record.execution_timeout_ms,
+        "watchdogDeadlineAtMs": record.watchdog_deadline_at_ms,
+    }
+    optional = {
+        "errorCode": record.error_code,
+        "dependsOnControlVersion": record.depends_on_control_version,
+        "appliedControlVersion": record.applied_control_version,
+        "terminalFingerprint": record.terminal_fingerprint,
+        "terminalAtMs": record.terminal_at_ms,
+    }
+    payload.update({key: value for key, value in optional.items() if value is not None})
+    return payload
+
+
+def _control_transaction_identity(
+    user_name,
+    requesting_client_id,
+    authority_client_id,
+    authority_device_session_id,
+    routed_connection_nonce,
+    routed_connection_epoch,
+    action,
+    accepted_target_json,
+    accepted_at_ms,
+    execution_timeout_ms,
+):
+    return (
+        user_name,
+        requesting_client_id,
+        authority_client_id,
+        authority_device_session_id,
+        routed_connection_nonce,
+        routed_connection_epoch,
+        action,
+        accepted_target_json,
+        accepted_at_ms,
+        execution_timeout_ms,
+    )
+
+
+@_serialize_strict_playback_context_mutation
+def createPlaybackControlTransaction(
+    playback_context_id,
+    user_name,
+    epoch,
+    command_control_version,
+    requesting_client_id,
+    authority_client_id,
+    authority_device_session_id,
+    routed_connection_nonce,
+    routed_connection_epoch,
+    action,
+    accepted_target,
+    accepted_at_ms,
+    execution_timeout_ms,
+):
+    if execution_timeout_ms < 1:
+        raise ValueError("executionTimeoutMs must be positive")
+    accepted_target_json = _canonical_json(accepted_target)
+    identity = _control_transaction_identity(
+        user_name,
+        requesting_client_id,
+        authority_client_id,
+        authority_device_session_id,
+        routed_connection_nonce,
+        routed_connection_epoch,
+        action,
+        accepted_target_json,
+        accepted_at_ms,
+        execution_timeout_ms,
+    )
+    open_connection(reuse=True)
+    try:
+        with _strict_playback_context_transaction():
+            existing = EmoPlaybackControlTransaction.get_or_none(
+                (EmoPlaybackControlTransaction.playback_context_id == playback_context_id)
+                & (EmoPlaybackControlTransaction.epoch == epoch)
+                & (
+                    EmoPlaybackControlTransaction.command_control_version
+                    == command_control_version
+                )
+            )
+            if existing is not None:
+                existing_identity = _control_transaction_identity(
+                    existing.user_name,
+                    existing.requesting_client_id,
+                    existing.authority_client_id,
+                    existing.authority_device_session_id,
+                    existing.routed_connection_nonce,
+                    existing.routed_connection_epoch,
+                    existing.action,
+                    existing.accepted_target_json,
+                    existing.accepted_at_ms,
+                    existing.execution_timeout_ms,
+                )
+                if existing_identity != identity:
+                    raise PlaybackControlTransactionConflictError(
+                        "Control transaction identity conflict"
+                    )
+                return serializePlaybackControlTransaction(existing), False
+            record = EmoPlaybackControlTransaction.create(
+                playback_context_id=playback_context_id,
+                user_name=user_name,
+                epoch=epoch,
+                command_control_version=command_control_version,
+                requesting_client_id=requesting_client_id,
+                authority_client_id=authority_client_id,
+                authority_device_session_id=authority_device_session_id,
+                routed_connection_nonce=routed_connection_nonce,
+                routed_connection_epoch=routed_connection_epoch,
+                action=action,
+                accepted_target_json=accepted_target_json,
+                status="pending",
+                accepted_at_ms=accepted_at_ms,
+                execution_timeout_ms=execution_timeout_ms,
+                watchdog_deadline_at_ms=(accepted_at_ms + execution_timeout_ms + 2000),
+            )
+            return serializePlaybackControlTransaction(record), True
+    finally:
+        close_connection()
+
+
+def getPlaybackControlTransaction(
+    playback_context_id,
+    epoch,
+    command_control_version,
+):
+    open_connection(reuse=True)
+    try:
+        record = EmoPlaybackControlTransaction.get_or_none(
+            (EmoPlaybackControlTransaction.playback_context_id == playback_context_id)
+            & (EmoPlaybackControlTransaction.epoch == epoch)
+            & (
+                EmoPlaybackControlTransaction.command_control_version
+                == command_control_version
+            )
+        )
+        return serializePlaybackControlTransaction(record)
+    finally:
+        close_connection()
+
+
+def listPendingPlaybackControlTransactions(playback_context_id, epoch):
+    open_connection(reuse=True)
+    try:
+        query = (
+            EmoPlaybackControlTransaction.select()
+            .where(
+                (EmoPlaybackControlTransaction.playback_context_id == playback_context_id)
+                & (EmoPlaybackControlTransaction.epoch == epoch)
+                & (EmoPlaybackControlTransaction.status == "pending")
+            )
+            .order_by(EmoPlaybackControlTransaction.command_control_version)
+        )
+        return [serializePlaybackControlTransaction(record) for record in query]
+    finally:
+        close_connection()
+
+
+def listExpiredPlaybackControlTransactions(deadline_at_ms):
+    open_connection(reuse=True)
+    try:
+        query = (
+            EmoPlaybackControlTransaction.select()
+            .where(
+                (EmoPlaybackControlTransaction.status == "pending")
+                & (
+                    EmoPlaybackControlTransaction.watchdog_deadline_at_ms
+                    <= deadline_at_ms
+                )
+            )
+            .order_by(
+                EmoPlaybackControlTransaction.watchdog_deadline_at_ms,
+                EmoPlaybackControlTransaction.playback_context_id,
+                EmoPlaybackControlTransaction.epoch,
+                EmoPlaybackControlTransaction.command_control_version,
+            )
+        )
+        return [serializePlaybackControlTransaction(record) for record in query]
+    finally:
+        close_connection()
+
+
+@_serialize_strict_playback_context_mutation
+def settlePlaybackControlTransaction(
+    playback_context_id,
+    epoch,
+    command_control_version,
+    status,
+    terminal_at_ms,
+    error_code=None,
+    depends_on_control_version=None,
+    applied_control_version=None,
+):
+    if status not in {"committed", "failed", "superseded"}:
+        raise ValueError("Invalid control transaction terminal status")
+    terminal = {
+        "status": status,
+        "errorCode": error_code,
+        "dependsOnControlVersion": depends_on_control_version,
+        "appliedControlVersion": applied_control_version,
+    }
+    terminal_fingerprint = _json_fingerprint(terminal)
+    open_connection(reuse=True)
+    try:
+        with _strict_playback_context_transaction():
+            record = EmoPlaybackControlTransaction.get_or_none(
+                (EmoPlaybackControlTransaction.playback_context_id == playback_context_id)
+                & (EmoPlaybackControlTransaction.epoch == epoch)
+                & (
+                    EmoPlaybackControlTransaction.command_control_version
+                    == command_control_version
+                )
+            )
+            if record is None:
+                return None, False
+            if record.status != "pending":
+                if record.terminal_fingerprint != terminal_fingerprint:
+                    raise PlaybackControlTransactionConflictError(
+                        "Control transaction terminal conflict"
+                    )
+                return serializePlaybackControlTransaction(record), False
+            updated = (
+                EmoPlaybackControlTransaction.update(
+                    status=status,
+                    error_code=error_code,
+                    depends_on_control_version=depends_on_control_version,
+                    applied_control_version=applied_control_version,
+                    terminal_fingerprint=terminal_fingerprint,
+                    terminal_at_ms=terminal_at_ms,
+                    updated_at=now(),
+                )
+                .where(
+                    (EmoPlaybackControlTransaction.id == record.id)
+                    & (EmoPlaybackControlTransaction.status == "pending")
+                )
+                .execute()
+            )
+            if updated != 1:
+                raise PlaybackControlTransactionConflictError(
+                    "Control transaction changed concurrently"
+                )
+            record = EmoPlaybackControlTransaction.get_by_id(record.id)
+            return serializePlaybackControlTransaction(record), True
+    finally:
+        close_connection()
+
+
+def serializePlaybackPrepareTransaction(record):
+    if record is None:
+        return None
+    payload = {
+        "playbackContextId": record.playback_context_id,
+        "userName": record.user_name,
+        "epoch": record.epoch,
+        "intentId": record.intent_id,
+        "requestingClientId": record.requesting_client_id,
+        "authorityClientId": record.authority_client_id,
+        "authorityDeviceSessionId": record.authority_device_session_id,
+        "routedConnectionNonce": record.routed_connection_nonce,
+        "routedConnectionEpoch": record.routed_connection_epoch,
+        "requestFingerprint": record.request_fingerprint,
+        "controlVersion": record.control_version,
+        "status": record.status,
+        "deadlineAtMs": record.deadline_at_ms,
+    }
+    if record.initial_queue_json is not None:
+        payload["initialQueue"] = _load_json_object(record.initial_queue_json)
+    if record.canonical_result_json is not None:
+        payload["canonicalResult"] = _load_json_object(record.canonical_result_json)
+    optional = {
+        "errorCode": record.error_code,
+        "errorMessage": record.error_message,
+        "terminalAtMs": record.terminal_at_ms,
+    }
+    payload.update({key: value for key, value in optional.items() if value is not None})
+    return payload
+
+
+@_serialize_strict_playback_context_mutation
+def createPlaybackPrepareTransaction(
+    playback_context_id,
+    user_name,
+    epoch,
+    intent_id,
+    requesting_client_id,
+    authority_client_id,
+    authority_device_session_id,
+    routed_connection_nonce,
+    routed_connection_epoch,
+    request_payload,
+    control_version,
+    deadline_at_ms,
+):
+    request_fingerprint = _json_fingerprint(request_payload)
+    initial_queue = request_payload.get("initialQueue")
+    initial_queue_json = (
+        _canonical_json(initial_queue) if initial_queue is not None else None
+    )
+    open_connection(reuse=True)
+    try:
+        with _strict_playback_context_transaction():
+            existing = EmoPlaybackPrepareTransaction.get_or_none(
+                (EmoPlaybackPrepareTransaction.playback_context_id == playback_context_id)
+                & (EmoPlaybackPrepareTransaction.epoch == epoch)
+                & (EmoPlaybackPrepareTransaction.intent_id == intent_id)
+            )
+            if existing is not None:
+                if existing.request_fingerprint != request_fingerprint:
+                    raise PlaybackPrepareTransactionConflictError(
+                        "Prepare intent content conflict"
+                    )
+                return serializePlaybackPrepareTransaction(existing), False
+            active = EmoPlaybackPrepareTransaction.get_or_none(
+                (EmoPlaybackPrepareTransaction.playback_context_id == playback_context_id)
+                & (EmoPlaybackPrepareTransaction.epoch == epoch)
+                & (EmoPlaybackPrepareTransaction.status == "preparing")
+            )
+            if active is not None:
+                raise PlaybackPrepareAlreadyActiveError(
+                    "Another prepare transaction is active"
+                )
+            record = EmoPlaybackPrepareTransaction.create(
+                playback_context_id=playback_context_id,
+                user_name=user_name,
+                epoch=epoch,
+                intent_id=intent_id,
+                requesting_client_id=requesting_client_id,
+                authority_client_id=authority_client_id,
+                authority_device_session_id=authority_device_session_id,
+                routed_connection_nonce=routed_connection_nonce,
+                routed_connection_epoch=routed_connection_epoch,
+                request_fingerprint=request_fingerprint,
+                initial_queue_json=initial_queue_json,
+                control_version=control_version,
+                status="preparing",
+                deadline_at_ms=deadline_at_ms,
+            )
+            return serializePlaybackPrepareTransaction(record), True
+    finally:
+        close_connection()
+
+
+def getPlaybackPrepareTransaction(playback_context_id, epoch, intent_id):
+    open_connection(reuse=True)
+    try:
+        record = EmoPlaybackPrepareTransaction.get_or_none(
+            (EmoPlaybackPrepareTransaction.playback_context_id == playback_context_id)
+            & (EmoPlaybackPrepareTransaction.epoch == epoch)
+            & (EmoPlaybackPrepareTransaction.intent_id == intent_id)
+        )
+        return serializePlaybackPrepareTransaction(record)
+    finally:
+        close_connection()
+
+
+def listExpiredPlaybackPrepareTransactions(deadline_at_ms):
+    open_connection(reuse=True)
+    try:
+        query = (
+            EmoPlaybackPrepareTransaction.select()
+            .where(
+                (EmoPlaybackPrepareTransaction.status == "preparing")
+                & (EmoPlaybackPrepareTransaction.deadline_at_ms <= deadline_at_ms)
+            )
+            .order_by(
+                EmoPlaybackPrepareTransaction.deadline_at_ms,
+                EmoPlaybackPrepareTransaction.playback_context_id,
+                EmoPlaybackPrepareTransaction.epoch,
+                EmoPlaybackPrepareTransaction.intent_id,
+            )
+        )
+        return [serializePlaybackPrepareTransaction(record) for record in query]
+    finally:
+        close_connection()
+
+
+@_serialize_strict_playback_context_mutation
+def settlePlaybackPrepareTransaction(
+    playback_context_id,
+    epoch,
+    intent_id,
+    status,
+    canonical_result,
+    terminal_at_ms,
+    error_code=None,
+    error_message=None,
+):
+    if status not in {"ready", "failed"}:
+        raise ValueError("Invalid prepare terminal status")
+    canonical_result_json = _canonical_json(canonical_result)
+    open_connection(reuse=True)
+    try:
+        with _strict_playback_context_transaction():
+            record = EmoPlaybackPrepareTransaction.get_or_none(
+                (EmoPlaybackPrepareTransaction.playback_context_id == playback_context_id)
+                & (EmoPlaybackPrepareTransaction.epoch == epoch)
+                & (EmoPlaybackPrepareTransaction.intent_id == intent_id)
+            )
+            if record is None:
+                return None, False
+            terminal_identity = (
+                status,
+                canonical_result_json,
+                error_code,
+                error_message,
+            )
+            if record.status != "preparing":
+                existing_identity = (
+                    record.status,
+                    record.canonical_result_json,
+                    record.error_code,
+                    record.error_message,
+                )
+                if existing_identity != terminal_identity:
+                    raise PlaybackPrepareTransactionConflictError(
+                        "Prepare terminal conflict"
+                    )
+                return serializePlaybackPrepareTransaction(record), False
+            updated = (
+                EmoPlaybackPrepareTransaction.update(
+                    status=status,
+                    error_code=error_code,
+                    error_message=error_message,
+                    canonical_result_json=canonical_result_json,
+                    terminal_at_ms=terminal_at_ms,
+                    updated_at=now(),
+                )
+                .where(
+                    (EmoPlaybackPrepareTransaction.id == record.id)
+                    & (EmoPlaybackPrepareTransaction.status == "preparing")
+                )
+                .execute()
+            )
+            if updated != 1:
+                raise PlaybackPrepareTransactionConflictError(
+                    "Prepare transaction changed concurrently"
+                )
+            record = EmoPlaybackPrepareTransaction.get_by_id(record.id)
+            return serializePlaybackPrepareTransaction(record), True
+    finally:
+        close_connection()
+
+
+def serializePlaybackLocalIntent(record):
+    if record is None:
+        return None
+    return {
+        "playbackContextId": record.playback_context_id,
+        "userName": record.user_name,
+        "epoch": record.epoch,
+        "intentId": record.intent_id,
+        "authorityClientId": record.authority_client_id,
+        "authorityDeviceSessionId": record.authority_device_session_id,
+        "requestFingerprint": record.request_fingerprint,
+        "canonicalUpdate": _load_json_object(record.canonical_update_json),
+        "controlVersion": record.control_version,
+        "supersededThroughControlVersion": (
+            record.superseded_through_control_version
+        ),
+    }
+
+
+@_serialize_strict_playback_context_mutation
+def savePlaybackLocalIntent(
+    playback_context_id,
+    user_name,
+    epoch,
+    intent_id,
+    authority_client_id,
+    authority_device_session_id,
+    request_payload,
+    canonical_update,
+    control_version,
+    superseded_through_control_version,
+):
+    request_fingerprint = _json_fingerprint(request_payload)
+    canonical_update_json = _canonical_json(canonical_update)
+    open_connection(reuse=True)
+    try:
+        with _strict_playback_context_transaction():
+            existing = EmoPlaybackLocalIntent.get_or_none(
+                (EmoPlaybackLocalIntent.playback_context_id == playback_context_id)
+                & (EmoPlaybackLocalIntent.epoch == epoch)
+                & (EmoPlaybackLocalIntent.intent_id == intent_id)
+            )
+            if existing is not None:
+                identity = (
+                    existing.user_name,
+                    existing.authority_client_id,
+                    existing.authority_device_session_id,
+                    existing.request_fingerprint,
+                )
+                expected = (
+                    user_name,
+                    authority_client_id,
+                    authority_device_session_id,
+                    request_fingerprint,
+                )
+                if identity != expected:
+                    raise PlaybackLocalIntentConflictError(
+                        "Local intent content or binding conflict"
+                    )
+                return serializePlaybackLocalIntent(existing), False
+            record = EmoPlaybackLocalIntent.create(
+                playback_context_id=playback_context_id,
+                user_name=user_name,
+                epoch=epoch,
+                intent_id=intent_id,
+                authority_client_id=authority_client_id,
+                authority_device_session_id=authority_device_session_id,
+                request_fingerprint=request_fingerprint,
+                canonical_update_json=canonical_update_json,
+                control_version=control_version,
+                superseded_through_control_version=(
+                    superseded_through_control_version
+                ),
+            )
+            return serializePlaybackLocalIntent(record), True
+    finally:
+        close_connection()
+
+
 def serializePlaybackContextV2(playback_context):
     if playback_context is None:
         return None
@@ -275,10 +856,13 @@ def serializeDevicePlaybackStateV2(device_state):
         "deviceSessionId": device_state.get("deviceSessionId"),
         "state": device_state.get("state"),
         "positionMs": device_state.get("positionMs", 0),
+        "appliedControlVersion": device_state.get("appliedControlVersion"),
         "clientSeq": device_state.get("clientSeq"),
         "serverUpdatedAtMs": device_state.get("serverUpdatedAtMs"),
     }
     if any(value is None for value in payload.values()):
+        return None
+    if payload["appliedControlVersion"] < 1 or payload["clientSeq"] < 1:
         return None
     for field_name in ("trackId", "volume", "muted"):
         value = device_state.get(field_name)
@@ -1440,6 +2024,9 @@ def _device_playback_state_payload(record):
             "volume": record.volume,
             "isAuthority": bool(record.is_authority),
             "mode": record.mode,
+            "contextEpoch": record.context_epoch,
+            "appliedControlVersion": record.applied_control_version,
+            "clientSeq": record.client_seq,
             "updatedAt": record.updated_at.timestamp(),
         }
     )
@@ -1511,6 +2098,9 @@ def saveDevicePlaybackState(
     track_id = payload.get("trackId")
     position_ms = payload.get("positionMs") or 0
     volume = payload.get("volume")
+    context_epoch = payload.get("epoch") or payload.get("contextEpoch") or 1
+    applied_control_version = payload.get("appliedControlVersion") or 0
+    client_seq = payload.get("clientSeq") or 0
     payload.pop("updatedAt", None)
     payload.pop("serverTimeMs", None)
 
@@ -1541,6 +2131,9 @@ def saveDevicePlaybackState(
                 volume=volume,
                 is_authority=1 if is_authority else 0,
                 mode=mode,
+                context_epoch=context_epoch,
+                applied_control_version=applied_control_version,
+                client_seq=client_seq,
                 playback_json=json.dumps(payload, ensure_ascii=True),
             )
             return
@@ -1554,6 +2147,9 @@ def saveDevicePlaybackState(
         record.volume = volume
         record.is_authority = 1 if is_authority else 0
         record.mode = mode
+        record.context_epoch = context_epoch
+        record.applied_control_version = applied_control_version
+        record.client_seq = client_seq
         record.playback_json = json.dumps(payload, ensure_ascii=True)
         record.updated_at = now()
         record.save()
