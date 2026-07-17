@@ -25,7 +25,7 @@ class StrictV2ManifestTestCase(unittest.TestCase):
 
         self.assertEqual(contract_hash, STRICT_V2_CONTRACT_SHA256)
         self.assertEqual(self.manifest["contractSha256"], contract_hash)
-        self.assertEqual(self.manifest["protocolVersion"], "2.3.0")
+        self.assertEqual(self.manifest["protocolVersion"], "2.4.0")
 
     def test_manifest_covers_every_strict_client_action(self):
         expected_actions = {
@@ -36,7 +36,9 @@ class StrictV2ManifestTestCase(unittest.TestCase):
             "device.volume.update",
             "system.ping",
             "playback.context.list",
-            "playback.context.create",
+            "playback.context.ensure",
+            "playback.context.prepare",
+            "playback.context.prepared",
             "playback.context.subscribe",
             "playback.context.unsubscribe",
             "playback.context.status",

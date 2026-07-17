@@ -59,20 +59,24 @@ ACTION_SCHEMAS = {
         "state",
         ("authorityClientId", "authorityDeviceSessionId"),
     ),
-    "playback.context.create": ActionSchema(
+    "playback.context.ensure": ActionSchema(
         "command",
         (
-            "playbackContextId",
             "deviceSessionId",
             "queueSongIds",
-            "currentIndex",
             "positionMs",
             "state",
         ),
+        ("currentIndex",),
     ),
     "playback.context.subscribe": ActionSchema("state", ("playbackContextId",)),
     "playback.context.unsubscribe": ActionSchema("state", ("playbackContextId",)),
     "playback.context.status": ActionSchema("state", ("playbackContextId",)),
+    "playback.context.prepare": ActionSchema(
+        "command",
+        ("playbackContextId", "intentId", "baseControlVersion"),
+        ("initialQueueSongIds", "currentIndex", "positionMs"),
+    ),
     "playback.context.close": ActionSchema("command", ("playbackContextId",)),
     "queue.context.sync": ActionSchema(
         "state",
@@ -80,16 +84,40 @@ ACTION_SCHEMAS = {
             "playbackContextId",
             "deviceSessionId",
             "queueSongIds",
-            "currentIndex",
             "positionMs",
             "baseQueueRevision",
         ),
-        ("baseControlVersion",),
+        ("currentIndex", "baseControlVersion"),
+    ),
+    "playback.context.prepared": ActionSchema(
+        "event",
+        ("playbackContextId", "deviceSessionId", "intentId", "ready"),
+        ("errorCode", "errorMessage"),
     ),
     "playback.update": ActionSchema(
         "event",
-        ("playbackContextId", "deviceSessionId", "state", "positionMs", "clientSeq"),
-        ("trackId", "volume", "muted"),
+        (
+            "playbackContextId",
+            "deviceSessionId",
+            "origin",
+            "state",
+            "positionMs",
+            "clientSeq",
+        ),
+        (
+            "trackId",
+            "volume",
+            "muted",
+            "executionStatus",
+            "commandControlVersion",
+            "appliedControlVersion",
+            "intentId",
+            "epoch",
+            "observedControlVersion",
+            "queueIndex",
+            "errorCode",
+            "errorMessage",
+        ),
     ),
     "queue.playItem": ActionSchema(
         "command",
@@ -159,6 +187,7 @@ _ID_FIELDS = {
     "targetClientId",
     "targetDeviceSessionId",
     "trackId",
+    "intentId",
 }
 _NON_NEGATIVE_INT_FIELDS = {
     "currentIndex",
@@ -166,6 +195,12 @@ _NON_NEGATIVE_INT_FIELDS = {
     "queueIndex",
     "baseQueueRevision",
     "baseControlVersion",
+}
+_POSITIVE_INT_FIELDS = {
+    "epoch",
+    "commandControlVersion",
+    "appliedControlVersion",
+    "observedControlVersion",
 }
 _BOOLEAN_FIELDS = {"ready", "muted", "autoPlay"}
 
@@ -246,7 +281,11 @@ def _validate_roles(value: object) -> Tuple[str, ...]:
     return tuple(role for role in ("player", "controller") if role in value)
 
 
-def _validate_field(payload: Dict[str, object], field_name: str) -> None:
+def _validate_field(
+    payload: Dict[str, object],
+    field_name: str,
+    action: str,
+) -> None:
     value = payload[field_name]
     if field_name in _ID_FIELDS:
         payload[field_name] = _normalize_string(value, field_name)
@@ -258,6 +297,9 @@ def _validate_field(payload: Dict[str, object], field_name: str) -> None:
     elif field_name in _NON_NEGATIVE_INT_FIELDS:
         if not _is_int(value) or value < 0:
             raise StrictRequestValidationError("%s must be an integer >= 0" % field_name)
+    elif field_name in _POSITIVE_INT_FIELDS:
+        if not _is_int(value) or value < 1:
+            raise StrictRequestValidationError("%s must be an integer >= 1" % field_name)
     elif field_name == "clientSeq":
         if not _is_int(value) or value < 1:
             raise StrictRequestValidationError("clientSeq must be an integer >= 1")
@@ -268,9 +310,18 @@ def _validate_field(payload: Dict[str, object], field_name: str) -> None:
         if not isinstance(value, bool):
             raise StrictRequestValidationError("%s must be a boolean" % field_name)
     elif field_name == "state":
-        if value not in {"playing", "paused", "stopped"}:
+        if value not in {"idle", "playing", "paused", "stopped"}:
             raise StrictRequestValidationError("state is invalid")
     elif field_name == "queueSongIds":
+        if not isinstance(value, list):
+            raise StrictRequestValidationError("queueSongIds must be an array")
+        if not value and action in {"playback.context.ensure", "queue.context.sync"}:
+            payload[field_name] = []
+        else:
+            payload[field_name] = list(
+                _normalize_string_array(value, field_name, MAX_QUEUE_ITEMS)
+            )
+    elif field_name == "initialQueueSongIds":
         payload[field_name] = list(
             _normalize_string_array(value, field_name, MAX_QUEUE_ITEMS)
         )
@@ -282,14 +333,163 @@ def _validate_field(payload: Dict[str, object], field_name: str) -> None:
         payload[field_name] = list(_validate_roles(value))
     elif field_name == "capabilities":
         payload[field_name] = _validate_capabilities(value)
+    elif field_name == "origin":
+        if value not in {"passive", "remoteCommand", "localUser"}:
+            raise StrictRequestValidationError("origin is invalid")
+    elif field_name == "executionStatus":
+        if value not in {"committed", "failed"}:
+            raise StrictRequestValidationError("executionStatus is invalid")
     else:
         raise StrictRequestValidationError("No validator exists for %s" % field_name)
 
 
 def _validate_action_combinations(action: str, payload: Dict[str, object]) -> None:
-    if action in {"playback.context.create", "queue.context.sync", "broadcast.start", "broadcast.queue.sync"}:
+    if action in {"broadcast.start", "broadcast.queue.sync"}:
         if payload["currentIndex"] >= len(payload["queueSongIds"]):
             raise StrictRequestValidationError("currentIndex is outside queueSongIds")
+    if action in {"playback.context.ensure", "queue.context.sync"}:
+        queue = payload["queueSongIds"]
+        if queue:
+            if "currentIndex" not in payload:
+                raise StrictRequestValidationError(
+                    "non-empty queueSongIds requires currentIndex"
+                )
+            if payload["currentIndex"] >= len(queue):
+                raise StrictRequestValidationError(
+                    "currentIndex is outside queueSongIds"
+                )
+            if action == "playback.context.ensure" and payload["state"] == "idle":
+                raise StrictRequestValidationError(
+                    "non-empty ensure queue forbids idle state"
+                )
+        else:
+            if "currentIndex" in payload:
+                raise StrictRequestValidationError(
+                    "empty queueSongIds forbids currentIndex"
+                )
+            if payload["positionMs"] != 0:
+                raise StrictRequestValidationError(
+                    "empty queueSongIds requires positionMs 0"
+                )
+            if action == "playback.context.ensure" and payload["state"] != "idle":
+                raise StrictRequestValidationError(
+                    "empty ensure queue requires idle state"
+                )
+    if action == "playback.context.prepare":
+        has_initial_queue = "initialQueueSongIds" in payload
+        has_index = "currentIndex" in payload
+        has_position = "positionMs" in payload
+        if has_initial_queue != has_index or has_initial_queue != has_position:
+            raise StrictRequestValidationError(
+                "initialQueueSongIds, currentIndex and positionMs must appear together"
+            )
+        if has_initial_queue and payload["currentIndex"] >= len(
+            payload["initialQueueSongIds"]
+        ):
+            raise StrictRequestValidationError(
+                "currentIndex is outside initialQueueSongIds"
+            )
+    if action == "playback.context.prepared":
+        if payload["ready"]:
+            if "errorCode" in payload or "errorMessage" in payload:
+                raise StrictRequestValidationError("ready:true forbids error fields")
+        elif "errorCode" not in payload:
+            raise StrictRequestValidationError("ready:false requires errorCode")
+        elif payload["errorCode"] not in {
+            "queue_required",
+            "restore_failed",
+            "prepare_timeout",
+            "authority_changed",
+        }:
+            raise StrictRequestValidationError(
+                "playback.context.prepared errorCode is invalid"
+            )
+    if action == "playback.update":
+        state_is_idle = payload["state"] == "idle"
+        if state_is_idle:
+            if payload["positionMs"] != 0 or "trackId" in payload:
+                raise StrictRequestValidationError(
+                    "idle playback.update requires positionMs 0 and forbids trackId"
+                )
+        elif "trackId" not in payload:
+            raise StrictRequestValidationError(
+                "non-idle playback.update requires trackId"
+            )
+
+        common_optional = {"trackId", "volume", "muted"}
+        origin = payload["origin"]
+        if origin == "passive":
+            required = {"appliedControlVersion"}
+            allowed = common_optional | required
+        elif origin == "remoteCommand":
+            required = {
+                "executionStatus",
+                "commandControlVersion",
+                "appliedControlVersion",
+            }
+            allowed = common_optional | required | {"errorCode", "errorMessage"}
+        else:
+            required = {
+                "executionStatus",
+                "intentId",
+                "epoch",
+                "observedControlVersion",
+                "queueIndex",
+                "trackId",
+            }
+            allowed = common_optional | required
+
+        shape_fields = set(payload) - {
+            "playbackContextId",
+            "deviceSessionId",
+            "origin",
+            "state",
+            "positionMs",
+            "clientSeq",
+        }
+        missing = required - shape_fields
+        forbidden = shape_fields - allowed
+        if missing:
+            raise StrictRequestValidationError(
+                "playback.update is missing fields: %s" % ", ".join(sorted(missing))
+            )
+        if forbidden:
+            raise StrictRequestValidationError(
+                "playback.update forbids fields: %s" % ", ".join(sorted(forbidden))
+            )
+        if origin == "remoteCommand":
+            if payload["executionStatus"] == "committed":
+                if payload["appliedControlVersion"] != payload["commandControlVersion"]:
+                    raise StrictRequestValidationError(
+                        "committed appliedControlVersion must equal commandControlVersion"
+                    )
+                if "errorCode" in payload or "errorMessage" in payload:
+                    raise StrictRequestValidationError(
+                        "committed playback.update forbids error fields"
+                    )
+            else:
+                if payload["appliedControlVersion"] >= payload["commandControlVersion"]:
+                    raise StrictRequestValidationError(
+                        "failed appliedControlVersion must be below commandControlVersion"
+                    )
+                if payload.get("errorCode") not in {
+                    "playback_failed",
+                    "track_load_failed",
+                    "seek_failed",
+                    "execution_timeout",
+                }:
+                    raise StrictRequestValidationError(
+                        "failed playback.update requires a stable errorCode"
+                    )
+        if origin == "localUser":
+            if payload["executionStatus"] != "committed":
+                raise StrictRequestValidationError(
+                    "localUser playback.update must be committed"
+                )
+            if state_is_idle:
+                raise StrictRequestValidationError(
+                    "localUser playback.update cannot be idle"
+                )
     if action == "playback.ready":
         if payload["ready"]:
             if "errorCode" in payload or "errorMessage" in payload:
@@ -357,7 +557,7 @@ def validate_strict_request(message: object) -> Dict[str, object]:
             % (action, ", ".join(sorted(missing_payload_fields)))
         )
     for field_name in payload:
-        _validate_field(payload, field_name)
+        _validate_field(payload, field_name, action)
     _validate_action_combinations(action, payload)
 
     normalized = dict(message)
@@ -375,12 +575,15 @@ STRICT_OUTPUT_ACTIONS = {
     "device.setVolume",
     "device.volume.update",
     "playback.context.list",
-    "playback.context.create",
+    "playback.context.ensure",
+    "playback.context.prepare",
+    "playback.context.prepared",
     "playback.context.status",
     "playback.context.closed",
     "playback.context.bindings.changed",
     "queue.context.sync",
     "playback.update",
+    "playback.control.settled",
     "queue.playItem",
     "player.play",
     "player.pause",
@@ -408,12 +611,15 @@ _OUTPUT_ACTION_TYPES = {
     "device.setVolume": "command",
     "device.volume.update": "event",
     "playback.context.list": "state",
-    "playback.context.create": "state",
+    "playback.context.ensure": "state",
+    "playback.context.prepare": "command",
+    "playback.context.prepared": "event",
     "playback.context.status": "state",
     "playback.context.closed": "event",
     "playback.context.bindings.changed": "event",
     "queue.context.sync": "state",
     "playback.update": "event",
+    "playback.control.settled": "event",
     "queue.playItem": "command",
     "player.play": "command",
     "player.pause": "command",
@@ -437,13 +643,14 @@ _DIRECT_RESPONSE_ACTIONS = {
     "system.pong",
     "device.list",
     "playback.context.list",
-    "playback.context.create",
+    "playback.context.ensure",
 }
 
 _ACK_ONLY_REQUEST_ACTIONS = {
     "playback.context.subscribe",
     "playback.context.unsubscribe",
     "playback.context.close",
+    "playback.context.prepare",
     "device.setVolume",
     "queue.context.sync",
     "queue.playItem",
@@ -471,6 +678,7 @@ _ERROR_CODES = {
     "not_found",
     "context_closed",
     "authority_offline",
+    "queue_required",
     "conflict",
     "stale_version",
     "client_sequence_conflict",
@@ -640,7 +848,6 @@ def _validate_context_snapshot(
         "playbackContextId",
         "authorityClientId",
         "queueSongIds",
-        "currentIndex",
         "state",
         "positionMs",
         "queueRevision",
@@ -648,7 +855,7 @@ def _validate_context_snapshot(
         "version",
         "epoch",
     }
-    optional = {"trackId", "timelineId", "serverUpdatedAtMs"}
+    optional = {"currentIndex", "trackId", "timelineId", "serverUpdatedAtMs"}
     if require_server_updated:
         required.add("serverUpdatedAtMs")
         optional.remove("serverUpdatedAtMs")
@@ -658,20 +865,34 @@ def _validate_context_snapshot(
     queue = _output_string_array(
         snapshot["queueSongIds"],
         label + ".queueSongIds",
-        non_empty=True,
     )
-    current_index = _output_int(snapshot["currentIndex"], label + ".currentIndex")
-    if current_index >= len(queue):
-        _output_error("%s.currentIndex is outside queueSongIds" % label)
-    if snapshot["state"] not in {"playing", "paused", "stopped"}:
-        _output_error("%s.state is invalid" % label)
     _output_int(snapshot["positionMs"], label + ".positionMs")
-    for field_name in ("queueRevision", "controlVersion", "version", "epoch"):
-        _output_int(snapshot[field_name], "%s.%s" % (label, field_name), 1)
-    if "trackId" in snapshot:
+    if queue:
+        if "currentIndex" not in snapshot or "trackId" not in snapshot:
+            _output_error(
+                "%s queue-backed snapshot requires currentIndex and trackId" % label
+            )
+        current_index = _output_int(
+            snapshot["currentIndex"], label + ".currentIndex"
+        )
+        if current_index >= len(queue):
+            _output_error("%s.currentIndex is outside queueSongIds" % label)
+        if snapshot["state"] not in {"playing", "paused", "stopped"}:
+            _output_error("%s.state is invalid" % label)
         _output_string(snapshot["trackId"], label + ".trackId")
         if snapshot["trackId"] != queue[current_index]:
             _output_error("%s.trackId must match the current queue item" % label)
+    else:
+        if "currentIndex" in snapshot or "trackId" in snapshot:
+            _output_error(
+                "%s idle snapshot forbids currentIndex and trackId" % label
+            )
+        if snapshot["state"] != "idle" or snapshot["positionMs"] != 0:
+            _output_error(
+                "%s idle snapshot requires state idle and positionMs 0" % label
+            )
+    for field_name in ("queueRevision", "controlVersion", "version", "epoch"):
+        _output_int(snapshot[field_name], "%s.%s" % (label, field_name), 1)
     if "timelineId" in snapshot:
         _output_string(snapshot["timelineId"], label + ".timelineId")
     if "serverUpdatedAtMs" in snapshot:
@@ -688,6 +909,7 @@ def _validate_device_state(value: object, playback_context_id: str, label: str) 
             "deviceSessionId",
             "state",
             "positionMs",
+            "appliedControlVersion",
             "clientSeq",
             "serverUpdatedAtMs",
         },
@@ -698,13 +920,25 @@ def _validate_device_state(value: object, playback_context_id: str, label: str) 
         _output_string(state[field_name], "%s.%s" % (label, field_name))
     if state["playbackContextId"] != playback_context_id:
         _output_error("%s.playbackContextId does not match the Context" % label)
-    if state["state"] not in {"playing", "paused", "stopped"}:
+    if state["state"] not in {"idle", "playing", "paused", "stopped"}:
         _output_error("%s.state is invalid" % label)
     _output_int(state["positionMs"], label + ".positionMs")
+    _output_int(
+        state["appliedControlVersion"],
+        label + ".appliedControlVersion",
+        1,
+    )
     _output_int(state["clientSeq"], label + ".clientSeq", 1)
     _output_int(state["serverUpdatedAtMs"], label + ".serverUpdatedAtMs")
     if "trackId" in state:
         _output_string(state["trackId"], label + ".trackId")
+    if state["state"] == "idle":
+        if state["positionMs"] != 0 or "trackId" in state:
+            _output_error(
+                "%s idle state requires positionMs 0 and forbids trackId" % label
+            )
+    elif "trackId" not in state:
+        _output_error("%s non-idle state requires trackId" % label)
     if "volume" in state:
         volume = _output_int(state["volume"], label + ".volume")
         if volume > 100:
@@ -880,6 +1114,21 @@ def _validate_output_ack(payload: object) -> str:
         _output_string(ack["userName"], "auth.login ACK userName")
     elif request_action == "device.register":
         _validate_registration_ack(payload)
+    elif request_action == "playback.context.prepare":
+        ack = _output_object(
+            payload,
+            {"action", "intentId", "status", "controlVersion"},
+            set(),
+            "playback.context.prepare ACK payload",
+        )
+        _output_string(ack["intentId"], "playback.context.prepare ACK intentId")
+        if ack["status"] not in {"preparing", "ready"}:
+            _output_error("playback.context.prepare ACK status is invalid")
+        _output_int(
+            ack["controlVersion"],
+            "playback.context.prepare ACK controlVersion",
+            1,
+        )
     elif request_action == "playback.handoff.start":
         ack = _output_object(
             payload,
@@ -958,6 +1207,15 @@ def _validate_output_error(payload: object) -> str:
         _output_int(error["retryAfterMs"], "system.error retryAfterMs", 1)
     if code in {"context_closed", "authority_offline"} and "playbackContextId" not in error:
         _output_error("%s requires playbackContextId" % code)
+    if code == "queue_required":
+        required = {
+            "playbackContextId",
+            "currentControlVersion",
+            "currentQueueRevision",
+            "currentVersion",
+        }
+        if not required.issubset(error):
+            _output_error("queue_required requires Context and all canonical cursors")
     if code == "rate_limited" and "retryAfterMs" not in error:
         _output_error("rate_limited requires retryAfterMs")
     if code == "client_sequence_conflict" and "currentClientSeq" not in error:
@@ -968,6 +1226,211 @@ def _validate_output_error(payload: object) -> str:
     ):
         _output_error("stale_version requires a current cursor")
     return request_action
+
+
+def _validate_playback_update_output(payload: object) -> None:
+    required = {
+        "playbackContextId",
+        "sourceClientId",
+        "deviceSessionId",
+        "origin",
+        "controlVersion",
+        "appliedControlVersion",
+        "state",
+        "positionMs",
+        "clientSeq",
+        "serverUpdatedAtMs",
+    }
+    optional = {
+        "trackId",
+        "volume",
+        "muted",
+        "executionStatus",
+        "commandControlVersion",
+        "intentId",
+        "supersededThroughControlVersion",
+        "queueIndex",
+        "errorCode",
+        "errorMessage",
+    }
+    update = _output_object(
+        payload,
+        required,
+        optional,
+        "playback.update payload",
+    )
+    for field_name in ("playbackContextId", "sourceClientId", "deviceSessionId"):
+        _output_string(update[field_name], "playback.update %s" % field_name)
+    if update["origin"] not in {"passive", "remoteCommand", "localUser"}:
+        _output_error("playback.update origin is invalid")
+    control_version = _output_int(
+        update["controlVersion"], "playback.update controlVersion", 1
+    )
+    applied_version = _output_int(
+        update["appliedControlVersion"],
+        "playback.update appliedControlVersion",
+        1,
+    )
+    if applied_version > control_version:
+        _output_error("playback.update appliedControlVersion exceeds controlVersion")
+    if update["state"] not in {"idle", "playing", "paused", "stopped"}:
+        _output_error("playback.update state is invalid")
+    _output_int(update["positionMs"], "playback.update positionMs")
+    _output_int(update["clientSeq"], "playback.update clientSeq", 1)
+    _output_int(update["serverUpdatedAtMs"], "playback.update serverUpdatedAtMs")
+    if "volume" in update:
+        volume = _output_int(update["volume"], "playback.update volume")
+        if volume > 100:
+            _output_error("playback.update volume must be <= 100")
+    if "muted" in update:
+        _output_bool(update["muted"], "playback.update muted")
+    if update["state"] == "idle":
+        if update["positionMs"] != 0 or "trackId" in update:
+            _output_error(
+                "idle playback.update requires positionMs 0 and forbids trackId"
+            )
+    else:
+        if "trackId" not in update:
+            _output_error("non-idle playback.update requires trackId")
+        _output_string(update["trackId"], "playback.update trackId")
+
+    shape_fields = set(update) - required - {"trackId", "volume", "muted"}
+    if update["origin"] == "passive":
+        if shape_fields:
+            _output_error("passive playback.update contains transaction fields")
+        return
+
+    if update["origin"] == "remoteCommand":
+        remote_required = {"executionStatus", "commandControlVersion"}
+        if not remote_required.issubset(update):
+            _output_error("remoteCommand playback.update is missing transaction fields")
+        if shape_fields - remote_required - {"errorCode", "errorMessage"}:
+            _output_error("remoteCommand playback.update contains forbidden fields")
+        if update["executionStatus"] not in {"committed", "failed"}:
+            _output_error("remoteCommand executionStatus is invalid")
+        command_version = _output_int(
+            update["commandControlVersion"],
+            "playback.update commandControlVersion",
+            1,
+        )
+        if command_version > control_version:
+            _output_error("commandControlVersion exceeds controlVersion")
+        if update["executionStatus"] == "committed":
+            if applied_version != command_version:
+                _output_error(
+                    "committed appliedControlVersion must equal commandControlVersion"
+                )
+            if "errorCode" in update or "errorMessage" in update:
+                _output_error("committed playback.update forbids error fields")
+        else:
+            if applied_version >= command_version:
+                _output_error(
+                    "failed appliedControlVersion must be below commandControlVersion"
+                )
+            if update.get("errorCode") not in {
+                "playback_failed",
+                "track_load_failed",
+                "seek_failed",
+                "execution_timeout",
+            }:
+                _output_error("failed playback.update errorCode is invalid")
+            if "errorMessage" in update:
+                _output_string(
+                    update["errorMessage"],
+                    "playback.update errorMessage",
+                    512,
+                )
+        return
+
+    local_required = {
+        "executionStatus",
+        "intentId",
+        "supersededThroughControlVersion",
+        "queueIndex",
+    }
+    if not local_required.issubset(update):
+        _output_error("localUser playback.update is missing transaction fields")
+    if shape_fields != local_required:
+        _output_error("localUser playback.update contains forbidden fields")
+    if update["executionStatus"] != "committed":
+        _output_error("localUser playback.update must be committed")
+    if update["state"] == "idle" or applied_version != control_version:
+        _output_error(
+            "localUser playback.update must be non-idle and fully applied"
+        )
+    _output_string(update["intentId"], "playback.update intentId")
+    superseded = _output_int(
+        update["supersededThroughControlVersion"],
+        "playback.update supersededThroughControlVersion",
+    )
+    if superseded >= control_version:
+        _output_error("supersededThroughControlVersion must be below controlVersion")
+    _output_int(update["queueIndex"], "playback.update queueIndex")
+
+
+def _validate_control_settled_output(payload: object) -> None:
+    settled = _output_object(
+        payload,
+        {
+            "playbackContextId",
+            "epoch",
+            "commandControlVersion",
+            "status",
+            "errorCode",
+            "controlVersion",
+            "appliedControlVersion",
+            "requestingClientId",
+            "serverUpdatedAtMs",
+        },
+        {"dependsOnControlVersion", "errorMessage"},
+        "playback.control.settled payload",
+    )
+    for field_name in ("playbackContextId", "requestingClientId"):
+        _output_string(settled[field_name], "playback.control.settled %s" % field_name)
+    if settled["status"] != "failed":
+        _output_error("playback.control.settled status must be failed")
+    if settled["errorCode"] not in {"dependency_failed", "execution_unknown"}:
+        _output_error("playback.control.settled errorCode is invalid")
+    _output_int(settled["epoch"], "playback.control.settled epoch", 1)
+    command_version = _output_int(
+        settled["commandControlVersion"],
+        "playback.control.settled commandControlVersion",
+        1,
+    )
+    control_version = _output_int(
+        settled["controlVersion"],
+        "playback.control.settled controlVersion",
+        1,
+    )
+    applied_version = _output_int(
+        settled["appliedControlVersion"],
+        "playback.control.settled appliedControlVersion",
+        1,
+    )
+    if command_version > control_version or applied_version > control_version:
+        _output_error("playback.control.settled cursors are inconsistent")
+    if settled["errorCode"] == "dependency_failed":
+        if "dependsOnControlVersion" not in settled:
+            _output_error("dependency_failed requires dependsOnControlVersion")
+        dependency = _output_int(
+            settled["dependsOnControlVersion"],
+            "playback.control.settled dependsOnControlVersion",
+            1,
+        )
+        if dependency >= command_version:
+            _output_error("dependsOnControlVersion must be below commandControlVersion")
+    elif "dependsOnControlVersion" in settled:
+        _output_error("execution_unknown forbids dependsOnControlVersion")
+    if "errorMessage" in settled:
+        _output_string(
+            settled["errorMessage"],
+            "playback.control.settled errorMessage",
+            512,
+        )
+    _output_int(
+        settled["serverUpdatedAtMs"],
+        "playback.control.settled serverUpdatedAtMs",
+    )
 
 
 def _validate_output_payload(action: str, payload: object) -> Optional[str]:
@@ -1060,8 +1523,84 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
                 "playback.context.list contexts must use one authority/device pair"
             )
         return None
-    if action == "playback.context.create":
-        _validate_context_snapshot(payload, "playback.context.create payload")
+    if action == "playback.context.ensure":
+        _validate_context_snapshot(payload, "playback.context.ensure payload")
+        return None
+    if action == "playback.context.prepare":
+        prepare = _output_object(
+            payload,
+            {"playbackContextId", "intentId", "controlVersion", "sourceClientId"},
+            {"initialQueueSongIds", "currentIndex", "positionMs"},
+            "playback.context.prepare payload",
+        )
+        for field_name in ("playbackContextId", "intentId", "sourceClientId"):
+            _output_string(prepare[field_name], "playback.context.prepare %s" % field_name)
+        _output_int(
+            prepare["controlVersion"],
+            "playback.context.prepare controlVersion",
+            1,
+        )
+        has_queue = "initialQueueSongIds" in prepare
+        if has_queue != ("currentIndex" in prepare) or has_queue != (
+            "positionMs" in prepare
+        ):
+            _output_error(
+                "playback.context.prepare initial queue fields must appear together"
+            )
+        if has_queue:
+            queue = _output_string_array(
+                prepare["initialQueueSongIds"],
+                "playback.context.prepare initialQueueSongIds",
+                non_empty=True,
+            )
+            current_index = _output_int(
+                prepare["currentIndex"],
+                "playback.context.prepare currentIndex",
+            )
+            if current_index >= len(queue):
+                _output_error(
+                    "playback.context.prepare currentIndex is outside initialQueueSongIds"
+                )
+            _output_int(
+                prepare["positionMs"],
+                "playback.context.prepare positionMs",
+            )
+        return None
+    if action == "playback.context.prepared":
+        prepared = _output_object(
+            payload,
+            {"playbackContextId", "intentId", "ready", "controlVersion"},
+            {"errorCode", "errorMessage"},
+            "playback.context.prepared payload",
+        )
+        _output_string(
+            prepared["playbackContextId"],
+            "playback.context.prepared playbackContextId",
+        )
+        _output_string(prepared["intentId"], "playback.context.prepared intentId")
+        _output_bool(prepared["ready"], "playback.context.prepared ready")
+        _output_int(
+            prepared["controlVersion"],
+            "playback.context.prepared controlVersion",
+            1,
+        )
+        if prepared["ready"]:
+            if "errorCode" in prepared or "errorMessage" in prepared:
+                _output_error("prepared ready:true forbids error fields")
+        else:
+            if prepared.get("errorCode") not in {
+                "queue_required",
+                "restore_failed",
+                "prepare_timeout",
+                "authority_changed",
+            }:
+                _output_error("prepared ready:false errorCode is invalid")
+            if "errorMessage" in prepared:
+                _output_string(
+                    prepared["errorMessage"],
+                    "playback.context.prepared errorMessage",
+                    512,
+                )
         return None
     if action == "playback.context.status":
         status = _output_object(
@@ -1076,16 +1615,27 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
         )
         if not isinstance(status["deviceStates"], list):
             _output_error("playback.context.status deviceStates must be an array")
-        client_ids = [
-            _validate_device_state(
+        client_ids = []
+        device_session_ids = []
+        for index, device_state in enumerate(status["deviceStates"]):
+            client_ids.append(
+                _validate_device_state(
                 device_state,
                 context["playbackContextId"],
                 "playback.context.status deviceStates[%d]" % index,
             )
-            for index, device_state in enumerate(status["deviceStates"])
-        ]
+            )
+            device_session_ids.append(device_state["deviceSessionId"])
+            if device_state["appliedControlVersion"] > context["controlVersion"]:
+                _output_error(
+                    "deviceState appliedControlVersion exceeds Context controlVersion"
+                )
         if client_ids != sorted(client_ids) or len(set(client_ids)) != len(client_ids):
             _output_error("playback.context.status deviceStates must be uniquely sorted")
+        if len(set(device_session_ids)) != len(device_session_ids):
+            _output_error(
+                "playback.context.status deviceSessionId values must be unique"
+            )
         return None
     if action == "playback.context.closed":
         closed = _output_object(
@@ -1113,53 +1663,16 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
         )
         return None
     if action == "queue.context.sync":
-        queue = _output_object(
-            payload,
-            {
-                "playbackContextId",
-                "authorityClientId",
-                "queueSongIds",
-                "currentIndex",
-                "positionMs",
-                "queueRevision",
-                "controlVersion",
-                "version",
-                "epoch",
-                "serverUpdatedAtMs",
-            },
-            {"timelineId"},
-            "queue.context.sync payload",
-        )
-        synthetic = dict(queue)
-        synthetic["state"] = "stopped"
         _validate_context_snapshot(
-            synthetic,
+            payload,
             "queue.context.sync payload",
-            require_server_updated=True,
         )
         return None
     if action == "playback.update":
-        update = _output_object(
-            payload,
-            {
-                "playbackContextId",
-                "sourceClientId",
-                "deviceSessionId",
-                "state",
-                "positionMs",
-                "clientSeq",
-                "serverUpdatedAtMs",
-            },
-            {"trackId", "volume", "muted"},
-            "playback.update payload",
-        )
-        device_state = dict(update)
-        device_state["clientId"] = device_state.pop("sourceClientId")
-        _validate_device_state(
-            device_state,
-            update["playbackContextId"],
-            "playback.update payload",
-        )
+        _validate_playback_update_output(payload)
+        return None
+    if action == "playback.control.settled":
+        _validate_control_settled_output(payload)
         return None
     if action in {"player.play", "player.pause", "player.seek", "player.next", "player.prev"}:
         if action == "player.play" and isinstance(payload, dict) and "handoffId" in payload:
@@ -1179,7 +1692,12 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
             _output_string(control["handoffId"], "handoff commit handoffId")
             _output_int(control["effectiveAtServerMs"], "handoff commit effectiveAtServerMs", 1)
         else:
-            required = {"playbackContextId", "controlVersion", "sourceClientId"}
+            required = {
+                "playbackContextId",
+                "controlVersion",
+                "sourceClientId",
+                "executionTimeoutMs",
+            }
             optional = {"positionMs"} if action in {"player.play", "player.pause"} else set()
             if action == "player.seek":
                 required.add("positionMs")
@@ -1187,6 +1705,12 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
         _output_string(control["playbackContextId"], "%s playbackContextId" % action)
         _output_string(control["sourceClientId"], "%s sourceClientId" % action)
         _output_int(control["controlVersion"], "%s controlVersion" % action, 1)
+        if "executionTimeoutMs" in control:
+            _output_int(
+                control["executionTimeoutMs"],
+                "%s executionTimeoutMs" % action,
+                1,
+            )
         if "positionMs" in control:
             _output_int(control["positionMs"], "%s positionMs" % action)
         return None
@@ -1200,6 +1724,7 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
                 "queueRevision",
                 "controlVersion",
                 "sourceClientId",
+                "executionTimeoutMs",
             },
             set(),
             "queue.playItem payload",
@@ -1215,6 +1740,11 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
             _output_error("queue.playItem queueIndex is outside queueSongIds")
         _output_int(control["queueRevision"], "queue.playItem queueRevision", 1)
         _output_int(control["controlVersion"], "queue.playItem controlVersion", 1)
+        _output_int(
+            control["executionTimeoutMs"],
+            "queue.playItem executionTimeoutMs",
+            1,
+        )
         _output_string(control["sourceClientId"], "queue.playItem sourceClientId")
         return None
     if action == "playback.prepare":

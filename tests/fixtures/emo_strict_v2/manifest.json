@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "protocolVersion": "2.3.0",
+  "protocolVersion": "2.4.0",
   "contractSha256": "4bf1a099fd3c060514215c202b7bb3c82b80e9c73959c39782541d8cda9dea96",
   "sharedErrorConditionFields": [
     "playbackContextId",
@@ -88,15 +88,15 @@
       "cursorMutation": "none",
       "errorConditionFields": ["retryAfterMs"]
     },
-    "playback.context.create": {
+    "playback.context.ensure": {
       "profile": "core",
       "type": "command",
       "contractSection": "5.1/6.2",
-      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "deviceSessionId:string", "queueSongIds:distinct-string[]", "currentIndex:int>=0", "positionMs:int>=0", "state:playing|paused|stopped"], "optional": []},
+      "payloadSchema": {"closed": true, "required": ["deviceSessionId:string", "queueSongIds:distinct-string[]", "positionMs:int>=0", "state:idle|playing|paused|stopped"], "optional": ["currentIndex:int>=0"]},
       "settlement": "correlated_direct_response",
       "serverPushes": ["playback.context.bindings.changed"],
       "roleCapabilityGate": "same-device player",
-      "cursorMutation": "initialize epoch/version/queueRevision/controlVersion to 1",
+      "cursorMutation": "create at 1 or conditionally advance when initializing/rebinding",
       "errorConditionFields": ["playbackContextId", "currentControlVersion", "currentQueueRevision", "currentVersion", "retryAfterMs"]
     },
     "playback.context.subscribe": {
@@ -132,6 +132,17 @@
       "cursorMutation": "none",
       "errorConditionFields": ["playbackContextId", "retryAfterMs"]
     },
+    "playback.context.prepare": {
+      "profile": "core",
+      "type": "command",
+      "contractSection": "5.1/6.2.1-6.2.3",
+      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "intentId:string", "baseControlVersion:int>=0"], "optional": ["initialQueueSongIds:non-empty-distinct-string[]", "currentIndex:int>=0", "positionMs:int>=0"]},
+      "settlement": "correlated_ack",
+      "serverPushes": ["playback.context.prepare", "playback.context.prepared"],
+      "roleCapabilityGate": "same-user controller; unique online authority; idle Context",
+      "cursorMutation": "none",
+      "errorConditionFields": ["playbackContextId", "currentControlVersion", "currentQueueRevision", "currentVersion", "retryAfterMs"]
+    },
     "playback.context.close": {
       "profile": "core",
       "type": "command",
@@ -147,22 +158,33 @@
       "profile": "core",
       "type": "state",
       "contractSection": "5.2/6.5",
-      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "deviceSessionId:string", "queueSongIds:distinct-string[]", "currentIndex:int>=0", "positionMs:int>=0", "baseQueueRevision:int>=0"], "optional": ["baseControlVersion:int>=0"]},
+      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "deviceSessionId:string", "queueSongIds:distinct-string[]", "positionMs:int>=0", "baseQueueRevision:int>=0"], "optional": ["currentIndex:int>=0", "baseControlVersion:int>=0"]},
       "settlement": "correlated_ack",
       "serverPushes": ["queue.context.sync"],
       "roleCapabilityGate": "current authority with matching device",
       "cursorMutation": "version +1; queueRevision +1; conditional controlVersion +1",
       "errorConditionFields": ["playbackContextId", "currentControlVersion", "currentQueueRevision", "currentVersion", "retryAfterMs"]
     },
+    "playback.context.prepared": {
+      "profile": "core",
+      "type": "event",
+      "contractSection": "5.2/6.2.3",
+      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "deviceSessionId:string", "intentId:string", "ready:bool"], "optional": ["errorCode:string", "errorMessage:string"]},
+      "settlement": "event_confirmed",
+      "serverPushes": ["playback.context.prepared"],
+      "roleCapabilityGate": "current authority with matching device and prepare intent",
+      "cursorMutation": "none",
+      "errorConditionFields": ["playbackContextId", "currentControlVersion", "currentQueueRevision", "currentVersion", "retryAfterMs"]
+    },
     "playback.update": {
       "profile": "core",
       "type": "event",
       "contractSection": "5.2/6.6",
-      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "deviceSessionId:string", "state:playing|paused|stopped", "positionMs:int>=0", "clientSeq:int>=1"], "optional": ["trackId:string", "volume:int:0..100", "muted:bool"]},
+      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "deviceSessionId:string", "origin:passive|remoteCommand|localUser", "state:idle|playing|paused|stopped", "positionMs:int>=0", "clientSeq:int>=1"], "optional": ["trackId:string", "volume:int:0..100", "muted:bool", "executionStatus:committed|failed", "commandControlVersion:int>=1", "appliedControlVersion:int>=1", "intentId:string", "epoch:int>=1", "observedControlVersion:int>=1", "queueIndex:int>=0", "errorCode:string", "errorMessage:string"]},
       "settlement": "event_confirmed",
       "serverPushes": ["playback.update"],
       "roleCapabilityGate": "registered source with matching device",
-      "cursorMutation": "Context cursors unchanged; DeviceState clientSeq advances",
+      "cursorMutation": "shape-dependent applied/control/queue/version mutation",
       "errorConditionFields": ["playbackContextId", "currentClientSeq", "retryAfterMs"]
     },
     "queue.playItem": {

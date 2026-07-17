@@ -121,10 +121,9 @@ class StrictV2ContractTestCase(unittest.TestCase):
     def test_rejects_business_and_transport_limits(self):
         request = {
             "type": "command",
-            "action": "playback.context.create",
-            "requestId": "create-1",
+            "action": "playback.context.ensure",
+            "requestId": "ensure-1",
             "payload": {
-                "playbackContextId": "context-1",
                 "deviceSessionId": "device-1",
                 "queueSongIds": ["song-%d" % index for index in range(1001)],
                 "currentIndex": 0,
@@ -249,6 +248,153 @@ class StrictV2ContractTestCase(unittest.TestCase):
         with self.assertRaises(StrictRequestValidationError):
             validate_strict_request(unknown)
 
+    def test_validates_ensure_idle_and_queue_backed_shapes(self):
+        idle = {
+            "type": "command",
+            "action": "playback.context.ensure",
+            "requestId": "ensure-idle-1",
+            "payload": {
+                "deviceSessionId": "device:player-1",
+                "queueSongIds": [],
+                "positionMs": 0,
+                "state": "idle",
+            },
+        }
+        queue_backed = copy.deepcopy(idle)
+        queue_backed["requestId"] = "ensure-queue-1"
+        queue_backed["payload"].update(
+            {
+                "queueSongIds": ["song-1"],
+                "currentIndex": 0,
+                "state": "paused",
+            }
+        )
+
+        self.assertEqual(validate_strict_request(idle), idle)
+        self.assertEqual(validate_strict_request(queue_backed), queue_backed)
+
+        invalid = copy.deepcopy(idle)
+        invalid["payload"]["currentIndex"] = 0
+        with self.assertRaises(StrictRequestValidationError):
+            validate_strict_request(invalid)
+
+        invalid = copy.deepcopy(queue_backed)
+        invalid["payload"]["state"] = "idle"
+        with self.assertRaises(StrictRequestValidationError):
+            validate_strict_request(invalid)
+
+    def test_validates_prepare_and_prepared_request_shapes(self):
+        prepare = {
+            "type": "command",
+            "action": "playback.context.prepare",
+            "requestId": "prepare-1",
+            "payload": {
+                "playbackContextId": "context-1",
+                "intentId": "intent-1",
+                "baseControlVersion": 1,
+                "initialQueueSongIds": ["song-1"],
+                "currentIndex": 0,
+                "positionMs": 0,
+            },
+        }
+        prepared = {
+            "type": "event",
+            "action": "playback.context.prepared",
+            "requestId": "prepared-1",
+            "payload": {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "intentId": "intent-1",
+                "ready": False,
+                "errorCode": "queue_required",
+            },
+        }
+
+        self.assertEqual(validate_strict_request(prepare), prepare)
+        self.assertEqual(validate_strict_request(prepared), prepared)
+
+        missing_pair = copy.deepcopy(prepare)
+        del missing_pair["payload"]["positionMs"]
+        with self.assertRaises(StrictRequestValidationError):
+            validate_strict_request(missing_pair)
+
+        invalid_error = copy.deepcopy(prepared)
+        invalid_error["payload"]["errorCode"] = "execution_unknown"
+        with self.assertRaises(StrictRequestValidationError):
+            validate_strict_request(invalid_error)
+
+    def test_validates_all_playback_update_request_shapes(self):
+        common = {
+            "playbackContextId": "context-1",
+            "deviceSessionId": "device:player-1",
+            "state": "playing",
+            "trackId": "song-1",
+            "positionMs": 100,
+            "clientSeq": 1,
+        }
+        payloads = [
+            dict(common, origin="passive", appliedControlVersion=1),
+            dict(
+                common,
+                origin="remoteCommand",
+                executionStatus="committed",
+                commandControlVersion=2,
+                appliedControlVersion=2,
+            ),
+            dict(
+                common,
+                origin="remoteCommand",
+                executionStatus="failed",
+                commandControlVersion=2,
+                appliedControlVersion=1,
+                errorCode="track_load_failed",
+            ),
+            dict(
+                common,
+                origin="localUser",
+                executionStatus="committed",
+                intentId="local-1",
+                epoch=1,
+                observedControlVersion=1,
+                queueIndex=0,
+            ),
+        ]
+
+        for index, payload in enumerate(payloads):
+            message = {
+                "type": "event",
+                "action": "playback.update",
+                "requestId": "update-%d" % index,
+                "payload": payload,
+            }
+            with self.subTest(index=index):
+                self.assertEqual(validate_strict_request(message), message)
+
+        invalid = {
+            "type": "event",
+            "action": "playback.update",
+            "requestId": "update-invalid",
+            "payload": dict(
+                payloads[2],
+                errorCode="dependency_failed",
+            ),
+        }
+        with self.assertRaises(StrictRequestValidationError):
+            validate_strict_request(invalid)
+
+    def test_client_cannot_send_server_only_settled(self):
+        request = {
+            "type": "event",
+            "action": "playback.control.settled",
+            "requestId": "settled-1",
+            "payload": {},
+        }
+
+        with self.assertRaises(StrictRequestValidationError) as context:
+            validate_strict_request(request)
+
+        self.assertEqual(context.exception.code, "not_supported")
+
     def test_identifies_strict_registration_without_accepting_other_messages(self):
         self.assertTrue(is_strict_registration_request(self._register_request()))
         login = {
@@ -332,7 +478,9 @@ class StrictV2ContractTestCase(unittest.TestCase):
                         "clientId": "player-1",
                         "deviceSessionId": "device:player-1",
                         "state": "playing",
+                        "trackId": "song-1",
                         "positionMs": 1200,
+                        "appliedControlVersion": 1,
                         "clientSeq": 1,
                         "serverUpdatedAtMs": 1000,
                     }
@@ -347,7 +495,11 @@ class StrictV2ContractTestCase(unittest.TestCase):
                 "playbackContextId": "context-1",
                 "sourceClientId": "player-1",
                 "deviceSessionId": "device:player-1",
+                "origin": "passive",
+                "controlVersion": 1,
+                "appliedControlVersion": 1,
                 "state": "playing",
+                "trackId": "song-1",
                 "positionMs": 1200,
                 "clientSeq": 1,
                 "serverUpdatedAtMs": 1000,
@@ -356,6 +508,75 @@ class StrictV2ContractTestCase(unittest.TestCase):
 
         self.assertEqual(validate_strict_output(status), status)
         self.assertEqual(validate_strict_output(feedback), feedback)
+
+    def test_validates_idle_context_prepare_and_settled_outputs(self):
+        idle = self._output(
+            "state",
+            "playback.context.ensure",
+            {
+                "playbackContextId": "context-1",
+                "authorityClientId": "player-1",
+                "queueSongIds": [],
+                "state": "idle",
+                "positionMs": 0,
+                "queueRevision": 1,
+                "controlVersion": 1,
+                "version": 1,
+                "epoch": 1,
+            },
+            "ensure-1",
+        )
+        prepare = self._output(
+            "command",
+            "playback.context.prepare",
+            {
+                "playbackContextId": "context-1",
+                "intentId": "intent-1",
+                "controlVersion": 1,
+                "sourceClientId": "controller-1",
+            },
+        )
+        prepared = self._output(
+            "event",
+            "playback.context.prepared",
+            {
+                "playbackContextId": "context-1",
+                "intentId": "intent-1",
+                "ready": False,
+                "errorCode": "queue_required",
+                "controlVersion": 1,
+            },
+        )
+        settled = self._output(
+            "event",
+            "playback.control.settled",
+            {
+                "playbackContextId": "context-1",
+                "epoch": 1,
+                "commandControlVersion": 2,
+                "status": "failed",
+                "errorCode": "dependency_failed",
+                "dependsOnControlVersion": 1,
+                "controlVersion": 3,
+                "appliedControlVersion": 1,
+                "requestingClientId": "controller-1",
+                "serverUpdatedAtMs": 1000,
+            },
+        )
+
+        for message in (idle, prepare, prepared, settled):
+            with self.subTest(action=message["action"]):
+                self.assertEqual(validate_strict_output(message), message)
+
+        invalid = copy.deepcopy(settled)
+        invalid["payload"]["sourceClientId"] = "player-1"
+        with self.assertRaises(StrictOutputValidationError):
+            validate_strict_output(invalid)
+
+        invalid = copy.deepcopy(settled)
+        invalid["payload"]["errorCode"] = "execution_unknown"
+        with self.assertRaises(StrictOutputValidationError):
+            validate_strict_output(invalid)
 
     def test_validates_device_volume_outputs_and_extended_device_list(self):
         command = self._output(
@@ -698,11 +919,16 @@ class StrictV2ContractTestCase(unittest.TestCase):
             validate_strict_output(missing_provenance)
 
     def test_output_action_inventory_is_closed(self):
-        self.assertEqual(len(STRICT_OUTPUT_ACTIONS), 30)
+        self.assertEqual(len(STRICT_OUTPUT_ACTIONS), 33)
         self.assertIn("system.ack", STRICT_OUTPUT_ACTIONS)
         self.assertIn("device.setVolume", STRICT_OUTPUT_ACTIONS)
         self.assertIn("device.volume.update", STRICT_OUTPUT_ACTIONS)
         self.assertIn("playback.context.list", STRICT_OUTPUT_ACTIONS)
+        self.assertIn("playback.context.ensure", STRICT_OUTPUT_ACTIONS)
+        self.assertIn("playback.context.prepare", STRICT_OUTPUT_ACTIONS)
+        self.assertIn("playback.context.prepared", STRICT_OUTPUT_ACTIONS)
+        self.assertIn("playback.control.settled", STRICT_OUTPUT_ACTIONS)
+        self.assertNotIn("playback.context.create", STRICT_OUTPUT_ACTIONS)
         self.assertIn(
             "playback.context.bindings.changed",
             STRICT_OUTPUT_ACTIONS,
