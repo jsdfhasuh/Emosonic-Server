@@ -1,30 +1,22 @@
 {
   "schemaVersion": 1,
-  "contractSha256": "5269b53a615ca97f820d3624510acb459e3d3031667a742bd50d1185af8d1e37",
+  "contractSha256": "4bf1a099fd3c060514215c202b7bb3c82b80e9c73959c39782541d8cda9dea96",
   "profiles": {
     "core": {
-      "codeConformanceReady": true,
-      "evidence": [
-        "local-test-only:test_supysonic:r8:core"
-      ]
+      "codeConformanceReady": false,
+      "evidence": []
     },
     "follow": {
-      "codeConformanceReady": true,
-      "evidence": [
-        "local-test-only:test_supysonic:r8:follow"
-      ]
+      "codeConformanceReady": false,
+      "evidence": []
     },
     "handoff": {
-      "codeConformanceReady": true,
-      "evidence": [
-        "local-test-only:test_supysonic:r8:handoff"
-      ]
+      "codeConformanceReady": false,
+      "evidence": []
     },
     "broadcast": {
-      "codeConformanceReady": true,
-      "evidence": [
-        "local-test-only:test_supysonic:r8:broadcast"
-      ]
+      "codeConformanceReady": false,
+      "evidence": []
     }
   }
 }

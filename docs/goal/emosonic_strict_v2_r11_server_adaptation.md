@@ -1,6 +1,6 @@
 # Goal: EmoSonic strict-v2 Socket.IO r11 服务端适配
 
-> 状态：Planned（只完成实施计划，尚未修改服务端实现）
+> 状态：In Progress（Goal 0 已完成；Goal 1 的 2.4.0 schema/fixtures 适配进行中）
 >
 > 制定日期：2026-07-17
 >
@@ -10,7 +10,7 @@
 >
 > r11 来源 SHA-256：`4bf1a099fd3c060514215c202b7bb3c82b80e9c73959c39782541d8cda9dea96`
 >
-> 当前规范基线：`specs/emosonic_strict_v2_socketio_server_contract.md` r8 / `2.3.0`
+> 当前规范：`specs/emosonic_strict_v2_socketio_server_contract.md` r11 / `2.4.0`
 >
 > 制定时基线 commit：`067ddfb3b64facbc7df2a0ef32ac2b011dd1c411`
 >
@@ -819,7 +819,7 @@ failed feedback。
 
 ## 十二、执行检查表
 
-- [ ] Goal 0：提升 r11 权威契约并关闭中间 readiness
+- [x] Goal 0：提升 r11 权威契约并关闭中间 readiness
 - [ ] Goal 1：更新 2.4.0 action inventory 和 closed schema
 - [ ] Goal 2：完成三数据库 migration 和 store 原语
 - [ ] Goal 3：用 ensure 替换 create，支持 idle Context
