@@ -1,6 +1,6 @@
 # Goal: EmoSonic strict-v2 Socket.IO r11 服务端适配
 
-> 状态：Server implementation complete（Goal 0—11 已完成；Goal 12 等待 Flutter/Windows 外部验收和最终 build evidence）
+> 状态：Server implementation and repository verification complete（Goal 0—12 的服务端、真实浏览器和最终 build evidence 已完成；等待 Flutter/Windows 外部验收）
 >
 > 制定日期：2026-07-17
 >
@@ -660,6 +660,20 @@ python -m unittest
 - Android/Flutter、Windows、服务端日志可按 Context/epoch/controlVersion 对齐；
 - 未自动执行 production rollout。
 
+### 2026-07-18 服务端最终验证结果
+
+- 最终服务端 build：`297b07170ad9dd573469734c418419b2b5abdbb4`；
+- 自动化证据：`docs/verification/emosonic_strict_v2_r11/297b07170ad9dd573469734c418419b2b5abdbb4/`，总体 `PASS`；
+- EARS：131 项通过，覆盖 `REQ-001` 至 `REQ-045`；
+- 全量 unittest：1305 项通过，3 项为已有环境跳过；
+- SQLite、PostgreSQL 16、MySQL 8.4 clean install 和 upgrade 通过；
+- JavaScript：20 项通过；wheel、sdist 和 Sphinx 构建通过；
+- 真实浏览器：Chromium 140、Firefox 141 和移动尺寸控制页完成 16 个场景；30 次前台
+  Handoff 全部在 200ms 内，最大绝对误差 4.141ms；
+- production readiness 继续全部为 `false`，未执行 production rollout；
+- 尚缺 Flutter 对 settled 三字段键幂等的外部验收，以及 Windows 15 秒 lease 失效和迟到
+  callback 隔离的外部验收。服务端仓库不能替这两个外部客户端出具证据。
+
 ---
 
 ## 七、REQ-001 至 REQ-045 覆盖表
@@ -831,5 +845,6 @@ failed feedback。
 - [x] Goal 9：实现 watchdog、断线、重启和 source-only correction
 - [x] Goal 10：完成 Handoff idle retirement 和 Web 适配
 - [x] Goal 11：完成自动化、并发和三数据库验证
-- [ ] Goal 12：服务端 conformance freeze 已完成；等待 Flutter/Windows、真实浏览器和最终 build evidence
-- [ ] 确认 Definition of Done 全部满足
+- [x] Goal 12：完成服务端 conformance freeze、真实浏览器和最终 build evidence
+- [ ] Flutter/Windows 外部验收：settled 幂等、15 秒 lease 失效和迟到 callback 隔离
+- [ ] 确认 Definition of Done 全部满足（仅剩上一项外部验收）
