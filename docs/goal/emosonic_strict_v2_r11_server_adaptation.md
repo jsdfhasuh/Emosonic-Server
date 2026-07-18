@@ -672,7 +672,8 @@ python -m unittest
   Handoff 全部在 200ms 内，最大绝对误差 4.141ms；
 - production readiness 继续全部为 `false`，未执行 production rollout；
 - 尚缺 Flutter 对 settled 三字段键幂等的外部验收，以及 Windows 15 秒 lease 失效和迟到
-  callback 隔离的外部验收。服务端仓库不能替这两个外部客户端出具证据。
+  callback 隔离的外部验收。服务端仓库不能替这两个外部客户端出具证据；具体交接项见
+  `docs/verification/emosonic_strict_v2_r11/297b07170ad9dd573469734c418419b2b5abdbb4/external-client-acceptance-request.md`。
 
 ---
 
