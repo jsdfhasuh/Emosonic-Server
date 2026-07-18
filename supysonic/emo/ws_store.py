@@ -1984,6 +1984,55 @@ def _active_context_records_for_stable_client(user_name, client_id):
     )
 
 
+def _active_context_records_for_authority_pair(
+    user_name,
+    client_id,
+    device_session_id,
+):
+    return list(
+        EmoPlaybackContext.select()
+        .where(
+            (EmoPlaybackContext.user_name == user_name)
+            & (EmoPlaybackContext.lifecycle == "active")
+            & (EmoPlaybackContext.authority_client_id == client_id)
+            & (
+                EmoPlaybackContext.authority_device_session_id
+                == device_session_id
+            )
+        )
+        .order_by(EmoPlaybackContext.playback_context_id)
+        .limit(3)
+    )
+
+
+def _active_context_records_for_ensure(
+    user_name,
+    client_id,
+    device_session_id,
+):
+    exact_pair_candidates = _active_context_records_for_authority_pair(
+        user_name,
+        client_id,
+        device_session_id,
+    )
+    if len(exact_pair_candidates) > 1:
+        raise PlaybackContextEnsureConflictError(
+            _playback_context_payload(exact_pair_candidates[0])
+        )
+    if exact_pair_candidates:
+        return exact_pair_candidates
+
+    candidates = _active_context_records_for_stable_client(
+        user_name,
+        client_id,
+    )
+    if len(candidates) > 1:
+        raise PlaybackContextEnsureConflictError(
+            _playback_context_payload(candidates[0])
+        )
+    return candidates
+
+
 def _initialize_idle_context_from_ensure(
     record,
     queue_song_ids,
@@ -2037,28 +2086,22 @@ def ensureStrictPlaybackContextState(
         open_connection(reuse=True)
         try:
             while True:
-                candidates = _active_context_records_for_stable_client(
+                candidates = _active_context_records_for_ensure(
                     user_name,
                     authority_client_id,
+                    authority_device_session_id,
                 )
-                if len(candidates) > 1:
-                    raise PlaybackContextEnsureConflictError(
-                        _playback_context_payload(candidates[0])
-                    )
                 selected_context_id = (
                     candidates[0].playback_context_id
                     if candidates
                     else generated_context_id
                 )
                 with _strict_playback_context_lock(selected_context_id):
-                    candidates = _active_context_records_for_stable_client(
+                    candidates = _active_context_records_for_ensure(
                         user_name,
                         authority_client_id,
+                        authority_device_session_id,
                     )
-                    if len(candidates) > 1:
-                        raise PlaybackContextEnsureConflictError(
-                            _playback_context_payload(candidates[0])
-                        )
                     if candidates and candidates[0].playback_context_id != selected_context_id:
                         continue
                     if not candidates and selected_context_id != generated_context_id:
@@ -2068,14 +2111,11 @@ def ensureStrictPlaybackContextState(
                         authority_pairs.append(_record_authority_pair(candidates[0]))
                     with _strict_authority_pair_lock(authority_pairs):
                         with _strict_playback_context_transaction():
-                            candidates = _active_context_records_for_stable_client(
+                            candidates = _active_context_records_for_ensure(
                                 user_name,
                                 authority_client_id,
+                                authority_device_session_id,
                             )
-                            if len(candidates) > 1:
-                                raise PlaybackContextEnsureConflictError(
-                                    _playback_context_payload(candidates[0])
-                                )
                             if candidates and candidates[0].playback_context_id != selected_context_id:
                                 continue
                             if not candidates:

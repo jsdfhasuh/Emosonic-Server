@@ -2153,6 +2153,57 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 "idle",
             )
 
+    def test_ensure_returns_exact_pair_when_legacy_active_contexts_remain(self):
+        for context_id in (
+            "device:player-1",
+            "player-1",
+        ):
+            createStrictPlaybackContextState(
+                context_id,
+                "alice",
+                "player-1",
+                None,
+                ["legacy-song"],
+                0,
+                0,
+                "paused",
+            )
+        createStrictPlaybackContextState(
+            "playback:canonical",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            250,
+            "playing",
+        )
+
+        result = ensureStrictPlaybackContextState(
+            "alice",
+            "player-1",
+            "device:player-1",
+            [],
+            None,
+            0,
+            "idle",
+        )
+
+        canonical, mutated = result
+        self.assertFalse(mutated)
+        self.assertFalse(result.binding_mutated)
+        self.assertEqual(canonical["playbackContextId"], "playback:canonical")
+        self.assertEqual(
+            canonical["authorityDeviceSessionId"],
+            "device:player-1",
+        )
+        self.assertNotEqual(
+            canonical["playbackContextId"],
+            canonical["authorityDeviceSessionId"],
+        )
+        self.assertEqual(canonical["queueSongIds"], ["song-1"])
+        self.assertEqual(canonical["positionMs"], 250)
+
     def test_queue_sync_crosses_idle_boundary_with_closed_snapshot(self):
         createStrictPlaybackContextState(
             "context-1",
