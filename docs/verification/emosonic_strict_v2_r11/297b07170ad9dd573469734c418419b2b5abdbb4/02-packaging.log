@@ -1,0 +1,6 @@
++ /root/enter/bin/python -m build --no-isolation --outdir /tmp/emosonic-strict-v2-packaging-n0f4560s/dist
++ /root/enter/bin/python -m venv --system-site-packages /tmp/emosonic-strict-v2-packaging-n0f4560s/venv-emosonic_server-0-8-0-py3-none-any-whl
++ /tmp/emosonic-strict-v2-packaging-n0f4560s/venv-emosonic_server-0-8-0-py3-none-any-whl/bin/python -m pip install --no-deps --no-index /tmp/emosonic-strict-v2-packaging-n0f4560s/dist/emosonic_server-0.8.0-py3-none-any.whl
++ /root/enter/bin/python -m venv --system-site-packages /tmp/emosonic-strict-v2-packaging-n0f4560s/venv-emosonic server-0-8-0-tar-gz
++ /tmp/emosonic-strict-v2-packaging-n0f4560s/venv-emosonic server-0-8-0-tar-gz/bin/python -m pip install --no-deps --no-index --no-build-isolation /tmp/emosonic-strict-v2-packaging-n0f4560s/dist/emosonic server-0.8.0.tar.gz
+Strict-v2 packaging verification passed for wheel and sdist; installed missing/invalid/hash-mismatched manifests fail closed.
