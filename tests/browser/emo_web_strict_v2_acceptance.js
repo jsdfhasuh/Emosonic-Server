@@ -205,20 +205,20 @@ async function selectControlPlayer(control, clientId) {
     Array.from(document.querySelectorAll('#strict-device-list .strict-device'))
       .some((button) => button.textContent.includes(value))
   ), clientId, { timeout: 20000 });
-  const bindings = await contextBindings(control);
-  const binding = bindings.find((candidate) => candidate.clientId === clientId);
-  assert.ok(binding, `No browser Context binding for ${clientId}`);
   const device = control.locator('#strict-device-list .strict-device').filter({ hasText: clientId });
   await device.evaluate((button) => button.click());
-  await control.waitForFunction(({ expectedClientId, expectedContextId }) => {
+  await control.waitForFunction(async (expectedClientId) => {
     const snapshot = window.__emoStrictV2Acceptance.snapshot();
+    const response = await fetch('/emo/web-context-bindings', {
+      credentials: 'same-origin',
+      cache: 'no-store',
+    });
+    const bindings = (await response.json()).bindings;
+    const binding = bindings.find((candidate) => candidate.clientId === expectedClientId);
     return snapshot.selectedClientId === expectedClientId
-      && snapshot.selectedContextId === expectedContextId
+      && snapshot.selectedContextId === binding?.playbackContextId
       && Number.isInteger(snapshot.controlVersion);
-  }, {
-    expectedClientId: clientId,
-    expectedContextId: binding.playbackContextId,
-  }, { timeout: 15000 });
+  }, clientId, { timeout: 15000 });
 }
 
 async function waitHandoff(control, status, previousHandoffId = null) {
@@ -683,6 +683,7 @@ async function run() {
         ? playerTwoIdentity.clientId
         : playerOneIdentity.clientId;
       const targetPage = targetClientId === playerOneIdentity.clientId ? playerOne : playerTwo;
+      await targetPage.bringToFront();
       await selectControlPlayer(control, authorityClientId);
       const previous = (await acceptanceSnapshot(control)).handoffId;
       await startHandoffTo(control, targetClientId);
@@ -713,7 +714,10 @@ async function run() {
       ...(await playerTwo.evaluate(() => window.__emoStrictV2Acceptance.handoffSamples)),
     ];
     assert.equal(handoffSamples.length, 30);
-    assert.ok(handoffSamples.every((sample) => sample.absoluteErrorMs <= 200));
+    assert.ok(
+      handoffSamples.every((sample) => sample.absoluteErrorMs <= 200),
+      JSON.stringify(handoffSamples),
+    );
     completedSteps.push('handoff-30-sample-timing');
 
     logStep('verify protocol error UI remains strict and never falls back');
