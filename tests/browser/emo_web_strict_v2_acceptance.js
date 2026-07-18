@@ -353,24 +353,25 @@ async function run() {
     );
     completedSteps.push('chromium-firefox-mobile-bootstrap');
 
-    logStep('select an online player without a Context and verify diagnostics');
+    logStep('select an online player with its startup idle Context');
     await control.waitForFunction((clientId) => (
       document.querySelector('#strict-device-list')?.textContent.includes(clientId)
     ), playerOneIdentity.clientId, { timeout: 20000 });
-    const contextlessDevice = control.locator('#strict-device-list .strict-device')
-      .filter({ hasText: playerOneIdentity.clientId });
-    await contextlessDevice.evaluate((button) => button.click());
-    await control.waitForFunction((clientId) => {
-      const snapshot = window.__emoStrictV2Acceptance.snapshot();
-      return snapshot.selectedClientId === clientId && snapshot.selectedContextId === null;
-    }, playerOneIdentity.clientId, { timeout: 10000 });
-    assert.match(await control.textContent('#strict-context-empty-message'), /PlaybackContext/);
-    assert.equal(await control.locator('#strict-context-empty').isVisible(), true);
-    assert.equal(await control.locator('#strict-context-active').isVisible(), false);
+    await selectControlPlayer(control, playerOneIdentity.clientId);
+    const idleBinding = (await contextBindings(control))
+      .find((candidate) => candidate.clientId === playerOneIdentity.clientId);
+    assert.ok(idleBinding, `No startup idle Context for ${playerOneIdentity.clientId}`);
+    assert.equal(
+      (await acceptanceSnapshot(control)).selectedContextId,
+      idleBinding.playbackContextId,
+    );
+    assert.equal(await control.locator('#strict-context-empty').isVisible(), false);
+    assert.equal(await control.locator('#strict-context-active').isVisible(), true);
+    assert.match(await control.textContent('#strict-queue-summary'), /0/);
     assert.equal(await control.locator('[data-control="player.play"]').isDisabled(), true);
-    completedSteps.push('contextless-player-diagnostics');
+    completedSteps.push('startup-idle-context');
 
-    logStep('create source Context and verify duplicate-queue UI');
+    logStep('populate the source idle Context and verify duplicate-queue UI');
     await addTracks(playerOne, 2);
     const sourceContextId = (await acceptanceSnapshot(playerOne)).contextId;
     await playerOne.locator('#strict-search-results li button').first().click();
@@ -505,7 +506,13 @@ async function run() {
     }));
     assert.deepEqual(followTrace.seekEvents, []);
     const authorityCursor = (await acceptanceSnapshot(control)).controlVersion;
-    await playerOneContext.setOffline(true);
+    await playerOne.evaluate(() => (
+      window.__emoStrictV2Acceptance.disconnectTransport()
+    ));
+    await playerOne.waitForFunction(() => (
+      window.__emoStrictV2Acceptance.snapshot().connectionState === 'disconnected'
+    ));
+    await playerTwo.locator('#strict-follow-refresh').click();
     await playerTwo.waitForFunction(() => (
       document.querySelector('#strict-follow-state')?.textContent.includes('source offline')
     ), null, { timeout: 25000 });
@@ -517,7 +524,9 @@ async function run() {
     ), { playbackContextId: sourceContextId, controlVersion: authorityCursor });
     assert.equal(offlineError.code, 'authority_offline');
     assert.match(await control.textContent('#strict-control-error'), /authority_offline/);
-    await playerOneContext.setOffline(false);
+    await playerOne.evaluate(() => (
+      window.__emoStrictV2Acceptance.reconnectTransport()
+    ));
     await waitReady(playerOne, '#strict-connection-state');
     assert.equal((await acceptanceSnapshot(playerOne)).contextId, sourceContextId);
     completedSteps.push('follow-source-offline-authority-error');
@@ -558,6 +567,14 @@ async function run() {
     completedSteps.push('server-restart-reconnect');
 
     logStep('verify strict Broadcast with two real browser players');
+    await control.locator('#strict-refresh-devices').click();
+    await control.waitForFunction(({ firstClientId, secondClientId }) => {
+      const deviceList = document.querySelector('#strict-device-list')?.textContent || '';
+      return deviceList.includes(firstClientId) && deviceList.includes(secondClientId);
+    }, {
+      firstClientId: playerOneIdentity.clientId,
+      secondClientId: playerTwoIdentity.clientId,
+    }, { timeout: 20000 });
     await selectControlPlayer(control, playerTwoIdentity.clientId);
     await selectControlPlayer(control, playerOneIdentity.clientId);
     await control.waitForFunction(async ({ playbackContextId, clientId }) => {
@@ -704,7 +721,7 @@ async function run() {
     await control.waitForFunction(() => (
       document.querySelector('#strict-control-error')?.textContent.includes('protocol error')
     ));
-    assert.match(await control.textContent('body'), /PlaybackContext strict-v2 2\.1\.0/);
+    assert.match(await control.textContent('body'), /PlaybackContext strict-v2 2\.4\.0/);
     assert.doesNotMatch(await control.textContent('body'), /Local queue editor/);
     completedSteps.push('protocol-error-no-fallback');
 

@@ -100,7 +100,7 @@ class WebStrictV2FrontendTestCase(FrontendTestBase):
             "playback.ready",
             "playback.handoff.complete",
             "const handoffCommit = message.action === 'player.play' && payload.handoffId",
-            "reportFeedback(releasedContextId)",
+            "const hasIdleStandby = Boolean(",
             "safePlay('播放失败').then(() => reportFeedback())",
             "feedbackMutation: Promise.resolve()",
             "state.controlLeases.delete(leaseKey)",
@@ -124,6 +124,7 @@ class WebStrictV2FrontendTestCase(FrontendTestBase):
             "autoplay_blocked",
         ):
             self.assertIn(evidence, response.data)
+        self.assertNotIn("reportFeedback(releasedContextId)", response.data)
         for profile in ('"broadcast": false', '"follow": false', '"handoff": false'):
             self.assertIn(profile, response.data)
         self.assertIn("stopFollow('source offline')", response.data)

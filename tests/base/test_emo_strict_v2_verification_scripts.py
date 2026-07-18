@@ -106,6 +106,18 @@ class StrictV2VerificationScriptsTestCase(unittest.TestCase):
 
         self.assertFalse(any(identity["readiness"].values()))
 
+    def test_evidence_collector_runs_real_browser_acceptance(self):
+        commands = {
+            name: command
+            for name, command, _cwd
+            in collect_emo_strict_v2_r7_evidence._command_specs(ROOT)
+        }
+
+        self.assertEqual(
+            commands["browser"],
+            ("npm", "run", "test:emo-browser"),
+        )
+
     def test_evidence_collector_rejects_premature_formal_readiness(self):
         contract_hash, descriptor, conformance, manifest = (
             self._metadata_documents()

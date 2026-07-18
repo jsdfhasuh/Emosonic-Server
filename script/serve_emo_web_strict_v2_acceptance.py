@@ -102,6 +102,7 @@ def create_acceptance_application(state_dir: Path, port: int):
             "emo_strict_rate_limit_load_test_evidence": (
                 "local-test-only: 30-sample strict web Handoff acceptance"
             ),
+            "emo_strict_v2_allow_local_test_evidence": True,
             "emo_strict_v2_core_enabled": True,
             "emo_strict_v2_follow_enabled": True,
             "emo_strict_v2_handoff_enabled": True,

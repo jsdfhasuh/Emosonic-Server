@@ -216,6 +216,11 @@ def _command_specs(repository: Path) -> List[Tuple[str, Sequence[str], Path]]:
             ("node", "--test", "tests/js/emo_strict_v2_client.test.js"),
             repository,
         ),
+        (
+            "browser",
+            ("npm", "run", "test:emo-browser"),
+            repository,
+        ),
         ("docs", ("make", "html"), repository / "docs"),
         ("full_unittest", (python, "-m", "unittest"), repository),
     ]

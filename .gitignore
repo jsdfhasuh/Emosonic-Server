@@ -50,6 +50,11 @@ nosetests.xml
 coverage.xml
 *,cover
 
+# Node browser-acceptance dependencies and output
+node_modules/
+test-results/
+playwright-report/
+
 # Translations
 *.mo
 *.pot

@@ -212,10 +212,11 @@
   }
   function clearPendingPrepare(reason) {
     if (!state.pendingPrepare) return;
+    const standbyContextId = state.pendingPrepare.standbyContextId;
     state.pendingPrepare = null;
     audio.pause();
-    state.playbackState = 'paused';
-    if (!state.contextId) {
+    state.playbackState = standbyContextId ? 'idle' : 'paused';
+    if (!state.contextId || standbyContextId) {
       state.queue = [];
       state.index = 0;
       audio.removeAttribute('src');
@@ -817,10 +818,22 @@
     if (alreadyProcessed('playback.prepare', payload)) return;
     if (!state.client.capability('playbackPrepare') || !state.client.capability('effectiveAtPlayback')) return;
     if (payload.deviceSessionId !== deviceSessionId) throw new api.StrictProtocolError('playback.prepare target identity mismatch');
+    const hasIdleStandby = Boolean(
+      state.contextId
+      && state.contextId !== payload.playbackContextId
+      && state.queue.length === 0
+      && state.playbackState === 'idle'
+      && currentPositionMs() === 0
+      && !audio.dataset.trackId
+    );
     if (
       state.followingContextId
       || state.activeBroadcastId
-      || (state.contextId && state.contextId !== payload.playbackContextId)
+      || (
+        state.contextId
+        && state.contextId !== payload.playbackContextId
+        && !hasIdleStandby
+      )
     ) {
       await state.client.request('playback.ready', {
         playbackContextId: payload.playbackContextId,
@@ -844,7 +857,11 @@
     }
     try {
       await ensureMeta(payload.queueSongIds);
-      state.pendingPrepare = { ...payload, queueSongIds: payload.queueSongIds.slice() };
+      state.pendingPrepare = {
+        ...payload,
+        queueSongIds: payload.queueSongIds.slice(),
+        standbyContextId: hasIdleStandby ? state.contextId : null,
+      };
       state.queue = payload.queueSongIds.slice();
       state.index = payload.currentIndex;
       loadRequiredCurrent(payload.positionMs);
@@ -1001,8 +1018,17 @@
     } else if (action === 'playback.context.status') {
       const context = message.payload.playbackContext;
       if (context.playbackContextId === state.followingContextId) applyContext(context, true, message.payload.deviceStates).catch((error) => showError(error.message));
-      else if (context.playbackContextId === state.contextId) applyContext(context, false, message.payload.deviceStates).catch((error) => showError(error.message));
-    } else if (action === 'queue.context.sync' && message.payload.playbackContextId === state.contextId) {
+      else if (
+        !state.followingContextId
+        && !state.activeBroadcastId
+        && context.playbackContextId === state.contextId
+      ) applyContext(context, false, message.payload.deviceStates).catch((error) => showError(error.message));
+    } else if (
+      action === 'queue.context.sync'
+      && !state.followingContextId
+      && !state.activeBroadcastId
+      && message.payload.playbackContextId === state.contextId
+    ) {
       applyContext(message.payload).catch((error) => showError(error.message));
     } else if (['device.setVolume', 'player.play', 'player.pause', 'player.seek', 'player.next', 'player.prev', 'queue.playItem'].includes(action)) {
       applyControl(message).catch((error) => showError(error.message));
@@ -1040,7 +1066,6 @@
       audio.pause();
       state.playbackState = 'paused';
       text('strict-handoff-state', `released to ${message.payload.newAuthorityClientId}`);
-      reportFeedback(releasedContextId).catch(() => {});
     } else if (action === 'playback.handoff.status') {
       text('strict-handoff-state', message.payload.status);
       if (['failed', 'cancelled', 'timedOut'].includes(message.payload.status)) {
@@ -1154,7 +1179,11 @@
     });
     document.getElementById('strict-follow-start').addEventListener('click', () => startFollow().catch((error) => showError(error.message)));
     document.getElementById('strict-follow-stop').addEventListener('click', () => stopFollow('user').catch((error) => showError(error.message)));
-    document.getElementById('strict-follow-refresh').addEventListener('click', () => refreshBindings().catch((error) => showError(error.message)));
+    document.getElementById('strict-follow-refresh').addEventListener('click', () => {
+      state.client.request('device.list', {})
+        .then(refreshBindings)
+        .catch((error) => showError(error.message));
+    });
     document.getElementById('strict-reset-device').addEventListener('click', () => {
       runQueueMutation(resetDevice).catch((error) => showError(error.message));
     });
@@ -1254,6 +1283,12 @@
         },
         forceProtocolError(message = 'acceptance injected protocol failure') {
           state.client._protocolError(new api.StrictProtocolError(message));
+        },
+        disconnectTransport() {
+          state.client.disconnect();
+        },
+        reconnectTransport() {
+          state.client.connect();
         },
       };
     }

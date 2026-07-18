@@ -352,6 +352,7 @@
   function updateCapabilityUi() {
     const selected = selectedDevice();
     const targetCapabilities = selected?.capabilities || {};
+    const hasPlayableQueue = Boolean(state.context?.queueSongIds?.length);
     const actionCapability = {
       'player.play': 'canPlay',
       'player.pause': 'canPause',
@@ -360,13 +361,13 @@
     };
     document.querySelectorAll('[data-control]').forEach((button) => {
       button.disabled = (
-        !state.context
+        !hasPlayableQueue
         || state.controlBusy
         || !targetCapabilities[actionCapability[button.dataset.control]]
       );
     });
     const seekEnabled = Boolean(
-      state.context && targetCapabilities.canSeek && !state.controlBusy
+      hasPlayableQueue && targetCapabilities.canSeek && !state.controlBusy
     );
     document.getElementById('strict-seek-back').disabled = !seekEnabled;
     document.getElementById('strict-seek-forward').disabled = !seekEnabled;
@@ -375,7 +376,7 @@
       && targetCapabilities.supportsBroadcast
     );
     document.getElementById('strict-broadcast-start').disabled = (
-      !broadcastEnabled || !state.context || state.broadcastBusy || Boolean(state.activeBroadcast)
+      !broadcastEnabled || !hasPlayableQueue || state.broadcastBusy || Boolean(state.activeBroadcast)
     );
     document.querySelectorAll('[data-broadcast]').forEach((button) => {
       button.disabled = !broadcastEnabled || !state.activeBroadcast || state.broadcastBusy;
@@ -387,7 +388,7 @@
     const terminalHandoff = state.handoff
       && ['completed', 'failed', 'cancelled', 'timedOut'].includes(state.handoff.status);
     document.getElementById('strict-handoff-start').disabled = (
-      !state.context
+      !hasPlayableQueue
       || !document.getElementById('strict-handoff-target').value
       || Boolean(state.handoff && !terminalHandoff)
     );
@@ -1150,7 +1151,16 @@
         refreshBindings().then(refreshSelected).catch((error) => showError(error.message));
       }
     } else if (action === 'playback.handoff.cancel') {
-      state.handoff = { ...(state.handoff || {}), ...message.payload, status: 'cancelled' };
+      const sameHandoff = state.handoff?.handoffId === message.payload.handoffId;
+      const existingStatus = sameHandoff ? state.handoff?.status : null;
+      const terminalStatus = ['failed', 'cancelled', 'timedOut'].includes(existingStatus)
+        ? existingStatus
+        : (
+          ['prepare_timeout', 'commit_timeout'].includes(message.payload.errorCode)
+            ? 'timedOut'
+            : (message.payload.errorCode ? 'failed' : 'cancelled')
+        );
+      state.handoff = { ...(state.handoff || {}), ...message.payload, status: terminalStatus };
       renderHandoff();
     } else if (action === 'system.error') {
       showError(`${message.payload.code}: ${message.payload.message}`);
