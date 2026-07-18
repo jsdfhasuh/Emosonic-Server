@@ -18,12 +18,6 @@ FROZEN_CONTRACT_SHA256 = (
 )
 FROZEN_PROTOCOL_VERSION = "2.4.0"
 PROFILES = ("core", "follow", "handoff", "broadcast")
-PROVIDER_ENVIRONMENT = (
-    "SUPYSONIC_TEST_POSTGRES_URI",
-    "SUPYSONIC_TEST_MYSQL_URI",
-)
-
-
 class EvidenceError(RuntimeError):
     """Raised when evidence cannot be bound safely to one build."""
 
@@ -190,25 +184,8 @@ def _command_specs(repository: Path) -> List[Tuple[str, Sequence[str], Path]]:
             repository,
         ),
         (
-            "postgres_migration",
-            (
-                python,
-                "-m",
-                "unittest",
-                "tests.base.test_emo_schema_migration.EmoSchemaMigrationTestCase."
-                "test_postgres_runtime_clean_schema_and_20260708_upgrade",
-            ),
-            repository,
-        ),
-        (
-            "mysql_migration",
-            (
-                python,
-                "-m",
-                "unittest",
-                "tests.base.test_emo_schema_migration.EmoSchemaMigrationTestCase."
-                "test_mysql_runtime_clean_schema_and_20260708_upgrade",
-            ),
+            "database_migrations",
+            ("sh", "tests/emo_migrations/run.sh"),
             repository,
         ),
         (
@@ -329,15 +306,6 @@ def main() -> int:
         print(json.dumps(identity, indent=2, sort_keys=True))
         if args.identity_only:
             return 0
-
-        missing_environment = [
-            name for name in PROVIDER_ENVIRONMENT if not os.environ.get(name)
-        ]
-        if missing_environment:
-            raise EvidenceError(
-                "Final evidence requires provider configuration: %s"
-                % ", ".join(missing_environment)
-            )
 
         output_root = args.output_root
         if not output_root.is_absolute():

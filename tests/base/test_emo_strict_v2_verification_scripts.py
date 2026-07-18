@@ -117,6 +117,10 @@ class StrictV2VerificationScriptsTestCase(unittest.TestCase):
             commands["browser"],
             ("npm", "run", "test:emo-browser"),
         )
+        self.assertEqual(
+            commands["database_migrations"],
+            ("sh", "tests/emo_migrations/run.sh"),
+        )
 
     def test_evidence_collector_rejects_premature_formal_readiness(self):
         contract_hash, descriptor, conformance, manifest = (
