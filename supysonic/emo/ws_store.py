@@ -2414,7 +2414,6 @@ def mutateStrictPlaybackContextQueue(
                 if queue_song_ids and next_index is not None
                 else None
             )
-            queue_changed = previous_queue != queue_song_ids
             index_changed = previous_index != next_index
             boundary_changed = bool(previous_queue) != bool(queue_song_ids)
             control_changed = (
@@ -2436,9 +2435,6 @@ def mutateStrictPlaybackContextQueue(
             ):
                 raise PlaybackContextStaleVersionError(current, "controlVersion")
 
-            if not queue_changed and not control_changed:
-                return current
-
             record.queue_json = json.dumps(queue_song_ids, ensure_ascii=True)
             record.current_index = next_index or 0
             record.track_id = next_track
@@ -2449,8 +2445,7 @@ def mutateStrictPlaybackContextQueue(
             elif not previous_queue or record.state == "idle":
                 record.state = "paused"
             record.version += 1
-            if queue_changed or index_changed:
-                record.queue_revision += 1
+            record.queue_revision += 1
             if control_changed:
                 record.control_version += 1
             record.updated_at = now()

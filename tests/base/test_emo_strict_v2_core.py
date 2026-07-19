@@ -3425,6 +3425,10 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(persisted["queueRevision"], 2)
         self.assertEqual(persisted["controlVersion"], 2)
 
+        before_stale = tuple(
+            persisted[field]
+            for field in ("version", "queueRevision", "controlVersion")
+        )
         stale = {
             "type": "state",
             "action": "queue.context.sync",
@@ -3442,7 +3446,14 @@ class StrictV2CoreTestCase(unittest.TestCase):
         error = self.messages(client)[0]
         self.assertEqual(error["payload"]["code"], "stale_version")
         self.assertEqual(error["payload"]["currentQueueRevision"], 2)
-        self.assertEqual(getPlaybackContextState("context-1")["version"], 2)
+        after_stale = getPlaybackContextState("context-1")
+        self.assertEqual(
+            tuple(
+                after_stale[field]
+                for field in ("version", "queueRevision", "controlVersion")
+            ),
+            before_stale,
+        )
 
     def test_controller_control_routes_only_to_bound_authority_then_acks(self):
         player = self.ready_strict_client()
@@ -3626,9 +3637,9 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.create_context(client)
         scenarios = (
             ("content", ["song-2", "song-3"], 0, 1200, None, (2, 2, 1)),
-            ("position", ["song-2", "song-3"], 0, 1300, 1, (3, 2, 2)),
-            ("index", ["song-2", "song-3"], 1, 0, 2, (4, 3, 3)),
-            ("no-op", ["song-2", "song-3"], 1, 0, None, (4, 3, 3)),
+            ("position", ["song-2", "song-3"], 0, 29639, 1, (3, 3, 2)),
+            ("index", ["song-2", "song-3"], 1, 0, 2, (4, 4, 3)),
+            ("no-op", ["song-2", "song-3"], 1, 0, None, (5, 5, 3)),
         )
         for name, queue, index, position, base_control, expected in scenarios:
             with self.subTest(name=name):
@@ -3649,6 +3660,10 @@ class StrictV2CoreTestCase(unittest.TestCase):
                     "queue.context.sync",
                     "queue-%s" % name,
                     payload,
+                )
+                self.assertEqual(
+                    [message["action"] for message in messages],
+                    ["system.ack", "queue.context.sync"],
                 )
                 push = next(
                     message
@@ -3679,6 +3694,13 @@ class StrictV2CoreTestCase(unittest.TestCase):
                         persisted["version"],
                         persisted["queueRevision"],
                         persisted["controlVersion"],
+                    ),
+                    expected,
+                )
+                self.assertEqual(
+                    tuple(
+                        push["payload"][field]
+                        for field in ("version", "queueRevision", "controlVersion")
                     ),
                     expected,
                 )
