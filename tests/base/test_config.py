@@ -67,6 +67,93 @@ class ConfigTestCase(unittest.TestCase):
             DefaultConfig.WEBAPP = original_webapp
             DefaultConfig.LASTFM = original_lastfm
 
+    def test_emo_strict_v2_safety_defaults_and_ini_values(self):
+        defaults = DefaultConfig.WEBAPP
+        self.assertEqual(defaults["emo_allowed_origins"], "")
+        self.assertFalse(defaults["emo_development_mode"])
+        self.assertEqual(defaults["emo_socketio_ping_interval"], 25)
+        self.assertEqual(defaults["emo_socketio_ping_timeout"], 20)
+        self.assertEqual(defaults["emo_unauthenticated_connections_per_ip"], 10)
+        self.assertEqual(defaults["emo_authenticated_connections_per_user"], 20)
+        self.assertEqual(
+            defaults["emo_strict_requests_per_connection_per_minute"],
+            120,
+        )
+        self.assertFalse(
+            defaults["emo_strict_v2_allow_local_test_evidence"]
+        )
+        self.assertEqual(defaults["emo_web_realtime_protocol"], "legacy")
+        self.assertEqual(defaults["emo_browser_otp_ttl_seconds"], 60)
+        self.assertEqual(defaults["emo_browser_otp_outstanding_per_session"], 4)
+        self.assertFalse(defaults["emo_web_strict_v2_follow_enabled"])
+        self.assertFalse(defaults["emo_web_strict_v2_handoff_enabled"])
+        self.assertFalse(defaults["emo_web_strict_v2_broadcast_enabled"])
+        self.assertFalse(defaults["emo_web_strict_v2_acceptance_mode"])
+
+        config_file_path = None
+        try:
+            with NamedTemporaryFile("w", delete=False) as config_file:
+                config_file.write(
+                    "[webapp]\n"
+                    "emo_allowed_origins = https://music.example\n"
+                    "emo_development_mode = on\n"
+                    "emo_socketio_ping_interval = 15\n"
+                    "emo_socketio_ping_timeout = 10\n"
+                    "emo_unauthenticated_connections_per_ip = 4\n"
+                    "emo_authenticated_connections_per_user = 8\n"
+                    "emo_strict_requests_per_connection_per_minute = 60\n"
+                    "emo_strict_shutdown_grace_seconds = 3\n"
+                    "emo_strict_v2_allow_local_test_evidence = on\n"
+                    "emo_web_realtime_protocol = strict_v2\n"
+                    "emo_browser_otp_ttl_seconds = 45\n"
+                    "emo_browser_otp_outstanding_per_session = 6\n"
+                    "emo_web_strict_v2_follow_enabled = on\n"
+                    "emo_web_strict_v2_handoff_enabled = on\n"
+                    "emo_web_strict_v2_broadcast_enabled = on\n"
+                    "emo_web_strict_v2_acceptance_mode = on\n"
+                )
+                config_file.flush()
+                config_file_path = config_file.name
+
+            conf = IniConfig(config_file_path)
+
+            self.assertEqual(
+                conf.WEBAPP["emo_allowed_origins"],
+                "https://music.example",
+            )
+            self.assertTrue(conf.WEBAPP["emo_development_mode"])
+            self.assertEqual(conf.WEBAPP["emo_socketio_ping_interval"], 15)
+            self.assertEqual(conf.WEBAPP["emo_socketio_ping_timeout"], 10)
+            self.assertEqual(
+                conf.WEBAPP["emo_unauthenticated_connections_per_ip"],
+                4,
+            )
+            self.assertEqual(
+                conf.WEBAPP["emo_authenticated_connections_per_user"],
+                8,
+            )
+            self.assertEqual(
+                conf.WEBAPP["emo_strict_requests_per_connection_per_minute"],
+                60,
+            )
+            self.assertTrue(
+                conf.WEBAPP["emo_strict_v2_allow_local_test_evidence"]
+            )
+            self.assertEqual(conf.WEBAPP["emo_strict_shutdown_grace_seconds"], 3)
+            self.assertEqual(conf.WEBAPP["emo_web_realtime_protocol"], "strict_v2")
+            self.assertEqual(conf.WEBAPP["emo_browser_otp_ttl_seconds"], 45)
+            self.assertEqual(
+                conf.WEBAPP["emo_browser_otp_outstanding_per_session"],
+                6,
+            )
+            self.assertTrue(conf.WEBAPP["emo_web_strict_v2_follow_enabled"])
+            self.assertTrue(conf.WEBAPP["emo_web_strict_v2_handoff_enabled"])
+            self.assertTrue(conf.WEBAPP["emo_web_strict_v2_broadcast_enabled"])
+            self.assertTrue(conf.WEBAPP["emo_web_strict_v2_acceptance_mode"])
+        finally:
+            if config_file_path:
+                os.remove(config_file_path)
+
     def test_recommendation_agent_config_defaults_and_ini_values(self):
         original_agent = DefaultConfig.RECOMMENDATION_AGENT.copy()
 

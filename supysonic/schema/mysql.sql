@@ -307,11 +307,15 @@ CREATE TABLE IF NOT EXISTS emo_playback_context (
     playback_context_id VARCHAR(128) NOT NULL UNIQUE,
     user_name VARCHAR(64) NOT NULL,
     authority_client_id VARCHAR(128),
+    authority_device_session_id VARCHAR(128),
     origin_client_id VARCHAR(128),
+    timeline_id VARCHAR(128),
+    creation_fingerprint VARCHAR(64),
+    lifecycle VARCHAR(16) NOT NULL DEFAULT 'active',
     queue_json TEXT NOT NULL,
     current_index INTEGER NOT NULL DEFAULT 0,
     track_id VARCHAR(128),
-    state VARCHAR(32) NOT NULL DEFAULT 'stopped',
+    state VARCHAR(32) NOT NULL DEFAULT 'idle',
     position_ms INTEGER NOT NULL DEFAULT 0,
     volume INTEGER,
     queue_revision INTEGER NOT NULL DEFAULT 1,
@@ -319,9 +323,18 @@ CREATE TABLE IF NOT EXISTS emo_playback_context (
     version INTEGER NOT NULL DEFAULT 1,
     epoch INTEGER NOT NULL DEFAULT 1,
     playback_json TEXT,
+    closed_at DATETIME,
     created_at DATETIME NOT NULL,
     updated_at DATETIME NOT NULL
 ) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE INDEX idx_emo_playback_context_binding
+ON emo_playback_context (
+    user_name,
+    lifecycle,
+    authority_client_id,
+    authority_device_session_id
+);
 
 CREATE TABLE IF NOT EXISTS emo_device_playback_state (
     id CHAR(32) PRIMARY KEY,
@@ -335,10 +348,94 @@ CREATE TABLE IF NOT EXISTS emo_device_playback_state (
     volume INTEGER,
     is_authority INTEGER NOT NULL DEFAULT 0,
     mode VARCHAR(32) NOT NULL DEFAULT 'normal',
+    context_epoch INTEGER NOT NULL DEFAULT 1,
+    applied_control_version INTEGER NOT NULL DEFAULT 0,
+    client_seq INTEGER NOT NULL DEFAULT 0,
     playback_json TEXT,
     created_at DATETIME NOT NULL,
     updated_at DATETIME NOT NULL,
     UNIQUE KEY uniq_emo_device_playback_context_client (playback_context_id, owner_client_id)
+) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS emo_playback_control_transaction (
+    id CHAR(32) PRIMARY KEY,
+    playback_context_id VARCHAR(128) NOT NULL,
+    user_name VARCHAR(64) NOT NULL,
+    epoch INTEGER NOT NULL,
+    command_control_version INTEGER NOT NULL,
+    requesting_client_id VARCHAR(128) NOT NULL,
+    authority_client_id VARCHAR(128) NOT NULL,
+    authority_device_session_id VARCHAR(128) NOT NULL,
+    routed_connection_nonce VARCHAR(128) NOT NULL,
+    routed_connection_epoch INTEGER NOT NULL DEFAULT 1,
+    action VARCHAR(64) NOT NULL,
+    accepted_target_json TEXT NOT NULL,
+    status VARCHAR(32) NOT NULL DEFAULT 'pending',
+    error_code VARCHAR(64),
+    depends_on_control_version INTEGER,
+    accepted_at_ms BIGINT NOT NULL,
+    execution_timeout_ms INTEGER NOT NULL,
+    watchdog_deadline_at_ms BIGINT NOT NULL,
+    applied_control_version INTEGER,
+    terminal_fingerprint VARCHAR(64),
+    terminal_at_ms BIGINT,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    UNIQUE KEY uniq_emo_control_context_epoch_version (
+        playback_context_id, epoch, command_control_version
+    ),
+    KEY idx_emo_control_pending_deadline (status, watchdog_deadline_at_ms),
+    KEY idx_emo_control_context_status (
+        playback_context_id, epoch, status, command_control_version
+    )
+) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS emo_playback_prepare_transaction (
+    id CHAR(32) PRIMARY KEY,
+    playback_context_id VARCHAR(128) NOT NULL,
+    user_name VARCHAR(64) NOT NULL,
+    epoch INTEGER NOT NULL,
+    intent_id VARCHAR(128) NOT NULL,
+    requesting_client_id VARCHAR(128) NOT NULL,
+    authority_client_id VARCHAR(128) NOT NULL,
+    authority_device_session_id VARCHAR(128) NOT NULL,
+    routed_connection_nonce VARCHAR(128) NOT NULL,
+    routed_connection_epoch INTEGER NOT NULL DEFAULT 1,
+    request_fingerprint VARCHAR(64) NOT NULL,
+    initial_queue_json TEXT,
+    control_version INTEGER NOT NULL,
+    status VARCHAR(32) NOT NULL DEFAULT 'preparing',
+    error_code VARCHAR(64),
+    error_message TEXT,
+    deadline_at_ms BIGINT NOT NULL,
+    canonical_result_json TEXT,
+    terminal_at_ms BIGINT,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    UNIQUE KEY uniq_emo_prepare_context_epoch_intent (
+        playback_context_id, epoch, intent_id
+    ),
+    KEY idx_emo_prepare_context_status (playback_context_id, epoch, status),
+    KEY idx_emo_prepare_pending_deadline (status, deadline_at_ms)
+) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS emo_playback_local_intent (
+    id CHAR(32) PRIMARY KEY,
+    playback_context_id VARCHAR(128) NOT NULL,
+    user_name VARCHAR(64) NOT NULL,
+    epoch INTEGER NOT NULL,
+    intent_id VARCHAR(128) NOT NULL,
+    authority_client_id VARCHAR(128) NOT NULL,
+    authority_device_session_id VARCHAR(128) NOT NULL,
+    request_fingerprint VARCHAR(64) NOT NULL,
+    canonical_update_json TEXT NOT NULL,
+    control_version INTEGER NOT NULL,
+    superseded_through_control_version INTEGER NOT NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    UNIQUE KEY uniq_emo_local_context_epoch_intent (
+        playback_context_id, epoch, intent_id
+    )
 ) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS emo_playback_handoff (
@@ -445,8 +542,8 @@ CREATE TABLE user_play_activity (
     user_id CHAR(32) NOT NULL,
     time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, 
     CONSTRAINT fk_track FOREIGN KEY (track_id) REFERENCES track(id) ON DELETE CASCADE,
-    CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE,
-);DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+    CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
+) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 CREATE INDEX index_activity_user_id_fk ON user_play_activity(user_id);
 CREATE INDEX index_activity_track_id_fk ON user_play_activity(track_id);

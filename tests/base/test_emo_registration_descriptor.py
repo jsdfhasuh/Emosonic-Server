@@ -1,5 +1,8 @@
 import copy
+import json
+import re
 import unittest
+from pathlib import Path
 
 from jsonschema import Draft202012Validator
 
@@ -25,11 +28,17 @@ class EmoRegistrationDescriptorTestCase(unittest.TestCase):
                 "clientId": "phone-1",
                 "deviceSessionId": "device:phone-1",
                 "deviceName": "Alice phone",
-                "roles": ["player"],
+                "roles": ["player", "controller"],
                 "capabilities": {
                     "playbackContextV2": True,
                     "playbackPrepare": True,
                     "effectiveAtPlayback": True,
+                    "canPlay": True,
+                    "canPause": True,
+                    "canSeek": True,
+                    "canSetVolume": True,
+                    "supportsFollow": True,
+                    "supportsBroadcast": True,
                 },
             },
         }
@@ -41,14 +50,19 @@ class EmoRegistrationDescriptorTestCase(unittest.TestCase):
             "requestId": "register-phone-1",
             "timestamp": 1000.0,
             "payload": {
-                "client": {
-                    "userName": "alice",
-                    "clientId": "phone-1",
-                    "deviceSessionId": "device:phone-1",
-                    "roles": ["player"],
-                    "capabilities": {
-                        "playbackContextV2": True,
-                    },
+                "action": "device.register",
+                "clientId": "phone-1",
+                "deviceSessionId": "device:phone-1",
+                "negotiatedCapabilities": {
+                    "playbackContextV2": True,
+                    "playbackPrepare": True,
+                    "effectiveAtPlayback": True,
+                    "canPlay": True,
+                    "canPause": True,
+                    "canSeek": True,
+                    "canSetVolume": True,
+                    "supportsFollow": True,
+                    "supportsBroadcast": True,
                 },
                 "strictV2": get_strict_v2_registration_metadata(
                     "nonce-for-descriptor-test"
@@ -89,12 +103,30 @@ class EmoRegistrationDescriptorTestCase(unittest.TestCase):
         self.assertFalse(self.validator.is_valid(invalid_epoch))
         self.assertFalse(self.validator.is_valid(boolean_epoch))
 
+    def test_descriptor_requires_all_capabilities_and_accepts_single_role(self):
+        missing_capability = self._strict_register_request()
+        del missing_capability["payload"]["capabilities"]["supportsBroadcast"]
+        single_role = self._strict_register_request()
+        single_role["payload"]["roles"] = ["player"]
+        duplicate_roles = self._strict_register_request()
+        duplicate_roles["payload"]["roles"] = ["player", "player"]
+
+        self.assertFalse(self.validator.is_valid(missing_capability))
+        self.assertTrue(self.validator.is_valid(single_role))
+        self.assertFalse(self.validator.is_valid(duplicate_roles))
+
     def test_descriptor_rejects_a_legacy_ack_as_strict_ack(self):
         legacy_ack = self._strict_register_ack()
         del legacy_ack["payload"]["strictV2"]
-        legacy_ack["payload"]["client"]["sessionId"] = "legacy-room"
+        legacy_ack["payload"]["client"] = {"sessionId": "legacy-room"}
 
         self.assertFalse(self.validator.is_valid(legacy_ack))
+
+    def test_descriptor_requires_the_correlated_request_action(self):
+        ack = self._strict_register_ack()
+        del ack["payload"]["action"]
+
+        self.assertFalse(self.validator.is_valid(ack))
 
     def test_descriptor_accepts_a_registration_error(self):
         error = {
@@ -103,9 +135,58 @@ class EmoRegistrationDescriptorTestCase(unittest.TestCase):
             "requestId": "register-phone-1",
             "timestamp": 1000.0,
             "payload": {
+                "action": "device.register",
                 "code": "bad_request",
                 "message": "deviceSessionId must be a non-empty string",
+                "retryable": False,
             },
         }
 
         self.assertTrue(self.validator.is_valid(error))
+
+    def test_server_change_note_registration_examples_match_descriptor(self):
+        repository_root = Path(__file__).resolve().parents[2]
+        change_note = (
+            repository_root / "docs" / "emosonic_strict_v2_server_change_note.md"
+        ).read_text(encoding="utf-8")
+        registration_section = change_note.split(
+            "## 3. `device.register`",
+            1,
+        )[1].split("## 4.", 1)[0]
+        examples = [
+            json.loads(block)
+            for block in re.findall(
+                r"```json\n(.*?)\n```",
+                registration_section,
+                flags=re.DOTALL,
+            )
+        ]
+
+        self.assertEqual(len(examples), 3)
+        request, error, ack = examples
+        for example in examples:
+            self.assertTrue(
+                self.validator.is_valid(example),
+                self.validator.iter_errors(example),
+            )
+        self.assertEqual(request["payload"]["roles"], ["player", "controller"])
+        self.assertNotIn("client", ack["payload"])
+        self.assertIn("negotiatedCapabilities", ack["payload"])
+        self.assertEqual(
+            ack["connectionNonce"],
+            ack["payload"]["strictV2"]["connectionNonce"],
+        )
+        self.assertFalse(error["payload"]["retryable"])
+
+    def test_server_change_note_uses_current_optional_profile_error(self):
+        repository_root = Path(__file__).resolve().parents[2]
+        change_note = (
+            repository_root / "docs" / "emosonic_strict_v2_server_change_note.md"
+        ).read_text(encoding="utf-8")
+        capability_section = change_note.split(
+            "## 6. Follow 与 Broadcast capability gate",
+            1,
+        )[1].split("## 7.", 1)[0]
+
+        self.assertIn("`capability_required`", capability_section)
+        self.assertNotIn("`forbidden`", capability_section)

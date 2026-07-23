@@ -1,0 +1,1306 @@
+{% extends "layout.html" %}
+{% block body %}
+<style>
+  .strict-player { max-width: 1180px; margin: 0 auto; }
+  .strict-grid { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(280px, .8fr); gap: 1rem; }
+  .strict-grid > * { min-width: 0; }
+  .strict-card { border: 1px solid #d8dde5; border-radius: 14px; background: #fff; padding: 1rem; margin-bottom: 1rem; }
+  .strict-status { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: 1rem; }
+  .strict-status span { border-radius: 999px; background: #edf2f7; padding: .3rem .65rem; font-size: .82rem; }
+  .strict-error { color: #a61b1b; white-space: pre-wrap; }
+  .strict-muted { color: #667085; }
+  .strict-queue { list-style: none; padding: 0; margin: .75rem 0 0; max-height: 360px; overflow: auto; }
+  .strict-queue li { display: flex; gap: .6rem; align-items: center; border-top: 1px solid #edf0f4; padding: .55rem 0; }
+  .strict-queue li.is-current { color: #0b57d0; font-weight: 700; }
+  .strict-queue button { margin-left: auto; }
+  .strict-controls { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+  .strict-controls input[type="range"] { min-width: 180px; flex: 1; }
+  .strict-meta { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: .35rem .7rem; font-size: .88rem; }
+  .strict-meta > * { min-width: 0; overflow-wrap: anywhere; }
+  @media (max-width: 800px) { .strict-grid { grid-template-columns: 1fr; } }
+</style>
+
+<main class="strict-player" id="strict-player-root"
+      data-search-url="{{ url_for('frontend.player_search') }}"
+      data-meta-url="{{ url_for('frontend.player_track_meta') }}">
+  <div class="d-flex justify-content-between align-items-start gap-3 mb-3">
+    <div>
+      <h1 class="h3 mb-1">EmoSonic Web Player</h1>
+      <div class="strict-muted">PlaybackContext strict-v2 2.4.0</div>
+    </div>
+    <button class="btn btn-outline-danger btn-sm" id="strict-reset-device" type="button">重置网页设备</button>
+  </div>
+
+  <div class="strict-status">
+    <span id="strict-connection-state">disconnected</span>
+    <span id="strict-context-state">no context</span>
+    <span id="strict-follow-state">solo</span>
+    <span id="strict-broadcast-state">no broadcast</span>
+    <span id="strict-handoff-state">no handoff</span>
+  </div>
+  <div class="alert alert-danger d-none" id="strict-player-error" role="alert"></div>
+  <div class="alert alert-warning d-none" id="strict-owner-warning" role="alert">网页播放器已在另一个标签页运行。</div>
+
+  <div class="strict-grid">
+    <section>
+      <div class="strict-card">
+        <h2 class="h5">当前播放</h2>
+        <div class="mb-2" id="strict-now-playing">尚未选择曲目</div>
+        <audio id="strict-player-audio" preload="metadata"></audio>
+        <div class="strict-controls mb-2">
+          <button class="btn btn-outline-secondary" id="strict-prev" type="button">上一首</button>
+          <button class="btn btn-primary" id="strict-play" type="button">播放</button>
+          <button class="btn btn-outline-secondary" id="strict-pause" type="button">暂停</button>
+          <button class="btn btn-outline-secondary" id="strict-next" type="button">下一首</button>
+        </div>
+        <div class="strict-controls">
+          <input type="range" id="strict-progress" min="0" max="1000" value="0" aria-label="播放进度">
+          <span id="strict-position">0:00 / 0:00</span>
+          <label class="d-flex align-items-center gap-2">音量 <input type="range" id="strict-volume" min="0" max="100" value="70"></label>
+        </div>
+      </div>
+
+      <div class="strict-card">
+        <div class="d-flex justify-content-between align-items-center gap-2">
+          <h2 class="h5 mb-0">播放队列</h2>
+          <button class="btn btn-outline-danger btn-sm" id="strict-clear-queue" type="button">清空并关闭 Context</button>
+        </div>
+        <ul class="strict-queue" id="strict-player-queue"></ul>
+      </div>
+
+      <div class="strict-card">
+        <h2 class="h5">搜索并加入队列</h2>
+        <div class="input-group">
+          <input class="form-control" id="strict-search" placeholder="歌曲、艺人或专辑">
+          <button class="btn btn-dark" id="strict-search-button" type="button">搜索</button>
+        </div>
+        <ul class="strict-queue" id="strict-search-results"></ul>
+      </div>
+    </section>
+
+    <aside>
+      <div class="strict-card">
+        <h2 class="h5">跟随其他播放源</h2>
+        <select class="form-select mb-2" id="strict-follow-source"></select>
+        <div class="d-flex gap-2">
+          <button class="btn btn-outline-secondary" id="strict-follow-refresh" type="button">刷新来源</button>
+          <button class="btn btn-dark" id="strict-follow-start" type="button">开始 Follow</button>
+          <button class="btn btn-outline-secondary" id="strict-follow-stop" type="button">停止 Follow</button>
+        </div>
+        <small class="strict-muted">开始前必须先在本页执行一次播放手势。</small>
+      </div>
+
+      <div class="strict-card">
+        <h2 class="h5">协议与身份</h2>
+        <div class="strict-meta">
+          <span>clientId</span><code id="strict-client-id"></code>
+          <span>deviceSessionId</span><code id="strict-device-id"></code>
+          <span>playbackContextId</span><code id="strict-context-id">-</code>
+          <span>protocol</span><code id="strict-protocol">-</code>
+          <span>schema</span><code id="strict-schema">-</code>
+          <span>build</span><code id="strict-build">-</code>
+          <span>capabilities</span><code id="strict-capabilities">-</code>
+        </div>
+      </div>
+
+      <div class="strict-card">
+        <h2 class="h5">事件</h2>
+        <div class="strict-muted" id="strict-player-log"></div>
+      </div>
+    </aside>
+  </div>
+</main>
+
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+<script src="{{ url_for('static', filename='js/emo_strict_v2_client.js') }}"></script>
+<script>
+(() => {
+  'use strict';
+  const bootstrap = {{ emo_web_bootstrap | tojson }};
+  const optionalProfiles = bootstrap.strictV2Profiles || {};
+  const root = document.getElementById('strict-player-root');
+  const audio = document.getElementById('strict-player-audio');
+  const api = window.EmoStrictV2;
+  const META_BATCH_SIZE = 50;
+  const clientId = api.stableIdentity(localStorage, 'emosonic.webPlayer.clientId.v2', 'web-player-');
+  const deviceSessionId = api.stableIdentity(localStorage, 'emosonic.webPlayer.deviceSessionId.v2', 'web-player-device:');
+  const ownerToken = api.stableIdentity(sessionStorage, 'emosonic.webPlayer.ownerToken.v2', 'web-player-tab:');
+  const lock = new api.PlayerOwnerLock({
+    ownerToken,
+    onLost() {
+      if (state.client) state.client.disconnect();
+      document.getElementById('strict-owner-warning').classList.remove('d-none');
+      text('strict-connection-state', 'secondary tab');
+    },
+  });
+  const state = {
+    client: null,
+    contextId: localStorage.getItem('emosonic.webPlayer.playbackContextId.v2'),
+    queue: [],
+    index: 0,
+    playbackState: 'stopped',
+    trackMeta: {},
+    devices: [],
+    bindings: [],
+    userGestureSeen: false,
+    followingContextId: null,
+    followTimer: null,
+    activeBroadcastId: null,
+    broadcastContextId: null,
+    broadcastCursor: null,
+    pendingPrepare: null,
+    processedCommands: new Set(),
+    contextSnapshots: new Map(),
+    appliedControlVersions: new Map(),
+    controlLeases: new Map(),
+    queueMutation: Promise.resolve(),
+    feedbackMutation: Promise.resolve(),
+    volumeMutation: Promise.resolve(),
+    logLines: [],
+  };
+
+  const capabilities = {
+    playbackContextV2: true,
+    playbackPrepare: true,
+    effectiveAtPlayback: optionalProfiles.handoff === true,
+    canPlay: true,
+    canPause: true,
+    canSeek: true,
+    canSetVolume: true,
+    remoteVolumeControl: true,
+    supportsFollow: optionalProfiles.follow === true,
+    supportsBroadcast: optionalProfiles.broadcast === true,
+  };
+
+  function text(id, value) { document.getElementById(id).textContent = value; }
+  function formatMs(value) {
+    const seconds = Math.max(0, Math.floor((Number(value) || 0) / 1000));
+    return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+  }
+  function currentPositionMs() { return Math.max(0, Math.floor((audio.currentTime || 0) * 1000)); }
+  function durationMs() {
+    if (Number.isFinite(audio.duration)) return Math.floor(audio.duration * 1000);
+    return Number(state.trackMeta[state.queue[state.index]]?.durationMs) || 0;
+  }
+  function log(message, level = 'info') {
+    state.logLines.unshift(`[${new Date().toLocaleTimeString()}] ${level}: ${message}`);
+    state.logLines = state.logLines.slice(0, 20);
+    document.getElementById('strict-player-log').textContent = state.logLines.join('\n');
+  }
+  function showError(message) {
+    const element = document.getElementById('strict-player-error');
+    element.textContent = message;
+    element.classList.remove('d-none');
+    log(message, 'error');
+  }
+  function clearError() { document.getElementById('strict-player-error').classList.add('d-none'); }
+  function updateCapabilityUi() {
+    const ready = state.client && state.client.state === 'ready';
+    const followEnabled = ready && state.client.capability('supportsFollow');
+    document.getElementById('strict-follow-start').disabled = !followEnabled;
+    document.getElementById('strict-follow-stop').disabled = !followEnabled || !state.followingContextId;
+  }
+  function clearTransientFollow(reason) {
+    const sourcePlaybackContextId = state.followingContextId;
+    if (!sourcePlaybackContextId) return;
+    if (state.client) state.client.forgetSubscription(sourcePlaybackContextId);
+    state.followingContextId = null;
+    clearInterval(state.followTimer);
+    state.followTimer = null;
+    text('strict-follow-state', reason ? `stopped: ${reason}` : 'solo');
+    updateCapabilityUi();
+  }
+  function clearPendingPrepare(reason) {
+    if (!state.pendingPrepare) return;
+    const standbyContextId = state.pendingPrepare.standbyContextId;
+    state.pendingPrepare = null;
+    audio.pause();
+    state.playbackState = standbyContextId ? 'idle' : 'paused';
+    if (!state.contextId || standbyContextId) {
+      state.queue = [];
+      state.index = 0;
+      audio.removeAttribute('src');
+      delete audio.dataset.trackId;
+      audio.load();
+      renderQueue();
+    }
+    text('strict-handoff-state', reason || 'no handoff');
+  }
+  function setContextId(value) {
+    state.contextId = value || null;
+    text('strict-context-id', state.contextId || '-');
+    text('strict-context-state', state.contextId ? 'context active' : 'no context');
+    if (state.contextId) localStorage.setItem('emosonic.webPlayer.playbackContextId.v2', state.contextId);
+    else localStorage.removeItem('emosonic.webPlayer.playbackContextId.v2');
+  }
+  function activeFeedbackContextId() { return state.broadcastContextId || state.followingContextId || state.contextId; }
+  function alreadyProcessed(action, payload) {
+    const signature = api.stableStringify({ action, payload });
+    if (state.processedCommands.has(signature)) return true;
+    state.processedCommands.add(signature);
+    if (state.processedCommands.size > 200) {
+      state.processedCommands.delete(state.processedCommands.values().next().value);
+    }
+    return false;
+  }
+
+  function renderQueue() {
+    const list = document.getElementById('strict-player-queue');
+    if (!state.queue.length) {
+      list.innerHTML = '<li class="strict-muted">队列为空</li>';
+      text('strict-now-playing', '尚未选择曲目');
+      return;
+    }
+    list.innerHTML = '';
+    state.queue.forEach((trackId, index) => {
+      const item = document.createElement('li');
+      if (index === state.index) item.classList.add('is-current');
+      const label = state.trackMeta[trackId]?.label || trackId;
+      item.append(document.createTextNode(`${index + 1}. ${label}`));
+      const play = document.createElement('button');
+      play.className = 'btn btn-sm btn-outline-primary';
+      play.textContent = '播放';
+      play.addEventListener('click', () => {
+        state.userGestureSeen = true;
+        playIndex(index, 0, true).catch((error) => showError(error.message));
+      });
+      item.append(play);
+      list.append(item);
+    });
+    const currentId = state.queue[state.index];
+    text('strict-now-playing', state.trackMeta[currentId]?.label || currentId);
+  }
+
+  async function ensureMeta(trackIds) {
+    const missing = Array.from(new Set(trackIds.filter((id) => id && !state.trackMeta[id])));
+    for (let offset = 0; offset < missing.length; offset += META_BATCH_SIZE) {
+      const params = new URLSearchParams();
+      missing.slice(offset, offset + META_BATCH_SIZE).forEach((id) => params.append('ids', id));
+      const response = await fetch(`${root.dataset.metaUrl}?${params}`, { credentials: 'same-origin' });
+      if (!response.ok) throw new Error(`曲目元数据加载失败 (${response.status})`);
+      Object.assign(state.trackMeta, await response.json());
+    }
+  }
+
+  function loadCurrent(positionMs = 0, seekExisting = true) {
+    const trackId = state.queue[state.index];
+    const meta = state.trackMeta[trackId];
+    if (!trackId || !meta?.streamUrl) return false;
+    const trackChanged = audio.dataset.trackId !== trackId;
+    if (trackChanged) {
+      audio.src = meta.streamUrl;
+      audio.dataset.trackId = trackId;
+    }
+    if (trackChanged || seekExisting) {
+      const setPosition = () => {
+        try { audio.currentTime = Math.max(0, positionMs) / 1000; } catch (error) { /* metadata not ready */ }
+      };
+      if (audio.readyState >= 1) setPosition();
+      else audio.addEventListener('loadedmetadata', setPosition, { once: true });
+    }
+    renderQueue();
+    return true;
+  }
+
+  function loadRequiredCurrent(positionMs = 0, seekExisting = true) {
+    const trackId = state.queue[state.index];
+    if (loadCurrent(positionMs, seekExisting) && audio.dataset.trackId === trackId) return;
+    audio.pause();
+    audio.removeAttribute('src');
+    delete audio.dataset.trackId;
+    audio.load();
+    state.playbackState = 'paused';
+    throw new Error(`media_unavailable: ${trackId || 'missing track'}`);
+  }
+
+  async function safePlay(reason) {
+    const expectedTrackId = state.queue[state.index];
+    if (!expectedTrackId || audio.dataset.trackId !== expectedTrackId || !audio.getAttribute('src')) {
+      state.playbackState = 'paused';
+      showError(`media_unavailable: ${expectedTrackId || 'missing track'}`);
+      await reportFeedback();
+      if (state.followingContextId) await stopFollow('media_unavailable');
+      return false;
+    }
+    try {
+      await audio.play();
+      state.playbackState = 'playing';
+      clearError();
+      return true;
+    } catch (error) {
+      state.playbackState = audio.paused ? 'paused' : 'playing';
+      showError(`autoplay_blocked: ${reason || error.message}`);
+      await reportFeedback();
+      if (state.followingContextId) await stopFollow('autoplay_blocked');
+      return false;
+    }
+  }
+
+  async function playIndex(index, positionMs, autoplay, syncContext = true, sendUpdate = true) {
+    if (!state.queue.length) return false;
+    state.index = Math.max(0, Math.min(index, state.queue.length - 1));
+    loadRequiredCurrent(positionMs);
+    const playbackStarted = autoplay
+      ? await safePlay('需要用户播放手势')
+      : true;
+    if (!autoplay) audio.pause();
+    if (syncContext && state.contextId && !state.followingContextId && !state.activeBroadcastId) {
+      await syncAuthorityQueue();
+    }
+    if (sendUpdate) await reportFeedback();
+    return playbackStarted;
+  }
+
+  async function sendFeedback(playbackContextId = null, terminal = null) {
+    if (typeof playbackContextId !== 'string') {
+      playbackContextId = activeFeedbackContextId();
+    }
+    if (!playbackContextId || !state.client || state.client.state !== 'ready') return;
+    const trackId = state.queue[state.index];
+    const lastApplied = state.appliedControlVersions.get(playbackContextId);
+    if (!Number.isInteger(lastApplied)) {
+      log(`等待 ${playbackContextId} 的 appliedControlVersion 水合`, 'warning');
+      return;
+    }
+    const committed = terminal?.executionStatus === 'committed';
+    const appliedControlVersion = committed
+      ? terminal.commandControlVersion
+      : lastApplied;
+    const payload = {
+      playbackContextId,
+      deviceSessionId,
+      origin: terminal ? 'remoteCommand' : 'passive',
+      appliedControlVersion,
+      state: trackId
+        ? (audio.paused ? (state.playbackState === 'stopped' ? 'stopped' : 'paused') : 'playing')
+        : 'idle',
+      positionMs: trackId ? currentPositionMs() : 0,
+      clientSeq: state.client.nextClientSeq(),
+      volume: Math.round(audio.volume * 100),
+      muted: audio.muted,
+    };
+    if (trackId) payload.trackId = trackId;
+    if (terminal) {
+      payload.executionStatus = terminal.executionStatus;
+      payload.commandControlVersion = terminal.commandControlVersion;
+      if (terminal.executionStatus === 'failed') {
+        payload.errorCode = terminal.errorCode || 'playback_failed';
+        if (terminal.errorMessage) payload.errorMessage = terminal.errorMessage;
+      }
+    }
+    await state.client.request('playback.update', payload).then((response) => {
+      const canonicalApplied = response?.payload?.appliedControlVersion;
+      if (Number.isInteger(canonicalApplied)) {
+        state.appliedControlVersions.set(playbackContextId, canonicalApplied);
+      }
+    }).catch((error) => {
+      if (error.code === 'client_sequence_conflict') showError(error.message);
+      else log(error.message, 'error');
+    });
+  }
+
+  function reportFeedback(playbackContextId = null, terminal = null) {
+    const operation = state.feedbackMutation
+      .catch(() => {})
+      .then(() => sendFeedback(playbackContextId, terminal));
+    state.feedbackMutation = operation;
+    return operation;
+  }
+
+  async function sendDeviceVolume() {
+    if (!state.client || state.client.state !== 'ready') return;
+    await state.client.request('device.volume.update', {
+      deviceSessionId,
+      volume: Math.round(audio.volume * 100),
+      clientSeq: state.client.nextClientSeq(),
+    }).catch((error) => {
+      if (error.code === 'client_sequence_conflict') showError(error.message);
+      else log(error.message, 'error');
+    });
+  }
+
+  function reportDeviceVolume() {
+    const operation = state.volumeMutation
+      .catch(() => {})
+      .then(sendDeviceVolume);
+    state.volumeMutation = operation;
+    return operation;
+  }
+
+  async function createContext() {
+    const queueSongIds = state.queue.slice();
+    const payload = {
+      deviceSessionId,
+      queueSongIds,
+      positionMs: queueSongIds.length ? currentPositionMs() : 0,
+      state: queueSongIds.length
+        ? (audio.paused ? 'paused' : 'playing')
+        : 'idle',
+    };
+    if (queueSongIds.length) {
+      api.validateQueue(queueSongIds, state.index);
+      payload.currentIndex = state.index;
+    }
+    const response = await state.client.request('playback.context.ensure', payload);
+    const playbackContextId = response.payload.playbackContextId;
+    setContextId(playbackContextId);
+    state.client.rememberSubscription(playbackContextId);
+    state.appliedControlVersions.set(
+      playbackContextId,
+      response.payload.controlVersion,
+    );
+    await applyContext(response.payload);
+  }
+
+  async function ensureContext() {
+    if (!state.contextId) await createContext();
+  }
+
+  async function syncAuthorityQueue(retry = true) {
+    await ensureContext();
+    if (!state.contextId) return;
+    api.validateQueue(state.queue, state.index);
+    const cursor = state.client.cursor(state.contextId);
+    if (!cursor?.queueRevision) {
+      await state.client.refreshContext(state.contextId);
+      return syncAuthorityQueue(retry);
+    }
+    const payload = {
+      playbackContextId: state.contextId,
+      deviceSessionId,
+      queueSongIds: state.queue.slice(),
+      currentIndex: state.index,
+      positionMs: currentPositionMs(),
+      baseQueueRevision: cursor.queueRevision,
+    };
+    if (cursor.controlVersion) payload.baseControlVersion = cursor.controlVersion;
+    try {
+      await state.client.request('queue.context.sync', payload);
+      await state.client.refreshContext(state.contextId);
+    } catch (error) {
+      if (retry && error.code === 'stale_version') {
+        await state.client.refreshContext(state.contextId);
+        return syncAuthorityQueue(false);
+      }
+      throw error;
+    }
+  }
+
+  async function closeContext() {
+    if (state.followingContextId || state.activeBroadcastId) {
+      throw new Error('Follow/Broadcast 活动时不能关闭 authority Context');
+    }
+    if (!state.contextId) {
+      state.queue = [];
+      state.index = 0;
+      renderQueue();
+      return;
+    }
+    const closingId = state.contextId;
+    await state.client.request('playback.context.close', { playbackContextId: closingId });
+    state.client.forgetSubscription(closingId);
+    setContextId(null);
+    state.queue = [];
+    state.index = 0;
+    audio.pause();
+    audio.removeAttribute('src');
+    delete audio.dataset.trackId;
+    audio.load();
+    state.playbackState = 'stopped';
+    renderQueue();
+  }
+
+  async function restoreContext() {
+    if (!state.contextId) return;
+    try {
+      const response = await state.client.subscribe(state.contextId);
+      applyContext(response.payload.playbackContext);
+    } catch (error) {
+      if (['not_found', 'context_closed'].includes(error.code)) {
+        setContextId(null);
+        return;
+      }
+      throw error;
+    }
+  }
+
+  async function applyContext(context, follow = false, deviceStates = []) {
+    if (!context || typeof context.playbackContextId !== 'string') return;
+    const incomingCurrent = state.client.isCurrentContextSnapshot(context);
+    const canonicalContext = state.client.cursor(context.playbackContextId);
+    if (canonicalContext && Array.isArray(canonicalContext.queueSongIds)) {
+      context = { ...context, ...canonicalContext };
+    }
+    if (!Array.isArray(context.queueSongIds)) return;
+    const expectedContextId = follow ? state.followingContextId : state.contextId;
+    if (context.playbackContextId !== expectedContextId) return;
+    const snapshot = Number.isInteger(context.epoch) && Number.isInteger(context.version)
+      ? { epoch: context.epoch, version: context.version }
+      : null;
+    const appliedSnapshot = state.contextSnapshots.get(context.playbackContextId);
+    if (
+      !incomingCurrent
+      && snapshot
+      && appliedSnapshot
+      && (
+        appliedSnapshot.epoch > snapshot.epoch
+        || (appliedSnapshot.epoch === snapshot.epoch && appliedSnapshot.version >= snapshot.version)
+      )
+    ) return;
+    if (!incomingCurrent) deviceStates = [];
+    if (
+      snapshot
+      && appliedSnapshot
+      && (
+        snapshot.epoch < appliedSnapshot.epoch
+        || (snapshot.epoch === appliedSnapshot.epoch && snapshot.version < appliedSnapshot.version)
+      )
+    ) return;
+    if (snapshot) state.contextSnapshots.set(context.playbackContextId, snapshot);
+    await ensureMeta(context.queueSongIds);
+    if ((follow ? state.followingContextId : state.contextId) !== expectedContextId) return;
+    if (snapshot) {
+      const latestSnapshot = state.contextSnapshots.get(context.playbackContextId);
+      if (
+        !latestSnapshot
+        || latestSnapshot.epoch !== snapshot.epoch
+        || latestSnapshot.version !== snapshot.version
+      ) return;
+    }
+    state.queue = context.queueSongIds.slice();
+    const ownDeviceState = Array.isArray(deviceStates)
+      ? deviceStates.find((item) => item.clientId === clientId)
+      : null;
+    if (Number.isInteger(ownDeviceState?.appliedControlVersion)) {
+      state.appliedControlVersions.set(
+        context.playbackContextId,
+        ownDeviceState.appliedControlVersion,
+      );
+    }
+    if (!state.queue.length) {
+      state.index = 0;
+      state.playbackState = 'idle';
+      audio.pause();
+      audio.removeAttribute('src');
+      delete audio.dataset.trackId;
+      audio.load();
+      renderQueue();
+      if (state.appliedControlVersions.has(context.playbackContextId)) {
+        await reportFeedback(context.playbackContextId);
+      }
+      return;
+    }
+    const authorityFeedback = follow && Array.isArray(deviceStates)
+      ? deviceStates.find((item) => item.clientId === context.authorityClientId)
+      : null;
+    const playback = authorityFeedback || context;
+    const feedbackIndex = typeof playback.trackId === 'string'
+      ? state.queue.indexOf(playback.trackId)
+      : -1;
+    const requestedIndex = feedbackIndex >= 0 ? feedbackIndex : (context.currentIndex || 0);
+    state.index = Math.max(0, Math.min(requestedIndex, state.queue.length - 1));
+    state.playbackState = playback.state || 'stopped';
+    if (follow) {
+      const projected = playback.state === 'playing'
+        ? (playback.positionMs || 0) + Math.max(0, state.client.serverNowMs() - (playback.serverUpdatedAtMs || state.client.serverNowMs()))
+        : (playback.positionMs || 0);
+      const trackChanged = audio.dataset.trackId !== state.queue[state.index];
+      const driftMs = Math.abs(currentPositionMs() - projected);
+      loadRequiredCurrent(projected, false);
+      if (!trackChanged && driftMs > 1500) {
+        try { audio.currentTime = projected / 1000; } catch (error) { /* metadata pending */ }
+      }
+    } else {
+      loadRequiredCurrent(context.positionMs || 0);
+    }
+    if (playback.state === 'playing') await safePlay('远程播放需要用户手势');
+    else if (playback.state === 'paused') audio.pause();
+    else { audio.pause(); state.playbackState = 'stopped'; }
+    renderQueue();
+    await reportFeedback();
+  }
+
+  async function refreshBindings() {
+    state.bindings = await state.client.fetchContextBindings();
+    const onlinePlayers = new Set(state.devices.filter((device) => (
+      device.clientId !== clientId && device.roles.includes('player')
+    )).map((device) => `${device.clientId}\u0000${device.deviceSessionId}`));
+    const options = state.bindings.filter((binding) => onlinePlayers.has(`${binding.clientId}\u0000${binding.deviceSessionId}`));
+    if (
+      state.followingContextId
+      && !options.some((binding) => binding.playbackContextId === state.followingContextId)
+    ) {
+      await stopFollow('source offline');
+    }
+    const select = document.getElementById('strict-follow-source');
+    select.innerHTML = '<option value="">选择在线播放源</option>';
+    options.forEach((binding) => {
+      const option = document.createElement('option');
+      option.value = binding.playbackContextId;
+      option.textContent = `${binding.clientId} · ${binding.playbackContextId}`;
+      select.append(option);
+    });
+  }
+
+  async function startFollow() {
+    if (!state.client.capability('supportsFollow')) throw new Error('capability_required: supportsFollow');
+    if (!state.userGestureSeen) throw new Error('请先点击本页播放按钮以授权媒体播放');
+    const sourcePlaybackContextId = document.getElementById('strict-follow-source').value;
+    if (!sourcePlaybackContextId) throw new Error('请选择 Follow 播放源');
+    await state.client.request('follow.start', { sourcePlaybackContextId, deviceSessionId });
+    state.followingContextId = sourcePlaybackContextId;
+    try {
+      await state.client.subscribe(sourcePlaybackContextId);
+    } catch (error) {
+      await state.client.request('follow.stop', { sourcePlaybackContextId }).catch(() => {});
+      clearTransientFollow('subscribe failed');
+      throw error;
+    }
+    text('strict-follow-state', `following ${sourcePlaybackContextId}`);
+    updateCapabilityUi();
+    clearInterval(state.followTimer);
+    state.followTimer = setInterval(() => {
+      state.client.refreshContext(sourcePlaybackContextId).catch((error) => showError(error.message));
+    }, 2000);
+  }
+
+  async function stopFollow(reason) {
+    const sourcePlaybackContextId = state.followingContextId;
+    if (!sourcePlaybackContextId) return;
+    await state.client.request('follow.stop', { sourcePlaybackContextId }).catch((error) => log(error.message, 'error'));
+    await state.client.unsubscribe(sourcePlaybackContextId).catch(() => {});
+    clearTransientFollow(reason);
+    if (state.contextId) {
+      const response = await state.client.refreshContext(state.contextId).catch(() => null);
+      if (response) await applyContext(response.payload.playbackContext);
+    }
+  }
+
+  async function applyControl(message) {
+    if (alreadyProcessed(message.action, message.payload)) return;
+    const payload = message.payload || {};
+    if (message.action === 'device.setVolume') {
+      audio.volume = Math.max(0, Math.min(100, payload.volume)) / 100;
+      document.getElementById('strict-volume').value = String(Math.round(audio.volume * 100));
+      await reportDeviceVolume();
+      if (activeFeedbackContextId()) await reportFeedback();
+      return;
+    }
+    const handoffCommit = message.action === 'player.play' && payload.handoffId;
+    if (
+      !handoffCommit
+      && payload.playbackContextId !== state.contextId
+      && payload.playbackContextId !== state.followingContextId
+    ) return;
+    if (handoffCommit) {
+      await commitHandoff(payload);
+      return;
+    }
+    const commandControlVersion = payload.controlVersion;
+    const leaseKey = `${payload.playbackContextId}\u0000${commandControlVersion}`;
+    const lease = Symbol(leaseKey);
+    state.controlLeases.set(leaseKey, lease);
+    try {
+      if (message.action === 'queue.playItem') {
+        await ensureMeta(payload.queueSongIds || []);
+        state.queue = payload.queueSongIds.slice();
+        if (!await playIndex(payload.queueIndex, 0, true, false, false)) {
+          throw new Error('track_load_failed');
+        }
+      } else if (message.action === 'player.play') {
+        if (Number.isInteger(payload.positionMs)) loadCurrent(payload.positionMs);
+        if (!await safePlay('远程播放被浏览器阻止')) {
+          throw new Error('playback_failed');
+        }
+      } else if (message.action === 'player.pause') {
+        if (Number.isInteger(payload.positionMs)) loadCurrent(payload.positionMs);
+        audio.pause();
+        state.playbackState = 'paused';
+      } else if (message.action === 'player.seek') {
+        loadCurrent(payload.positionMs);
+      } else if (message.action === 'player.next') {
+        if (!await playIndex((state.index + 1) % state.queue.length, 0, true, false, false)) {
+          throw new Error('track_load_failed');
+        }
+      } else if (message.action === 'player.prev') {
+        if (!await playIndex((state.index - 1 + state.queue.length) % state.queue.length, 0, true, false, false)) {
+          throw new Error('track_load_failed');
+        }
+      }
+    } catch (error) {
+      if (state.controlLeases.get(leaseKey) !== lease) return;
+      const errorCode = message.action === 'player.seek'
+        ? 'seek_failed'
+        : (error.message === 'track_load_failed' ? 'track_load_failed' : 'playback_failed');
+      await reportFeedback(payload.playbackContextId, {
+        executionStatus: 'failed',
+        commandControlVersion,
+        errorCode,
+        errorMessage: error.message,
+      });
+      if (state.controlLeases.get(leaseKey) === lease) {
+        state.controlLeases.delete(leaseKey);
+      }
+      throw error;
+    }
+    if (state.controlLeases.get(leaseKey) !== lease) return;
+    await reportFeedback(payload.playbackContextId, {
+      executionStatus: 'committed',
+      commandControlVersion,
+    });
+    if (state.controlLeases.get(leaseKey) === lease) {
+      state.controlLeases.delete(leaseKey);
+    }
+  }
+
+  async function handleContextPrepare(payload) {
+    if (alreadyProcessed('playback.context.prepare', payload)) return;
+    if (payload.playbackContextId !== state.contextId) return;
+    let queueSongIds = Array.isArray(payload.initialQueueSongIds)
+      ? payload.initialQueueSongIds.slice()
+      : state.queue.slice();
+    if (!queueSongIds.length) {
+      await state.client.request('playback.context.prepared', {
+        playbackContextId: payload.playbackContextId,
+        deviceSessionId,
+        intentId: payload.intentId,
+        ready: false,
+        errorCode: 'queue_required',
+      });
+      return;
+    }
+    const currentIndex = Number.isInteger(payload.currentIndex)
+      ? payload.currentIndex
+      : Math.max(0, Math.min(state.index, queueSongIds.length - 1));
+    const positionMs = Number.isInteger(payload.positionMs)
+      ? payload.positionMs
+      : 0;
+    try {
+      api.validateQueue(queueSongIds, currentIndex);
+      await ensureMeta(queueSongIds);
+      state.queue = queueSongIds;
+      state.index = currentIndex;
+      loadRequiredCurrent(positionMs);
+      audio.pause();
+      state.playbackState = 'paused';
+      const cursor = state.client.cursor(payload.playbackContextId);
+      if (!cursor) throw new Error('Context cursor is not hydrated');
+      await state.client.request('queue.context.sync', {
+        playbackContextId: payload.playbackContextId,
+        deviceSessionId,
+        queueSongIds: state.queue.slice(),
+        currentIndex: state.index,
+        positionMs,
+        baseQueueRevision: cursor.queueRevision,
+        baseControlVersion: cursor.controlVersion,
+      });
+      await state.client.request('playback.context.prepared', {
+        playbackContextId: payload.playbackContextId,
+        deviceSessionId,
+        intentId: payload.intentId,
+        ready: true,
+      });
+      renderQueue();
+    } catch (error) {
+      await state.client.request('playback.context.prepared', {
+        playbackContextId: payload.playbackContextId,
+        deviceSessionId,
+        intentId: payload.intentId,
+        ready: false,
+        errorCode: 'restore_failed',
+        errorMessage: error.message,
+      }).catch(() => {});
+      throw error;
+    }
+  }
+
+  async function handlePrepare(payload) {
+    if (alreadyProcessed('playback.prepare', payload)) return;
+    if (!state.client.capability('playbackPrepare') || !state.client.capability('effectiveAtPlayback')) return;
+    if (payload.deviceSessionId !== deviceSessionId) throw new api.StrictProtocolError('playback.prepare target identity mismatch');
+    const hasIdleStandby = Boolean(
+      state.contextId
+      && state.contextId !== payload.playbackContextId
+      && state.queue.length === 0
+      && state.playbackState === 'idle'
+      && currentPositionMs() === 0
+      && !audio.dataset.trackId
+    );
+    if (
+      state.followingContextId
+      || state.activeBroadcastId
+      || (
+        state.contextId
+        && state.contextId !== payload.playbackContextId
+        && !hasIdleStandby
+      )
+    ) {
+      await state.client.request('playback.ready', {
+        playbackContextId: payload.playbackContextId,
+        prepareId: payload.prepareId,
+        handoffId: payload.handoffId,
+        ready: false,
+        errorCode: 'target_busy',
+      });
+      return;
+    }
+    const canSchedule = state.userGestureSeen && document.visibilityState === 'visible';
+    if (!canSchedule) {
+      await state.client.request('playback.ready', {
+        playbackContextId: payload.playbackContextId,
+        prepareId: payload.prepareId,
+        handoffId: payload.handoffId,
+        ready: false,
+        errorCode: state.userGestureSeen ? 'page_hidden' : 'autoplay_blocked',
+      });
+      return;
+    }
+    try {
+      await ensureMeta(payload.queueSongIds);
+      state.pendingPrepare = {
+        ...payload,
+        queueSongIds: payload.queueSongIds.slice(),
+        standbyContextId: hasIdleStandby ? state.contextId : null,
+      };
+      state.queue = payload.queueSongIds.slice();
+      state.index = payload.currentIndex;
+      loadRequiredCurrent(payload.positionMs);
+      const expectedTrackId = state.queue[state.index];
+      await new Promise((resolve, reject) => {
+        if (audio.readyState >= 2 && audio.dataset.trackId === expectedTrackId) { resolve(); return; }
+        const timer = setTimeout(() => reject(new Error('media_load_timeout')), 8000);
+        audio.addEventListener('canplay', () => {
+          clearTimeout(timer);
+          if (audio.dataset.trackId === expectedTrackId) resolve();
+          else reject(new Error('media_load_mismatch'));
+        }, { once: true });
+        audio.addEventListener('error', () => { clearTimeout(timer); reject(new Error('media_load_failed')); }, { once: true });
+      });
+      await state.client.request('playback.ready', {
+        playbackContextId: payload.playbackContextId,
+        prepareId: payload.prepareId,
+        handoffId: payload.handoffId,
+        ready: true,
+      });
+      text('strict-handoff-state', 'ready');
+    } catch (error) {
+      if (state.pendingPrepare?.handoffId === payload.handoffId) {
+        clearPendingPrepare('media_load_failed');
+      }
+      await state.client.request('playback.ready', {
+        playbackContextId: payload.playbackContextId,
+        prepareId: payload.prepareId,
+        handoffId: payload.handoffId,
+        ready: false,
+        errorCode: 'media_load_failed',
+        errorMessage: error.message,
+      });
+    }
+  }
+
+  async function commitHandoff(payload) {
+    const prepared = state.pendingPrepare;
+    if (
+      !prepared
+      || prepared.playbackContextId !== payload.playbackContextId
+      || prepared.handoffId !== payload.handoffId
+      || prepared.sourceClientId !== payload.sourceClientId
+      || prepared.controlVersion > payload.controlVersion
+    ) {
+      throw new api.StrictProtocolError('handoff commit does not match accepted prepare');
+    }
+    if (document.visibilityState !== 'visible' || !state.userGestureSeen) return;
+    const delay = Math.max(0, payload.effectiveAtServerMs - state.client.serverNowMs());
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    try {
+      loadRequiredCurrent(payload.positionMs);
+    } catch (error) {
+      clearPendingPrepare('media_load_failed');
+      throw error;
+    }
+    const started = await safePlay('handoff commit autoplay_blocked');
+    if (!started) return;
+    const actualStartServerMs = state.client.serverNowMs();
+    if (window.__emoStrictV2Acceptance) {
+      window.__emoStrictV2Acceptance.handoffSamples.push({
+        handoffId: payload.handoffId,
+        effectiveAtServerMs: payload.effectiveAtServerMs,
+        actualStartServerMs,
+        absoluteErrorMs: Math.abs(actualStartServerMs - payload.effectiveAtServerMs),
+      });
+    }
+    await state.client.request('playback.handoff.complete', {
+      playbackContextId: payload.playbackContextId,
+      handoffId: payload.handoffId,
+      positionMs: currentPositionMs(),
+    });
+    state.pendingPrepare = null;
+    setContextId(payload.playbackContextId);
+    state.client.rememberSubscription(payload.playbackContextId);
+    text('strict-handoff-state', 'completed');
+  }
+
+  async function applyBroadcast(message) {
+    if (alreadyProcessed(message.action, message.payload)) return;
+    if (!state.client.capability('supportsBroadcast')) return;
+    const snapshot = message.payload;
+    const snapshotVersion = Number.isInteger(snapshot.version)
+      ? snapshot.version
+      : snapshot.controlVersion;
+    if (
+      state.broadcastCursor
+      && state.broadcastCursor.broadcastId === snapshot.broadcastId
+      && Number.isInteger(snapshotVersion)
+      && snapshotVersion < state.broadcastCursor.version
+    ) {
+      return;
+    }
+    if (Number.isInteger(snapshotVersion)) {
+      state.broadcastCursor = {
+        broadcastId: snapshot.broadcastId,
+        version: snapshotVersion,
+      };
+    }
+    if (Number.isInteger(snapshot.effectiveAtServerMs)) {
+      const delay = Math.max(0, snapshot.effectiveAtServerMs - state.client.serverNowMs());
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+    if (
+      Number.isInteger(snapshotVersion)
+      && (
+        state.broadcastCursor?.broadcastId !== snapshot.broadcastId
+        || state.broadcastCursor.version !== snapshotVersion
+      )
+    ) {
+      return;
+    }
+    const stopped = message.action === 'broadcast.stop' || snapshot.state === 'stopped';
+    state.activeBroadcastId = stopped ? null : snapshot.broadcastId;
+    state.broadcastContextId = stopped ? null : snapshot.playbackContextId;
+    text('strict-broadcast-state', state.activeBroadcastId ? `${snapshot.state} · ${snapshot.broadcastId}` : 'no broadcast');
+    if (stopped) {
+      audio.pause();
+      state.playbackState = 'stopped';
+      if (state.contextId) {
+        const contextId = state.contextId;
+        const response = await state.client.refreshContext(contextId).catch(() => null);
+        if (response && state.contextId === contextId) {
+          await applyContext(response.payload.playbackContext);
+        }
+      } else {
+        state.queue = [];
+        state.index = 0;
+        audio.removeAttribute('src');
+        delete audio.dataset.trackId;
+        audio.load();
+        renderQueue();
+      }
+      return;
+    }
+    await ensureMeta(snapshot.queueSongIds || []);
+    state.queue = snapshot.queueSongIds.slice();
+    state.index = snapshot.currentIndex || 0;
+    loadRequiredCurrent(snapshot.positionMs || 0);
+    if (snapshot.state === 'playing') await safePlay('群播自动播放被阻止');
+    else {
+      state.playbackState = 'paused';
+      audio.pause();
+    }
+    renderQueue();
+    await reportFeedback();
+  }
+
+  function onEvent(message) {
+    const action = message.action;
+    if (action === 'device.list') {
+      state.devices = message.payload.devices;
+      refreshBindings().catch((error) => showError(error.message));
+    } else if (action === 'playback.context.status') {
+      const context = message.payload.playbackContext;
+      if (context.playbackContextId === state.followingContextId) applyContext(context, true, message.payload.deviceStates).catch((error) => showError(error.message));
+      else if (
+        !state.followingContextId
+        && !state.activeBroadcastId
+        && context.playbackContextId === state.contextId
+      ) applyContext(context, false, message.payload.deviceStates).catch((error) => showError(error.message));
+    } else if (
+      action === 'queue.context.sync'
+      && !state.followingContextId
+      && !state.activeBroadcastId
+      && message.payload.playbackContextId === state.contextId
+    ) {
+      applyContext(message.payload).catch((error) => showError(error.message));
+    } else if (['device.setVolume', 'player.play', 'player.pause', 'player.seek', 'player.next', 'player.prev', 'queue.playItem'].includes(action)) {
+      applyControl(message).catch((error) => showError(error.message));
+    } else if (
+      action === 'device.volume.update'
+      && message.payload.sourceClientId === clientId
+    ) {
+      document.getElementById('strict-volume').value = String(message.payload.volume);
+    } else if (action === 'playback.prepare') {
+      handlePrepare(message.payload).catch((error) => showError(error.message));
+    } else if (action === 'playback.context.prepare') {
+      handleContextPrepare(message.payload).catch((error) => showError(error.message));
+    } else if (action === 'playback.control.settled') {
+      const leaseKey = `${message.payload.playbackContextId}\u0000${message.payload.commandControlVersion}`;
+      state.controlLeases.delete(leaseKey);
+      showError(`远程操作未完成：${message.payload.errorCode}`);
+      state.client.refreshContext(message.payload.playbackContextId)
+        .then((response) => applyContext(
+          response.payload.playbackContext,
+          false,
+          response.payload.deviceStates,
+        ))
+        .catch((error) => showError(error.message));
+    } else if (action === 'playback.handoff.release') {
+      if (alreadyProcessed(action, message.payload)) return;
+      if (state.pendingPrepare && state.pendingPrepare.handoffId === message.payload.handoffId) {
+        state.pendingPrepare = null;
+      }
+      const releasedContextId = message.payload.playbackContextId;
+      state.client.forgetSubscription(releasedContextId);
+      if (
+        message.payload.newAuthorityClientId !== clientId
+        && state.contextId === releasedContextId
+      ) setContextId(null);
+      audio.pause();
+      state.playbackState = 'paused';
+      text('strict-handoff-state', `released to ${message.payload.newAuthorityClientId}`);
+    } else if (action === 'playback.handoff.status') {
+      text('strict-handoff-state', message.payload.status);
+      if (['failed', 'cancelled', 'timedOut'].includes(message.payload.status)) {
+        clearPendingPrepare(message.payload.status);
+      }
+    } else if (action === 'playback.context.closed') {
+      state.client.forgetSubscription(message.payload.playbackContextId);
+      if (message.payload.playbackContextId === state.contextId) setContextId(null);
+      if (message.payload.playbackContextId === state.followingContextId) stopFollow('source closed');
+    } else if (action.startsWith('broadcast.')) {
+      applyBroadcast(message).catch((error) => showError(error.message));
+    } else if (action === 'system.error') {
+      showError(`${message.payload.code}: ${message.payload.message}`);
+    }
+  }
+
+  async function addTrack(track) {
+    if (state.followingContextId || state.activeBroadcastId) throw new Error('Follow/Broadcast 活动时不能修改 authority 队列');
+    if (state.queue.includes(track.id)) throw new Error('strict-v2 队列不支持重复曲目');
+    state.trackMeta[track.id] = track;
+    state.queue.push(track.id);
+    if (state.queue.length === 1) state.index = 0;
+    renderQueue();
+    await ensureContext();
+    if (state.queue.length > 1) await syncAuthorityQueue();
+  }
+
+  async function resetDevice() {
+    if (state.activeBroadcastId) throw new Error('请先退出活动 Broadcast 再重置设备');
+    if (state.pendingPrepare) throw new Error('Handoff 准备期间不能重置设备');
+    if (state.followingContextId) await stopFollow('device reset');
+    if (state.contextId) {
+      if (!state.client || state.client.state !== 'ready') {
+        throw new Error('必须先重新连接，关闭活动 Context 后才能重置设备');
+      }
+      try {
+        await closeContext();
+      } catch (error) {
+        if (!['not_found', 'context_closed'].includes(error.code)) throw error;
+        setContextId(null);
+      }
+    }
+    ['emosonic.webPlayer.clientId.v2', 'emosonic.webPlayer.deviceSessionId.v2', 'emosonic.webPlayer.playbackContextId.v2'].forEach((key) => localStorage.removeItem(key));
+    lock.release();
+    if (state.client) state.client.disconnect();
+    location.reload();
+  }
+
+  function runQueueMutation(operation) {
+    const pending = state.queueMutation.then(operation, operation);
+    state.queueMutation = pending.catch(() => {});
+    return pending;
+  }
+
+  async function search() {
+    const query = document.getElementById('strict-search').value.trim();
+    const response = await fetch(`${root.dataset.searchUrl}?q=${encodeURIComponent(query)}&limit=30`, { credentials: 'same-origin' });
+    if (!response.ok) throw new Error(`搜索失败 (${response.status})`);
+    const payload = await response.json();
+    const list = document.getElementById('strict-search-results');
+    list.innerHTML = '';
+    payload.tracks.forEach((track) => {
+      const item = document.createElement('li');
+      item.append(document.createTextNode(track.label));
+      const add = document.createElement('button');
+      add.className = 'btn btn-sm btn-outline-dark';
+      add.textContent = '加入';
+      add.addEventListener('click', () => {
+        runQueueMutation(() => addTrack(track)).catch((error) => showError(error.message));
+      });
+      item.append(add);
+      list.append(item);
+    });
+  }
+
+  function bindUi() {
+    text('strict-client-id', clientId);
+    text('strict-device-id', deviceSessionId);
+    text('strict-context-id', state.contextId || '-');
+    document.getElementById('strict-search-button').addEventListener('click', () => search().catch((error) => showError(error.message)));
+    document.getElementById('strict-search').addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') search().catch((error) => showError(error.message));
+    });
+    document.getElementById('strict-play').addEventListener('click', () => {
+      state.userGestureSeen = true;
+      safePlay('播放失败').then(() => reportFeedback());
+    });
+    document.getElementById('strict-pause').addEventListener('click', () => { audio.pause(); state.playbackState = 'paused'; reportFeedback(); });
+    document.getElementById('strict-next').addEventListener('click', () => {
+      state.userGestureSeen = true;
+      playIndex((state.index + 1) % state.queue.length, 0, true).catch((error) => showError(error.message));
+    });
+    document.getElementById('strict-prev').addEventListener('click', () => {
+      state.userGestureSeen = true;
+      playIndex((state.index - 1 + state.queue.length) % state.queue.length, 0, true).catch((error) => showError(error.message));
+    });
+    document.getElementById('strict-volume').addEventListener('input', (event) => {
+      audio.volume = Number(event.target.value) / 100;
+    });
+    document.getElementById('strict-volume').addEventListener('change', () => {
+      reportDeviceVolume();
+      if (activeFeedbackContextId()) reportFeedback();
+    });
+    document.getElementById('strict-progress').addEventListener('change', (event) => {
+      const target = (Number(event.target.value) / 1000) * durationMs();
+      try { audio.currentTime = target / 1000; } catch (error) { /* ignored */ }
+      reportFeedback();
+    });
+    document.getElementById('strict-clear-queue').addEventListener('click', () => {
+      runQueueMutation(closeContext).catch((error) => showError(error.message));
+    });
+    document.getElementById('strict-follow-start').addEventListener('click', () => startFollow().catch((error) => showError(error.message)));
+    document.getElementById('strict-follow-stop').addEventListener('click', () => stopFollow('user').catch((error) => showError(error.message)));
+    document.getElementById('strict-follow-refresh').addEventListener('click', () => {
+      state.client.request('device.list', {})
+        .then(refreshBindings)
+        .catch((error) => showError(error.message));
+    });
+    document.getElementById('strict-reset-device').addEventListener('click', () => {
+      runQueueMutation(resetDevice).catch((error) => showError(error.message));
+    });
+    audio.volume = .7;
+    audio.addEventListener('play', () => { state.playbackState = 'playing'; reportFeedback(); });
+    audio.addEventListener('pause', () => { if (!audio.ended) { state.playbackState = 'paused'; reportFeedback(); } });
+    audio.addEventListener('ended', () => {
+      playIndex((state.index + 1) % state.queue.length, 0, true).catch((error) => showError(error.message));
+    });
+    audio.addEventListener('timeupdate', () => {
+      const total = durationMs();
+      document.getElementById('strict-progress').value = total ? Math.floor(currentPositionMs() / total * 1000) : 0;
+      text('strict-position', `${formatMs(currentPositionMs())} / ${formatMs(total)}`);
+    });
+  }
+
+  async function start() {
+    bindUi();
+    renderQueue();
+    const acquired = await lock.acquire();
+    if (!acquired) {
+      document.getElementById('strict-owner-warning').classList.remove('d-none');
+      text('strict-connection-state', 'secondary tab');
+      return;
+    }
+    window.addEventListener('beforeunload', () => lock.release());
+    state.client = new api.StrictV2Client({
+      ioFactory: window.io,
+      socketUrl: window.location.origin + '/emo',
+      socketPath: '/emo/ws',
+      authPasswordUrl: bootstrap.authPasswordUrl,
+      contextBindingsUrl: bootstrap.contextBindingsUrl,
+      csrfToken: bootstrap.csrfToken,
+      registration: {
+        clientId,
+        deviceSessionId,
+        deviceName: 'Web Player',
+        alias: '网页播放器',
+        roles: ['player'],
+        capabilities,
+      },
+      onState(connectionState, detail) {
+        text('strict-connection-state', connectionState);
+        if (['disconnected', 'offline', 'protocol_error'].includes(connectionState)) {
+          clearTransientFollow('connection lost');
+          clearPendingPrepare('connection lost');
+          if (state.activeBroadcastId) {
+            audio.pause();
+            state.playbackState = 'paused';
+          }
+        }
+        if (connectionState === 'registered' && detail) {
+          const metadata = detail.metadata;
+          text('strict-protocol', metadata.protocolVersion);
+          text('strict-schema', metadata.schemaHash);
+          text('strict-build', metadata.serverBuildCommit);
+          text('strict-capabilities', JSON.stringify(detail.negotiatedCapabilities));
+        }
+        updateCapabilityUi();
+      },
+      onEvent,
+      onDebug(summary) { log(JSON.stringify(summary), 'debug'); },
+      onReady() {
+        restoreContext()
+          .then(ensureContext)
+          .then(refreshBindings)
+          .then(reportDeviceVolume)
+          .then(async () => {
+            if (!state.activeBroadcastId || !state.broadcastContextId) return;
+            const response = await state.client.request('broadcast.status', {
+              playbackContextId: state.broadcastContextId,
+              broadcastId: state.activeBroadcastId,
+            });
+            await applyBroadcast({ action: 'broadcast.status', payload: response.payload.broadcast });
+          })
+          .catch((error) => showError(error.message));
+      },
+      onBootstrapError(error) { showError(`strict-v2 bootstrap failed: ${error.message}`); },
+      onProtocolError(error) { showError(`protocol error: ${error.message}`); },
+    });
+    if (bootstrap.acceptanceMode) {
+      window.__emoStrictV2Acceptance = {
+        clientId,
+        deviceSessionId,
+        handoffSamples: [],
+        snapshot() {
+          return {
+            connectionState: state.client.state,
+            contextId: state.contextId,
+            followingContextId: state.followingContextId,
+            activeBroadcastId: state.activeBroadcastId,
+            playbackState: state.playbackState,
+            userGestureSeen: state.userGestureSeen,
+            pendingPrepareId: state.pendingPrepare?.prepareId || null,
+            pendingPrepareHandoffId: state.pendingPrepare?.handoffId || null,
+          };
+        },
+        forceProtocolError(message = 'acceptance injected protocol failure') {
+          state.client._protocolError(new api.StrictProtocolError(message));
+        },
+        disconnectTransport() {
+          state.client.disconnect();
+        },
+        reconnectTransport() {
+          state.client.connect();
+        },
+      };
+    }
+    state.client.connect();
+    updateCapabilityUi();
+    search().catch((error) => showError(error.message));
+    setInterval(() => {
+      if (state.client.state === 'ready') refreshBindings().catch(() => {});
+    }, 10000);
+  }
+
+  start().catch((error) => showError(error.message));
+})();
+</script>
+{% endblock %}

@@ -80,12 +80,14 @@ jobs:
           python -m pip install --no-deps --target "$wheel_target" dist/*.whl
           (
             cd "$RUNNER_TEMP"
-            PYTHONPATH="$wheel_target" python -c 'from supysonic.emo.protocol_metadata import get_strict_v2_metadata; assert get_strict_v2_metadata()["protocolVersion"] == "2.1.0"'
+            EMO_SERVER_BUILD_COMMIT="${{ github.sha }}" PYTHONPATH="$wheel_target" \
+              python -c 'import os, re; from supysonic.emo.protocol_metadata import get_strict_v2_metadata; metadata = get_strict_v2_metadata(); expected = os.environ["EMO_SERVER_BUILD_COMMIT"]; assert metadata["serverBuildCommit"] == expected, metadata; assert re.fullmatch(r"[0-9a-f]{64}", metadata["schemaHash"]), metadata; print(metadata)'
           )
           python -m pip install --no-deps --target "$sdist_target" dist/*.tar.gz
           (
             cd "$RUNNER_TEMP"
-            PYTHONPATH="$sdist_target" python -c 'from supysonic.emo.protocol_metadata import get_strict_v2_metadata; assert get_strict_v2_metadata()["protocolVersion"] == "2.1.0"'
+            EMO_SERVER_BUILD_COMMIT="${{ github.sha }}" PYTHONPATH="$sdist_target" \
+              python -c 'import os, re; from supysonic.emo.protocol_metadata import get_strict_v2_metadata; metadata = get_strict_v2_metadata(); expected = os.environ["EMO_SERVER_BUILD_COMMIT"]; assert metadata["serverBuildCommit"] == expected, metadata; assert re.fullmatch(r"[0-9a-f]{64}", metadata["schemaHash"]), metadata; print(metadata)'
           )
 
       - name: Upload coverage
@@ -93,6 +95,59 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
         if: ${{ !cancelled() }}
+
+  database-migrations:
+    name: Database Migrations
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r ci-requirements.txt psycopg2-binary
+
+      - name: Start migration databases
+        run: |
+          docker compose -f tests/compose.emo_migrations.yml up -d --wait
+
+      - name: Record database images and versions
+        run: |
+          evidence="$RUNNER_TEMP/emosonic-migration-evidence.txt"
+          postgres_id=$(docker compose -f tests/compose.emo_migrations.yml ps -q postgres)
+          mysql_id=$(docker compose -f tests/compose.emo_migrations.yml ps -q mysql)
+          {
+            docker exec "$postgres_id" postgres --version
+            docker exec "$mysql_id" mysql --version
+            docker image inspect postgres:16.9-alpine --format 'postgres image={{index .RepoDigests 0}}'
+            docker image inspect mysql:8.4.5 --format 'mysql image={{index .RepoDigests 0}}'
+          } | tee "$evidence"
+
+      - name: Run migration tests
+        env:
+          SUPYSONIC_MIGRATION_EVIDENCE_FILE: ${{ runner.temp }}/emosonic-migration-evidence.txt
+          SUPYSONIC_TEST_MYSQL_URI: mysql://supysonic:supysonic@127.0.0.1:53306/supysonic_test
+          SUPYSONIC_TEST_POSTGRES_URI: postgresql://supysonic:supysonic@127.0.0.1:55432/supysonic_test
+        run: |
+          python -m unittest -v tests.base.test_emo_schema_migration 2>&1 | tee -a "$SUPYSONIC_MIGRATION_EVIDENCE_FILE"
+
+      - name: Stop migration databases
+        if: ${{ always() }}
+        run: |
+          docker compose -f tests/compose.emo_migrations.yml down -v --remove-orphans
+
+      - name: Upload migration evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: emosonic-database-migration-evidence
+          path: ${{ runner.temp }}/emosonic-migration-evidence.txt
 
   docker-build:
     name: Docker Build
@@ -112,5 +167,5 @@ jobs:
           docker run --rm --entrypoint python \
             -e "EMO_EXPECTED_SERVER_BUILD_COMMIT=${{ github.sha }}" \
             emosonic-server:test \
-            -c 'import os, re; from supysonic.emo.protocol_metadata import get_strict_v2_metadata; metadata = get_strict_v2_metadata(); expected = os.environ["EMO_EXPECTED_SERVER_BUILD_COMMIT"]; assert metadata["protocolVersion"] == "2.1.0", metadata; assert metadata["serverBuildCommit"] == expected, metadata; assert re.fullmatch(r"[0-9a-f]{40}", metadata["serverBuildCommit"]), metadata; assert re.fullmatch(r"[0-9a-f]{64}", metadata["schemaHash"]), metadata; print(metadata)'
+            -c 'import os, re; from supysonic.emo.protocol_metadata import get_strict_v2_metadata; metadata = get_strict_v2_metadata(); expected = os.environ["EMO_EXPECTED_SERVER_BUILD_COMMIT"]; assert metadata["serverBuildCommit"] == expected, metadata; assert re.fullmatch(r"[0-9a-f]{40}", metadata["serverBuildCommit"]), metadata; assert re.fullmatch(r"[0-9a-f]{64}", metadata["schemaHash"]), metadata; print(metadata)'
           test "$(docker image inspect emosonic-server:test --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = "${{ github.sha }}"

@@ -1,5 +1,13 @@
 # Flutter EffectiveAt Playback v2
 
+> **Legacy/superseded registration examples.** This timing note predates the
+> strict-v2 R7 registration contract. Examples below that contain `sessionId`
+> describe the legacy path and must not be copied into an R7 client. For R7,
+> use `deviceSessionId`, omit `sessionId`, send all nine capability booleans,
+> and follow
+> `specs/emosonic_strict_v2_socketio_server_contract.md` as the authoritative
+> wire contract.
+
 This document describes the Flutter/player-side contract required by the
 server effective-at playback rollout in
 `ref/2026-07-01-server-effective-at-playback.md`.

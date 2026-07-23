@@ -152,6 +152,56 @@ Configuration relative to the HTTP server.
 
    Defaults to ``on``.
 
+``emo_web_realtime_protocol``
+   Selects the realtime client rendered by both :file:`/player` and
+   :file:`/control`. The only accepted values are ``legacy`` and ``strict_v2``.
+   Invalid values fail back to the explicit legacy page; a strict-v2 protocol
+   failure never causes an automatic runtime downgrade. Defaults to ``legacy``.
+
+``emo_strict_v2_allow_local_test_evidence``
+   Allows a development deployment to use packaged ``local-test-only:``
+   conformance evidence for external client integration testing. This option
+   is effective only when ``emo_development_mode`` is also enabled. Both
+   settings must remain disabled in production. Defaults to ``off``.
+
+``emo_browser_otp_ttl_seconds``
+   Lifetime of the one-time, same-origin browser password used by the web
+   player and control console for Socket.IO ``auth.login``. The credential is
+   bound to the authenticated Cookie session and is not stored in browser
+   persistent storage. Defaults to ``60`` seconds.
+
+``emo_browser_otp_issues_per_session_per_minute``
+   Maximum browser passwords issued to one authenticated browser session per
+   minute. Defaults to ``12``.
+
+``emo_browser_otp_outstanding_per_session``
+   Maximum unconsumed browser passwords retained for one authenticated Cookie
+   session. This permits player and control tabs to bootstrap concurrently;
+   issuing beyond the limit evicts the oldest password. Defaults to ``4``.
+
+``emo_browser_otp_global_capacity``
+   Maximum total number of unconsumed browser passwords in the in-memory store.
+   It also bounds the number of per-session issuance windows retained by the
+   rate limiter, preventing consumed credentials from bypassing the store's
+   memory ceiling. New credentials receive a temporary-unavailable response
+   when either limit is reached. Defaults to ``10000``.
+
+``emo_web_strict_v2_follow_enabled``
+   Advertise Follow capability from the strict-v2 web player.
+
+``emo_web_strict_v2_handoff_enabled``
+   Advertise Handoff prepare and effective-at capabilities from the strict-v2
+   web player.
+
+``emo_web_strict_v2_broadcast_enabled``
+   Advertise Broadcast capability from the strict-v2 web player and control
+   console.
+
+   All three optional-profile gates default to ``off`` and should be enabled
+   only after their browser acceptance evidence and server profile readiness
+   have been reviewed. They do not override server-side deployment or
+   conformance readiness.
+
 ``index_ignored_prefixes``
    Space-separated list of prefixes that should be ignored from artist names
    when returning their index. Example: if the word *The* is in this list,
@@ -198,6 +248,26 @@ Sample configuration::
 
    ; Enable the administrative web interface. Default: on
    ;mount_webui = on
+
+   ; Render both /player and /control with legacy or strict-v2 realtime logic.
+   ;emo_web_realtime_protocol = legacy
+
+   ; Development-only gate for local-test-only conformance evidence.
+   ; Requires emo_development_mode = on. Never enable in production.
+   ;emo_strict_v2_allow_local_test_evidence = off
+
+   ; One-time browser Socket.IO password lifetime. Default: 60 seconds.
+   ;emo_browser_otp_ttl_seconds = 60
+
+   ; Browser password issuance limits.
+   ;emo_browser_otp_issues_per_session_per_minute = 12
+   ;emo_browser_otp_outstanding_per_session = 4
+   ;emo_browser_otp_global_capacity = 10000
+
+   ; Optional web profiles default to off pending browser acceptance evidence.
+   ;emo_web_strict_v2_follow_enabled = off
+   ;emo_web_strict_v2_handoff_enabled = off
+   ;emo_web_strict_v2_broadcast_enabled = off
 
    ; Space separated list of prefixes that should be ignored on index endpoints
    ; Default: El La Le Las Les Los The

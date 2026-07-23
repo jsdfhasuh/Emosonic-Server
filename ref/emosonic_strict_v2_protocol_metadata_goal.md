@@ -1,5 +1,10 @@
 # EmoSonic Server strict-v2 注册握手元数据描述符 Goal
 
+> **Superseded design Goal.** 本文只保留早期 registration descriptor 的设计背景，
+> 不再定义 strict-v2 conformance 或完整 wire contract。当前权威要求见
+> `specs/emosonic_strict_v2_socketio_server_contract.md` 和
+> `docs/goal/emosonic_strict_v2_r5_server_adaptation.md`。
+
 > 目标：让实际部署的 PlaybackContext strict-v2 服务端在 device.register 的成功 ACK 中返回静态声明与动态连接证据：
 >
 > - protocolVersion

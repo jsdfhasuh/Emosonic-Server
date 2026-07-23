@@ -1,6 +1,7 @@
 import secrets
 import threading
 import time
+from typing import Dict, List, Optional, Tuple
 
 
 DEFAULT_CLIENT_STALE_SECONDS = 90
@@ -61,6 +62,13 @@ class BroadcastVersionMismatchError(Exception):
         super().__init__("Broadcast version mismatch")
         self.current_version = current_version
         self.current_control_version = current_control_version
+
+
+class BroadcastCursorMismatchError(Exception):
+    def __init__(self, cursor_name, broadcast):
+        super().__init__("Broadcast %s is stale" % cursor_name)
+        self.cursor_name = cursor_name
+        self.broadcast = dict(broadcast)
 
 
 class QueueRevisionMismatchError(Exception):
@@ -129,6 +137,12 @@ class WebSocketState:
         self._playback_contexts = {}
         # (playbackContextId, clientId) -> device feedback state
         self._device_playback_states = {}
+        # (playbackContextId, clientId, connectionNonce, connectionEpoch) -> sequence record
+        self._strict_feedback_sequences = {}
+        # (userName, clientId, deviceSessionId) -> live device volume state
+        self._device_volume_states = {}
+        # (userName, clientId, deviceSessionId, connectionNonce, connectionEpoch) -> sequence record
+        self._strict_device_volume_sequences = {}
         # handoffId -> playback authority handoff state
         self._handoffs = {}
         # (userName, requestId) -> handoffId for idempotent start requests
@@ -136,7 +150,31 @@ class WebSocketState:
         # sid -> subscribed playbackContextIds
         self._playback_context_subscriptions = {}
 
-    def register_session(self, sid, now=None):
+    @staticmethod
+    def _client_key(user_name, client_id):
+        return (user_name, client_id)
+
+    def _find_client_key_locked(self, client_id, user_name=None):
+        if user_name is not None:
+            key = self._client_key(user_name, client_id)
+            return key if key in self._clients else None
+        matches = [key for key in self._clients if key[1] == client_id]
+        return matches[0] if len(matches) == 1 else None
+
+    def _clear_device_volume_state_locked(
+        self,
+        user_name,
+        client_id,
+        device_session_id=None,
+    ):
+        for key in list(self._device_volume_states):
+            if key[0] != user_name or key[1] != client_id:
+                continue
+            if device_session_id is not None and key[2] != device_session_id:
+                continue
+            self._device_volume_states.pop(key, None)
+
+    def register_session(self, sid, remote_address=None, now=None):
         now = time.time() if now is None else now
         with self._lock:
             self._sessions[sid] = {
@@ -147,7 +185,37 @@ class WebSocketState:
                 "authenticated": False,
                 "userName": None,
                 "clientId": None,
+                "remoteAddress": remote_address,
             }
+
+    def try_register_session(
+        self,
+        sid,
+        remote_address,
+        max_unauthenticated,
+        now=None,
+    ):
+        now = time.time() if now is None else now
+        with self._lock:
+            current = sum(
+                1
+                for session_info in self._sessions.values()
+                if not session_info.get("authenticated")
+                and session_info.get("remoteAddress") == remote_address
+            )
+            if current >= max_unauthenticated:
+                return None
+            self._sessions[sid] = {
+                "sid": sid,
+                "connectedAt": now,
+                "lastSeenAt": now,
+                "connectionNonce": _new_connection_nonce(),
+                "authenticated": False,
+                "userName": None,
+                "clientId": None,
+                "remoteAddress": remote_address,
+            }
+            return dict(self._sessions[sid])
 
     def authenticate_session(self, sid, user_name):
         with self._lock:
@@ -158,10 +226,52 @@ class WebSocketState:
             session_info["userName"] = user_name
             return dict(session_info)
 
+    def try_authenticate_session(self, sid, user_name, max_authenticated):
+        with self._lock:
+            session_info = self._sessions.get(sid)
+            if session_info is None:
+                return None
+            current = sum(
+                1
+                for other_sid, other_session in self._sessions.items()
+                if other_sid != sid
+                and other_session.get("authenticated")
+                and other_session.get("userName") == user_name
+            )
+            if current >= max_authenticated:
+                return None
+            session_info["authenticated"] = True
+            session_info["userName"] = user_name
+            return dict(session_info)
+
     def get_session(self, sid):
         with self._lock:
             session_info = self._sessions.get(sid)
             return dict(session_info) if session_info is not None else None
+
+    def count_unauthenticated_sessions(self, remote_address, exclude_sid=None):
+        with self._lock:
+            return sum(
+                1
+                for sid, session_info in self._sessions.items()
+                if sid != exclude_sid
+                and not session_info.get("authenticated")
+                and session_info.get("remoteAddress") == remote_address
+            )
+
+    def count_authenticated_sessions(self, user_name, exclude_sid=None):
+        with self._lock:
+            return sum(
+                1
+                for sid, session_info in self._sessions.items()
+                if sid != exclude_sid
+                and session_info.get("authenticated")
+                and session_info.get("userName") == user_name
+            )
+
+    def list_session_sids(self):
+        with self._lock:
+            return list(self._sessions)
 
     def register_client(self, sid, client_id, info, now=None):
         # Registered device metadata usually includes userName, deviceName,
@@ -172,13 +282,20 @@ class WebSocketState:
         client_info["connectedAt"] = now
         client_info["lastSeenAt"] = now
         with self._lock:
-            previous_sid = self._client_to_sid.get(client_id)
+            client_key = self._client_key(client_info.get("userName"), client_id)
+            previous_sid = self._client_to_sid.get(client_key)
             if previous_sid is not None and previous_sid != sid:
+                previous_client = self._clients.get(client_key) or {}
+                self._clear_device_volume_state_locked(
+                    client_info.get("userName"),
+                    client_id,
+                    previous_client.get("deviceSessionId"),
+                )
                 previous_session = self._sessions.get(previous_sid)
                 if previous_session is not None:
                     previous_session["clientId"] = None
-            self._clients[client_id] = client_info
-            self._client_to_sid[client_id] = sid
+            self._clients[client_key] = client_info
+            self._client_to_sid[client_key] = sid
             session_info = self._sessions.get(sid)
             if session_info is not None:
                 session_info["clientId"] = client_id
@@ -196,8 +313,9 @@ class WebSocketState:
                 return None
             session_info["lastSeenAt"] = now
             client_id = session_info.get("clientId")
-            if client_id and self._client_to_sid.get(client_id) == sid:
-                client_info = self._clients.get(client_id)
+            client_key = self._client_key(session_info.get("userName"), client_id)
+            if client_id and self._client_to_sid.get(client_key) == sid:
+                client_info = self._clients.get(client_key)
                 if client_info is not None:
                     client_info["lastSeenAt"] = now
             return dict(session_info)
@@ -209,18 +327,24 @@ class WebSocketState:
         now = time.time() if now is None else now
         removed = []
         with self._lock:
-            for client_id, client_info in list(self._clients.items()):
+            for client_key, client_info in list(self._clients.items()):
+                client_id = client_info.get("clientId")
                 last_seen_at = client_info.get("lastSeenAt") or client_info.get("connectedAt")
                 if last_seen_at is None or now - last_seen_at <= stale_after_seconds:
                     continue
 
-                sid = self._client_to_sid.get(client_id)
+                sid = self._client_to_sid.get(client_key)
                 if sid is not None:
                     session_info = self._sessions.get(sid)
                     if session_info is not None and session_info.get("clientId") == client_id:
                         session_info["clientId"] = None
-                self._client_to_sid.pop(client_id, None)
-                removed_client = self._clients.pop(client_id)
+                self._client_to_sid.pop(client_key, None)
+                removed_client = self._clients.pop(client_key)
+                self._clear_device_volume_state_locked(
+                    removed_client.get("userName"),
+                    client_id,
+                    removed_client.get("deviceSessionId"),
+                )
                 self._mark_broadcast_participant_offline_locked(client_id, now=now)
                 self._deactivate_follow_relationships_for_client_locked(client_id, now=now)
                 removed.append(removed_client)
@@ -236,22 +360,31 @@ class WebSocketState:
             client_id = session_info.get("clientId")
             client_info = None
             if client_id:
-                current_sid = self._client_to_sid.get(client_id)
+                client_key = self._client_key(session_info.get("userName"), client_id)
+                current_sid = self._client_to_sid.get(client_key)
                 if current_sid == sid:
-                    self._client_to_sid.pop(client_id, None)
-                    client_info = self._clients.pop(client_id, None)
+                    self._client_to_sid.pop(client_key, None)
+                    client_info = self._clients.pop(client_key, None)
+                    if client_info is not None:
+                        self._clear_device_volume_state_locked(
+                            client_info.get("userName"),
+                            client_id,
+                            client_info.get("deviceSessionId"),
+                        )
                     self._mark_broadcast_participant_offline_locked(client_id)
                     self._deactivate_follow_relationships_for_client_locked(client_id)
             return session_info, client_info
 
-    def get_client(self, client_id):
+    def get_client(self, client_id, user_name=None):
         with self._lock:
-            client = self._clients.get(client_id)
+            client_key = self._find_client_key_locked(client_id, user_name=user_name)
+            client = None if client_key is None else self._clients.get(client_key)
             return dict(client) if client is not None else None
 
-    def get_sid_for_client(self, client_id):
+    def get_sid_for_client(self, client_id, user_name=None):
         with self._lock:
-            return self._client_to_sid.get(client_id)
+            client_key = self._find_client_key_locked(client_id, user_name=user_name)
+            return None if client_key is None else self._client_to_sid.get(client_key)
 
     def get_client_for_sid(self, sid):
         # Resolve the current sending device from a live Socket.IO sid.
@@ -259,7 +392,10 @@ class WebSocketState:
             session_info = self._sessions.get(sid)
             if session_info is None or not session_info.get("clientId"):
                 return None
-            client = self._clients.get(session_info["clientId"])
+            client_key = self._client_key(
+                session_info.get("userName"), session_info["clientId"]
+            )
+            client = self._clients.get(client_key)
             return dict(client) if client is not None else None
 
     def list_clients(self, user_name=None, session_id=None, stale_after_seconds=None, now=None):
@@ -284,7 +420,8 @@ class WebSocketState:
                 client_id = session_info.get("clientId")
                 if not client_id:
                     continue
-                client = self._clients.get(client_id)
+                client_key = self._client_key(session_info.get("userName"), client_id)
+                client = self._clients.get(client_key)
                 if client is None:
                     continue
                 if user_name is not None and client.get("userName") != user_name:
@@ -293,6 +430,35 @@ class WebSocketState:
                     continue
                 items.append((sid, dict(client)))
             return items
+
+    def list_strict_controller_sids(self, user_name):
+        with self._lock:
+            items = []
+            for sid, session_info in self._sessions.items():
+                if (
+                    not session_info.get("authenticated")
+                    or session_info.get("userName") != user_name
+                ):
+                    continue
+                client_id = session_info.get("clientId")
+                if not client_id:
+                    continue
+                client_key = self._client_key(user_name, client_id)
+                if self._client_to_sid.get(client_key) != sid:
+                    continue
+                client = self._clients.get(client_key)
+                if client is None:
+                    continue
+                if "controller" not in (client.get("roles") or []):
+                    continue
+                capabilities = client.get("capabilities")
+                if (
+                    not isinstance(capabilities, dict)
+                    or capabilities.get("playbackContextV2") is not True
+                ):
+                    continue
+                items.append(sid)
+            return sorted(items)
 
     def subscribe_session(self, sid, session_id):
         if not session_id:
@@ -408,10 +574,14 @@ class WebSocketState:
 
             items = []
             for client_id in participant_client_ids:
-                sid = self._client_to_sid.get(client_id)
+                client_key = self._find_client_key_locked(
+                    client_id,
+                    user_name=user_name,
+                )
+                sid = None if client_key is None else self._client_to_sid.get(client_key)
                 if sid is None or sid == exclude_sid:
                     continue
-                client = self._clients.get(client_id)
+                client = self._clients.get(client_key)
                 if client is None:
                     continue
                 if user_name is not None and client.get("userName") != user_name:
@@ -834,6 +1004,10 @@ class WebSocketState:
             "authoritative": True,
         }
         for field_name in (
+            "authorityDeviceSessionId",
+            "creationFingerprint",
+            "lifecycle",
+            "closedAtMs",
             "contextType",
             "broadcastId",
             "ownerClientId",
@@ -1080,6 +1254,174 @@ class WebSocketState:
             self._device_playback_states[(playback_context_id, client_id)] = payload
             return dict(payload)
 
+    def record_strict_device_playback_state(
+        self,
+        playback_context_id,
+        device_session_id,
+        client_id,
+        user_name,
+        playback_state,
+        connection_nonce,
+        connection_epoch=1,
+        is_authority=False,
+        now=None,
+    ):
+        client_seq = playback_state.get("clientSeq")
+        sequence_key = (
+            playback_context_id,
+            client_id,
+            connection_nonce,
+            connection_epoch,
+        )
+        fingerprint = {
+            key: playback_state.get(key)
+            for key in (
+                "playbackContextId",
+                "deviceSessionId",
+                "state",
+                "trackId",
+                "positionMs",
+                "volume",
+                "muted",
+                "clientSeq",
+            )
+            if key in playback_state
+        }
+        server_updated_at_ms = _timestamp_ms(now)
+        with self._lock:
+            previous = self._strict_feedback_sequences.get(sequence_key)
+            if previous is not None:
+                previous_seq = previous["clientSeq"]
+                if client_seq < previous_seq:
+                    raise ClientSeqStaleError(previous_seq)
+                if client_seq == previous_seq:
+                    if previous["fingerprint"] != fingerprint:
+                        raise ClientSeqStaleError(previous_seq)
+                    return dict(previous["deviceState"]), False
+
+            payload = dict(playback_state)
+            payload.update(
+                {
+                    "playbackContextId": playback_context_id,
+                    "deviceSessionId": device_session_id,
+                    "sessionId": device_session_id,
+                    "sourceClientId": client_id,
+                    "state": payload["state"],
+                    "positionMs": payload["positionMs"],
+                    "isAuthority": bool(is_authority),
+                    "mode": "normal",
+                    "serverUpdatedAtMs": server_updated_at_ms,
+                    "updatedAt": server_updated_at_ms / 1000,
+                    "userName": user_name,
+                }
+            )
+            self._device_playback_states[(playback_context_id, client_id)] = payload
+            self._strict_feedback_sequences[sequence_key] = {
+                "clientSeq": client_seq,
+                "fingerprint": fingerprint,
+                "deviceState": dict(payload),
+            }
+            return dict(payload), True
+
+    def get_device_volume_state(
+        self,
+        user_name: str,
+        client_id: str,
+        device_session_id: str,
+    ) -> Optional[Dict[str, object]]:
+        with self._lock:
+            volume_state = self._device_volume_states.get(
+                (user_name, client_id, device_session_id)
+            )
+            return dict(volume_state) if volume_state is not None else None
+
+    def record_strict_device_volume_state(
+        self,
+        user_name: str,
+        client_id: str,
+        device_session_id: str,
+        volume_state: Dict[str, object],
+        connection_nonce: str,
+        connection_epoch: int = 1,
+        now: Optional[float] = None,
+    ) -> Tuple[Dict[str, object], bool]:
+        client_seq = volume_state.get("clientSeq")
+        sequence_key = (
+            user_name,
+            client_id,
+            device_session_id,
+            connection_nonce,
+            connection_epoch,
+        )
+        fingerprint = {
+            "deviceSessionId": device_session_id,
+            "volume": volume_state.get("volume"),
+            "clientSeq": client_seq,
+        }
+        server_updated_at_ms = _timestamp_ms(now)
+        with self._lock:
+            previous = self._strict_device_volume_sequences.get(sequence_key)
+            if previous is not None:
+                previous_seq = previous["clientSeq"]
+                if client_seq < previous_seq:
+                    raise ClientSeqStaleError(previous_seq)
+                if client_seq == previous_seq:
+                    if previous["fingerprint"] != fingerprint:
+                        raise ClientSeqStaleError(previous_seq)
+                    return dict(previous["volumeState"]), False
+
+            payload = {
+                "sourceClientId": client_id,
+                "deviceSessionId": device_session_id,
+                "volume": volume_state["volume"],
+                "clientSeq": client_seq,
+                "serverUpdatedAtMs": server_updated_at_ms,
+            }
+            self._device_volume_states[
+                (user_name, client_id, device_session_id)
+            ] = payload
+            self._strict_device_volume_sequences[sequence_key] = {
+                "clientSeq": client_seq,
+                "fingerprint": fingerprint,
+                "volumeState": dict(payload),
+            }
+            return dict(payload), True
+
+    def clear_strict_feedback_connection(self, connection_nonce):
+        with self._lock:
+            for key in list(self._strict_feedback_sequences):
+                if key[2] == connection_nonce:
+                    self._strict_feedback_sequences.pop(key, None)
+            for key in list(self._strict_device_volume_sequences):
+                if key[3] == connection_nonce:
+                    self._strict_device_volume_sequences.pop(key, None)
+
+    def restore_strict_playback_contexts(self, playback_contexts):
+        with self._lock:
+            self._sessions.clear()
+            self._clients.clear()
+            self._client_to_sid.clear()
+            self._session_subscriptions.clear()
+            self._playback_contexts.clear()
+            self._device_playback_states.clear()
+            self._strict_feedback_sequences.clear()
+            self._device_volume_states.clear()
+            self._strict_device_volume_sequences.clear()
+            self._playback_context_subscriptions.clear()
+            self._follow_relationships.clear()
+            self._pending_prepares.clear()
+            self._handoffs.clear()
+            self._handoff_request_index.clear()
+            self._broadcasts.clear()
+            self._broadcast_participants.clear()
+            self._broadcast_playback_states.clear()
+            self._client_active_broadcast.clear()
+        for playback_context in playback_contexts:
+            self.restore_playback_context(
+                playback_context.get("playbackContextId"),
+                playback_context,
+            )
+
     def get_device_playback_state(self, playback_context_id, client_id):
         with self._lock:
             playback_state = self._device_playback_states.get(
@@ -1322,6 +1664,20 @@ class WebSocketState:
             handoff = self._handoffs.get(handoff_id)
             return dict(handoff) if handoff is not None else None
 
+    def discard_playback_handoff(self, handoff_id):
+        with self._lock:
+            handoff = self._handoffs.pop(handoff_id, None)
+            if handoff is None:
+                return None
+            request_key = (
+                handoff.get("userName"),
+                handoff.get("originClientId"),
+                handoff.get("requestId"),
+            )
+            if self._handoff_request_index.get(request_key) == handoff_id:
+                self._handoff_request_index.pop(request_key, None)
+            return dict(handoff)
+
     def get_playback_handoff_by_request(self, user_name, origin_client_id, request_id):
         if not user_name or not origin_client_id or not request_id:
             return None
@@ -1342,6 +1698,7 @@ class WebSocketState:
         error_message=None,
         prepare_id=None,
         complete_expires_at_ms=None,
+        snapshot=None,
         now=None,
     ):
         now_ms = _timestamp_ms(now)
@@ -1359,6 +1716,8 @@ class WebSocketState:
                 handoff["prepareId"] = prepare_id
             if complete_expires_at_ms is not None:
                 handoff["completeExpiresAtMs"] = complete_expires_at_ms
+            if snapshot is not None:
+                handoff["snapshot"] = dict(snapshot)
             handoff["updatedAtMs"] = now_ms
             return dict(handoff)
 
@@ -1388,6 +1747,42 @@ class WebSocketState:
                 handoff["errorMessage"] = error_message
             handoff["updatedAtMs"] = now_ms
             return dict(handoff)
+
+    def fail_playback_handoffs_for_disconnect(
+        self,
+        client_id: str,
+        now: Optional[float] = None,
+    ) -> List[Dict[str, object]]:
+        now_ms = _timestamp_ms(now)
+        terminal = []
+        with self._lock:
+            for handoff in self._handoffs.values():
+                if handoff.get("status") not in (
+                    "preparing",
+                    "ready",
+                    "committed",
+                    "committing",
+                ):
+                    continue
+                if handoff.get("targetClientId") == client_id:
+                    handoff["status"] = "failed"
+                    handoff["errorCode"] = "target_disconnected"
+                    handoff["errorMessage"] = "Handoff target disconnected"
+                elif handoff.get("sourceClientId") == client_id:
+                    handoff["status"] = "cancelled"
+                    handoff["errorCode"] = "source_disconnected"
+                    handoff["errorMessage"] = "Handoff source disconnected"
+                else:
+                    continue
+                prepare_id = handoff.get("prepareId")
+                if prepare_id:
+                    prepare = self._pending_prepares.get(prepare_id)
+                    if prepare is not None and prepare.get("status") == "preparing":
+                        prepare["status"] = handoff["status"]
+                        prepare["updatedAtMs"] = now_ms
+                handoff["updatedAtMs"] = now_ms
+                terminal.append(dict(handoff))
+        return terminal
 
     def update_playback_state(self, session_id, client_id, state, now=None):
         if not session_id or not client_id:
@@ -1689,6 +2084,8 @@ class WebSocketState:
         updated_by_client_id=None,
         effective_at_server_ms=None,
         playback_context_id=None,
+        authority_client_id=None,
+        require_context_available=False,
         now=None,
     ):
         now = time.time() if now is None else now
@@ -1700,7 +2097,7 @@ class WebSocketState:
             "timelineId": _broadcast_timeline_id(broadcast_id),
             "userName": user_name,
             "ownerClientId": owner_client_id,
-            "authorityClientId": "server",
+            "authorityClientId": authority_client_id or "server",
             "originClientId": updated_by_client_id or owner_client_id,
             "participants": participant_ids,
             "queueSongIds": list(queue_song_ids),
@@ -1725,6 +2122,18 @@ class WebSocketState:
         if effective_at_server_ms is not None and state_name == "playing":
             broadcast["effectiveAtServerMs"] = effective_at_server_ms
         with self._lock:
+            if require_context_available and playback_context_id is not None:
+                for existing in self._broadcasts.values():
+                    if existing.get("playbackContextId") != playback_context_id:
+                        continue
+                    if not self._is_broadcast_active_locked(
+                        existing.get("broadcastId")
+                    ):
+                        continue
+                    raise PlaybackContextConflictError(
+                        playback_context_id,
+                        existing_context=existing,
+                    )
             self._broadcasts[broadcast_id] = broadcast
             self._broadcast_participants[broadcast_id] = set(participant_ids)
             for client_id in participant_ids:
@@ -1966,6 +2375,7 @@ class WebSocketState:
         increment_control_version=True,
         require_active=False,
         effective_at_server_ms=None,
+        expected_queue_revision=None,
         now=None,
     ):
         now = time.time() if now is None else now
@@ -1983,6 +2393,14 @@ class WebSocketState:
                 raise BroadcastVersionMismatchError(
                     broadcast.get("version"),
                     broadcast.get("controlVersion", broadcast.get("version")),
+                )
+            if (
+                expected_queue_revision is not None
+                and broadcast.get("queueRevision") != expected_queue_revision
+            ):
+                raise BroadcastCursorMismatchError(
+                    "queueRevision",
+                    broadcast,
                 )
 
             previous_queue = list(broadcast.get("queueSongIds") or [])
@@ -2026,7 +2444,14 @@ class WebSocketState:
                 broadcast["version"] = broadcast.get("version", 0) + 1
             return dict(broadcast)
 
-    def stop_broadcast(self, broadcast_id, updated_by_client_id, expected_version=None, now=None):
+    def stop_broadcast(
+        self,
+        broadcast_id,
+        updated_by_client_id,
+        expected_version=None,
+        increment_control_version=True,
+        now=None,
+    ):
         now = time.time() if now is None else now
         server_updated_at_ms = _timestamp_ms(now)
         with self._lock:
@@ -2050,19 +2475,125 @@ class WebSocketState:
             broadcast["trackId"] = queue[index] if queue and 0 <= index < len(queue) else None
             broadcast["originClientId"] = updated_by_client_id
             broadcast["updatedByClientId"] = updated_by_client_id
-            broadcast["controlVersion"] = broadcast.get(
-                "controlVersion",
-                broadcast.get("version", 0),
-            ) + 1
+            if increment_control_version:
+                broadcast["controlVersion"] = broadcast.get(
+                    "controlVersion",
+                    broadcast.get("version", 0),
+                ) + 1
             broadcast["serverUpdatedAtMs"] = server_updated_at_ms
             broadcast["updatedAt"] = server_updated_at_ms / 1000
             broadcast.pop("effectiveAtServerMs", None)
+            broadcast.pop("authorityDisconnectDeadlineMs", None)
+            broadcast.pop("authorityDeviceSessionId", None)
             broadcast["version"] = broadcast.get("version", 0) + 1
 
             for client_id in self._broadcast_participants.get(broadcast_id, set()):
                 if self._client_active_broadcast.get(client_id) == broadcast_id:
                     self._client_active_broadcast.pop(client_id, None)
             return dict(broadcast)
+
+    def suspend_broadcast_for_authority_disconnect(
+        self,
+        broadcast_id,
+        authority_client_id,
+        authority_device_session_id,
+        deadline_ms,
+        now=None,
+    ):
+        server_updated_at_ms = _timestamp_ms(now)
+        with self._lock:
+            broadcast = self._broadcasts.get(broadcast_id)
+            if broadcast is None or not self._is_broadcast_active_locked(broadcast_id):
+                return None
+            if broadcast.get("authorityClientId") != authority_client_id:
+                return None
+            broadcast["state"] = "paused"
+            broadcast["originClientId"] = authority_client_id
+            broadcast["updatedByClientId"] = authority_client_id
+            broadcast["controlVersion"] = broadcast.get(
+                "controlVersion",
+                broadcast.get("version", 0),
+            ) + 1
+            broadcast["version"] = broadcast.get("version", 0) + 1
+            broadcast["serverUpdatedAtMs"] = server_updated_at_ms
+            broadcast["updatedAt"] = server_updated_at_ms / 1000
+            broadcast.pop("effectiveAtServerMs", None)
+            broadcast["authorityDisconnectDeadlineMs"] = deadline_ms
+            broadcast["authorityDeviceSessionId"] = authority_device_session_id
+            return dict(broadcast)
+
+    def clear_broadcast_authority_disconnect(
+        self,
+        broadcast_id,
+        authority_client_id,
+        authority_device_session_id,
+    ):
+        with self._lock:
+            broadcast = self._broadcasts.get(broadcast_id)
+            if broadcast is None or not self._is_broadcast_active_locked(broadcast_id):
+                return None
+            if broadcast.get("authorityClientId") != authority_client_id:
+                return None
+            if (
+                broadcast.get("authorityDeviceSessionId")
+                != authority_device_session_id
+            ):
+                return None
+            broadcast.pop("authorityDisconnectDeadlineMs", None)
+            broadcast.pop("authorityDeviceSessionId", None)
+            return dict(broadcast)
+
+    def stop_broadcast_if_authority_deadline(
+        self,
+        broadcast_id,
+        deadline_ms,
+        now=None,
+    ):
+        now_ms = _timestamp_ms(now)
+        with self._lock:
+            broadcast = self._broadcasts.get(broadcast_id)
+            if broadcast is None or not self._is_broadcast_active_locked(broadcast_id):
+                return None
+            if broadcast.get("authorityDisconnectDeadlineMs") != deadline_ms:
+                return None
+            if now_ms < deadline_ms:
+                return None
+            broadcast["state"] = "stopped"
+            broadcast["version"] = broadcast.get("version", 0) + 1
+            broadcast["serverUpdatedAtMs"] = now_ms
+            broadcast["updatedAt"] = now_ms / 1000
+            broadcast.pop("effectiveAtServerMs", None)
+            broadcast.pop("authorityDisconnectDeadlineMs", None)
+            broadcast.pop("authorityDeviceSessionId", None)
+            for client_id in self._broadcast_participants.get(broadcast_id, set()):
+                if self._client_active_broadcast.get(client_id) == broadcast_id:
+                    self._client_active_broadcast.pop(client_id, None)
+            return dict(broadcast)
+
+    def stop_active_broadcasts_for_restart(self, now=None):
+        now_ms = _timestamp_ms(now)
+        stopped = []
+        with self._lock:
+            for broadcast_id, broadcast in self._broadcasts.items():
+                if not self._is_broadcast_active_locked(broadcast_id):
+                    continue
+                if broadcast.get("authorityClientId") == "server":
+                    continue
+                broadcast["state"] = "stopped"
+                broadcast["version"] = broadcast.get("version", 0) + 1
+                broadcast["serverUpdatedAtMs"] = now_ms
+                broadcast["updatedAt"] = now_ms / 1000
+                broadcast.pop("effectiveAtServerMs", None)
+                broadcast.pop("authorityDisconnectDeadlineMs", None)
+                broadcast.pop("authorityDeviceSessionId", None)
+                for client_id in self._broadcast_participants.get(
+                    broadcast_id,
+                    set(),
+                ):
+                    if self._client_active_broadcast.get(client_id) == broadcast_id:
+                        self._client_active_broadcast.pop(client_id, None)
+                stopped.append(dict(broadcast))
+        return stopped
 
     def update_broadcast_participant_state(
         self,
@@ -2088,6 +2619,13 @@ class WebSocketState:
             "errorMessage": playback_state.get("errorMessage"),
             "lastSeenAt": now,
         }
+        client_seq = playback_state.get("clientSeq")
+        if type(client_seq) is int and client_seq >= 1:
+            participant_state["clientSeq"] = client_seq
+            participant_state["serverUpdatedAtMs"] = _timestamp_ms_from_payload(
+                playback_state,
+                now,
+            )
         with self._lock:
             self._broadcast_playback_states[(broadcast_id, client_id)] = participant_state
         return dict(participant_state)
@@ -2162,6 +2700,21 @@ class WebSocketState:
             relationship["active"] = False
             relationship["updatedAtMs"] = now_ms
             return dict(relationship)
+
+    def stop_follow_relationships_for_context(self, playback_context_id, now=None):
+        now_ms = _timestamp_ms(now)
+        stopped = []
+        with self._lock:
+            for relationship in self._follow_relationships.values():
+                if (
+                    relationship.get("active")
+                    and relationship.get("sourcePlaybackContextId")
+                    == playback_context_id
+                ):
+                    relationship["active"] = False
+                    relationship["updatedAtMs"] = now_ms
+                    stopped.append(dict(relationship))
+        return stopped
 
     def create_prepare(
         self,

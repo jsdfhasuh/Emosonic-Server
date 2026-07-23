@@ -60,6 +60,12 @@ class DbLayerContractTestCase(unittest.TestCase):
             "EmoSessionQueue",
             "EmoLocalQueue",
             "EmoPlaybackState",
+            "EmoPlaybackContext",
+            "EmoDevicePlaybackState",
+            "EmoPlaybackControlTransaction",
+            "EmoPlaybackPrepareTransaction",
+            "EmoPlaybackLocalIntent",
+            "EmoPlaybackHandoff",
             "StarredFolder",
             "StarredArtist",
             "StarredAlbum",
@@ -176,6 +182,24 @@ class DbLayerContractTestCase(unittest.TestCase):
         self.assertIs(db_module.EmoSessionQueue, emo.EmoSessionQueue)
         self.assertIs(db_module.EmoLocalQueue, emo.EmoLocalQueue)
         self.assertIs(db_module.EmoPlaybackState, emo.EmoPlaybackState)
+        self.assertIs(db_module.EmoPlaybackContext, emo.EmoPlaybackContext)
+        self.assertIs(
+            db_module.EmoDevicePlaybackState,
+            emo.EmoDevicePlaybackState,
+        )
+        self.assertIs(
+            db_module.EmoPlaybackControlTransaction,
+            emo.EmoPlaybackControlTransaction,
+        )
+        self.assertIs(
+            db_module.EmoPlaybackPrepareTransaction,
+            emo.EmoPlaybackPrepareTransaction,
+        )
+        self.assertIs(
+            db_module.EmoPlaybackLocalIntent,
+            emo.EmoPlaybackLocalIntent,
+        )
+        self.assertIs(db_module.EmoPlaybackHandoff, emo.EmoPlaybackHandoff)
         self.assertIs(db_module.ClientRelease, client_releases.ClientRelease)
 
     def test_main_model_groups_are_shared_with_facade(self):

@@ -1,27 +1,91 @@
-import os
 import logging
+import os
+import threading
 import time
 import uuid
+from typing import Dict, Iterable, List, Optional, Tuple
 
-from flask import current_app, request, session
-from flask_socketio import Namespace, SocketIO, emit
+from flask import (
+    current_app,
+    g,
+    has_app_context,
+    has_request_context,
+    request,
+    session,
+)
+from flask_socketio import Namespace, SocketIO, disconnect
 
-from ..db import close_connection, open_connection
+from ..db import User, close_connection, open_connection
 from ..logging_utils import format_log_event
 from ..managers.user import UserManager
-from .protocol_metadata import get_strict_v2_registration_metadata
+from .browser_auth import BROWSER_OTP_PREFIX, browser_one_time_passwords
+from .protocol_metadata import (
+    get_strict_v2_metadata,
+    get_strict_v2_registration_metadata,
+)
+from .strict_v2_acceptance import consume_binding_emit_failure
+from .strict_v2_contract import (
+    ACTION_SCHEMAS,
+    StrictRequestValidationError,
+    is_strict_registration_request,
+    validate_strict_output,
+    validate_strict_request,
+)
+from .strict_v2_readiness import (
+    CoreProfileNotReady,
+    is_local_test_evidence_allowed,
+    is_local_test_evidence_requested,
+    negotiate_capabilities,
+)
+from .strict_v2_runtime import (
+    RequestFingerprintConflict,
+    StrictRequestCache,
+    request_fingerprint,
+)
+from .strict_v2_safety import resolve_allowed_origins, strict_v2_safety
 from .ws_store import (
+    PlaybackContextAuthorityAmbiguousError,
+    PlaybackContextClosedError,
+    PlaybackContextEnsureConflictError,
+    PlaybackContextIntentConflictError,
+    PlaybackContextQueueRequiredError,
+    PlaybackPrepareAlreadyActiveError,
+    PlaybackPrepareTransactionConflictError,
+    PlaybackHandoffTargetConflictError,
+    PlaybackContextStaleVersionError,
+    PlaybackControlTransactionConflictError,
+    PlaybackClientSequenceConflictError,
+    PlaybackLocalIntentConflictError,
+    closeStrictPlaybackContextState,
+    commitStrictPlaybackHandoff,
+    completeStrictPlaybackHandoff,
     createPlaybackContextState,
+    createStrictPlaybackHandoff,
+    ensureStrictPlaybackContextState,
+    createPlaybackPrepareTransaction,
+    failActivePlaybackHandoffsForRestart,
     getActivePlaybackHandoffs,
     getLocalQueueState,
     getLocalQueueStates,
     getDevicePlaybackStates,
+    getDevicePlaybackState,
     getPlaybackContextState,
+    getPlaybackControlTransaction,
     getPlaybackHandoff,
     getPlaybackHandoffByRequest,
+    getPlaybackPrepareTransaction,
     getPlaybackState,
     getPlaybackStates,
     getQueueState,
+    listActivePlaybackContextBindings,
+    listActivePlaybackPrepareTransactions,
+    listAllPendingPlaybackControlTransactions,
+    listExpiredPlaybackControlTransactions,
+    listPendingPlaybackControlTransactions,
+    listPendingPlaybackControlTransactionsForAuthorityConnection,
+    listPlaybackContexts,
+    mutateStrictPlaybackContextControl,
+    mutateStrictPlaybackContextQueue,
     saveDevicePlaybackState,
     saveLocalQueueState,
     savePlaybackContextState,
@@ -30,9 +94,14 @@ from .ws_store import (
     saveQueueState,
     serializeDevicePlaybackStateV2,
     serializePlaybackContextV2,
+    settlePlaybackPrepareTransaction,
+    settlePlaybackControlTransaction,
+    applyStrictPlaybackUpdate,
+    terminateStrictPlaybackHandoff,
     updatePlaybackContextState,
 )
 from .ws_state import (
+    BroadcastCursorMismatchError,
     BroadcastInactiveError,
     BroadcastVersionMismatchError,
     ClientSeqStaleError,
@@ -49,12 +118,28 @@ from .ws_state import (
 logger = logging.getLogger(__name__)
 state = get_state()
 async_mode = os.environ.get("EMO_SOCKETIO_ASYNC_MODE") or None
-socketio_kwargs = {"cors_allowed_origins": "*", "path": "/emo/ws"}
+socketio_kwargs = {
+    "cors_allowed_origins": None,
+    "max_http_buffer_size": 256 * 1024,
+    "path": "/emo/ws",
+    "ping_interval": 25,
+    "ping_timeout": 20,
+}
 if async_mode is not None:
     socketio_kwargs["async_mode"] = async_mode
 socketio = SocketIO(**socketio_kwargs)
+strict_request_cache = StrictRequestCache()
+_control_watchdog_lock = threading.RLock()
+_control_watchdog_generation = 0
+_control_watchdog_tokens = {}
 
-ALLOWED_PRE_AUTH = {"auth.login", "system.ping"}
+ALLOWED_PRE_AUTH = {"auth.login"}
+EVENT_CONFIRMED_ACTIONS = {
+    "device.volume.update",
+    "playback.update",
+    "playback.ready",
+    "playback.handoff.complete",
+}
 CONTROL_ACTIONS = {
     "player.play",
     "player.pause",
@@ -85,12 +170,17 @@ BROADCAST_ACTIONS = {
 ACTION_EVENT_NAMES = {
     "auth.login": "auth_login",
     "device.register": "device_register",
+    "device.setVolume": "device_set_volume",
+    "device.volume.update": "device_volume_update",
     "session.subscribe": "session_subscribe",
     "session.unsubscribe": "session_unsubscribe",
     "follow.start": "follow_start",
     "follow.stop": "follow_stop",
     "playback.ready": "playback_ready",
-    "playback.context.create": "playback_context_create",
+    "playback.context.ensure": "playback_context_ensure",
+    "playback.context.prepare": "playback_context_prepare",
+    "playback.context.prepared": "playback_context_prepared",
+    "playback.context.list": "playback_context_list",
     "playback.context.status": "playback_context_status",
     "playback.context.subscribe": "playback_context_subscribe",
     "playback.context.unsubscribe": "playback_context_unsubscribe",
@@ -124,14 +214,42 @@ CONTROL_POLICIES = {
 CAPABILITY_EFFECTIVE_AT = "effectiveAtPlayback"
 CAPABILITY_PLAYBACK_PREPARE = "playbackPrepare"
 CAPABILITY_PLAYBACK_CONTEXT_V2 = "playbackContextV2"
+CAPABILITY_CAN_PLAY = "canPlay"
+CAPABILITY_CAN_PAUSE = "canPause"
+CAPABILITY_CAN_SEEK = "canSeek"
+CAPABILITY_CAN_SET_VOLUME = "canSetVolume"
+CAPABILITY_REMOTE_VOLUME_CONTROL = "remoteVolumeControl"
+CAPABILITY_SUPPORTS_FOLLOW = "supportsFollow"
+CAPABILITY_SUPPORTS_BROADCAST = "supportsBroadcast"
+STRICT_BROADCAST_PARTICIPANT_CAPABILITIES = (
+    CAPABILITY_SUPPORTS_BROADCAST,
+    CAPABILITY_CAN_PLAY,
+    CAPABILITY_CAN_PAUSE,
+    CAPABILITY_CAN_SEEK,
+)
+STRICT_V2_REQUIRED_CAPABILITIES = (
+    CAPABILITY_PLAYBACK_CONTEXT_V2,
+    CAPABILITY_PLAYBACK_PREPARE,
+    CAPABILITY_EFFECTIVE_AT,
+    CAPABILITY_CAN_PLAY,
+    CAPABILITY_CAN_PAUSE,
+    CAPABILITY_CAN_SEEK,
+    CAPABILITY_CAN_SET_VOLUME,
+    CAPABILITY_SUPPORTS_FOLLOW,
+    CAPABILITY_SUPPORTS_BROADCAST,
+)
+STRICT_V2_OPTIONAL_CAPABILITIES = (CAPABILITY_REMOTE_VOLUME_CONTROL,)
 PROTOCOL_LEGACY = "legacy"
 PROTOCOL_SINGLE_FUTURE = "single_future"
 PROTOCOL_TWO_PHASE = "two_phase"
 TWO_PHASE_COMMIT_LEAD_MS = 350
 SINGLE_PHASE_COMMIT_LEAD_MS = 700
 PREPARE_TIMEOUT_MS = 1200
+CONTEXT_PREPARE_TIMEOUT_MS = 10000
+DEFAULT_CONTROL_EXECUTION_TIMEOUT_MS = 15000
 HANDOFF_PREPARE_TIMEOUT_MS = 8000
 HANDOFF_COMPLETE_TIMEOUT_MS = 5000
+BROADCAST_AUTHORITY_DISCONNECT_TIMEOUT_MS = 30000
 
 
 class BroadcastConflictError(Exception):
@@ -157,11 +275,44 @@ class PlaybackAuthorityOfflineError(Exception):
     pass
 
 
+class CapabilityRequiredError(PermissionError):
+    pass
+
+
+class FollowConflictError(Exception):
+    pass
+
+
 class FollowControlForbiddenError(PermissionError):
     pass
 
 
 def _log_emo_event(level, event, **fields):
+    if has_request_context() and getattr(g, "emo_strict_request", False):
+        allowed_fields = {
+            "action",
+            "authority_client_id",
+            "authority_device_session_id",
+            "client_request_id",
+            "context_count",
+            "exception_type",
+            "failed_sid_count",
+            "recipient_count",
+            "result",
+            "source_client_id",
+            "user",
+        }
+        fields = {
+            key: value
+            for key, value in fields.items()
+            if key in allowed_fields
+        }
+        started_at = getattr(g, "emo_request_started_at", None)
+        if started_at is not None:
+            fields["latency_ms"] = max(
+                0,
+                int((time.monotonic() - started_at) * 1000),
+            )
     logger.log(level, format_log_event("emo", event, **fields))
 
 
@@ -206,6 +357,20 @@ def _get_client_stale_seconds():
     return value if value > 0 else None
 
 
+def _get_control_execution_timeout_ms():
+    value = current_app.config["WEBAPP"].get(
+        "emo_strict_execution_timeout_ms",
+        DEFAULT_CONTROL_EXECUTION_TIMEOUT_MS,
+    )
+    if isinstance(value, bool):
+        return DEFAULT_CONTROL_EXECUTION_TIMEOUT_MS
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_CONTROL_EXECUTION_TIMEOUT_MS
+    return value if value > 0 else DEFAULT_CONTROL_EXECUTION_TIMEOUT_MS
+
+
 def _list_clients(user_name=None, session_id=None):
     return state.list_clients(
         user_name=user_name,
@@ -214,15 +379,52 @@ def _list_clients(user_name=None, session_id=None):
     )
 
 
-def _serialize_client_info_v2(client):
-    payload = dict(client)
-    payload.pop("sessionId", None)
+def _serialize_client_info_v2(client, target_client=None):
+    client_capabilities = client.get("capabilities")
+    if not isinstance(client_capabilities, dict):
+        client_capabilities = {}
+    target_capabilities = _client_capabilities(target_client)
+    capability_names = list(STRICT_V2_REQUIRED_CAPABILITIES)
+    if CAPABILITY_REMOTE_VOLUME_CONTROL in target_capabilities:
+        capability_names.extend(STRICT_V2_OPTIONAL_CAPABILITIES)
+    capabilities = {
+        capability: (
+            client_capabilities[capability]
+            if type(client_capabilities.get(capability)) is bool
+            else False
+        )
+        for capability in capability_names
+    }
+    payload = {
+        "clientId": client.get("clientId"),
+        "deviceSessionId": client.get("deviceSessionId"),
+        "deviceName": client.get("deviceName"),
+        "roles": list(client.get("roles") or []),
+        "capabilities": capabilities,
+    }
+    if isinstance(client.get("alias"), str) and client.get("alias"):
+        payload["alias"] = client["alias"]
+    if CAPABILITY_REMOTE_VOLUME_CONTROL in target_capabilities:
+        volume_state = state.get_device_volume_state(
+            client.get("userName"),
+            client.get("clientId"),
+            client.get("deviceSessionId"),
+        )
+        if volume_state is not None:
+            payload["volumeState"] = {
+                "volume": volume_state["volume"],
+                "clientSeq": volume_state["clientSeq"],
+                "serverUpdatedAtMs": volume_state["serverUpdatedAtMs"],
+            }
     return payload
 
 
 def _serialize_clients_for_target(clients, target_client):
     if _is_strict_playback_context_v2(target_client):
-        return [_serialize_client_info_v2(client) for client in clients]
+        return [
+            _serialize_client_info_v2(client, target_client)
+            for client in sorted(clients, key=lambda item: item.get("clientId") or "")
+        ]
     return clients
 
 
@@ -246,8 +448,107 @@ def _build_action_log_context(action, request_id, current_user_name, current_cli
 
 
 def init_socketio(app):
-    socketio.init_app(app, path="/emo/ws")
+    webapp_config = app.config["WEBAPP"]
+    development = bool(webapp_config.get("emo_development_mode", False))
+    local_test_evidence_requested = is_local_test_evidence_requested(
+        webapp_config
+    )
+    local_test_evidence_allowed = is_local_test_evidence_allowed(
+        webapp_config,
+        app.testing,
+    )
+    if local_test_evidence_requested:
+        if local_test_evidence_allowed:
+            logger.warning(
+                format_log_event(
+                    "emo",
+                    "strict_v2_local_test_evidence",
+                    result="enabled",
+                    app_testing=app.testing,
+                )
+            )
+        else:
+            logger.warning(
+                format_log_event(
+                    "emo",
+                    "strict_v2_local_test_evidence",
+                    result="ignored",
+                    reason="development_mode_disabled",
+                )
+            )
+    allowed_origins = resolve_allowed_origins(
+        webapp_config,
+        development=development,
+    )
+    socketio.init_app(
+        app,
+        path="/emo/ws",
+        cors_allowed_origins=allowed_origins,
+        max_http_buffer_size=256 * 1024,
+        ping_interval=webapp_config.get("emo_socketio_ping_interval", 25),
+        ping_timeout=webapp_config.get("emo_socketio_ping_timeout", 20),
+    )
+    strict_v2_safety.configure(webapp_config)
+    strict_request_cache.clear_all()
+    watchdog_generation = _reset_control_watchdog_runtime()
+    state.restore_strict_playback_contexts(listPlaybackContexts())
+    recovered_controls = _settle_control_transactions_unknown(
+        listAllPendingPlaybackControlTransactions(),
+        emit=False,
+    )
+    if recovered_controls:
+        logger.warning(
+            "Marked %d pending strict playback controls execution_unknown after restart",
+            len(recovered_controls),
+        )
+    failed_handoffs = failActivePlaybackHandoffsForRestart()
+    if failed_handoffs:
+        logger.warning(
+            "Marked %d active Emo handoffs failed after restart",
+            len(failed_handoffs),
+        )
+    stopped_broadcasts = state.stop_active_broadcasts_for_restart()
+    if stopped_broadcasts:
+        logger.warning(
+            "Marked %d active strict Emo broadcasts stopped after restart",
+            len(stopped_broadcasts),
+        )
+    metadata = get_strict_v2_metadata()
+    logger.warning(
+        format_log_event(
+            "emo",
+            "strict_v2_registration_metadata",
+            protocol_version=metadata["protocolVersion"],
+            schema_hash=metadata["schemaHash"],
+            server_build_commit=metadata["serverBuildCommit"],
+        )
+    )
+    if not app.testing or webapp_config.get(
+        "emo_strict_watchdog_sweep_in_tests",
+        False,
+    ):
+        socketio.start_background_task(
+            _control_watchdog_sweep_later,
+            watchdog_generation,
+        )
     return socketio
+
+
+def begin_strict_v2_shutdown(timeout_seconds=None):
+    if timeout_seconds is None:
+        timeout_seconds = current_app.config["WEBAPP"].get(
+            "emo_strict_shutdown_grace_seconds",
+            5,
+        )
+    drained = strict_v2_safety.begin_shutdown(float(timeout_seconds))
+    _settle_control_transactions_unknown(
+        listAllPendingPlaybackControlTransactions(),
+        emit=True,
+    )
+    _reset_control_watchdog_runtime()
+    for sid in state.list_session_sids():
+        socketio.server.disconnect(sid, namespace="/emo")
+    return drained
 
 
 def _get_access_logger():
@@ -274,6 +575,20 @@ def _build_message(msg_type, action, payload=None, **extra):
     message_payload = payload or {}
     if isinstance(message_payload, dict):
         message_payload = dict(message_payload)
+        if action in {"system.ack", "system.error"}:
+            request_action = (
+                getattr(g, "emo_request_action", None)
+                if has_request_context()
+                else None
+            )
+            if request_action:
+                message_payload["action"] = request_action
+        if action == "system.error":
+            retryable_codes = {"authority_offline", "rate_limited", "internal_error"}
+            message_payload.setdefault(
+                "retryable",
+                message_payload.get("code") in retryable_codes,
+            )
         if "serverUpdatedAtMs" in message_payload:
             message_payload["serverTimeMs"] = int(timestamp * 1000)
     message = {
@@ -284,6 +599,167 @@ def _build_message(msg_type, action, payload=None, **extra):
     }
     message.update(extra)
     return message
+
+
+def _message_for_recipient(message, target_sid):
+    """Add strict-v2 connection provenance for one Socket.IO recipient."""
+    target_client = state.get_client_for_sid(target_sid)
+    strict_target = _is_strict_playback_context_v2(target_client)
+    strict_request_reply = (
+        has_request_context()
+        and target_sid == request.sid
+        and getattr(g, "emo_strict_request", False)
+    )
+    if not strict_target and not strict_request_reply:
+        return message
+
+    outgoing = dict(message)
+    if outgoing.get("action") not in {"system.ack", "system.error", "system.pong", "device.list"}:
+        outgoing.pop("targetClientId", None)
+    outgoing_payload = _strip_strict_transport_fields(outgoing.get("payload"))
+    if (
+        isinstance(outgoing_payload, dict)
+        and outgoing.get("action")
+        not in {
+            "system.pong",
+            "broadcast.play",
+            "broadcast.pause",
+            "broadcast.seek",
+            "broadcast.playItem",
+        }
+    ):
+        outgoing_payload.pop("serverTimeMs", None)
+    outgoing["payload"] = outgoing_payload
+    if strict_target:
+        session_info = state.get_session(target_sid)
+        if session_info is not None:
+            connection_nonce = session_info.get("connectionNonce")
+            if isinstance(connection_nonce, str) and connection_nonce:
+                outgoing["connectionNonce"] = connection_nonce
+                outgoing["connectionEpoch"] = 1
+    validate_strict_output(outgoing, registered=strict_target)
+    return outgoing
+
+
+def _strip_strict_transport_fields(value):
+    if isinstance(value, dict):
+        return {
+            key: _strip_strict_transport_fields(item)
+            for key, item in value.items()
+            if key not in {"sessionId", "targetClientId"}
+        }
+    if isinstance(value, list):
+        return [_strip_strict_transport_fields(item) for item in value]
+    return value
+
+
+def _emit_message(
+    message,
+    target_sid=None,
+    record_settlement=True,
+    emit_reserved=False,
+):
+    """Emit a message to one recipient with its strict-v2 provenance."""
+    if target_sid is None:
+        if not has_request_context():
+            raise RuntimeError("A target Socket.IO sid is required outside a request")
+        target_sid = request.sid
+    outgoing = _message_for_recipient(message, target_sid)
+    settled_request_id = (
+        getattr(g, "emo_settled_request_id", None)
+        if record_settlement and has_request_context()
+        else None
+    )
+    if (
+        settled_request_id is not None
+        and target_sid == request.sid
+        and outgoing.get("requestId") == settled_request_id
+    ):
+        _log_emo_event(
+            logging.ERROR,
+            "duplicate_settlement",
+            result="suppressed",
+            action=outgoing.get("action"),
+            client_request_id=settled_request_id,
+        )
+        return
+    cache_context = (
+        getattr(g, "emo_request_cache_context", None)
+        if record_settlement and has_request_context()
+        else None
+    )
+    settlement_stored = (
+        cache_context is not None
+        and target_sid == request.sid
+        and outgoing.get("requestId") == cache_context["requestId"]
+    )
+    if settlement_stored:
+        strict_request_cache.store_result(
+            cache_context["connectionNonce"],
+            cache_context["requestId"],
+            cache_context["fingerprint"],
+            {"messages": [outgoing]},
+        )
+        g.emo_settled_request_id = cache_context["requestId"]
+        g.emo_request_cache_context = None
+
+    reserved = emit_reserved or strict_v2_safety.reserve_emit(target_sid)
+    if not reserved:
+        if settlement_stored:
+            _log_emo_event(
+                logging.ERROR,
+                "settlement_emit",
+                result="send_buffer_full",
+                action=outgoing.get("action"),
+                client_request_id=outgoing.get("requestId"),
+            )
+            return
+        raise RuntimeError("Socket.IO send buffer is full")
+    try:
+        try:
+            socketio.emit(
+                "message",
+                outgoing,
+                to=target_sid,
+                namespace="/emo",
+            )
+        except Exception as exc:
+            if not settlement_stored:
+                raise
+            _log_emo_event(
+                logging.ERROR,
+                "settlement_emit",
+                result="emit_failed",
+                action=outgoing.get("action"),
+                client_request_id=outgoing.get("requestId"),
+                exception_type=type(exc).__name__,
+            )
+    finally:
+        if not emit_reserved:
+            strict_v2_safety.release_emit(target_sid)
+
+
+def _store_event_confirmations(messages):
+    if not has_request_context():
+        raise RuntimeError("Event confirmations require a request context")
+    cache_context = getattr(g, "emo_request_cache_context", None)
+    if cache_context is None:
+        return
+    outgoing = [
+        _message_for_recipient(message, request.sid)
+        for message in messages
+        if message is not None
+    ]
+    if not outgoing:
+        raise RuntimeError("Event-confirmed request produced no canonical confirmation")
+    strict_request_cache.store_result(
+        cache_context["connectionNonce"],
+        cache_context["requestId"],
+        cache_context["fingerprint"],
+        {"messages": outgoing},
+    )
+    g.emo_settled_request_id = cache_context["requestId"]
+    g.emo_request_cache_context = None
 
 
 def _server_time_ms():
@@ -359,13 +835,13 @@ def _client_supports(client, capability):
     return _client_capabilities(client).get(capability) is True
 
 
-def _select_playback_protocol(client_ids):
+def _select_playback_protocol(client_ids, user_name=None):
     if not client_ids:
         return PROTOCOL_LEGACY
 
     clients = []
     for client_id in client_ids:
-        client = state.get_client(client_id)
+        client = state.get_client(client_id, user_name=user_name)
         if client is None or not _has_role(client, "player"):
             return PROTOCOL_LEGACY
         clients.append(client)
@@ -392,12 +868,119 @@ def _effective_at_server_ms(protocol):
 
 
 def _send_ack(request_id=None, payload=None):
-    emit("message", _build_message("system", "system.ack", payload, requestId=request_id))
+    if has_request_context() and getattr(g, "emo_suppress_success_ack", False):
+        return
+    _emit_message(_build_message("system", "system.ack", payload, requestId=request_id))
 
 
-def _send_error(code, message, request_id=None):
+def _send_error(code, message, request_id=None, **fields):
+    current_client = (
+        state.get_client_for_sid(request.sid) if has_request_context() else None
+    )
+    if _is_strict_playback_context_v2(current_client):
+        if code == "stale_client_seq":
+            code = "client_sequence_conflict"
+        elif code == "follow_control_forbidden":
+            code = "forbidden"
     payload = {"code": code, "message": message}
-    emit("message", _build_message("system", "system.error", payload, requestId=request_id))
+    payload.update({key: value for key, value in fields.items() if value is not None})
+    _emit_message(_build_message("system", "system.error", payload, requestId=request_id))
+
+
+def _send_direct_response(msg_type, action, request_id, payload):
+    _emit_message(
+        _build_message(
+            msg_type,
+            action,
+            payload,
+            requestId=request_id,
+        )
+    )
+
+
+def _prepare_strict_request_cache(
+    message,
+    session_info,
+    action,
+    request_id,
+):
+    connection_nonce = (
+        None if session_info is None else session_info.get("connectionNonce")
+    )
+    fingerprint = request_fingerprint(
+        message.get("type"),
+        action,
+        message.get("payload"),
+    )
+    try:
+        lookup = strict_request_cache.lookup_or_reserve(
+            connection_nonce,
+            request_id,
+            fingerprint,
+        )
+    except RequestFingerprintConflict as exc:
+        _send_error("conflict", str(exc), request_id)
+        return False
+    if lookup.status == "cached":
+        for cached_message in lookup.result["messages"]:
+            _emit_message(
+                cached_message,
+                request.sid,
+                record_settlement=False,
+            )
+        return False
+    if lookup.status == "in_flight":
+        _log_emo_event(
+            logging.INFO,
+            "strict_v2_duplicate_in_flight",
+            action=action,
+            client_request_id=request_id,
+            sid=request.sid,
+        )
+        return False
+    g.emo_request_cache_context = {
+        "connectionNonce": connection_nonce,
+        "requestId": request_id,
+        "fingerprint": fingerprint,
+    }
+    g.emo_suppress_success_ack = action in EVENT_CONFIRMED_ACTIONS
+
+    retry_after_ms = strict_v2_safety.check_rate_limit(
+        connection_nonce,
+        action,
+    )
+    if retry_after_ms is None:
+        return True
+    _log_emo_event(
+        logging.WARNING,
+        "strict_v2_rate_limit",
+        result="rate_limited",
+        action=action,
+        client_request_id=request_id,
+        user=None if session_info is None else session_info.get("userName"),
+        source_client_id=None,
+    )
+    _send_error(
+        "rate_limited",
+        "Strict-v2 request rate limit exceeded",
+        request_id,
+        retryAfterMs=retry_after_ms,
+    )
+    return False
+
+
+def _run_post_commit_push(action, request_id, push):
+    try:
+        return push()
+    except Exception:
+        _log_emo_event(
+            logging.ERROR,
+            "post_commit_push",
+            result="emit_failed",
+            action=action,
+            client_request_id=request_id,
+        )
+        return None
 
 
 def _get_session_user():
@@ -413,15 +996,27 @@ def _get_session_user():
         close_connection()
 
 
-def _authenticate(payload):
-    session_user = _get_session_user()
-    if session_user is not None:
-        return session_user
-
+def _authenticate(payload: Dict[str, object]) -> Optional[User]:
     user_name = payload.get("u")
     password = payload.get("p")
     if not user_name or not password:
         return None
+
+    if isinstance(password, str) and password.startswith(BROWSER_OTP_PREFIX):
+        session_user = _get_session_user()
+        browser_session_id = session.get("emo_browser_session_id")
+        if (
+            session_user is not None
+            and session_user.name == user_name
+            and isinstance(browser_session_id, str)
+            and browser_session_id
+            and browser_one_time_passwords.consume(
+                user_name,
+                browser_session_id,
+                password,
+            )
+        ):
+            return session_user
 
     open_connection(reuse=True)
     try:
@@ -430,15 +1025,122 @@ def _authenticate(payload):
         close_connection()
 
 
-def _broadcast_clients(user_name):
+def _broadcast_clients(user_name: str) -> None:
+    """Broadcast topology snapshots only to legacy clients."""
     clients = _list_clients(user_name=user_name)
     for target_sid, target_client in state.list_sids(user_name=user_name):
+        if target_client is None or _is_strict_playback_context_v2(target_client):
+            continue
         message = _build_message(
             "state",
             "device.list",
             {"devices": _serialize_clients_for_target(clients, target_client)},
         )
-        socketio.emit("message", message, to=target_sid, namespace="/emo")
+        _emit_message(message, target_sid)
+
+
+def _disconnect_strict_recipient(target_sid):
+    try:
+        socketio.server.disconnect(target_sid, namespace="/emo")
+    except Exception:
+        logger.exception(
+            "Unable to disconnect a stale strict-v2 recipient"
+        )
+
+
+def _consume_acceptance_binding_emit_failure(user_name, target_sid):
+    if not has_app_context() or not is_local_test_evidence_allowed(
+        current_app.config["WEBAPP"],
+        current_app.testing,
+    ):
+        return False
+    target_client = state.get_client_for_sid(target_sid)
+    if not isinstance(target_client, dict):
+        return False
+    client_id = target_client.get("clientId")
+    device_session_id = target_client.get("deviceSessionId")
+    if not isinstance(client_id, str) or not isinstance(device_session_id, str):
+        return False
+    if not consume_binding_emit_failure(
+        user_name,
+        client_id,
+        device_session_id,
+    ):
+        return False
+    _log_emo_event(
+        logging.WARNING,
+        "strict_v2_acceptance_fault",
+        result="injected",
+        fault="binding_emit_failure",
+        user=user_name,
+        client_id=client_id,
+        device_session_id=device_session_id,
+        sid=target_sid,
+    )
+    return True
+
+
+def _broadcast_playback_context_bindings_changed(
+    user_name,
+    affected_authority_pairs,
+):
+    authority_pairs = sorted(
+        {
+            tuple(authority_pair)
+            for authority_pair in affected_authority_pairs
+            if (
+                isinstance(authority_pair, (list, tuple))
+                and len(authority_pair) == 3
+                and authority_pair[0] == user_name
+            )
+        }
+    )
+    for _, authority_client_id, authority_device_session_id in authority_pairs:
+        recipient_sids = state.list_strict_controller_sids(user_name)
+        failed_sids = []
+        for target_sid in recipient_sids:
+            if not strict_v2_safety.reserve_emit(target_sid):
+                failed_sids.append(target_sid)
+                _disconnect_strict_recipient(target_sid)
+                continue
+            try:
+                if _consume_acceptance_binding_emit_failure(
+                    user_name,
+                    target_sid,
+                ):
+                    raise RuntimeError(
+                        "injected strict-v2 acceptance binding emit failure"
+                    )
+                _emit_message(
+                    _build_message(
+                        "event",
+                        "playback.context.bindings.changed",
+                        {
+                            "authorityClientId": authority_client_id,
+                            "authorityDeviceSessionId": (
+                                authority_device_session_id
+                            ),
+                        },
+                    ),
+                    target_sid,
+                    record_settlement=False,
+                    emit_reserved=True,
+                )
+            except Exception:
+                failed_sids.append(target_sid)
+                _disconnect_strict_recipient(target_sid)
+            finally:
+                strict_v2_safety.release_emit(target_sid)
+        _log_emo_event(
+            logging.INFO if not failed_sids else logging.ERROR,
+            "playback_context_bindings_changed",
+            result="success" if not failed_sids else "recipient_failed",
+            user=user_name,
+            authority_client_id=authority_client_id,
+            authority_device_session_id=authority_device_session_id,
+            recipient_count=len(recipient_sids),
+            failed_sid_count=len(failed_sids),
+        )
 
 
 def _broadcast_queue(user_name, session_id):
@@ -451,7 +1153,7 @@ def _broadcast_queue(user_name, session_id):
     }
     target_sids.update(state.list_subscribers(session_id, user_name=user_name))
     for target_sid in target_sids:
-        socketio.emit("message", message, to=target_sid, namespace="/emo")
+        _emit_message(message, target_sid)
 
 
 def _broadcast_playback_state(user_name, session_id):
@@ -465,7 +1167,7 @@ def _broadcast_playback_state(user_name, session_id):
     for playback_state in playback_states:
         message = _build_message("state", "playback.update", playback_state)
         for target_sid in target_sids:
-            socketio.emit("message", message, to=target_sid, namespace="/emo")
+            _emit_message(message, target_sid)
 
 
 def _broadcast_playback_context_queue(user_name, playback_context_id):
@@ -477,7 +1179,7 @@ def _broadcast_playback_context_queue(user_name, playback_context_id):
         sid for sid, _ in state.list_sids(user_name=user_name)
     }
     for target_sid in target_sids:
-        socketio.emit("message", message, to=target_sid, namespace="/emo")
+        _emit_message(message, target_sid)
 
 
 def _broadcast_context_queue_v2(user_name, playback_context_id):
@@ -487,7 +1189,7 @@ def _broadcast_context_queue_v2(user_name, playback_context_id):
     message = _build_message(
         "state",
         "queue.context.sync",
-        serializePlaybackContextV2(context),
+        _build_context_queue_payload_v2(context),
     )
     target_sids = set(
         state.list_playback_context_subscribers(
@@ -502,7 +1204,32 @@ def _broadcast_context_queue_v2(user_name, playback_context_id):
         )
     )
     for target_sid in target_sids:
-        socketio.emit("message", message, to=target_sid, namespace="/emo")
+        _emit_message(message, target_sid)
+
+
+def _build_context_queue_payload_v2(context):
+    payload = {
+        "playbackContextId": context.get("playbackContextId"),
+        "authorityClientId": context.get("authorityClientId"),
+        "queueSongIds": list(context.get("queueSongIds") or []),
+        "state": context.get("state") or "idle",
+        "positionMs": context.get("positionMs", 0),
+        "queueRevision": context.get("queueRevision", 1),
+        "controlVersion": context.get("controlVersion", 1),
+        "version": context.get("version", 1),
+        "epoch": context.get("epoch", 1),
+        "serverUpdatedAtMs": context.get("serverUpdatedAtMs"),
+    }
+    queue_song_ids = payload["queueSongIds"]
+    if queue_song_ids:
+        payload["currentIndex"] = context.get("currentIndex", 0)
+        payload["trackId"] = context.get("trackId") or queue_song_ids[
+            payload["currentIndex"]
+        ]
+    timeline_id = context.get("timelineId")
+    if timeline_id is not None:
+        payload["timelineId"] = timeline_id
+    return payload
 
 
 def _broadcast_playback_context_state(user_name, playback_context_id):
@@ -514,18 +1241,14 @@ def _broadcast_playback_context_state(user_name, playback_context_id):
         sid for sid, _ in state.list_sids(user_name=user_name)
     }
     for target_sid in target_sids:
-        socketio.emit("message", message, to=target_sid, namespace="/emo")
+        _emit_message(message, target_sid)
 
 
 def _broadcast_playback_context_state_v2(user_name, playback_context_id):
     context = state.get_playback_context(playback_context_id)
     if context is None:
         return
-    message = _build_message(
-        "state",
-        "playback.update",
-        serializePlaybackContextV2(context),
-    )
+    message = _build_playback_context_status_message(context)
     target_sids = set(
         state.list_playback_context_subscribers(
             playback_context_id,
@@ -539,7 +1262,107 @@ def _broadcast_playback_context_state_v2(user_name, playback_context_id):
         )
     )
     for target_sid in target_sids:
-        socketio.emit("message", message, to=target_sid, namespace="/emo")
+        _emit_message(message, target_sid)
+    return message
+
+
+def _build_playback_context_status_message(context):
+    return _build_message(
+        "state",
+        "playback.context.status",
+        _build_playback_context_status_payload(context),
+    )
+
+
+def _build_v2_playback_update_payload(device_state):
+    if not isinstance(device_state, dict):
+        return None
+    required_fields = (
+        "playbackContextId",
+        "sourceClientId",
+        "deviceSessionId",
+        "origin",
+        "controlVersion",
+        "appliedControlVersion",
+        "state",
+        "positionMs",
+        "clientSeq",
+        "serverUpdatedAtMs",
+    )
+    payload = {
+        field_name: device_state.get(field_name)
+        for field_name in required_fields
+    }
+    if not all(
+        payload.get(field_name) is not None
+        for field_name in required_fields
+    ):
+        return None
+    for field_name in (
+        "trackId",
+        "volume",
+        "muted",
+        "executionStatus",
+        "commandControlVersion",
+        "intentId",
+        "supersededThroughControlVersion",
+        "queueIndex",
+        "errorCode",
+        "errorMessage",
+    ):
+        if field_name in device_state and device_state[field_name] is not None:
+            payload[field_name] = device_state[field_name]
+    return payload
+
+
+def _broadcast_v2_playback_update(user_name, playback_context_id, device_state):
+    message = _build_v2_playback_update_message(device_state)
+    if message is None:
+        return
+    target_sids = set(
+        state.list_playback_context_subscribers(
+            playback_context_id,
+            user_name=user_name,
+        )
+    )
+    target_sids.update(
+        state.list_context_participant_sids(
+            playback_context_id,
+            user_name=user_name,
+        )
+    )
+    for target_sid in target_sids:
+        _emit_message(message, target_sid)
+    return message
+
+
+def _build_v2_playback_update_message(device_state):
+    payload = _build_v2_playback_update_payload(device_state)
+    if payload is None:
+        return None
+    return _build_message("event", "playback.update", payload)
+
+
+def _broadcast_playback_context_closed_v2(user_name, playback_context_id):
+    target_sids = set(
+        state.list_playback_context_subscribers(
+            playback_context_id,
+            user_name=user_name,
+        )
+    )
+    target_sids.update(
+        state.list_context_participant_sids(
+            playback_context_id,
+            user_name=user_name,
+        )
+    )
+    message = _build_message(
+        "event",
+        "playback.context.closed",
+        {"playbackContextId": playback_context_id},
+    )
+    for target_sid in target_sids:
+        _emit_message(message, target_sid)
 
 
 def _save_playback_state_snapshot(user_name, playback_state):
@@ -608,19 +1431,19 @@ def _broadcast_local_queue(user_name, session_id, client_id):
     }
     target_sids.update(state.list_subscribers(session_id, user_name=user_name))
     for target_sid in target_sids:
-        socketio.emit("message", message, to=target_sid, namespace="/emo")
+        _emit_message(message, target_sid)
 
 
-def _broadcast_local_queue_to_client(target_client_id, session_id, client_id):
+def _broadcast_local_queue_to_client(user_name, target_client_id, session_id, client_id):
     local_queue = state.get_local_queue(session_id, client_id)
     if local_queue is None:
         return
     payload = dict(local_queue)
     message = _build_message("state", "queue.local.set", payload)
     message["targetClientId"] = target_client_id
-    target_sid = state.get_sid_for_client(target_client_id)
+    target_sid = state.get_sid_for_client(target_client_id, user_name=user_name)
     if target_sid:
-        socketio.emit("message", message, to=target_sid, namespace="/emo")
+        _emit_message(message, target_sid)
 
 
 def _broadcast_queue_ready_complete(user_name, session_id, ready_payload, exclude_sid=None):
@@ -632,7 +1455,7 @@ def _broadcast_queue_ready_complete(user_name, session_id, ready_payload, exclud
     if exclude_sid is not None:
         target_sids.discard(exclude_sid)
     for target_sid in target_sids:
-        socketio.emit("message", message, to=target_sid, namespace="/emo")
+        _emit_message(message, target_sid)
 
 
 def _push_session_snapshot(sid, session_id):
@@ -653,12 +1476,7 @@ def _restorePersistedState(sid, session_id):
             )
 
     if queue_state is not None:
-        socketio.emit(
-            "message",
-            _build_message("state", "queue.session.sync", queue_state),
-            to=sid,
-            namespace="/emo",
-        )
+        _emit_message(_build_message("state", "queue.session.sync", queue_state), sid)
 
     local_queues = state.list_local_queues(session_id)
     if not local_queues:
@@ -686,12 +1504,7 @@ def _restorePersistedState(sid, session_id):
         )
         if client_id and local_queue.get("sourceClientId") == client_id:
             continue  # Skip sending the local queue back to its own client, as it should already have the latest state
-        socketio.emit(
-            "message",
-            _build_message("state", "queue.local.set", local_queue),
-            to=sid,
-            namespace="/emo",
-        )
+        _emit_message(_build_message("state", "queue.local.set", local_queue), sid)
 
     if client_id:
         active_broadcast_id = state.get_active_broadcast_for_client(client_id)
@@ -710,15 +1523,13 @@ def _restorePersistedState(sid, session_id):
                 participant_state,
                 online=True,
             )
-            socketio.emit(
-                "message",
+            _emit_message(
                 _build_message(
                     "state",
                     "broadcast.status",
                     _build_broadcast_status_payload(active_broadcast),
                 ),
-                to=sid,
-                namespace="/emo",
+                sid,
             )
 
     playback_states = state.list_playback_states(session_id)
@@ -740,18 +1551,13 @@ def _restorePersistedState(sid, session_id):
         ]
 
     for playback_state in playback_states:
-        socketio.emit(
-            "message",
-            _build_message("state", "playback.update", playback_state),
-            to=sid,
-            namespace="/emo",
-        )
+        _emit_message(_build_message("state", "playback.update", playback_state), sid)
 
 
 def _register_device(sid, user_name, payload):
     client_id = payload.get("clientId")
-    if not client_id:
-        raise ValueError("Missing clientId")
+    if not isinstance(client_id, str) or not client_id:
+        raise ValueError("clientId must be a non-empty string")
 
     roles = payload.get("roles")
     if roles is None:
@@ -760,12 +1566,41 @@ def _register_device(sid, user_name, payload):
         raise ValueError("roles must be a list")
 
     device_name = payload.get("deviceName")
-    if device_name is None:
-        device_name = client_id
-    if not isinstance(device_name, str):
-        raise ValueError("deviceName must be a string")
-    device_name = device_name.strip() or client_id
+    capabilities = payload.get("capabilities") or {}
+    strict_v2 = (
+        isinstance(capabilities, dict)
+        and capabilities.get(CAPABILITY_PLAYBACK_CONTEXT_V2) is True
+    )
+    if strict_v2:
+        if not roles or len(roles) > 2 or len(set(roles)) != len(roles):
+            raise ValueError("strict-v2 roles must contain distinct player/controller values")
+        if not all(role in {"player", "controller"} for role in roles):
+            raise ValueError("strict-v2 roles contain an unsupported value")
+        roles = [role for role in ("player", "controller") if role in roles]
+        for capability in STRICT_V2_REQUIRED_CAPABILITIES:
+            if type(capabilities.get(capability)) is not bool:
+                raise ValueError(
+                    f"strict-v2 capabilities.{capability} must be a boolean"
+                )
+        if not isinstance(device_name, str) or not device_name.strip():
+            raise ValueError("strict-v2 deviceName must be a non-empty string")
+        negotiated_capabilities = negotiate_capabilities(
+            capabilities,
+            roles,
+            current_app.config["WEBAPP"],
+            allow_local_test_evidence=is_local_test_evidence_allowed(
+                current_app.config["WEBAPP"],
+                current_app.testing,
+            ),
+        )
+    else:
+        if device_name is None:
+            device_name = client_id
+        if not isinstance(device_name, str):
+            raise ValueError("deviceName must be a string")
+        device_name = device_name.strip() or client_id
 
+    device_name = device_name.strip()
     alias = payload.get("alias")
     if alias is None:
         alias = payload.get("deviceAlias")
@@ -774,13 +1609,9 @@ def _register_device(sid, user_name, payload):
 
     if not isinstance(alias, str):
         raise ValueError("alias must be a string")
-
+    if strict_v2 and not alias.strip():
+        raise ValueError("strict-v2 alias must be a non-empty string")
     alias = alias.strip() or device_name
-    capabilities = payload.get("capabilities") or {}
-    strict_v2 = (
-        isinstance(capabilities, dict)
-        and capabilities.get(CAPABILITY_PLAYBACK_CONTEXT_V2) is True
-    )
     if strict_v2:
         _reject_session_id_for_strict_v2(payload, strict_v2=True)
         device_session_id = payload.get("deviceSessionId")
@@ -795,12 +1626,15 @@ def _register_device(sid, user_name, payload):
         "alias": alias,
         "roles": roles,
         "deviceSessionId": device_session_id,
-        "capabilities": capabilities,
+        "capabilities": negotiated_capabilities if strict_v2 else capabilities,
     }
+    if strict_v2:
+        client_info["rawCapabilities"] = dict(capabilities)
     if not strict_v2:
         client_info["sessionId"] = device_session_id
 
-    return state.register_client(sid, client_id, client_info)
+    registered_client = state.register_client(sid, client_id, client_info)
+    return registered_client
 
 
 def _route_command(sender, message):
@@ -814,7 +1648,7 @@ def _route_command(sender, message):
         sourceClientId=sender["clientId"],
         targetClientId=target_client_id,
     )
-    socketio.emit("message", outgoing, to=target_sid, namespace="/emo")
+    _emit_message(outgoing, target_sid)
 
 
 def _resolve_control_target(sender, message):
@@ -822,8 +1656,11 @@ def _resolve_control_target(sender, message):
     if not target_client_id:
         raise ValueError("Missing targetClientId")
 
-    target_sid = state.get_sid_for_client(target_client_id)
-    target_client = state.get_client(target_client_id)
+    user_name = sender.get("userName")
+    target_sid = state.get_sid_for_client(target_client_id, user_name=user_name)
+    target_client = state.get_client(target_client_id, user_name=user_name)
+    if target_client is None and state.get_client(target_client_id) is not None:
+        raise PermissionError("Cross-user control is not allowed")
     if target_sid is None or target_client is None:
         raise LookupError("Target client is offline")
 
@@ -943,6 +1780,85 @@ def _build_broadcast_status_payload(broadcast):
         "broadcast": _build_broadcast_core_payload(broadcast),
         "participantStates": state.list_broadcast_participant_states(
             broadcast.get("broadcastId")
+        ),
+    }
+
+
+def _build_strict_broadcast_snapshot(broadcast):
+    payload = {
+        "playbackContextId": broadcast.get("playbackContextId"),
+        "broadcastId": broadcast.get("broadcastId"),
+        "ownerClientId": broadcast.get("ownerClientId"),
+        "authorityClientId": broadcast.get("authorityClientId"),
+        "queueSongIds": list(broadcast.get("queueSongIds") or []),
+        "currentIndex": broadcast.get("currentIndex", 0),
+        "positionMs": broadcast.get("positionMs", 0),
+        "state": broadcast.get("state") or "stopped",
+        "version": broadcast.get("version", 1),
+        "queueRevision": broadcast.get("queueRevision", 1),
+        "controlVersion": broadcast.get("controlVersion", 1),
+        "epoch": broadcast.get("epoch", 1),
+        "serverUpdatedAtMs": broadcast.get("serverUpdatedAtMs"),
+        "playbackRate": broadcast.get("playbackRate", 1.0),
+        "participants": sorted(set(broadcast.get("participants") or [])),
+    }
+    track_id = broadcast.get("trackId")
+    if track_id is not None:
+        payload["trackId"] = track_id
+    return payload
+
+
+def _strict_broadcast_client_online(user_name, client_id):
+    sid = state.get_sid_for_client(client_id, user_name=user_name)
+    return sid is not None and socketio.server.manager.is_connected(
+        sid,
+        namespace="/emo",
+    )
+
+
+def _build_strict_broadcast_participant_states(broadcast):
+    broadcast_id = broadcast.get("broadcastId")
+    initial_state = broadcast.get("state") or "stopped"
+    initial_position_ms = broadcast.get("positionMs", 0)
+    participant_states = []
+    for client_id in sorted(set(broadcast.get("participants") or [])):
+        feedback = state.get_broadcast_participant_state(
+            broadcast_id,
+            client_id,
+        ) or {}
+        client_seq = feedback.get("clientSeq")
+        server_updated_at_ms = feedback.get("serverUpdatedAtMs")
+        has_feedback = (
+            type(client_seq) is int
+            and client_seq >= 1
+            and type(server_updated_at_ms) is int
+        )
+        participant_state = {
+            "broadcastId": broadcast_id,
+            "clientId": client_id,
+            "state": feedback.get("state") if has_feedback else initial_state,
+            "positionMs": (
+                feedback.get("positionMs", initial_position_ms)
+                if has_feedback
+                else initial_position_ms
+            ),
+            "online": _strict_broadcast_client_online(
+                broadcast.get("userName"),
+                client_id,
+            ),
+        }
+        if has_feedback:
+            participant_state["clientSeq"] = client_seq
+            participant_state["serverUpdatedAtMs"] = server_updated_at_ms
+        participant_states.append(participant_state)
+    return participant_states
+
+
+def _build_strict_broadcast_status_payload(broadcast):
+    return {
+        "broadcast": _build_strict_broadcast_snapshot(broadcast),
+        "participantStates": _build_strict_broadcast_participant_states(
+            broadcast
         ),
     }
 
@@ -1068,7 +1984,7 @@ def _restore_broadcast_from_playback_context(user_name, playback_context_id):
             client_id,
             device_state.get("deviceSessionId") or device_state.get("sessionId"),
             device_state,
-            online=state.get_sid_for_client(client_id) is not None,
+            online=state.get_sid_for_client(client_id, user_name=user_name) is not None,
         )
     return broadcast
 
@@ -1195,6 +2111,154 @@ def _has_role(client, role):
     return role in (client.get("roles") or [])
 
 
+def _handle_device_set_volume(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+):
+    if current_client is None or not _has_role(current_client, "controller"):
+        raise PermissionError("Device volume control requires the controller role")
+    if not _client_supports(
+        current_client,
+        CAPABILITY_REMOTE_VOLUME_CONTROL,
+    ):
+        raise CapabilityRequiredError(
+            "Controller did not negotiate remoteVolumeControl"
+        )
+
+    target_client_id = payload["targetClientId"]
+    target_device_session_id = payload["targetDeviceSessionId"]
+    target_client = state.get_client(
+        target_client_id,
+        user_name=current_user_name,
+    )
+    target_sid = state.get_sid_for_client(
+        target_client_id,
+        user_name=current_user_name,
+    )
+    if target_client is None or target_sid is None:
+        raise LookupError("Target device is not online")
+    if target_client.get("deviceSessionId") != target_device_session_id:
+        raise LookupError("Target device session is not online")
+    if not _has_role(target_client, "player"):
+        raise PermissionError("Target device is not a player")
+    if not _client_supports(
+        target_client,
+        CAPABILITY_REMOTE_VOLUME_CONTROL,
+    ):
+        raise CapabilityRequiredError(
+            "Target device did not negotiate remoteVolumeControl"
+        )
+    if not _client_supports(target_client, CAPABILITY_CAN_SET_VOLUME):
+        raise CapabilityRequiredError("Target device cannot set volume")
+    if not socketio.server.manager.is_connected(target_sid, namespace="/emo"):
+        raise LookupError("Target device socket is not online")
+    if not strict_v2_safety.reserve_emit(target_sid):
+        raise LookupError("Target device send buffer is unavailable")
+    try:
+        _emit_message(
+            _build_message(
+                "command",
+                "device.setVolume",
+                {
+                    "sourceClientId": current_client.get("clientId"),
+                    "volume": payload["volume"],
+                },
+            ),
+            target_sid,
+            emit_reserved=True,
+        )
+    finally:
+        strict_v2_safety.release_emit(target_sid)
+    _send_ack(request_id)
+
+
+def _build_device_volume_update_message(volume_state):
+    if not isinstance(volume_state, dict):
+        return None
+    return _build_message(
+        "event",
+        "device.volume.update",
+        {
+            "sourceClientId": volume_state.get("sourceClientId"),
+            "deviceSessionId": volume_state.get("deviceSessionId"),
+            "volume": volume_state.get("volume"),
+            "clientSeq": volume_state.get("clientSeq"),
+            "serverUpdatedAtMs": volume_state.get("serverUpdatedAtMs"),
+        },
+    )
+
+
+def _broadcast_device_volume_update(user_name, source_sid, volume_state):
+    message = _build_device_volume_update_message(volume_state)
+    if message is None:
+        return None
+    target_sids = {source_sid}
+    for target_sid, target_client in state.list_sids(user_name=user_name):
+        if (
+            _has_role(target_client, "controller")
+            and _client_supports(
+                target_client,
+                CAPABILITY_REMOTE_VOLUME_CONTROL,
+            )
+        ):
+            target_sids.add(target_sid)
+    for target_sid in sorted(target_sids):
+        _emit_message(message, target_sid)
+    return message
+
+
+def _handle_device_volume_update(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+):
+    if current_client is None or not _has_role(current_client, "player"):
+        raise PermissionError("Device volume feedback requires the player role")
+    if not _client_supports(
+        current_client,
+        CAPABILITY_REMOTE_VOLUME_CONTROL,
+    ) or not _client_supports(current_client, CAPABILITY_CAN_SET_VOLUME):
+        raise CapabilityRequiredError(
+            "Device did not negotiate remote volume feedback"
+        )
+    if payload["deviceSessionId"] != current_client.get("deviceSessionId"):
+        raise PermissionError("deviceSessionId does not match the registered device")
+    session_info = state.get_session(request.sid) or {}
+    connection_nonce = session_info.get("connectionNonce")
+    if not isinstance(connection_nonce, str) or not connection_nonce:
+        raise PermissionError("Registered connection provenance is missing")
+
+    volume_state, created = state.record_strict_device_volume_state(
+        current_user_name,
+        current_client.get("clientId"),
+        current_client.get("deviceSessionId"),
+        payload,
+        connection_nonce,
+    )
+    update_message = _build_device_volume_update_message(volume_state)
+    _store_event_confirmations([update_message])
+    if created:
+        _run_post_commit_push(
+            "device.volume.update",
+            request_id,
+            lambda: _broadcast_device_volume_update(
+                current_user_name,
+                request.sid,
+                volume_state,
+            ),
+        )
+    else:
+        _run_post_commit_push(
+            "device.volume.update",
+            request_id,
+            lambda: _emit_message(update_message, request.sid),
+        )
+    return volume_state
+
+
 def _can_control_broadcast(client, broadcast):
     if client.get("userName") != broadcast.get("userName"):
         return False
@@ -1245,13 +2309,21 @@ def _resolve_broadcast_start_participants(current_user_name, current_client, pay
             return
         seen.add(client_id)
 
-        client = state.get_client(client_id)
+        client = state.get_client(client_id, user_name=current_user_name)
         if client is None:
+            if state.get_client(client_id) is not None:
+                raise PermissionError("Cross-user broadcast target is not allowed")
             skipped_client_ids.append(client_id)
             return
         if client.get("userName") != current_user_name:
             raise PermissionError("Cross-user broadcast target is not allowed")
         if not _has_role(client, "player"):
+            skipped_client_ids.append(client_id)
+            return
+        if (
+            _is_strict_playback_context_v2(client)
+            and not _client_supports(client, CAPABILITY_SUPPORTS_BROADCAST)
+        ):
             skipped_client_ids.append(client_id)
             return
         participants.append(client_id)
@@ -1278,10 +2350,246 @@ def _resolve_broadcast_start_participants(current_user_name, current_client, pay
     return participants, skipped_client_ids
 
 
+def _strict_broadcast_participant_eligible(client):
+    return (
+        client is not None
+        and _has_role(client, "player")
+        and all(
+            _client_supports(client, capability)
+            for capability in STRICT_BROADCAST_PARTICIPANT_CAPABILITIES
+        )
+    )
+
+
+def _get_strict_broadcast_context(current_user_name, playback_context_id):
+    context = _get_existing_playback_context(playback_context_id)
+    if context is None:
+        raise LookupError("Playback context not found")
+    _ensure_playback_context_for_user(context, current_user_name)
+    _ensure_playback_context_active(context)
+    return context
+
+
+def _get_online_strict_broadcast_authority(current_user_name, context):
+    authority_client_id = context.get("authorityClientId")
+    authority = state.get_client(
+        authority_client_id,
+        user_name=current_user_name,
+    )
+    authority_sid = state.get_sid_for_client(
+        authority_client_id,
+        user_name=current_user_name,
+    )
+    if authority is None or authority_sid is None:
+        raise PlaybackAuthorityOfflineError("Playback context authority is offline")
+    if not socketio.server.manager.is_connected(authority_sid, namespace="/emo"):
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority socket is unavailable"
+        )
+    if authority.get("deviceSessionId") != context.get("authorityDeviceSessionId"):
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority device is not connected"
+        )
+    if not _strict_broadcast_participant_eligible(authority):
+        raise CapabilityRequiredError(
+            "Playback context authority lacks Broadcast playback capabilities"
+        )
+    return authority
+
+
+def _resolve_strict_broadcast_start_participants(
+    current_user_name,
+    context,
+    payload,
+):
+    authority = _get_online_strict_broadcast_authority(
+        current_user_name,
+        context,
+    )
+    authority_client_id = authority["clientId"]
+    requested_participants = payload.get("participants")
+    participants = {authority_client_id}
+    skipped_client_ids = set()
+
+    if requested_participants is None:
+        for client in _list_clients(user_name=current_user_name):
+            client_id = client.get("clientId")
+            if not client_id or not _strict_broadcast_participant_eligible(client):
+                continue
+            if _strict_broadcast_client_online(current_user_name, client_id):
+                participants.add(client_id)
+        return sorted(participants), []
+
+    for client_id in requested_participants:
+        client = state.get_client(client_id, user_name=current_user_name)
+        if client is None:
+            other_user_client = state.get_client(client_id)
+            if other_user_client is not None:
+                raise PermissionError("Cross-user broadcast target is not allowed")
+            skipped_client_ids.add(client_id)
+            continue
+        if client.get("userName") != current_user_name:
+            raise PermissionError("Cross-user broadcast target is not allowed")
+        if not _strict_broadcast_participant_eligible(client):
+            skipped_client_ids.add(client_id)
+            continue
+        if not _strict_broadcast_client_online(current_user_name, client_id):
+            skipped_client_ids.add(client_id)
+            continue
+        participants.add(client_id)
+
+    return sorted(participants), sorted(skipped_client_ids - participants)
+
+
+def _get_strict_broadcast_from_payload(current_user_name, payload):
+    broadcast = state.get_broadcast(payload.get("broadcastId"))
+    if broadcast is None:
+        raise LookupError("Broadcast not found")
+    if broadcast.get("userName") != current_user_name:
+        raise PermissionError("Cross-user broadcast access is not allowed")
+    if broadcast.get("playbackContextId") != payload.get("playbackContextId"):
+        raise ValueError("playbackContextId does not match broadcast")
+    return broadcast
+
+
+def _emit_strict_broadcast_to_participants(broadcast, action, msg_type):
+    payload = _build_strict_broadcast_snapshot(broadcast)
+    if action in {
+        "broadcast.play",
+        "broadcast.pause",
+        "broadcast.seek",
+        "broadcast.playItem",
+    }:
+        payload["effectiveAtServerMs"] = broadcast["effectiveAtServerMs"]
+        payload["serverTimeMs"] = _server_time_ms()
+    message = _build_message(
+        msg_type,
+        action,
+        payload,
+    )
+    for client_id in sorted(set(broadcast.get("participants") or [])):
+        sid = state.get_sid_for_client(
+            client_id,
+            user_name=broadcast.get("userName"),
+        )
+        if sid is None:
+            continue
+        _emit_message(message, sid)
+
+
+def _expire_strict_broadcast_authority_disconnect(
+    broadcast_id,
+    deadline_ms,
+    now=None,
+):
+    stopped = state.stop_broadcast_if_authority_deadline(
+        broadcast_id,
+        deadline_ms,
+        now=now,
+    )
+    if stopped is None:
+        return None
+    _run_post_commit_push(
+        "broadcast.stop",
+        None,
+        lambda: _emit_strict_broadcast_to_participants(
+            stopped,
+            "broadcast.stop",
+            "command",
+        ),
+    )
+    return stopped
+
+
+def _expire_strict_broadcast_authority_disconnect_later(
+    broadcast_id,
+    deadline_ms,
+):
+    delay_seconds = max(0, deadline_ms - _server_time_ms()) / 1000
+    socketio.sleep(delay_seconds)
+    _expire_strict_broadcast_authority_disconnect(
+        broadcast_id,
+        deadline_ms,
+    )
+
+
+def _suspend_strict_broadcasts_for_authority_disconnect(client_info):
+    client_id = client_info.get("clientId")
+    user_name = client_info.get("userName")
+    device_session_id = client_info.get("deviceSessionId")
+    for broadcast in state.list_broadcasts(user_name=user_name):
+        if broadcast.get("authorityClientId") != client_id:
+            continue
+        if broadcast.get("authorityClientId") == "server":
+            continue
+        deadline_ms = _server_time_ms() + BROADCAST_AUTHORITY_DISCONNECT_TIMEOUT_MS
+        suspended = state.suspend_broadcast_for_authority_disconnect(
+            broadcast["broadcastId"],
+            client_id,
+            device_session_id,
+            deadline_ms,
+        )
+        if suspended is None:
+            continue
+        suspended["effectiveAtServerMs"] = _effective_at_server_ms(
+            PROTOCOL_SINGLE_FUTURE
+        )
+        _run_post_commit_push(
+            "broadcast.pause",
+            None,
+            lambda: _emit_strict_broadcast_to_participants(
+                suspended,
+                "broadcast.pause",
+                "command",
+            ),
+        )
+        _run_post_commit_push(
+            "broadcast.stop",
+            None,
+            lambda: socketio.start_background_task(
+                _expire_strict_broadcast_authority_disconnect_later,
+                broadcast["broadcastId"],
+                deadline_ms,
+            ),
+        )
+
+
+def _resume_strict_broadcast_authority_registration(client_info):
+    if not _strict_broadcast_participant_eligible(client_info):
+        return []
+    client_id = client_info.get("clientId")
+    user_name = client_info.get("userName")
+    device_session_id = client_info.get("deviceSessionId")
+    resumed = []
+    for broadcast in state.list_broadcasts(user_name=user_name):
+        if broadcast.get("authorityClientId") != client_id:
+            continue
+        cleared = state.clear_broadcast_authority_disconnect(
+            broadcast["broadcastId"],
+            client_id,
+            device_session_id,
+        )
+        if cleared is not None:
+            resumed.append(cleared)
+    return resumed
+
+
 def _broadcast_to_participants(broadcast, action, msg_type, source_client_id, request_id=None, extra_payload=None):
     payload = _build_broadcast_core_payload(broadcast, extra_payload)
     for target_client_id in broadcast.get("participants") or []:
-        target_sid = state.get_sid_for_client(target_client_id)
+        target_client = state.get_client(
+            target_client_id,
+            user_name=broadcast.get("userName"),
+        )
+        if (
+            _is_strict_playback_context_v2(target_client)
+            and not _client_supports(target_client, CAPABILITY_SUPPORTS_BROADCAST)
+        ):
+            continue
+        target_sid = state.get_sid_for_client(
+            target_client_id,
+            user_name=broadcast.get("userName"),
+        )
         if target_sid is None:
             continue
         message = _build_message(
@@ -1292,17 +2600,16 @@ def _broadcast_to_participants(broadcast, action, msg_type, source_client_id, re
             sourceClientId=source_client_id,
             targetClientId=target_client_id,
         )
-        socketio.emit("message", message, to=target_sid, namespace="/emo")
+        _emit_message(message, target_sid)
 
 
 def _broadcast_status_to_requester(broadcast):
-    emit(
-        "message",
+    _emit_message(
         _build_message(
             "state",
             "broadcast.status",
             _build_broadcast_status_payload(broadcast),
-        ),
+        )
     )
 
 
@@ -1325,9 +2632,10 @@ def _required_broadcast_ready_clients(owner_client_id, participant_ids):
 
 
 def _send_playback_prepare(prepare, payload):
+    user_name = (prepare.get("commitPayload") or {}).get("userName")
     for target_client_id in prepare.get("targetClientIds") or []:
-        target_client = state.get_client(target_client_id)
-        target_sid = state.get_sid_for_client(target_client_id)
+        target_client = state.get_client(target_client_id, user_name=user_name)
+        target_sid = state.get_sid_for_client(target_client_id, user_name=user_name)
         if target_client is None or target_sid is None:
             continue
         target_payload = dict(payload)
@@ -1335,14 +2643,23 @@ def _send_playback_prepare(prepare, payload):
         target_payload["deviceSessionId"] = _device_session_id(target_client)
         if not is_context_prepare or not _is_strict_playback_context_v2(target_client):
             target_payload["sessionId"] = _device_session_id(target_client)
-        message = _build_message(
-            "command",
-            "playback.prepare",
-            target_payload,
-            requestId=f"{prepare['prepareId']}-{target_client_id}",
-            targetClientId=target_client_id,
-        )
-        socketio.emit("message", message, to=target_sid, namespace="/emo")
+        elif _is_strict_playback_context_v2(target_client):
+            target_payload.pop("targetClientId", None)
+        if _is_strict_playback_context_v2(target_client):
+            message = _build_message(
+                "command",
+                "playback.prepare",
+                target_payload,
+            )
+        else:
+            message = _build_message(
+                "command",
+                "playback.prepare",
+                target_payload,
+                requestId=f"{prepare['prepareId']}-{target_client_id}",
+                targetClientId=target_client_id,
+            )
+        _emit_message(message, target_sid)
 
 
 def _send_target_player_play(
@@ -1353,18 +2670,20 @@ def _send_target_player_play(
     effective_at_server_ms,
     control_version,
     extra_payload=None,
+    user_name=None,
 ):
-    target_sid = state.get_sid_for_client(target_client_id)
+    target_sid = state.get_sid_for_client(target_client_id, user_name=user_name)
     if target_sid is None:
         return
+    target_client = state.get_client(target_client_id, user_name=user_name)
     payload = {
-        "sessionId": session_id,
         "effectiveAtServerMs": effective_at_server_ms,
         "controlVersion": control_version,
     }
+    if not _is_strict_playback_context_v2(target_client):
+        payload["sessionId"] = session_id
     payload.update(extra_payload or {})
-    socketio.emit(
-        "message",
+    _emit_message(
         _build_message(
             "command",
             "player.play",
@@ -1373,9 +2692,42 @@ def _send_target_player_play(
             sourceClientId=source_client_id,
             targetClientId=target_client_id,
         ),
-        to=target_sid,
-        namespace="/emo",
+        target_sid,
     )
+
+
+def _send_strict_handoff_commit(
+    target_client_id: str,
+    user_name: str,
+    playback_context_id: str,
+    handoff_id: str,
+    source_client_id: str,
+    control_version: int,
+    effective_at_server_ms: int,
+    position_ms: int,
+) -> bool:
+    target_sid = state.get_sid_for_client(
+        target_client_id,
+        user_name=user_name,
+    )
+    if target_sid is None:
+        return False
+    _emit_message(
+        _build_message(
+            "command",
+            "player.play",
+            {
+                "playbackContextId": playback_context_id,
+                "handoffId": handoff_id,
+                "controlVersion": control_version,
+                "sourceClientId": source_client_id,
+                "effectiveAtServerMs": effective_at_server_ms,
+                "positionMs": position_ms,
+            },
+        ),
+        target_sid,
+    )
+    return True
 
 
 def _prepare_ready_to_commit(prepare, now_ms=None):
@@ -1481,16 +2833,72 @@ def _expire_prepare(prepare_id):
         return None
     if _prepare_ready_to_commit(prepare, now_ms=now_ms):
         return _commit_prepare(prepare)
+    commit_payload = prepare.get("commitPayload") or {}
+    handoff_id = commit_payload.get("handoffId")
+    if handoff_id:
+        terminal_result = terminateStrictPlaybackHandoff(
+            commit_payload.get("playbackContextId"),
+            handoff_id,
+            commit_payload.get("userName"),
+            "timed_out",
+            error_code="prepare_timeout",
+            error_message="Handoff prepare timed out",
+        )
+        if terminal_result is None:
+            return None
+        handoff, transitioned = terminal_result
+        state.update_playback_handoff(
+            handoff_id,
+            status=handoff.get("status"),
+            error_code=handoff.get("errorCode"),
+            error_message=handoff.get("errorMessage"),
+        )
+        if not transitioned:
+            return None
     timed_out = state.finish_prepare_if_preparing(prepare_id, "timed_out")
     if timed_out is None:
         return None
-    commit_payload = prepare.get("commitPayload") or {}
-    _update_handoff_for_prepare(
-        timed_out,
-        "timed_out",
-        error_code="prepare_timeout",
-        error_message="Handoff prepare timed out",
-    )
+    if handoff_id:
+        target_client = state.get_client(
+            commit_payload.get("targetClientId"),
+            user_name=commit_payload.get("userName"),
+        )
+        if _is_strict_playback_context_v2(target_client):
+            _run_post_commit_push(
+                "playback.handoff.start",
+                prepare.get("requestId"),
+                lambda: _broadcast_handoff_cancel(
+                    handoff,
+                    "prepare_timeout",
+                ),
+            )
+            _run_post_commit_push(
+                "playback.handoff.start",
+                prepare.get("requestId"),
+                lambda: _broadcast_handoff_status(
+                    handoff,
+                    include_sid=state.get_sid_for_client(
+                        commit_payload.get("targetClientId"),
+                        user_name=commit_payload.get("userName"),
+                    ),
+                ),
+            )
+        else:
+            _send_handoff_release(
+                handoff,
+                handoff.get("targetClientId"),
+                "timed_out",
+                request_id=prepare.get("requestId"),
+                authority_client_id=handoff.get("sourceClientId"),
+                source_client_id=handoff.get("sourceClientId"),
+            )
+    else:
+        _update_handoff_for_prepare(
+            timed_out,
+            "timed_out",
+            error_code="prepare_timeout",
+            error_message="Handoff prepare timed out",
+        )
     _log_emo_event(
         logging.INFO,
         "playback_prepare",
@@ -1505,7 +2913,14 @@ def _expire_prepare(prepare_id):
     return timed_out
 
 
-def _update_handoff_for_prepare(prepare, status, error_code=None, error_message=None):
+def _update_handoff_for_prepare(
+    prepare,
+    status,
+    error_code=None,
+    error_message=None,
+    post_commit_action=None,
+    post_commit_request_id=None,
+):
     commit_payload = prepare.get("commitPayload") or {}
     handoff_id = commit_payload.get("handoffId")
     if not handoff_id:
@@ -1528,6 +2943,32 @@ def _update_handoff_for_prepare(prepare, status, error_code=None, error_message=
         if error_message is not None:
             handoff["errorMessage"] = error_message
     savePlaybackHandoff(handoff)
+    target_client = state.get_client(
+        handoff.get("targetClientId") or commit_payload.get("targetClientId"),
+        user_name=handoff.get("userName"),
+    )
+    if _is_strict_playback_context_v2(target_client) and status in {
+        "failed",
+        "timed_out",
+    }:
+        if post_commit_action == "playback.ready":
+            _store_event_confirmations(
+                [_build_handoff_status_message(handoff)]
+            )
+        push = lambda: _broadcast_handoff_cancel(
+            handoff,
+            error_code or status,
+            include_sid=prepare.get("requestSid"),
+        )
+        if post_commit_action is None:
+            push()
+        else:
+            _run_post_commit_push(
+                post_commit_action,
+                post_commit_request_id,
+                push,
+            )
+        return handoff
     release_reason = None
     if status == "timed_out":
         release_reason = "timed_out"
@@ -1570,38 +3011,94 @@ def _expire_handoff_complete_later(handoff_id):
 
 
 def _expire_handoff_complete(handoff_id):
-    handoff = state.get_playback_handoff(handoff_id)
-    if handoff is None:
-        handoff = getPlaybackHandoff(handoff_id)
-        if handoff is None or handoff.get("status") != "ready":
-            return None
+    handoff = state.get_playback_handoff(handoff_id) or getPlaybackHandoff(
+        handoff_id
+    )
+    target_client = None if handoff is None else state.get_client(
+        handoff.get("targetClientId"),
+        user_name=handoff.get("userName"),
+    )
+    if (
+        handoff is not None
+        and handoff.get("status") == "ready"
+        and not _is_strict_playback_context_v2(target_client)
+    ):
         expires_at_ms = handoff.get("completeExpiresAtMs")
         if expires_at_ms is None or _server_time_ms() < expires_at_ms:
             return None
-        handoff = dict(handoff)
-        handoff["status"] = "timed_out"
-        handoff["errorCode"] = "complete_timeout"
-        handoff["errorMessage"] = "Handoff complete timed out"
-        savePlaybackHandoff(handoff)
-        _send_handoff_release(
-            handoff,
-            handoff.get("targetClientId"),
+        expired = state.expire_playback_handoff_if_status(
+            handoff_id,
+            ("ready",),
             "timed_out",
-            request_id=handoff.get("requestId"),
-            authority_client_id=handoff.get("sourceClientId"),
-            source_client_id=handoff.get("sourceClientId"),
+            error_code="complete_timeout",
+            error_message="Handoff complete timed out",
+            now=_server_time_ms() / 1000,
         )
-        return handoff
+        if expired is not None:
+            savePlaybackHandoff(expired)
+            _send_handoff_release(
+                expired,
+                expired.get("targetClientId"),
+                "timed_out",
+                request_id=expired.get("requestId"),
+                authority_client_id=expired.get("sourceClientId"),
+                source_client_id=expired.get("sourceClientId"),
+            )
+        return expired
+    if handoff is None or handoff.get("status") not in (
+        "committed",
+        "committing",
+    ):
+        return None
+    expires_at_ms = handoff.get("completeExpiresAtMs")
+    if expires_at_ms is None or _server_time_ms() < expires_at_ms:
+        return None
 
-    expired = state.expire_playback_handoff_if_status(
+    terminal_result = terminateStrictPlaybackHandoff(
+        handoff.get("playbackContextId"),
         handoff_id,
-        ("ready",),
+        handoff.get("userName"),
         "timed_out",
-        error_code="complete_timeout",
-        error_message="Handoff complete timed out",
+        error_code="commit_timeout",
+        error_message="Handoff commit timed out",
     )
-    if expired is not None:
-        savePlaybackHandoff(expired)
+    if terminal_result is None:
+        return None
+    expired, transitioned = terminal_result
+    state.update_playback_handoff(
+        handoff_id,
+        status=expired.get("status"),
+        error_code=expired.get("errorCode"),
+        error_message=expired.get("errorMessage"),
+    )
+    if not transitioned:
+        return None
+
+    target_client = state.get_client(
+        expired.get("targetClientId"),
+        user_name=expired.get("userName"),
+    )
+    if _is_strict_playback_context_v2(target_client):
+        _run_post_commit_push(
+            "playback.handoff.complete",
+            expired.get("requestId"),
+            lambda: _broadcast_handoff_cancel(
+                expired,
+                "commit_timeout",
+            ),
+        )
+        _run_post_commit_push(
+            "playback.handoff.complete",
+            expired.get("requestId"),
+            lambda: _broadcast_handoff_status(
+                expired,
+                include_sid=state.get_sid_for_client(
+                    expired.get("targetClientId"),
+                    user_name=expired.get("userName"),
+                ),
+            ),
+        )
+    else:
         _send_handoff_release(
             expired,
             expired.get("targetClientId"),
@@ -1613,7 +3110,7 @@ def _expire_handoff_complete(handoff_id):
     return expired
 
 
-def _commit_prepare(prepare):
+def _commit_prepare(prepare, post_commit_request_id=None):
     if prepare.get("status") != "preparing":
         return None
     if not _prepare_ready_to_commit(prepare):
@@ -1629,6 +3126,110 @@ def _commit_prepare(prepare):
         "playback.handoff.start",
     ):
         return None
+
+    handoff_target = (
+        state.get_client(
+            commit_payload.get("targetClientId"),
+            user_name=commit_payload.get("userName"),
+        )
+        if action == "playback.handoff.start"
+        else None
+    )
+    if action == "playback.handoff.start" and _is_strict_playback_context_v2(
+        handoff_target
+    ):
+        effective_at_server_ms = _effective_at_server_ms(PROTOCOL_TWO_PHASE)
+        complete_expires_at_ms = (
+            effective_at_server_ms + HANDOFF_COMPLETE_TIMEOUT_MS
+        )
+        terminal_result = commitStrictPlaybackHandoff(
+            commit_payload.get("playbackContextId"),
+            commit_payload.get("handoffId"),
+            commit_payload.get("userName"),
+            complete_expires_at_ms,
+        )
+        if terminal_result is None:
+            return None
+        handoff, transitioned = terminal_result
+        if not transitioned:
+            return None
+        claimed_prepare = state.finish_prepare_if_preparing(
+            prepare["prepareId"],
+            "committed",
+        )
+        if claimed_prepare is None:
+            return None
+        target_client = state.get_client(
+            commit_payload["targetClientId"],
+            user_name=commit_payload.get("userName"),
+        )
+        target_sid = state.get_sid_for_client(
+            commit_payload["targetClientId"],
+            user_name=commit_payload.get("userName"),
+        )
+        if (
+            target_client is None
+            or target_sid != commit_payload.get("targetSid")
+            or _device_session_id(target_client)
+            != commit_payload.get("targetDeviceSessionId")
+        ):
+            terminateStrictPlaybackHandoff(
+                commit_payload.get("playbackContextId"),
+                commit_payload.get("handoffId"),
+                commit_payload.get("userName"),
+                "failed",
+                error_code="target_disconnected",
+                error_message="Handoff target changed before commit",
+            )
+            return None
+        handoff = state.update_playback_handoff(
+            commit_payload["handoffId"],
+            status="committed",
+            complete_expires_at_ms=complete_expires_at_ms,
+        ) or handoff
+        if post_commit_request_id is not None:
+            _store_event_confirmations(
+                [_build_handoff_status_message(handoff)]
+            )
+        socketio.start_background_task(
+            _expire_handoff_complete_later,
+            commit_payload["handoffId"],
+        )
+        if _is_strict_playback_context_v2(target_client):
+            _run_post_commit_push(
+                "playback.ready",
+                post_commit_request_id,
+                lambda: _send_strict_handoff_commit(
+                    commit_payload["targetClientId"],
+                    commit_payload.get("userName"),
+                    commit_payload["playbackContextId"],
+                    commit_payload["handoffId"],
+                    commit_payload.get("sourceClientId"),
+                    commit_payload["controlVersion"],
+                    effective_at_server_ms,
+                    commit_payload.get("positionMs", 0),
+                ),
+            )
+        else:
+            _send_target_player_play(
+                commit_payload["targetClientId"],
+                commit_payload.get("sourceClientId"),
+                prepare.get("requestId"),
+                _device_session_id(target_client),
+                effective_at_server_ms,
+                commit_payload["controlVersion"],
+                extra_payload={
+                    "playbackContextId": commit_payload["playbackContextId"],
+                    "deviceSessionId": _device_session_id(target_client),
+                    "handoffId": commit_payload["handoffId"],
+                    "trackId": commit_payload.get("trackId"),
+                    "positionMs": commit_payload.get("positionMs", 0),
+                    "state": "playing",
+                    "completeExpiresAtServerMs": complete_expires_at_ms,
+                },
+                user_name=commit_payload.get("userName"),
+            )
+        return handoff
 
     claimed_prepare = state.finish_prepare_if_preparing(
         prepare["prepareId"],
@@ -1657,7 +3258,10 @@ def _commit_prepare(prepare):
         )
         _sync_broadcast_playback_context(broadcast)
         for participant_id in broadcast.get("participants") or []:
-            participant = state.get_client(participant_id)
+            participant = state.get_client(
+                participant_id,
+                user_name=commit_payload.get("userName"),
+            )
             if participant is None:
                 continue
             state.update_broadcast_participant_state(
@@ -1749,12 +3353,18 @@ def _commit_prepare(prepare):
             commit_payload["sessionId"],
             effective_at_server_ms,
             playback_state["controlVersion"],
+            user_name=commit_payload.get("userName"),
         )
         return playback_state
     elif action == "playback.handoff.start":
-        target_client = state.get_client(commit_payload["targetClientId"])
+        target_client = state.get_client(
+            commit_payload["targetClientId"],
+            user_name=commit_payload.get("userName"),
+        )
         target_device_session_id = _device_session_id(target_client)
-        complete_expires_at_ms = effective_at_server_ms + HANDOFF_COMPLETE_TIMEOUT_MS
+        complete_expires_at_ms = (
+            effective_at_server_ms + HANDOFF_COMPLETE_TIMEOUT_MS
+        )
         handoff = state.update_playback_handoff(
             commit_payload["handoffId"],
             status="ready",
@@ -1782,6 +3392,7 @@ def _commit_prepare(prepare):
                 "state": "playing",
                 "completeExpiresAtServerMs": complete_expires_at_ms,
             },
+            user_name=commit_payload.get("userName"),
         )
         return handoff
     else:
@@ -1789,16 +3400,14 @@ def _commit_prepare(prepare):
 
     request_sid = prepare.get("requestSid")
     if request_sid:
-        socketio.emit(
-            "message",
+        _emit_message(
             _build_message(
                 "state",
                 "broadcast.status",
                 _build_broadcast_status_payload(broadcast),
                 requestId=prepare.get("requestId"),
             ),
-            to=request_sid,
-            namespace="/emo",
+            request_sid,
         )
     return broadcast
 
@@ -1999,13 +3608,16 @@ def _build_seek_media_change_commit_payload(
     }
 
 
-def _source_prepare_target_client_ids(source_client_id):
+def _source_prepare_target_client_ids(source_client_id, user_name):
     target_client_ids = [source_client_id]
     for relationship in state.list_followers_for_source(source_client_id):
         follower_client_id = relationship.get("followerClientId")
         if not follower_client_id or follower_client_id in target_client_ids:
             continue
-        follower_client = state.get_client(follower_client_id)
+        follower_client = state.get_client(
+            follower_client_id,
+            user_name=user_name,
+        )
         if follower_client is None or not _has_role(follower_client, "player"):
             continue
         if not (
@@ -2020,7 +3632,10 @@ def _source_prepare_target_client_ids(source_client_id):
 def _create_source_prepare(current_user_name, current_client, target_client_id, request_id, commit_payload):
     prepare_id = _new_prepare_id()
     now_ms = _server_time_ms()
-    target_client_ids = _source_prepare_target_client_ids(target_client_id)
+    target_client_ids = _source_prepare_target_client_ids(
+        target_client_id,
+        current_user_name,
+    )
     prepare = state.create_prepare(
         prepare_id,
         commit_payload["action"],
@@ -2073,8 +3688,187 @@ def _create_source_prepare(current_user_name, current_client, target_client_id, 
     return prepare
 
 
+def _handle_strict_v2_context_control(
+    current_user_name,
+    current_client,
+    action,
+    payload,
+    request_id,
+):
+    playback_context_id = payload["playbackContextId"]
+    context = _get_existing_playback_context(playback_context_id)
+    if context is None:
+        raise LookupError("Playback context not found")
+    _ensure_playback_context_for_user(context, current_user_name)
+    _ensure_playback_context_active(context)
+    if not _has_role(current_client, "controller"):
+        raise PermissionError("Player control requires the controller role")
+    _ensure_not_follow_source_context_control(
+        current_client,
+        playback_context_id,
+        action,
+    )
+
+    authority_client_id = context.get("authorityClientId")
+    authority_client = state.get_client(
+        authority_client_id,
+        user_name=current_user_name,
+    )
+    authority_sid = state.get_sid_for_client(
+        authority_client_id,
+        user_name=current_user_name,
+    )
+    if authority_client is None or authority_sid is None:
+        raise PlaybackAuthorityOfflineError("Playback context authority is offline")
+    if not socketio.server.manager.is_connected(authority_sid, namespace="/emo"):
+        raise PlaybackAuthorityOfflineError("Playback context authority socket is unavailable")
+    if (
+        authority_client.get("deviceSessionId")
+        != context.get("authorityDeviceSessionId")
+    ):
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority device is not connected"
+        )
+    if not _has_role(authority_client, "player"):
+        raise PlaybackAuthorityOfflineError("Playback context authority is not a player")
+    authority_session = state.get_session(authority_sid) or {}
+    authority_connection_nonce = authority_session.get("connectionNonce")
+    if not isinstance(authority_connection_nonce, str) or not authority_connection_nonce:
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority connection is unavailable"
+        )
+
+    required_capability = {
+        "player.pause": CAPABILITY_CAN_PAUSE,
+        "player.seek": CAPABILITY_CAN_SEEK,
+    }.get(action, CAPABILITY_CAN_PLAY)
+    if not _client_supports(authority_client, required_capability):
+        raise CapabilityRequiredError(
+            "Playback authority lacks %s" % required_capability
+        )
+
+    requested_index = None
+    position_ms = payload.get("positionMs")
+    if action == "queue.playItem":
+        requested_index = payload["queueIndex"]
+        position_ms = 0
+    elif action == "player.next":
+        position_ms = 0
+    elif action == "player.prev":
+        position_ms = 0
+    elif action == "player.play" and position_ms is None:
+        position_ms = context.get("positionMs", 0)
+
+    if not strict_v2_safety.reserve_emit(authority_sid):
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority send buffer is unavailable"
+        )
+    try:
+        accepted_at_ms = _server_time_ms()
+        execution_timeout_ms = _get_control_execution_timeout_ms()
+        updated_context = mutateStrictPlaybackContextControl(
+            playback_context_id,
+            current_user_name,
+            current_client.get("clientId"),
+            action,
+            payload["baseControlVersion"],
+            base_queue_revision=payload.get("baseQueueRevision"),
+            position_ms=position_ms,
+            current_index=requested_index,
+            requesting_client_id=current_client.get("clientId"),
+            authority_client_id=authority_client_id,
+            authority_device_session_id=context.get(
+                "authorityDeviceSessionId"
+            ),
+            routed_connection_nonce=authority_connection_nonce,
+            routed_connection_epoch=authority_session.get(
+                "connectionEpoch"
+            )
+            or 1,
+            accepted_at_ms=accepted_at_ms,
+            execution_timeout_ms=execution_timeout_ms,
+        )
+        if updated_context is None:
+            raise LookupError("Playback context not found")
+        control_transaction = updated_context.pop("_controlTransaction")
+        state.restore_playback_context(playback_context_id, updated_context)
+
+        source_client_id = current_client.get("clientId")
+        if action == "queue.playItem":
+            outgoing_payload = {
+                "playbackContextId": playback_context_id,
+                "queueSongIds": list(updated_context["queueSongIds"]),
+                "queueIndex": updated_context["currentIndex"],
+                "queueRevision": updated_context["queueRevision"],
+                "controlVersion": updated_context["controlVersion"],
+                "sourceClientId": source_client_id,
+                "executionTimeoutMs": execution_timeout_ms,
+            }
+        else:
+            outgoing_payload = {
+                "playbackContextId": playback_context_id,
+                "controlVersion": updated_context["controlVersion"],
+                "sourceClientId": source_client_id,
+                "executionTimeoutMs": execution_timeout_ms,
+            }
+            if action in {"player.play", "player.pause", "player.seek"}:
+                outgoing_payload["positionMs"] = updated_context["positionMs"]
+        try:
+            _emit_message(
+                _build_message("command", action, outgoing_payload),
+                authority_sid,
+                emit_reserved=True,
+            )
+        except Exception:
+            terminal, changed = settlePlaybackControlTransaction(
+                playback_context_id,
+                control_transaction["epoch"],
+                control_transaction["commandControlVersion"],
+                "failed",
+                _server_time_ms(),
+                error_code="execution_unknown",
+                applied_control_version=_last_applied_control_version(
+                    updated_context,
+                    authority_client_id,
+                ),
+            )
+            if changed:
+                _broadcast_control_settled(terminal, updated_context)
+            raise
+        _start_control_watchdog(control_transaction)
+    finally:
+        strict_v2_safety.release_emit(authority_sid)
+    _send_ack(request_id)
+    if action == "queue.playItem":
+        _run_post_commit_push(
+            action,
+            request_id,
+            lambda: _broadcast_context_queue_v2(
+                current_user_name,
+                playback_context_id,
+            ),
+        )
+    _run_post_commit_push(
+        action,
+        request_id,
+        lambda: _broadcast_playback_context_state_v2(
+            current_user_name,
+            playback_context_id,
+        ),
+    )
+    return True
+
+
 def _handle_v2_context_control(current_user_name, current_client, action, payload, request_id):
     strict_v2 = _is_strict_playback_context_v2(current_client)
+    if strict_v2:
+        return _handle_strict_v2_context_control(
+            current_user_name,
+            current_client,
+            action,
+            payload,
+            request_id,
+        )
     playback_context_id = _resolve_v2_playback_context_id(
         payload,
         strict_v2=strict_v2,
@@ -2104,8 +3898,14 @@ def _handle_v2_context_control(current_user_name, current_client, action, payloa
         )
 
     authority_client_id = context.get("authorityClientId")
-    authority_client = state.get_client(authority_client_id)
-    authority_sid = state.get_sid_for_client(authority_client_id)
+    authority_client = state.get_client(
+        authority_client_id,
+        user_name=current_user_name,
+    )
+    authority_sid = state.get_sid_for_client(
+        authority_client_id,
+        user_name=current_user_name,
+    )
     if authority_client is None or authority_sid is None:
         raise PlaybackAuthorityOfflineError("Playback context authority is offline")
     if authority_client.get("userName") != current_user_name:
@@ -2190,18 +3990,36 @@ def _handle_v2_context_control(current_user_name, current_client, action, payloa
     )
     _update_playback_context_snapshot(current_user_name, updated_context)
     _broadcast_playback_context_state_v2(current_user_name, playback_context_id)
-    socketio.emit(
-        "message",
+    outgoing_payload = command_payload
+    if _is_strict_playback_context_v2(authority_client):
+        source_client_id = current_client.get("clientId")
+        if action == "queue.playItem":
+            outgoing_payload = {
+                "playbackContextId": playback_context_id,
+                "queueSongIds": list(updated_context.get("queueSongIds") or []),
+                "queueIndex": updated_context.get("currentIndex"),
+                "queueRevision": updated_context.get("queueRevision"),
+                "controlVersion": updated_context.get("controlVersion"),
+                "sourceClientId": source_client_id,
+            }
+        else:
+            outgoing_payload = {
+                "playbackContextId": playback_context_id,
+                "controlVersion": updated_context.get("controlVersion"),
+                "sourceClientId": source_client_id,
+            }
+            if action in {"player.play", "player.pause", "player.seek"}:
+                outgoing_payload["positionMs"] = updated_context.get("positionMs", 0)
+    _emit_message(
         _build_message(
             "command",
             action,
-            command_payload,
+            outgoing_payload,
             requestId=request_id,
             sourceClientId=current_client.get("clientId"),
             targetClientId=authority_client_id,
         ),
-        to=authority_sid,
-        namespace="/emo",
+        authority_sid,
     )
     _send_ack(
         request_id,
@@ -2247,7 +4065,10 @@ def _handle_server_mediated_control(current_user_name, current_client, message, 
         )
 
     target_client_id, target_sid, target_client = _resolve_control_target(current_client, message)
-    protocol = _select_playback_protocol([target_client_id])
+    protocol = _select_playback_protocol(
+        [target_client_id],
+        user_name=current_user_name,
+    )
     if protocol == PROTOCOL_LEGACY:
         return False
 
@@ -2277,8 +4098,7 @@ def _handle_server_mediated_control(current_user_name, current_client, message, 
         )
         _save_playback_state_snapshot(current_user_name, playback_state)
         _broadcast_playback_state(current_user_name, session_id)
-        socketio.emit(
-            "message",
+        _emit_message(
             _build_message(
                 "command",
                 "player.pause",
@@ -2287,8 +4107,7 @@ def _handle_server_mediated_control(current_user_name, current_client, message, 
                 sourceClientId=current_client.get("clientId"),
                 targetClientId=target_client_id,
             ),
-            to=target_sid,
-            namespace="/emo",
+            target_sid,
         )
         _send_ack(
             request_id,
@@ -2353,8 +4172,7 @@ def _handle_server_mediated_control(current_user_name, current_client, message, 
         if effective_at_server_ms is not None:
             command_payload["effectiveAtServerMs"] = effective_at_server_ms
             command_payload["controlVersion"] = playback_state["controlVersion"]
-        socketio.emit(
-            "message",
+        _emit_message(
             _build_message(
                 "command",
                 "player.seek",
@@ -2363,8 +4181,7 @@ def _handle_server_mediated_control(current_user_name, current_client, message, 
                 sourceClientId=current_client.get("clientId"),
                 targetClientId=target_client_id,
             ),
-            to=target_sid,
-            namespace="/emo",
+            target_sid,
         )
         _send_ack(
             request_id,
@@ -2424,6 +4241,7 @@ def _handle_server_mediated_control(current_user_name, current_client, message, 
         commit_payload["sessionId"],
         effective_at_server_ms,
         playback_state["controlVersion"],
+        user_name=current_user_name,
     )
     _send_ack(
         request_id,
@@ -2436,11 +4254,415 @@ def _handle_server_mediated_control(current_user_name, current_client, message, 
     return True
 
 
+def _handle_strict_broadcast_start(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+):
+    playback_context_id = payload["playbackContextId"]
+    context = _get_strict_broadcast_context(
+        current_user_name,
+        playback_context_id,
+    )
+    client_id = current_client.get("clientId")
+    if client_id != context.get("authorityClientId") and not _has_role(
+        current_client,
+        "controller",
+    ):
+        raise PermissionError(
+            "Broadcast start requires Context authority or controller"
+        )
+
+    active_broadcast = state.get_broadcast_by_playback_context(
+        playback_context_id
+    )
+    if active_broadcast is not None and state.is_broadcast_active(
+        active_broadcast.get("broadcastId")
+    ):
+        raise BroadcastConflictError("Playback context already has an active Broadcast")
+
+    queue_song_ids = list(payload["queueSongIds"])
+    current_index = payload["currentIndex"]
+    position_ms = payload["positionMs"]
+    auto_play = payload.get("autoPlay", False)
+    participant_ids, skipped_client_ids = (
+        _resolve_strict_broadcast_start_participants(
+            current_user_name,
+            context,
+            payload,
+        )
+    )
+    try:
+        broadcast = state.create_broadcast(
+            _new_broadcast_id(),
+            current_user_name,
+            client_id,
+            participant_ids,
+            queue_song_ids,
+            current_index,
+            position_ms,
+            "playing" if auto_play else "paused",
+            "owner_only",
+            client_id,
+            playback_context_id=playback_context_id,
+            authority_client_id=context.get("authorityClientId"),
+            require_context_available=True,
+        )
+    except PlaybackContextConflictError:
+        raise BroadcastConflictError(
+            "Playback context already has an active Broadcast"
+        )
+    for participant_id in participant_ids:
+        participant = state.get_client(
+            participant_id,
+            user_name=current_user_name,
+        )
+        state.update_broadcast_participant_state(
+            broadcast["broadcastId"],
+            participant_id,
+            None if participant is None else participant.get("deviceSessionId"),
+            {
+                "state": broadcast["state"],
+                "positionMs": broadcast["positionMs"],
+            },
+            online=True,
+        )
+
+    _send_ack(
+        request_id,
+        {
+            "started": True,
+            "broadcastId": broadcast["broadcastId"],
+            "participants": participant_ids,
+            "skippedClientIds": skipped_client_ids,
+        },
+    )
+    _run_post_commit_push(
+        "broadcast.start",
+        request_id,
+        lambda: _emit_strict_broadcast_to_participants(
+            broadcast,
+            "broadcast.start",
+            "command",
+        ),
+    )
+    return broadcast
+
+
+def _require_strict_broadcast_status_access(current_client, broadcast):
+    client_id = current_client.get("clientId")
+    if client_id not in {
+        broadcast.get("ownerClientId"),
+        broadcast.get("authorityClientId"),
+        *(broadcast.get("participants") or []),
+    }:
+        raise PermissionError("Broadcast status access is not allowed")
+
+
+def _require_strict_broadcast_control(
+    current_user_name,
+    current_client,
+    broadcast,
+    require_authority_online=True,
+):
+    context = _get_strict_broadcast_context(
+        current_user_name,
+        broadcast.get("playbackContextId"),
+    )
+    client_id = current_client.get("clientId")
+    if client_id not in {
+        broadcast.get("ownerClientId"),
+        context.get("authorityClientId"),
+    }:
+        raise PermissionError("Broadcast control is not allowed")
+    if require_authority_online:
+        _get_online_strict_broadcast_authority(
+            current_user_name,
+            context,
+        )
+    return context
+
+
+def _handle_strict_broadcast_status(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+):
+    broadcast = _get_strict_broadcast_from_payload(
+        current_user_name,
+        payload,
+    )
+    _require_strict_broadcast_status_access(current_client, broadcast)
+    _send_ack(request_id, _build_strict_broadcast_status_payload(broadcast))
+    return broadcast
+
+
+def _handle_strict_broadcast_stop(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+):
+    broadcast = _get_strict_broadcast_from_payload(
+        current_user_name,
+        payload,
+    )
+    _require_strict_broadcast_control(
+        current_user_name,
+        current_client,
+        broadcast,
+        require_authority_online=False,
+    )
+    if not state.is_broadcast_active(broadcast["broadcastId"]):
+        _send_ack(request_id)
+        return broadcast
+
+    updated = state.stop_broadcast(
+        broadcast["broadcastId"],
+        current_client.get("clientId"),
+        increment_control_version=False,
+    )
+    if updated is None:
+        raise LookupError("Broadcast not found")
+    _send_ack(request_id)
+    _run_post_commit_push(
+        "broadcast.stop",
+        request_id,
+        lambda: _emit_strict_broadcast_to_participants(
+            updated,
+            "broadcast.stop",
+            "command",
+        ),
+    )
+    return updated
+
+
+def _update_strict_broadcast_state(broadcast, current_client, **changes):
+    try:
+        updated = state.update_broadcast_state(
+            broadcast["broadcastId"],
+            current_client.get("clientId"),
+            require_active=True,
+            **changes,
+        )
+    except BroadcastInactiveError:
+        raise BroadcastConflictError("Broadcast is stopped")
+    except BroadcastVersionMismatchError:
+        current = state.get_broadcast(broadcast["broadcastId"]) or broadcast
+        raise PlaybackContextStaleVersionError(current, "controlVersion")
+    except BroadcastCursorMismatchError as exc:
+        raise PlaybackContextStaleVersionError(
+            exc.broadcast,
+            exc.cursor_name,
+        )
+    if updated is None:
+        raise LookupError("Broadcast not found")
+    return updated
+
+
+def _settle_strict_broadcast_mutation(
+    action,
+    request_id,
+    updated,
+    msg_type,
+):
+    _send_ack(request_id)
+    _run_post_commit_push(
+        action,
+        request_id,
+        lambda: _emit_strict_broadcast_to_participants(
+            updated,
+            action,
+            msg_type,
+        ),
+    )
+    return updated
+
+
+def _handle_strict_broadcast_play(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+):
+    broadcast = _get_strict_broadcast_from_payload(current_user_name, payload)
+    _require_strict_broadcast_control(
+        current_user_name,
+        current_client,
+        broadcast,
+    )
+    updated = _update_strict_broadcast_state(
+        broadcast,
+        current_client,
+        state_name="playing",
+        effective_at_server_ms=_effective_at_server_ms(PROTOCOL_SINGLE_FUTURE),
+    )
+    return _settle_strict_broadcast_mutation(
+        "broadcast.play",
+        request_id,
+        updated,
+        "command",
+    )
+
+
+def _handle_strict_broadcast_pause(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+):
+    broadcast = _get_strict_broadcast_from_payload(current_user_name, payload)
+    _require_strict_broadcast_control(
+        current_user_name,
+        current_client,
+        broadcast,
+    )
+    updated = _update_strict_broadcast_state(
+        broadcast,
+        current_client,
+        position_ms=_estimate_broadcast_position_ms(broadcast),
+        state_name="paused",
+    )
+    updated["effectiveAtServerMs"] = _effective_at_server_ms(
+        PROTOCOL_SINGLE_FUTURE
+    )
+    return _settle_strict_broadcast_mutation(
+        "broadcast.pause",
+        request_id,
+        updated,
+        "command",
+    )
+
+
+def _handle_strict_broadcast_seek(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+):
+    broadcast = _get_strict_broadcast_from_payload(current_user_name, payload)
+    _require_strict_broadcast_control(
+        current_user_name,
+        current_client,
+        broadcast,
+    )
+    updated = _update_strict_broadcast_state(
+        broadcast,
+        current_client,
+        position_ms=payload["positionMs"],
+        effective_at_server_ms=_effective_at_server_ms(PROTOCOL_SINGLE_FUTURE),
+    )
+    updated.setdefault(
+        "effectiveAtServerMs",
+        _effective_at_server_ms(PROTOCOL_SINGLE_FUTURE),
+    )
+    return _settle_strict_broadcast_mutation(
+        "broadcast.seek",
+        request_id,
+        updated,
+        "command",
+    )
+
+
+def _handle_strict_broadcast_play_item(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+):
+    broadcast = _get_strict_broadcast_from_payload(current_user_name, payload)
+    _require_strict_broadcast_control(
+        current_user_name,
+        current_client,
+        broadcast,
+    )
+    queue_index = payload["queueIndex"]
+    if queue_index >= len(broadcast.get("queueSongIds") or []):
+        raise ValueError("broadcast.playItem queueIndex is out of bounds")
+    updated = _update_strict_broadcast_state(
+        broadcast,
+        current_client,
+        current_index=queue_index,
+        position_ms=0,
+        state_name="playing",
+        increment_queue_revision=True,
+        effective_at_server_ms=_effective_at_server_ms(PROTOCOL_SINGLE_FUTURE),
+    )
+    return _settle_strict_broadcast_mutation(
+        "broadcast.playItem",
+        request_id,
+        updated,
+        "command",
+    )
+
+
+def _handle_strict_broadcast_queue_sync(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+):
+    broadcast = _get_strict_broadcast_from_payload(current_user_name, payload)
+    _require_strict_broadcast_control(
+        current_user_name,
+        current_client,
+        broadcast,
+    )
+    queue_song_ids = list(payload["queueSongIds"])
+    current_index = payload["currentIndex"]
+    position_ms = payload["positionMs"]
+    previous_queue = list(broadcast.get("queueSongIds") or [])
+    previous_index = broadcast.get("currentIndex", 0)
+    previous_position_ms = broadcast.get("positionMs", 0)
+    previous_track_id = broadcast.get("trackId")
+    track_id = queue_song_ids[current_index]
+    queue_changed = queue_song_ids != previous_queue
+    control_changed = (
+        current_index != previous_index
+        or track_id != previous_track_id
+        or position_ms != previous_position_ms
+    )
+    if queue_changed and "baseQueueRevision" not in payload:
+        raise ValueError(
+            "broadcast.queue.sync requires baseQueueRevision when queue changes"
+        )
+    if control_changed and "baseControlVersion" not in payload:
+        raise ValueError(
+            "broadcast.queue.sync requires baseControlVersion when control changes"
+        )
+    updated = _update_strict_broadcast_state(
+        broadcast,
+        current_client,
+        queue_song_ids=queue_song_ids,
+        current_index=current_index,
+        position_ms=position_ms,
+        increment_queue_revision=True,
+        increment_control_version=control_changed,
+        expected_version=payload.get("baseControlVersion"),
+        expected_queue_revision=payload.get("baseQueueRevision"),
+    )
+    return _settle_strict_broadcast_mutation(
+        "broadcast.queue.sync",
+        request_id,
+        updated,
+        "state",
+    )
+
+
 def _handle_broadcast_start(current_user_name, current_client, payload, request_id):
     if current_client is None:
         raise PermissionError("Register the device before starting broadcast")
 
     strict_v2 = _is_strict_playback_context_v2(current_client)
+    if strict_v2:
+        return _handle_strict_broadcast_start(
+            current_user_name,
+            current_client,
+            payload,
+            request_id,
+        )
     playback_context_id = _get_broadcast_playback_context_id(
         payload,
         strict_v2=strict_v2,
@@ -2476,7 +4698,7 @@ def _handle_broadcast_start(current_user_name, current_client, payload, request_
         payload,
     )
     protocol = (
-        _select_playback_protocol(participant_ids)
+        _select_playback_protocol(participant_ids, user_name=current_user_name)
         if state_name == "playing"
         else PROTOCOL_LEGACY
     )
@@ -2524,7 +4746,7 @@ def _handle_broadcast_start(current_user_name, current_client, payload, request_
         current_client.get("clientId"),
         participant_ids,
         queue_song_ids,
-        current_index,
+        current_index if queue_song_ids else None,
         position_ms,
         state_name,
         control_policy,
@@ -2535,7 +4757,10 @@ def _handle_broadcast_start(current_user_name, current_client, payload, request_
     _sync_broadcast_playback_context(broadcast)
 
     for participant_id in participant_ids:
-        participant = state.get_client(participant_id)
+        participant = state.get_client(
+            participant_id,
+            user_name=current_user_name,
+        )
         if participant is None:
             continue
         state.update_broadcast_participant_state(
@@ -2575,6 +4800,13 @@ def _handle_broadcast_start(current_user_name, current_client, payload, request_
 def _handle_broadcast_status(current_user_name, current_client, payload, request_id):
     if current_client is None:
         raise PermissionError("Register the device before requesting broadcast status")
+    if _is_strict_playback_context_v2(current_client):
+        return _handle_strict_broadcast_status(
+            current_user_name,
+            current_client,
+            payload,
+            request_id,
+        )
     broadcast = _get_broadcast_from_payload(current_user_name, payload)
     _send_ack(request_id, _build_broadcast_status_payload(broadcast))
     _broadcast_status_to_requester(broadcast)
@@ -2582,6 +4814,13 @@ def _handle_broadcast_status(current_user_name, current_client, payload, request
 
 
 def _handle_broadcast_queue_sync(current_user_name, current_client, payload, request_id):
+    if _is_strict_playback_context_v2(current_client):
+        return _handle_strict_broadcast_queue_sync(
+            current_user_name,
+            current_client,
+            payload,
+            request_id,
+        )
     broadcast = _get_broadcast_from_payload(current_user_name, payload)
     _require_broadcast_control(current_client, broadcast)
     base_version = _get_broadcast_base_control_version(payload)
@@ -2614,6 +4853,13 @@ def _handle_broadcast_queue_sync(current_user_name, current_client, payload, req
 
 
 def _handle_broadcast_play_item(current_user_name, current_client, payload, request_id):
+    if _is_strict_playback_context_v2(current_client):
+        return _handle_strict_broadcast_play_item(
+            current_user_name,
+            current_client,
+            payload,
+            request_id,
+        )
     broadcast = _get_broadcast_from_payload(current_user_name, payload)
     _require_broadcast_control(current_client, broadcast)
     base_version = _get_broadcast_base_control_version(payload)
@@ -2630,7 +4876,10 @@ def _handle_broadcast_play_item(current_user_name, current_client, payload, requ
         raise ValueError("positionMs must be a non-negative integer")
     _ensure_broadcast_base_control_version_current(broadcast, base_version)
 
-    protocol = _select_playback_protocol(broadcast.get("participants") or [])
+    protocol = _select_playback_protocol(
+        broadcast.get("participants") or [],
+        user_name=current_user_name,
+    )
     if protocol == PROTOCOL_TWO_PHASE:
         prepare_payload = {
             "broadcastId": broadcast["broadcastId"],
@@ -2686,6 +4935,13 @@ def _handle_broadcast_play_item(current_user_name, current_client, payload, requ
 
 
 def _handle_broadcast_play(current_user_name, current_client, payload, request_id):
+    if _is_strict_playback_context_v2(current_client):
+        return _handle_strict_broadcast_play(
+            current_user_name,
+            current_client,
+            payload,
+            request_id,
+        )
     broadcast = _get_broadcast_from_payload(current_user_name, payload)
     _require_broadcast_control(current_client, broadcast)
     queue_song_ids = broadcast.get("queueSongIds") or []
@@ -2697,7 +4953,10 @@ def _handle_broadcast_play(current_user_name, current_client, payload, request_i
 
     expected_version = _get_optional_broadcast_base_control_version(payload)
     _ensure_broadcast_base_control_version_current(broadcast, expected_version)
-    protocol = _select_playback_protocol(broadcast.get("participants") or [])
+    protocol = _select_playback_protocol(
+        broadcast.get("participants") or [],
+        user_name=current_user_name,
+    )
     if protocol == PROTOCOL_TWO_PHASE:
         prepare_payload = {
             "broadcastId": broadcast["broadcastId"],
@@ -2750,6 +5009,13 @@ def _handle_broadcast_play(current_user_name, current_client, payload, request_i
 
 
 def _handle_broadcast_pause(current_user_name, current_client, payload, request_id):
+    if _is_strict_playback_context_v2(current_client):
+        return _handle_strict_broadcast_pause(
+            current_user_name,
+            current_client,
+            payload,
+            request_id,
+        )
     broadcast = _get_broadcast_from_payload(current_user_name, payload)
     _require_broadcast_control(current_client, broadcast)
     position_ms = payload.get("positionMs")
@@ -2777,6 +5043,13 @@ def _handle_broadcast_pause(current_user_name, current_client, payload, request_
 
 
 def _handle_broadcast_seek(current_user_name, current_client, payload, request_id):
+    if _is_strict_playback_context_v2(current_client):
+        return _handle_strict_broadcast_seek(
+            current_user_name,
+            current_client,
+            payload,
+            request_id,
+        )
     broadcast = _get_broadcast_from_payload(current_user_name, payload)
     _require_broadcast_control(current_client, broadcast)
     position_ms = payload.get("positionMs")
@@ -2801,6 +5074,13 @@ def _handle_broadcast_seek(current_user_name, current_client, payload, request_i
 
 
 def _handle_broadcast_stop(current_user_name, current_client, payload, request_id):
+    if _is_strict_playback_context_v2(current_client):
+        return _handle_strict_broadcast_stop(
+            current_user_name,
+            current_client,
+            payload,
+            request_id,
+        )
     broadcast = _get_broadcast_from_payload(current_user_name, payload)
     _require_broadcast_control(current_client, broadcast)
     try:
@@ -2837,6 +5117,8 @@ def _handle_broadcast_stop(current_user_name, current_client, payload, request_i
 def _handle_broadcast_action(current_user_name, current_client, action, payload, request_id):
     strict_v2 = _is_strict_playback_context_v2(current_client)
     if strict_v2:
+        if not _client_supports(current_client, CAPABILITY_SUPPORTS_BROADCAST):
+            raise CapabilityRequiredError("strict-v2 client does not support Broadcast")
         _reject_session_id_for_strict_v2(payload, strict_v2=True)
         if action != "broadcast.start" and not payload.get("playbackContextId"):
             raise ValueError(f"{action} requires a non-empty playbackContextId")
@@ -2900,7 +5182,13 @@ def _handle_follow_start(current_user_name, current_client, payload, request_id,
 
     strict_v2 = _is_strict_playback_context_v2(current_client)
     if strict_v2 or _is_follow_context_payload(payload):
+        if strict_v2 and not _client_supports(current_client, CAPABILITY_SUPPORTS_FOLLOW):
+            raise CapabilityRequiredError("strict-v2 client does not support Follow")
         _reject_session_id_for_strict_v2(payload, strict_v2)
+        if strict_v2 and not _has_role(current_client, "player"):
+            raise PermissionError("Follow requires the player role")
+        if strict_v2 and not _client_supports(current_client, CAPABILITY_CAN_PLAY):
+            raise CapabilityRequiredError("Follow requires canPlay")
         source_playback_context_id = payload.get("sourcePlaybackContextId")
         if source_playback_context_id is None:
             source_playback_context_id = payload.get("playbackContextId")
@@ -2911,6 +5199,7 @@ def _handle_follow_start(current_user_name, current_client, payload, request_id,
         if playback_context is None:
             raise LookupError("Playback context not found")
         _ensure_playback_context_for_user(playback_context, current_user_name)
+        _ensure_playback_context_active(playback_context)
 
         source_client_id = playback_context.get("authorityClientId")
         if source_client_id == current_client.get("clientId"):
@@ -2923,6 +5212,18 @@ def _handle_follow_start(current_user_name, current_client, payload, request_id,
         )
         if not isinstance(device_session_id, str) or not device_session_id:
             raise ValueError("follow.start requires a non-empty deviceSessionId")
+        if strict_v2 and device_session_id != current_client.get("deviceSessionId"):
+            raise PermissionError("deviceSessionId does not match the registered device")
+
+        existing = state.get_follow_relationship(current_client.get("clientId"))
+        if existing is not None:
+            if existing.get("sourcePlaybackContextId") != source_playback_context_id:
+                raise FollowConflictError(
+                    "Follow relationship already targets another playback context"
+                )
+            state.subscribe_playback_context(sid, source_playback_context_id)
+            _send_ack(request_id)
+            return existing
 
         relationship = state.start_follow_relationship(
             current_client.get("clientId"),
@@ -2932,12 +5233,8 @@ def _handle_follow_start(current_user_name, current_client, payload, request_id,
             current_user_name,
             source_playback_context_id=source_playback_context_id,
         )
-        subscriptions = state.subscribe_playback_context(sid, source_playback_context_id)
-        _send_ack(
-            request_id,
-            {"relationship": relationship, "subscriptions": subscriptions},
-        )
-        _push_playback_context_snapshot(sid, playback_context)
+        state.subscribe_playback_context(sid, source_playback_context_id)
+        _send_ack(request_id)
         return relationship
 
     source_client_id = payload.get("sourceClientId") or payload.get("followSourceClientId")
@@ -2946,7 +5243,10 @@ def _handle_follow_start(current_user_name, current_client, payload, request_id,
     if source_client_id == current_client.get("clientId"):
         raise ValueError("follow.start sourceClientId cannot be the current client")
 
-    source_client = state.get_client(source_client_id)
+    source_client = state.get_client(
+        source_client_id,
+        user_name=current_user_name,
+    )
     if source_client is None:
         raise LookupError("Follow source client is offline")
     if source_client.get("userName") != current_user_name:
@@ -2985,29 +5285,38 @@ def _handle_follow_stop(current_client, payload, request_id, sid):
 
     strict_v2 = _is_strict_playback_context_v2(current_client)
     if strict_v2 or _is_follow_context_payload(payload):
+        if strict_v2 and not _client_supports(current_client, CAPABILITY_SUPPORTS_FOLLOW):
+            raise CapabilityRequiredError("strict-v2 client does not support Follow")
         _reject_session_id_for_strict_v2(payload, strict_v2)
-        relationship = state.stop_follow_relationship(current_client.get("clientId"))
         source_playback_context_id = payload.get("sourcePlaybackContextId")
         if source_playback_context_id is None:
             source_playback_context_id = payload.get("playbackContextId")
+        relationship = state.get_follow_relationship(current_client.get("clientId"))
+        if (
+            relationship is not None
+            and source_playback_context_id is not None
+            and relationship.get("sourcePlaybackContextId")
+            != source_playback_context_id
+        ):
+            raise FollowConflictError(
+                "Follow relationship targets another playback context"
+            )
         if source_playback_context_id is None and relationship is not None:
             source_playback_context_id = relationship.get("sourcePlaybackContextId")
 
-        subscriptions = []
+        relationship = state.stop_follow_relationship(current_client.get("clientId"))
+
         if source_playback_context_id:
             if not isinstance(source_playback_context_id, str):
                 raise ValueError("follow.stop sourcePlaybackContextId must be a string")
-            subscriptions = state.unsubscribe_playback_context(
+            state.unsubscribe_playback_context(
                 sid,
                 source_playback_context_id,
             )
         else:
-            subscriptions = state.unsubscribe_playback_context(sid)
+            state.unsubscribe_playback_context(sid)
 
-        _send_ack(
-            request_id,
-            {"relationship": relationship, "subscriptions": subscriptions},
-        )
+        _send_ack(request_id)
         return relationship
 
     relationship = state.stop_follow_relationship(current_client.get("clientId"))
@@ -3048,8 +5357,13 @@ def _resolve_local_queue_owner(current_user_name, current_client, payload):
     if not isinstance(owner_client_id, str) or not owner_client_id:
         raise ValueError("queue.local.set clientId must be a non-empty string")
 
-    owner_client = state.get_client(owner_client_id)
+    owner_client = state.get_client(
+        owner_client_id,
+        user_name=current_user_name,
+    )
     if owner_client is None:
+        if state.get_client(owner_client_id) is not None:
+            raise PermissionError("Cross-user local queue update is not allowed")
         raise LookupError("Local queue client is offline")
     if owner_client.get("userName") != current_user_name:
         raise PermissionError("Cross-user local queue update is not allowed")
@@ -3063,8 +5377,13 @@ def _validate_local_queue_target(current_user_name, target_client_id):
     if not isinstance(target_client_id, str) or not target_client_id:
         raise ValueError("targetClientId must be a non-empty string")
 
-    target_client = state.get_client(target_client_id)
+    target_client = state.get_client(
+        target_client_id,
+        user_name=current_user_name,
+    )
     if target_client is None:
+        if state.get_client(target_client_id) is not None:
+            raise PermissionError("Cross-user local queue routing is not allowed")
         raise LookupError("Target client is offline")
     if target_client.get("userName") != current_user_name:
         raise PermissionError("Cross-user local queue routing is not allowed")
@@ -3125,22 +5444,50 @@ def _handle_playback_ready(current_client, payload, request_id):
         raise PermissionError("playback.ready clientId must match the current device")
 
     prepare = state.get_prepare(prepare_id)
+    strict_v2 = _is_strict_playback_context_v2(current_client)
     if prepare is None:
+        if strict_v2:
+            raise LookupError("Playback prepare not found")
         _send_ack(request_id, {"ignored": True, "prepareId": prepare_id})
         return None
+    commit_payload = prepare.get("commitPayload") or {}
+    if strict_v2:
+        if prepare.get("action") != "playback.handoff.start":
+            raise PermissionError("Strict playback.ready requires a handoff prepare")
+        if payload.get("playbackContextId") != commit_payload.get(
+            "playbackContextId"
+        ):
+            raise ValueError("playback.ready playbackContextId does not match prepare")
+        payload_handoff_id = payload.get("handoffId")
+        if (
+            payload_handoff_id is not None
+            and payload_handoff_id != commit_payload.get("handoffId")
+        ):
+            raise ValueError("playback.ready handoffId does not match prepare")
+        if current_client_id != commit_payload.get("targetClientId"):
+            raise PermissionError("playback.ready sender is not the handoff target")
+        if current_client.get("deviceSessionId") != commit_payload.get(
+            "targetDeviceSessionId"
+        ):
+            raise PermissionError("playback.ready device does not match handoff target")
+
     if prepare.get("status") != "preparing":
-        _send_ack(
-            request_id,
-            {
-                "ignored": True,
-                "prepareId": prepare_id,
-                "status": prepare.get("status"),
-            },
-        )
+        if not strict_v2:
+            _send_ack(
+                request_id,
+                {
+                    "ignored": True,
+                    "prepareId": prepare_id,
+                    "status": prepare.get("status"),
+                },
+            )
         return prepare
 
     control_version = payload.get("controlVersion")
-    if control_version != prepare.get("controlVersion"):
+    if (
+        control_version is not None
+        and control_version != prepare.get("controlVersion")
+    ):
         raise ValueError("playback.ready controlVersion does not match prepare")
 
     updated_prepare = state.update_prepare_ready(
@@ -3165,41 +5512,53 @@ def _handle_playback_ready(current_client, payload, request_id):
         not ready
         and current_client_id in set(updated_prepare.get("requiredClientIds") or [])
     ):
-        aborted_prepare = state.finish_prepare_if_preparing(prepare_id, "aborted")
+        terminal_status = "failed" if strict_v2 else "aborted"
+        aborted_prepare = state.finish_prepare_if_preparing(
+            prepare_id,
+            terminal_status,
+        )
         if aborted_prepare is None:
             latest_prepare = state.get_prepare(prepare_id) or updated_prepare
-            _send_ack(
-                request_id,
-                {
-                    "ignored": True,
-                    "prepareId": prepare_id,
-                    "status": latest_prepare.get("status"),
-                },
-            )
+            if not strict_v2:
+                _send_ack(
+                    request_id,
+                    {
+                        "ignored": True,
+                        "prepareId": prepare_id,
+                        "status": latest_prepare.get("status"),
+                    },
+                )
             return latest_prepare
         _update_handoff_for_prepare(
             aborted_prepare,
-            "aborted",
-            error_code="prepare_rejected",
-            error_message="Handoff target rejected prepare",
+            terminal_status,
+            error_code=payload.get("errorCode") or "prepare_failed",
+            error_message=payload.get("errorMessage"),
+            post_commit_action="playback.ready" if strict_v2 else None,
+            post_commit_request_id=request_id,
         )
-        _send_ack(
-            request_id,
-            {"ready": False, "prepareId": prepare_id, "status": "aborted"},
-        )
+        if not strict_v2:
+            _send_ack(
+                request_id,
+                {"ready": False, "prepareId": prepare_id, "status": "aborted"},
+            )
         return aborted_prepare
 
     committed = None
     if _prepare_ready_to_commit(updated_prepare):
-        committed = _commit_prepare(updated_prepare)
-    _send_ack(
-        request_id,
-        {
-            "ready": ready,
-            "prepareId": prepare_id,
-            "status": "committed" if committed is not None else "preparing",
-        },
-    )
+        committed = _commit_prepare(
+            updated_prepare,
+            post_commit_request_id=request_id,
+        )
+    if not strict_v2:
+        _send_ack(
+            request_id,
+            {
+                "ready": ready,
+                "prepareId": prepare_id,
+                "status": "committed" if committed is not None else "preparing",
+            },
+        )
     return committed or updated_prepare
 
 
@@ -3252,9 +5611,14 @@ def _ensure_playback_context_for_user(context, user_name):
         raise PermissionError("Playback context belongs to another user")
 
     authority_client_id = context.get("authorityClientId")
-    authority_client = state.get_client(authority_client_id)
+    authority_client = state.get_client(authority_client_id, user_name=user_name)
     if authority_client is not None and authority_client.get("userName") != user_name:
         raise PermissionError("Playback context authority belongs to another user")
+
+
+def _ensure_playback_context_active(context):
+    if context.get("lifecycle") == "closed":
+        raise PlaybackContextClosedError(context)
 
 
 def _validate_playback_context_queue_payload(payload):
@@ -3375,78 +5739,855 @@ def _build_playback_context_status_payload(playback_context):
             continue
         device_states_by_client_id[client_id] = device_state
     device_states.extend(device_states_by_client_id.values())
+    serialized_device_states = [
+        serializeDevicePlaybackStateV2(device_state)
+        for device_state in device_states
+    ]
+    serialized_device_states = sorted(
+        (
+            device_state
+            for device_state in serialized_device_states
+            if device_state is not None
+        ),
+        key=lambda device_state: device_state["clientId"],
+    )
     return {
         "playbackContext": serializePlaybackContextV2(playback_context),
-        "deviceStates": [
-            serializeDevicePlaybackStateV2(device_state)
-            for device_state in device_states
-        ],
+        "deviceStates": serialized_device_states,
     }
 
 
 def _push_playback_context_snapshot(sid, playback_context):
-    socketio.emit(
-        "message",
+    _emit_message(
         _build_message(
             "state",
             "playback.context.status",
             _build_playback_context_status_payload(playback_context),
         ),
-        to=sid,
-        namespace="/emo",
+        sid,
     )
 
 
-def _handle_playback_context_create(current_user_name, current_client, payload, request_id):
+def _handle_playback_context_ensure(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+    sid,
+):
     if current_client is None:
-        raise PermissionError("Register the device before creating playback context")
+        raise PermissionError("Register the device before ensuring playback context")
     _reject_session_id_for_strict_v2(payload, strict_v2=True)
-    playback_context_id = _resolve_v2_playback_context_id(payload, strict_v2=True)
-    if not isinstance(playback_context_id, str) or not playback_context_id:
-        raise ValueError("playback.context.create requires a non-empty playbackContextId")
     device_session_id = _resolve_v2_device_session_id(
         payload,
         current_client,
         strict_v2=True,
     )
     if not isinstance(device_session_id, str) or not device_session_id:
-        raise ValueError("playback.context.create requires a non-empty deviceSessionId")
+        raise ValueError("playback.context.ensure requires a non-empty deviceSessionId")
+    if not _has_role(current_client, "player"):
+        raise PermissionError("Only a player can ensure a playback context")
+    if not _client_supports(current_client, CAPABILITY_CAN_PLAY):
+        raise CapabilityRequiredError("playback.context.ensure requires canPlay")
+    if device_session_id != current_client.get("deviceSessionId"):
+        raise PermissionError("deviceSessionId does not match the registered device")
 
     queue_song_ids, current_index, position_ms = _validate_playback_context_queue_payload(
         payload
     )
-    playback_context = _get_existing_playback_context(playback_context_id)
-    if playback_context is not None:
-        _ensure_playback_context_for_user(playback_context, current_user_name)
-        _send_ack(
-            request_id,
-            {
-                "created": False,
-                "playbackContext": serializePlaybackContextV2(playback_context),
-            },
-        )
-        return playback_context
-
-    playback_context, created = state.create_playback_context(
-        playback_context_id,
-        device_session_id,
+    ensure_result = ensureStrictPlaybackContextState(
         current_user_name,
         current_client.get("clientId"),
-        queue_song_ids=queue_song_ids,
-        current_index=current_index,
-        position_ms=position_ms,
+        device_session_id,
+        queue_song_ids,
+        current_index if queue_song_ids else None,
+        position_ms,
+        payload["state"],
     )
+    playback_context, _mutated = ensure_result
+    playback_context_id = playback_context["playbackContextId"]
     _ensure_playback_context_for_user(playback_context, current_user_name)
-    if created:
-        _create_playback_context_snapshot(current_user_name, playback_context)
+    playback_context = state.restore_playback_context(
+        playback_context_id,
+        playback_context,
+    )
+    state.subscribe_playback_context(sid, playback_context_id)
+    _send_direct_response(
+        "state",
+        "playback.context.ensure",
+        request_id,
+        serializePlaybackContextV2(playback_context),
+    )
+    if len(ensure_result.affected_authority_pairs) > 1:
+        settled_prepares = (
+            _settle_active_context_prepares_for_authority_change(
+                playback_context_id,
+                playback_context["controlVersion"],
+            )
+        )
+        for canonical_result in settled_prepares:
+            _run_post_commit_push(
+                "playback.context.ensure",
+                request_id,
+                lambda result=canonical_result: _broadcast_context_prepared(
+                    current_user_name,
+                    playback_context_id,
+                    result,
+                    include_sids=(sid,),
+                ),
+            )
+    if ensure_result.binding_mutated:
+        _run_post_commit_push(
+            "playback.context.ensure",
+            request_id,
+            lambda: _broadcast_playback_context_bindings_changed(
+                current_user_name,
+                ensure_result.affected_authority_pairs,
+            ),
+        )
+    return playback_context
+
+
+def _build_context_prepared_message(canonical_result):
+    return _build_message(
+        "event",
+        "playback.context.prepared",
+        canonical_result,
+    )
+
+
+def _broadcast_context_prepared(
+    user_name,
+    playback_context_id,
+    canonical_result,
+    include_sids=(),
+):
+    message = _build_context_prepared_message(canonical_result)
+    target_sids = set(
+        state.list_playback_context_subscribers(
+            playback_context_id,
+            user_name=user_name,
+        )
+    )
+    target_sids.update(include_sids)
+    for target_sid in sorted(target_sids):
+        try:
+            _emit_message(message, target_sid)
+        except Exception:
+            logger.exception(
+                "Failed to emit playback.context.prepared context=%s sid=%s",
+                playback_context_id,
+                target_sid,
+            )
+
+
+def _settle_active_context_prepares_for_authority_change(
+    playback_context_id,
+    control_version,
+):
+    settled_results = []
+    for prepare in listActivePlaybackPrepareTransactions(playback_context_id):
+        canonical_result = {
+            "playbackContextId": playback_context_id,
+            "intentId": prepare["intentId"],
+            "ready": False,
+            "errorCode": "authority_changed",
+            "controlVersion": control_version,
+        }
+        try:
+            settled, changed = settlePlaybackPrepareTransaction(
+                playback_context_id,
+                prepare["epoch"],
+                prepare["intentId"],
+                "failed",
+                canonical_result,
+                _server_time_ms(),
+                error_code="authority_changed",
+            )
+        except PlaybackPrepareTransactionConflictError:
+            continue
+        if changed:
+            settled_results.append(settled["canonicalResult"])
+    return settled_results
+
+
+def _settle_active_context_prepares_ready(
+    playback_context_id,
+    epoch,
+    control_version,
+):
+    settled_results = []
+    for prepare in listActivePlaybackPrepareTransactions(
+        playback_context_id,
+        epoch=epoch,
+    ):
+        canonical_result = {
+            "playbackContextId": playback_context_id,
+            "intentId": prepare["intentId"],
+            "ready": True,
+            "controlVersion": control_version,
+        }
+        try:
+            settled, changed = settlePlaybackPrepareTransaction(
+                playback_context_id,
+                epoch,
+                prepare["intentId"],
+                "ready",
+                canonical_result,
+                _server_time_ms(),
+            )
+        except PlaybackPrepareTransactionConflictError:
+            continue
+        if changed:
+            settled_results.append(settled["canonicalResult"])
+    return settled_results
+
+
+def _last_applied_control_version(playback_context, authority_client_id):
+    device_state = getDevicePlaybackState(
+        playback_context["playbackContextId"],
+        authority_client_id,
+    )
+    if (
+        device_state is not None
+        and device_state.get("contextEpoch") == playback_context.get("epoch")
+        and isinstance(device_state.get("appliedControlVersion"), int)
+        and device_state["appliedControlVersion"] >= 1
+    ):
+        return device_state["appliedControlVersion"]
+    return 1
+
+
+def _control_watchdog_key(
+    playback_context_id: str,
+    epoch: int,
+    command_control_version: int,
+) -> Tuple[str, int, int]:
+    return (
+        playback_context_id,
+        epoch,
+        command_control_version,
+    )
+
+
+def _reset_control_watchdog_runtime() -> int:
+    global _control_watchdog_generation
+    with _control_watchdog_lock:
+        _control_watchdog_generation += 1
+        _control_watchdog_tokens.clear()
+        return _control_watchdog_generation
+
+
+def _control_watchdog_is_active(
+    key: Optional[Tuple[str, int, int]],
+    generation: int,
+    token: Optional[object] = None,
+) -> bool:
+    with _control_watchdog_lock:
+        if generation != _control_watchdog_generation:
+            return False
+        if token is None:
+            return True
+        return _control_watchdog_tokens.get(key) is token
+
+
+def _cancel_control_watchdog(
+    playback_context_id: str,
+    epoch: int,
+    command_control_version: int,
+) -> None:
+    key = _control_watchdog_key(
+        playback_context_id,
+        epoch,
+        command_control_version,
+    )
+    with _control_watchdog_lock:
+        _control_watchdog_tokens.pop(key, None)
+
+
+def _start_control_watchdog(transaction: Dict[str, object]) -> None:
+    key = _control_watchdog_key(
+        transaction["playbackContextId"],
+        transaction["epoch"],
+        transaction["commandControlVersion"],
+    )
+    token = object()
+    with _control_watchdog_lock:
+        generation = _control_watchdog_generation
+        _control_watchdog_tokens[key] = token
+    socketio.start_background_task(
+        _expire_control_transaction_later,
+        transaction["playbackContextId"],
+        transaction["epoch"],
+        transaction["commandControlVersion"],
+        generation,
+        token,
+    )
+
+
+def _settle_control_transactions_unknown(
+    transactions: Iterable[Dict[str, object]],
+    emit: bool,
+    terminal_at_ms: Optional[int] = None,
+) -> List[Dict[str, object]]:
+    terminal_at_ms = _server_time_ms() if terminal_at_ms is None else terminal_at_ms
+    settled = []
+    ordered = sorted(
+        transactions,
+        key=lambda item: (
+            item["playbackContextId"],
+            item["epoch"],
+            item["commandControlVersion"],
+        ),
+    )
+    for pending in ordered:
+        playback_context = getPlaybackContextState(
+            pending["playbackContextId"]
+        )
+        applied_control_version = pending.get("appliedControlVersion")
+        if applied_control_version is None:
+            applied_control_version = (
+                _last_applied_control_version(
+                    playback_context,
+                    pending["authorityClientId"],
+                )
+                if playback_context is not None
+                else 1
+            )
+        try:
+            transaction, changed = settlePlaybackControlTransaction(
+                pending["playbackContextId"],
+                pending["epoch"],
+                pending["commandControlVersion"],
+                "failed",
+                terminal_at_ms,
+                error_code="execution_unknown",
+                applied_control_version=applied_control_version,
+            )
+        except PlaybackControlTransactionConflictError:
+            _cancel_control_watchdog(
+                pending["playbackContextId"],
+                pending["epoch"],
+                pending["commandControlVersion"],
+            )
+            continue
+        _cancel_control_watchdog(
+            pending["playbackContextId"],
+            pending["epoch"],
+            pending["commandControlVersion"],
+        )
+        if not changed:
+            continue
+        settled.append((transaction, playback_context))
+    if emit:
+        for transaction, playback_context in settled:
+            if playback_context is not None:
+                _broadcast_control_settled(transaction, playback_context)
+    return [transaction for transaction, _playback_context in settled]
+
+
+def _settle_authority_connection_controls_unknown(
+    user_name: Optional[str],
+    authority_client_id: Optional[str],
+    authority_device_session_id: Optional[str],
+    routed_connection_nonce: Optional[str],
+) -> List[Dict[str, object]]:
+    if not all(
+        isinstance(value, str) and value
+        for value in (
+            user_name,
+            authority_client_id,
+            authority_device_session_id,
+            routed_connection_nonce,
+        )
+    ):
+        return []
+    pending = listPendingPlaybackControlTransactionsForAuthorityConnection(
+        user_name,
+        authority_client_id,
+        authority_device_session_id,
+        routed_connection_nonce,
+    )
+    return _settle_control_transactions_unknown(pending, emit=True)
+
+
+def _sweep_expired_control_transactions(
+    now_ms: Optional[int] = None,
+) -> List[Dict[str, object]]:
+    now_ms = _server_time_ms() if now_ms is None else now_ms
+    return _settle_control_transactions_unknown(
+        listExpiredPlaybackControlTransactions(now_ms),
+        emit=True,
+        terminal_at_ms=now_ms,
+    )
+
+
+def _control_watchdog_sweep_later(generation: int) -> None:
+    while _control_watchdog_is_active(None, generation):
+        socketio.sleep(1)
+        if not _control_watchdog_is_active(None, generation):
+            return
+        try:
+            _sweep_expired_control_transactions()
+        except Exception:
+            logger.exception("Strict playback control watchdog sweep failed")
+
+
+def _control_settled_payload(transaction, playback_context):
+    payload = {
+        "playbackContextId": transaction["playbackContextId"],
+        "epoch": transaction["epoch"],
+        "commandControlVersion": transaction["commandControlVersion"],
+        "status": "failed",
+        "errorCode": transaction["errorCode"],
+        "controlVersion": playback_context["controlVersion"],
+        "appliedControlVersion": transaction.get("appliedControlVersion")
+        or _last_applied_control_version(
+            playback_context,
+            transaction["authorityClientId"],
+        ),
+        "requestingClientId": transaction["requestingClientId"],
+        "serverUpdatedAtMs": transaction["terminalAtMs"],
+    }
+    if transaction.get("dependsOnControlVersion") is not None:
+        payload["dependsOnControlVersion"] = transaction[
+            "dependsOnControlVersion"
+        ]
+    return payload
+
+
+def _broadcast_control_settled(transaction, playback_context):
+    payload = _control_settled_payload(transaction, playback_context)
+    message = _build_message("event", "playback.control.settled", payload)
+    target_sids = set(
+        state.list_playback_context_subscribers(
+            transaction["playbackContextId"],
+            user_name=transaction["userName"],
+        )
+    )
+    authority_sid = state.get_sid_for_client(
+        transaction["authorityClientId"],
+        user_name=transaction["userName"],
+    )
+    if authority_sid is not None:
+        authority_client = state.get_client_for_sid(authority_sid) or {}
+        authority_session = state.get_session(authority_sid) or {}
+        if (
+            authority_client.get("deviceSessionId")
+            == transaction["authorityDeviceSessionId"]
+            and authority_session.get("connectionNonce")
+            == transaction["routedConnectionNonce"]
+        ):
+            target_sids.add(authority_sid)
+    for target_sid in sorted(target_sids):
+        try:
+            _emit_message(message, target_sid)
+        except Exception:
+            logger.exception(
+                "Failed to emit playback.control.settled context=%s version=%s sid=%s",
+                transaction["playbackContextId"],
+                transaction["commandControlVersion"],
+                target_sid,
+            )
+
+
+def _expire_control_transaction_later(
+    playback_context_id: str,
+    epoch: int,
+    command_control_version: int,
+    generation: int,
+    token: object,
+) -> None:
+    key = _control_watchdog_key(
+        playback_context_id,
+        epoch,
+        command_control_version,
+    )
+    transaction = getPlaybackControlTransaction(
+        playback_context_id,
+        epoch,
+        command_control_version,
+    )
+    if transaction is None or transaction["status"] != "pending":
+        _cancel_control_watchdog(
+            playback_context_id,
+            epoch,
+            command_control_version,
+        )
+        return
+    remaining_ms = transaction["watchdogDeadlineAtMs"] - _server_time_ms()
+    while remaining_ms > 0:
+        socketio.sleep(min(remaining_ms / 1000, 1.0))
+        if not _control_watchdog_is_active(key, generation, token):
+            return
+        remaining_ms = transaction["watchdogDeadlineAtMs"] - _server_time_ms()
+    if not _control_watchdog_is_active(key, generation, token):
+        return
+    transaction = getPlaybackControlTransaction(
+        playback_context_id,
+        epoch,
+        command_control_version,
+    )
+    if transaction is None or transaction["status"] != "pending":
+        _cancel_control_watchdog(
+            playback_context_id,
+            epoch,
+            command_control_version,
+        )
+        return
+    _settle_control_transactions_unknown(
+        [transaction],
+        emit=True,
+        terminal_at_ms=max(
+            _server_time_ms(),
+            transaction["watchdogDeadlineAtMs"],
+        ),
+    )
+
+
+def _context_prepare_request_record(payload):
+    record = {"baseControlVersion": payload["baseControlVersion"]}
+    if "initialQueueSongIds" in payload:
+        record["initialQueue"] = {
+            "queueSongIds": list(payload["initialQueueSongIds"]),
+            "currentIndex": payload["currentIndex"],
+            "positionMs": payload["positionMs"],
+        }
+    return record
+
+
+def _handle_playback_context_prepare(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+):
+    if current_client is None:
+        raise PermissionError("Register before preparing a playback context")
+    if not _has_role(current_client, "controller"):
+        raise PermissionError("Only a controller can prepare a playback context")
+    playback_context_id = payload["playbackContextId"]
+    context = _get_existing_playback_context(playback_context_id)
+    if context is None:
+        raise LookupError("Playback context not found")
+    _ensure_playback_context_for_user(context, current_user_name)
+    _ensure_playback_context_active(context)
+
+    authority_client_id = context.get("authorityClientId")
+    authority_sid = state.get_sid_for_client(
+        authority_client_id,
+        user_name=current_user_name,
+    )
+    authority_client = state.get_client(
+        authority_client_id,
+        user_name=current_user_name,
+    )
+    if authority_sid is None or authority_client is None:
+        raise PlaybackAuthorityOfflineError("Playback context authority is offline")
+    if (
+        authority_client.get("deviceSessionId")
+        != context.get("authorityDeviceSessionId")
+    ):
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority device is not connected"
+        )
+    if not _has_role(authority_client, "player"):
+        raise PlaybackAuthorityOfflineError("Playback context authority is not a player")
+    if not _client_supports(authority_client, CAPABILITY_PLAYBACK_PREPARE):
+        raise CapabilityRequiredError(
+            "Playback authority lacks playbackPrepare"
+        )
+    if not _client_supports(authority_client, CAPABILITY_CAN_PLAY):
+        raise CapabilityRequiredError("Playback authority lacks canPlay")
+
+    authority_session = state.get_session(authority_sid) or {}
+    routed_nonce = authority_session.get("connectionNonce")
+    if not isinstance(routed_nonce, str) or not routed_nonce:
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority connection is unavailable"
+        )
+    should_reserve = not context.get("queueSongIds")
+    if should_reserve and not strict_v2_safety.reserve_emit(authority_sid):
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority send buffer is unavailable"
+        )
+    try:
+        now_ms = _server_time_ms()
+        prepare, created = createPlaybackPrepareTransaction(
+            playback_context_id,
+            current_user_name,
+            context["epoch"],
+            payload["intentId"],
+            current_client.get("clientId"),
+            authority_client_id,
+            context.get("authorityDeviceSessionId"),
+            routed_nonce,
+            authority_session.get("connectionEpoch") or 1,
+            _context_prepare_request_record(payload),
+            payload["baseControlVersion"],
+            now_ms + CONTEXT_PREPARE_TIMEOUT_MS,
+            validate_context=True,
+        )
+        if prepare is None:
+            raise LookupError("Playback context not found")
+        if created and prepare["status"] == "preparing":
+            command_payload = {
+                "playbackContextId": playback_context_id,
+                "intentId": prepare["intentId"],
+                "controlVersion": prepare["controlVersion"],
+                "sourceClientId": current_client.get("clientId"),
+            }
+            if "initialQueueSongIds" in payload:
+                command_payload.update(
+                    {
+                        "initialQueueSongIds": list(
+                            payload["initialQueueSongIds"]
+                        ),
+                        "currentIndex": payload["currentIndex"],
+                        "positionMs": payload["positionMs"],
+                    }
+                )
+            _emit_message(
+                _build_message(
+                    "command",
+                    "playback.context.prepare",
+                    command_payload,
+                ),
+                authority_sid,
+                emit_reserved=should_reserve,
+            )
+            socketio.start_background_task(
+                _expire_context_prepare_later,
+                playback_context_id,
+                prepare["epoch"],
+                prepare["intentId"],
+            )
+    finally:
+        if should_reserve:
+            strict_v2_safety.release_emit(authority_sid)
+
+    ack_status = "ready" if prepare["status"] == "ready" else "preparing"
     _send_ack(
         request_id,
         {
-            "created": created,
-            "playbackContext": serializePlaybackContextV2(playback_context),
+            "intentId": prepare["intentId"],
+            "status": ack_status,
+            "controlVersion": prepare["controlVersion"],
         },
     )
-    return playback_context
+    if not created and prepare.get("canonicalResult") is not None:
+        _run_post_commit_push(
+            "playback.context.prepare",
+            request_id,
+            lambda: _broadcast_context_prepared(
+                current_user_name,
+                playback_context_id,
+                prepare["canonicalResult"],
+                include_sids=(request.sid,),
+            ),
+        )
+    return prepare
+
+
+def _handle_playback_context_prepared(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+):
+    if current_client is None or not _has_role(current_client, "player"):
+        raise PermissionError("Only the authority player can settle prepare")
+    playback_context_id = payload["playbackContextId"]
+    context = _get_existing_playback_context(playback_context_id)
+    if context is None:
+        raise LookupError("Playback context not found")
+    _ensure_playback_context_for_user(context, current_user_name)
+    _ensure_playback_context_active(context)
+    if (
+        context.get("authorityClientId") != current_client.get("clientId")
+        or context.get("authorityDeviceSessionId") != payload["deviceSessionId"]
+        or payload["deviceSessionId"] != current_client.get("deviceSessionId")
+    ):
+        raise PermissionError("Prepare feedback authority binding mismatch")
+
+    prepare = getPlaybackPrepareTransaction(
+        playback_context_id,
+        context["epoch"],
+        payload["intentId"],
+    )
+    if prepare is None:
+        raise PlaybackPrepareTransactionConflictError(
+            "Prepare transaction not found"
+        )
+    session_info = state.get_session(request.sid) or {}
+    if (
+        prepare["authorityClientId"] != current_client.get("clientId")
+        or prepare["authorityDeviceSessionId"] != payload["deviceSessionId"]
+        or prepare["routedConnectionNonce"]
+        != session_info.get("connectionNonce")
+    ):
+        raise PermissionError("Prepare feedback came from a replaced Socket")
+
+    if prepare["status"] != "preparing":
+        canonical_result = prepare.get("canonicalResult")
+        if canonical_result is None:
+            raise PlaybackPrepareTransactionConflictError(
+                "Prepare terminal has no canonical result"
+            )
+        same_result = canonical_result.get("ready") == payload["ready"]
+        if not payload["ready"]:
+            same_result = same_result and canonical_result.get(
+                "errorCode"
+            ) == payload.get("errorCode")
+        if not same_result and prepare["status"] != "ready":
+            raise PlaybackPrepareTransactionConflictError(
+                "Prepare terminal conflict"
+            )
+    else:
+        if payload["ready"] and not context.get("queueSongIds"):
+            raise PlaybackPrepareTransactionConflictError(
+                "Prepare cannot be ready while Context is idle"
+            )
+        canonical_result = {
+            "playbackContextId": playback_context_id,
+            "intentId": payload["intentId"],
+            "ready": payload["ready"],
+            "controlVersion": context["controlVersion"],
+        }
+        status = "ready" if payload["ready"] else "failed"
+        if not payload["ready"]:
+            canonical_result["errorCode"] = payload["errorCode"]
+            if "errorMessage" in payload:
+                canonical_result["errorMessage"] = payload["errorMessage"]
+        prepare, _changed = settlePlaybackPrepareTransaction(
+            playback_context_id,
+            context["epoch"],
+            payload["intentId"],
+            status,
+            canonical_result,
+            _server_time_ms(),
+            error_code=canonical_result.get("errorCode"),
+            error_message=canonical_result.get("errorMessage"),
+        )
+        canonical_result = prepare["canonicalResult"]
+
+    confirmation = _build_context_prepared_message(canonical_result)
+    _store_event_confirmations([confirmation])
+    _run_post_commit_push(
+        "playback.context.prepared",
+        request_id,
+        lambda: _broadcast_context_prepared(
+            current_user_name,
+            playback_context_id,
+            canonical_result,
+            include_sids=(request.sid,),
+        ),
+    )
+    return prepare
+
+
+def _expire_context_prepare_later(playback_context_id, epoch, intent_id):
+    socketio.sleep(CONTEXT_PREPARE_TIMEOUT_MS / 1000)
+    prepare = getPlaybackPrepareTransaction(
+        playback_context_id,
+        epoch,
+        intent_id,
+    )
+    if prepare is None or prepare["status"] != "preparing":
+        return
+    context = getPlaybackContextState(playback_context_id)
+    ready = bool(
+        context is not None
+        and context.get("lifecycle") == "active"
+        and context.get("epoch") == epoch
+        and context.get("authorityClientId") == prepare["authorityClientId"]
+        and context.get("authorityDeviceSessionId")
+        == prepare["authorityDeviceSessionId"]
+        and context.get("queueSongIds")
+    )
+    error_code = None
+    if not ready:
+        if (
+            context is None
+            or context.get("lifecycle") != "active"
+            or context.get("epoch") != epoch
+            or context.get("authorityClientId") != prepare["authorityClientId"]
+            or context.get("authorityDeviceSessionId")
+            != prepare["authorityDeviceSessionId"]
+        ):
+            error_code = "authority_changed"
+        else:
+            error_code = "prepare_timeout"
+    canonical_result = {
+        "playbackContextId": playback_context_id,
+        "intentId": intent_id,
+        "ready": ready,
+        "controlVersion": (
+            prepare["controlVersion"]
+            if context is None
+            else context.get("controlVersion", prepare["controlVersion"])
+        ),
+    }
+    if error_code is not None:
+        canonical_result["errorCode"] = error_code
+    try:
+        settled, changed = settlePlaybackPrepareTransaction(
+            playback_context_id,
+            epoch,
+            intent_id,
+            "ready" if ready else "failed",
+            canonical_result,
+            _server_time_ms(),
+            error_code=error_code,
+        )
+    except PlaybackPrepareTransactionConflictError:
+        return
+    if changed:
+        _broadcast_context_prepared(
+            prepare["userName"],
+            playback_context_id,
+            settled["canonicalResult"],
+        )
+
+
+def _handle_playback_context_list(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+):
+    if current_client is None:
+        raise PermissionError(
+            "Register the device before listing playback contexts"
+        )
+    if not _client_supports(
+        current_client,
+        CAPABILITY_PLAYBACK_CONTEXT_V2,
+    ):
+        raise CapabilityRequiredError(
+            "playbackContextV2 is required to list playback contexts"
+        )
+    if not _has_role(current_client, "controller"):
+        raise PermissionError(
+            "Only a controller can list playback contexts"
+        )
+
+    authority_client_id = payload["authorityClientId"]
+    authority_device_session_id = payload[
+        "authorityDeviceSessionId"
+    ]
+    bindings = listActivePlaybackContextBindings(
+        current_user_name,
+        authority_client_id,
+        authority_device_session_id,
+    )
+    _send_direct_response(
+        "state",
+        "playback.context.list",
+        request_id,
+        {"contexts": bindings},
+    )
+    return bindings
 
 
 def _handle_playback_context_status(current_user_name, current_client, payload, request_id):
@@ -3458,10 +6599,15 @@ def _handle_playback_context_status(current_user_name, current_client, payload, 
         raise ValueError("playback.context.status requires a non-empty playbackContextId")
 
     playback_context = _get_existing_playback_context(playback_context_id)
-    if playback_context is None:
-        raise LookupError("Playback context not found")
-    _ensure_playback_context_for_user(playback_context, current_user_name)
-    _send_ack(
+    if (
+        playback_context is None
+        or playback_context.get("userName") != current_user_name
+    ):
+        raise PermissionError("Playback context access is not allowed")
+    _ensure_playback_context_active(playback_context)
+    _send_direct_response(
+        "state",
+        "playback.context.status",
         request_id,
         _build_playback_context_status_payload(playback_context),
     )
@@ -3483,12 +6629,14 @@ def _handle_playback_context_subscribe(
         raise ValueError("playback.context.subscribe requires a non-empty playbackContextId")
 
     playback_context = _get_existing_playback_context(playback_context_id)
-    if playback_context is None:
-        raise LookupError("Playback context not found")
-    _ensure_playback_context_for_user(playback_context, current_user_name)
-    subscriptions = state.subscribe_playback_context(sid, playback_context_id)
-    _send_ack(request_id, {"subscriptions": subscriptions})
-    _push_playback_context_snapshot(sid, playback_context)
+    if (
+        playback_context is None
+        or playback_context.get("userName") != current_user_name
+    ):
+        raise PermissionError("Playback context access is not allowed")
+    _ensure_playback_context_active(playback_context)
+    state.subscribe_playback_context(sid, playback_context_id)
+    _send_ack(request_id)
     return playback_context
 
 
@@ -3509,8 +6657,9 @@ def _handle_playback_context_unsubscribe(
     playback_context = _get_existing_playback_context(playback_context_id)
     if playback_context is not None:
         _ensure_playback_context_for_user(playback_context, current_user_name)
-    subscriptions = state.unsubscribe_playback_context(sid, playback_context_id)
-    _send_ack(request_id, {"subscriptions": subscriptions})
+        _ensure_playback_context_active(playback_context)
+    state.unsubscribe_playback_context(sid, playback_context_id)
+    _send_ack(request_id)
     return playback_context
 
 
@@ -3532,21 +6681,57 @@ def _handle_playback_context_close(current_user_name, current_client, payload, r
     ):
         raise PermissionError("Only playback context authority or a controller can close context")
 
-    closed_context = state.close_playback_context(
+    active_handoffs = getActivePlaybackHandoffs(playback_context_id)
+    closed_context = closeStrictPlaybackContextState(
         playback_context_id,
-        updated_by_client_id=current_client.get("clientId"),
+        current_user_name,
     )
     if closed_context is None:
         raise LookupError("Playback context not found")
-    _update_playback_context_snapshot(current_user_name, closed_context)
-    _send_ack(
-        request_id,
-        {
-            "closed": True,
-            "playbackContext": serializePlaybackContextV2(closed_context),
-        },
+    settled_prepares = _settle_active_context_prepares_for_authority_change(
+        playback_context_id,
+        closed_context.get("controlVersion", 1),
     )
-    _broadcast_playback_context_state_v2(current_user_name, playback_context_id)
+    state.restore_playback_context(playback_context_id, closed_context)
+    for active_handoff in active_handoffs:
+        handoff = getPlaybackHandoff(active_handoff.get("handoffId"))
+        if handoff is None:
+            continue
+        state.update_playback_handoff(
+            handoff["handoffId"],
+            status=handoff.get("status"),
+            error_code=handoff.get("errorCode"),
+            error_message=handoff.get("errorMessage"),
+        )
+    _send_ack(request_id)
+    for canonical_result in settled_prepares:
+        _run_post_commit_push(
+            "playback.context.close",
+            request_id,
+            lambda result=canonical_result: _broadcast_context_prepared(
+                current_user_name,
+                playback_context_id,
+                result,
+            ),
+        )
+    _run_post_commit_push(
+        "playback.context.close",
+        request_id,
+        lambda: _broadcast_playback_context_closed_v2(
+            current_user_name,
+            playback_context_id,
+        ),
+    )
+    if closed_context.mutated:
+        _run_post_commit_push(
+            "playback.context.close",
+            request_id,
+            lambda: _broadcast_playback_context_bindings_changed(
+                current_user_name,
+                closed_context.affected_authority_pairs,
+            ),
+        )
+    state.stop_follow_relationships_for_context(playback_context_id)
     state.clear_playback_context_subscriptions(playback_context_id)
     return closed_context
 
@@ -3570,41 +6755,154 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
     if playback_context is None:
         raise LookupError("Playback context not found")
     _ensure_playback_context_for_user(playback_context, current_user_name)
+    _ensure_playback_context_active(playback_context)
     if playback_context.get("authorityClientId") != current_client.get("clientId"):
         raise PermissionError("Playback context authority mismatch")
+    if (
+        device_session_id != current_client.get("deviceSessionId")
+        or playback_context.get("authorityDeviceSessionId") != device_session_id
+    ):
+        raise PermissionError("Playback context authority device mismatch")
 
     queue_song_ids, current_index, position_ms = _validate_playback_context_queue_payload(
         payload
     )
-    try:
-        updated_context = state.update_existing_playback_context_queue(
-            playback_context_id,
-            device_session_id,
-            queue_song_ids,
-            current_index,
-            position_ms,
-            current_client.get("clientId"),
-            user_name=current_user_name,
-            expected_queue_revision=_get_base_queue_revision(payload),
-        )
-    except QueueRevisionMismatchError as exc:
-        raise QueueConflictError(
-            "Queue revision conflict",
-            current_queue_revision=exc.current_revision,
-        )
+    updated_context = mutateStrictPlaybackContextQueue(
+        playback_context_id,
+        current_user_name,
+        current_client.get("clientId"),
+        device_session_id,
+        queue_song_ids,
+        current_index,
+        position_ms,
+        _get_base_queue_revision(payload),
+        payload.get("baseControlVersion"),
+    )
     if updated_context is None:
         raise LookupError("Playback context not found")
 
-    _update_playback_context_snapshot(current_user_name, updated_context)
-    _send_ack(
+    settled_prepares = []
+    if updated_context.get("queueSongIds"):
+        settled_prepares = _settle_active_context_prepares_ready(
+            playback_context_id,
+            updated_context["epoch"],
+            updated_context["controlVersion"],
+        )
+
+    state.restore_playback_context(playback_context_id, updated_context)
+    _send_ack(request_id)
+    for canonical_result in settled_prepares:
+        _run_post_commit_push(
+            "queue.context.sync",
+            request_id,
+            lambda result=canonical_result: _broadcast_context_prepared(
+                current_user_name,
+                playback_context_id,
+                result,
+            ),
+        )
+    _run_post_commit_push(
+        "queue.context.sync",
         request_id,
-        {
-            "updated": True,
-            "queue": serializePlaybackContextV2(updated_context),
-        },
+        lambda: _broadcast_context_queue_v2(
+            current_user_name,
+            playback_context_id,
+        ),
     )
-    _broadcast_context_queue_v2(current_user_name, playback_context_id)
     return updated_context
+
+
+def _handle_strict_v2_playback_update(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+):
+    if current_client is None or not _has_role(current_client, "player"):
+        raise PermissionError("playback.update requires the authority player")
+    if payload["deviceSessionId"] != current_client.get("deviceSessionId"):
+        raise PermissionError("playback.update deviceSessionId mismatch")
+    session_info = state.get_session(request.sid) or {}
+    connection_nonce = session_info.get("connectionNonce")
+    if not isinstance(connection_nonce, str) or not connection_nonce:
+        raise PermissionError("Registered connection provenance is missing")
+
+    result = applyStrictPlaybackUpdate(
+        payload["playbackContextId"],
+        current_user_name,
+        current_client.get("clientId"),
+        payload["deviceSessionId"],
+        connection_nonce,
+        payload,
+        _server_time_ms(),
+    )
+    if result is None:
+        raise LookupError("Playback context not found")
+    playback_context = result["playbackContext"]
+    for command_control_version in result.get(
+        "terminalControlVersions",
+        (),
+    ):
+        _cancel_control_watchdog(
+            playback_context["playbackContextId"],
+            playback_context["epoch"],
+            command_control_version,
+        )
+    state.restore_playback_context(
+        playback_context["playbackContextId"],
+        playback_context,
+    )
+    confirmation = _build_v2_playback_update_message(
+        result["canonicalUpdate"]
+    )
+    _store_event_confirmations([confirmation])
+    if result["sourceOnly"]:
+        _run_post_commit_push(
+            "playback.update",
+            request_id,
+            lambda: _emit_message(confirmation, request.sid),
+        )
+        return result
+
+    _run_post_commit_push(
+        "playback.update",
+        request_id,
+        lambda: _broadcast_v2_playback_update(
+            current_user_name,
+            playback_context["playbackContextId"],
+            result["canonicalUpdate"],
+        ),
+    )
+    for dependency in result["dependencySettlements"]:
+        _run_post_commit_push(
+            "playback.update",
+            request_id,
+            lambda transaction=dependency: _broadcast_control_settled(
+                transaction,
+                playback_context,
+            ),
+        )
+    if payload["origin"] == "localUser" or (
+        payload["origin"] == "remoteCommand"
+        and payload["executionStatus"] == "failed"
+    ):
+        _run_post_commit_push(
+            "playback.update",
+            request_id,
+            lambda: _broadcast_context_queue_v2(
+                current_user_name,
+                playback_context["playbackContextId"],
+            ),
+        )
+        _run_post_commit_push(
+            "playback.update",
+            request_id,
+            lambda: _broadcast_playback_context_state_v2(
+                current_user_name,
+                playback_context["playbackContextId"],
+            ),
+        )
+    return result
 
 
 def _ensure_handoff_for_user(handoff, user_name):
@@ -3616,19 +6914,114 @@ def _ensure_handoff_for_user(handoff, user_name):
 def _send_handoff_start_ack(request_id, handoff, duplicate=False):
     status = handoff.get("status") or "preparing"
     payload = {
-        "preparing": status == "preparing",
         "handoffId": handoff.get("handoffId"),
         "prepareId": handoff.get("prepareId"),
-        "playbackContextId": handoff.get("playbackContextId"),
-        "sourceClientId": handoff.get("sourceClientId"),
-        "targetClientId": handoff.get("targetClientId"),
-        "originClientId": handoff.get("originClientId"),
         "controlVersion": handoff.get("controlVersion"),
         "status": status,
     }
-    if duplicate:
-        payload["duplicate"] = True
     _send_ack(request_id, payload)
+
+
+def _build_handoff_status_payload(handoff):
+    status = handoff.get("status")
+    status = {
+        "aborted": "failed",
+        "canceled": "cancelled",
+        "committed": "committing",
+        "superseded": "failed",
+        "timed_out": "timedOut",
+    }.get(status, status)
+    payload = {
+        "playbackContextId": handoff.get("playbackContextId"),
+        "handoffId": handoff.get("handoffId"),
+        "status": status,
+        "controlVersion": handoff.get("controlVersion"),
+    }
+    source_client_id = handoff.get("sourceClientId")
+    if source_client_id:
+        payload["sourceClientId"] = source_client_id
+    if status == "completed":
+        payload["newAuthorityClientId"] = handoff.get("targetClientId")
+    elif status in {"failed", "timedOut"}:
+        payload["errorCode"] = handoff.get("errorCode") or "prepare_failed"
+        if handoff.get("errorMessage"):
+            payload["errorMessage"] = handoff["errorMessage"]
+    return payload
+
+
+def _broadcast_handoff_status(handoff, include_sid=None):
+    user_name = handoff.get("userName")
+    playback_context_id = handoff.get("playbackContextId")
+    message = _build_handoff_status_message(handoff)
+    target_sids = set(
+        state.list_playback_context_subscribers(
+            playback_context_id,
+            user_name=user_name,
+        )
+    )
+    target_sids.update(
+        state.list_context_participant_sids(
+            playback_context_id,
+            user_name=user_name,
+        )
+    )
+    if include_sid is not None:
+        target_sids.add(include_sid)
+    for target_sid in target_sids:
+        _emit_message(message, target_sid)
+    return message
+
+
+def _build_handoff_status_message(handoff):
+    return _build_message(
+        "state",
+        "playback.handoff.status",
+        _build_handoff_status_payload(handoff),
+    )
+
+
+def _broadcast_handoff_cancel(
+    handoff: Dict[str, object],
+    reason: str,
+    include_sid: Optional[str] = None,
+) -> Dict[str, object]:
+    payload = {
+        "playbackContextId": handoff.get("playbackContextId"),
+        "handoffId": handoff.get("handoffId"),
+        "reason": reason,
+        "controlVersion": handoff.get("controlVersion"),
+    }
+    if handoff.get("errorCode"):
+        payload["errorCode"] = handoff["errorCode"]
+    if handoff.get("errorMessage"):
+        payload["errorMessage"] = handoff["errorMessage"]
+    message = _build_message(
+        "command",
+        "playback.handoff.cancel",
+        payload,
+    )
+    target_sids = set(
+        state.list_playback_context_subscribers(
+            handoff.get("playbackContextId"),
+            user_name=handoff.get("userName"),
+        )
+    )
+    for client_id in (
+        handoff.get("sourceClientId"),
+        handoff.get("targetClientId"),
+        handoff.get("originClientId"),
+    ):
+        target_sid = state.get_sid_for_client(
+            client_id,
+            user_name=handoff.get("userName"),
+        )
+        if target_sid is not None:
+            target_sids.add(target_sid)
+    if include_sid is not None:
+        target_sids.add(include_sid)
+    for target_sid in target_sids:
+        _emit_message(message, target_sid)
+    return message
 
 
 def _handoff_expiry_ms(handoff):
@@ -3669,12 +7062,12 @@ def _expire_stale_handoff(handoff, now_ms=None):
     error_code = (
         "prepare_timeout"
         if handoff.get("status") == "preparing"
-        else "complete_timeout"
+        else "commit_timeout"
     )
     error_message = (
         "Handoff prepare timed out"
         if handoff.get("status") == "preparing"
-        else "Handoff complete timed out"
+        else "Handoff commit timed out"
     )
     expired = state.update_playback_handoff(
         handoff_id,
@@ -3704,15 +7097,32 @@ def _expire_stale_handoff(handoff, now_ms=None):
 
 def _require_online_handoff_target(handoff):
     target_client_id = handoff.get("targetClientId")
-    target_client = state.get_client(target_client_id)
-    target_sid = state.get_sid_for_client(target_client_id)
+    target_client = state.get_client(
+        target_client_id,
+        user_name=handoff.get("userName"),
+    )
+    target_sid = state.get_sid_for_client(
+        target_client_id,
+        user_name=handoff.get("userName"),
+    )
+    if target_client is None and state.get_client(target_client_id) is not None:
+        raise PermissionError("Cross-user handoff is not allowed")
     if target_client is None or target_sid is None:
         raise LookupError("Handoff target client is offline")
     if target_client.get("userName") != handoff.get("userName"):
         raise PermissionError("Cross-user handoff is not allowed")
     if not _has_role(target_client, "player"):
         raise PermissionError("Handoff target must be a player")
-    if not (
+    if strict_v2:
+        if not (
+            _client_supports(target_client, CAPABILITY_EFFECTIVE_AT)
+            and _client_supports(target_client, CAPABILITY_PLAYBACK_PREPARE)
+            and _client_supports(target_client, CAPABILITY_CAN_PLAY)
+        ):
+            raise CapabilityRequiredError(
+                "Handoff target requires playbackPrepare, effectiveAtPlayback, and canPlay"
+            )
+    elif not (
         _client_supports(target_client, CAPABILITY_EFFECTIVE_AT)
         and _client_supports(target_client, CAPABILITY_PLAYBACK_PREPARE)
     ):
@@ -3753,6 +7163,11 @@ def _rebuild_handoff_prepare_if_missing(handoff, context, request_sid):
     snapshot["handoffControlVersion"] = control_version
     snapshot["prepareId"] = prepare_id
     snapshot["prepareExpiresAtMs"] = expires_at_ms
+    snapshot["targetDeviceSessionId"] = target_device_session_id
+    snapshot["targetSid"] = state.get_sid_for_client(
+        target_client_id,
+        user_name=handoff.get("userName"),
+    )
     if state.get_playback_handoff(handoff.get("handoffId")) is None:
         handoff = state.create_playback_handoff(
             handoff.get("handoffId"),
@@ -3779,6 +7194,7 @@ def _rebuild_handoff_prepare_if_missing(handoff, context, request_sid):
         "targetClientId": target_client_id,
         "originClientId": origin_client_id,
         "targetDeviceSessionId": target_device_session_id,
+        "targetSid": snapshot.get("targetSid"),
         "timelineId": context.get("timelineId") or f"playback:{playback_context_id}",
         "queueSongIds": list(context.get("queueSongIds") or []),
         "currentIndex": context.get("currentIndex", 0),
@@ -3805,23 +7221,18 @@ def _rebuild_handoff_prepare_if_missing(handoff, context, request_sid):
     prepare_payload = {
         "prepareId": prepare_id,
         "handoffId": handoff.get("handoffId"),
-        "purpose": "handoff",
         "playbackContextId": playback_context_id,
         "deviceSessionId": target_device_session_id,
         "sourceClientId": source_client_id,
-        "targetClientId": target_client_id,
-        "originClientId": origin_client_id,
         "authorityClientId": source_client_id,
         "queueSongIds": list(context.get("queueSongIds") or []),
         "currentIndex": context.get("currentIndex", 0),
         "trackId": context.get("trackId"),
         "positionMs": context.get("positionMs", 0),
-        "state": context.get("state") or "stopped",
-        "queueRevision": context.get("queueRevision", 0),
         "controlVersion": control_version,
-        "serverTimeMs": now_ms,
-        "expiresAtServerMs": expires_at_ms,
     }
+    if context.get("timelineId"):
+        prepare_payload["timelineId"] = context["timelineId"]
     _send_playback_prepare(prepare, prepare_payload)
     socketio.start_background_task(_expire_prepare_later, prepare_id)
     return handoff
@@ -3883,6 +7294,7 @@ def _restore_ready_handoff_if_missing(handoff, context):
             "state": context.get("state") or "playing",
             "completeExpiresAtServerMs": complete_expires_at_ms,
         },
+        user_name=restored.get("userName"),
     )
     socketio.start_background_task(
         _expire_handoff_complete_later,
@@ -3901,13 +7313,38 @@ def _send_handoff_release(
 ):
     if not isinstance(target_client_id, str) or not target_client_id:
         return False
-    target_sid = state.get_sid_for_client(target_client_id)
+    target_sid = state.get_sid_for_client(
+        target_client_id,
+        user_name=handoff.get("userName"),
+    )
     if target_sid is None:
         return False
     playback_context_id = handoff.get("playbackContextId")
     authority_client_id = authority_client_id or handoff.get("sourceClientId")
-    socketio.emit(
-        "message",
+    target_client = state.get_client(
+        target_client_id,
+        user_name=handoff.get("userName"),
+    )
+    if (
+        _is_strict_playback_context_v2(target_client)
+        and reason == "handoff_completed"
+    ):
+        _emit_message(
+            _build_message(
+                "command",
+                "playback.handoff.release",
+                {
+                    "playbackContextId": playback_context_id,
+                    "handoffId": handoff.get("handoffId"),
+                    "instruction": "pause",
+                    "controlVersion": handoff.get("controlVersion"),
+                    "newAuthorityClientId": authority_client_id,
+                },
+            ),
+            target_sid,
+        )
+        return True
+    _emit_message(
         _build_message(
             "command",
             "playback.handoff.release",
@@ -3921,8 +7358,7 @@ def _send_handoff_release(
             sourceClientId=source_client_id or authority_client_id,
             targetClientId=target_client_id,
         ),
-        to=target_sid,
-        namespace="/emo",
+        target_sid,
     )
     return True
 
@@ -3951,6 +7387,10 @@ def _handle_handoff_start(current_user_name, current_client, payload, request_id
     if context is None:
         raise LookupError("Playback context not found")
     _ensure_playback_context_for_user(context, current_user_name)
+    if strict_v2:
+        _ensure_playback_context_active(context)
+        if not _has_role(current_client, "controller"):
+            raise PermissionError("Playback handoff requires the controller role")
 
     origin_client_id = current_client.get("clientId")
     requested_source_client_id = payload.get("sourceClientId")
@@ -4021,6 +7461,18 @@ def _handle_handoff_start(current_user_name, current_client, payload, request_id
         _ensure_handoff_for_user(active_handoff, current_user_name)
         if _expire_stale_handoff(active_handoff) is not None:
             continue
+        if strict_v2 and (
+            active_handoff.get("sourceClientId") == source_client_id
+            and active_handoff.get("targetClientId") == target_client_id
+            and active_handoff.get("originClientId") == origin_client_id
+        ):
+            active_handoff = _rebuild_handoff_prepare_if_missing(
+                active_handoff,
+                context,
+                request_sid,
+            )
+            _send_handoff_start_ack(request_id, active_handoff, duplicate=True)
+            return active_handoff
         raise ControlConflictError(
             "Playback handoff already in progress",
             current_control_version=context.get("controlVersion", 0),
@@ -4034,19 +7486,57 @@ def _handle_handoff_start(current_user_name, current_client, payload, request_id
     ):
         raise PermissionError("Only handoff source or a controller can start handoff")
 
-    source_client = state.get_client(source_client_id)
+    source_client = state.get_client(
+        source_client_id,
+        user_name=current_user_name,
+    )
+    source_sid = state.get_sid_for_client(
+        source_client_id,
+        user_name=current_user_name,
+    )
     if source_client is not None and source_client.get("userName") != current_user_name:
         raise PermissionError("Handoff source belongs to another user")
+    if strict_v2:
+        if source_client is None or source_sid is None:
+            raise PlaybackAuthorityOfflineError("Playback context authority is offline")
+        if not _has_role(source_client, "player"):
+            raise PermissionError("Playback context authority must be a player")
+        if not _client_supports(source_client, CAPABILITY_CAN_PAUSE):
+            raise CapabilityRequiredError("Handoff source requires canPause")
+        if (
+            source_client.get("deviceSessionId")
+            != context.get("authorityDeviceSessionId")
+        ):
+            raise PlaybackAuthorityOfflineError(
+                "Playback context authority device is unavailable"
+            )
 
-    target_client = state.get_client(target_client_id)
-    target_sid = state.get_sid_for_client(target_client_id)
+    target_client = state.get_client(
+        target_client_id,
+        user_name=current_user_name,
+    )
+    target_sid = state.get_sid_for_client(
+        target_client_id,
+        user_name=current_user_name,
+    )
+    if target_client is None and state.get_client(target_client_id) is not None:
+        raise PermissionError("Cross-user handoff is not allowed")
     if target_client is None or target_sid is None:
         raise LookupError("Handoff target client is offline")
     if target_client.get("userName") != current_user_name:
         raise PermissionError("Cross-user handoff is not allowed")
     if not _has_role(target_client, "player"):
         raise PermissionError("Handoff target must be a player")
-    if not (
+    if _is_strict_playback_context_v2(target_client):
+        if not (
+            _client_supports(target_client, CAPABILITY_EFFECTIVE_AT)
+            and _client_supports(target_client, CAPABILITY_PLAYBACK_PREPARE)
+            and _client_supports(target_client, CAPABILITY_CAN_PLAY)
+        ):
+            raise CapabilityRequiredError(
+                "Handoff target requires playbackPrepare, effectiveAtPlayback, and canPlay"
+            )
+    elif not (
         _client_supports(target_client, CAPABILITY_EFFECTIVE_AT)
         and _client_supports(target_client, CAPABILITY_PLAYBACK_PREPARE)
     ):
@@ -4074,6 +7564,8 @@ def _handle_handoff_start(current_user_name, current_client, payload, request_id
     snapshot["handoffControlVersion"] = control_version
     snapshot["prepareId"] = prepare_id
     snapshot["prepareExpiresAtMs"] = prepare_expires_at_ms
+    snapshot["targetDeviceSessionId"] = _device_session_id(target_client)
+    snapshot["targetSid"] = target_sid
     try:
         handoff = state.create_playback_handoff(
             handoff_id,
@@ -4093,9 +7585,21 @@ def _handle_handoff_start(current_user_name, current_client, payload, request_id
             "Playback handoff already in progress",
             current_control_version=context.get("controlVersion", 0),
         )
-    savePlaybackHandoff(handoff)
-
     target_device_session_id = _device_session_id(target_client)
+    try:
+        persisted_handoff, _created = createStrictPlaybackHandoff(
+            playback_context_id,
+            handoff,
+            target_device_session_id,
+        )
+    except Exception:
+        state.discard_playback_handoff(handoff_id)
+        raise
+    handoff = state.update_playback_handoff(
+        handoff_id,
+        snapshot=persisted_handoff.get("snapshot") or {},
+    ) or persisted_handoff
+
     commit_payload = {
         "userName": current_user_name,
         "handoffId": handoff["handoffId"],
@@ -4104,6 +7608,7 @@ def _handle_handoff_start(current_user_name, current_client, payload, request_id
         "targetClientId": target_client_id,
         "originClientId": origin_client_id,
         "targetDeviceSessionId": target_device_session_id,
+        "targetSid": target_sid,
         "timelineId": context.get("timelineId") or f"playback:{playback_context_id}",
         "queueSongIds": list(context.get("queueSongIds") or []),
         "currentIndex": context.get("currentIndex", 0),
@@ -4130,30 +7635,42 @@ def _handle_handoff_start(current_user_name, current_client, payload, request_id
     prepare_payload = {
         "prepareId": prepare_id,
         "handoffId": handoff["handoffId"],
-        "purpose": "handoff",
         "playbackContextId": playback_context_id,
         "deviceSessionId": target_device_session_id,
         "sourceClientId": source_client_id,
-        "targetClientId": target_client_id,
-        "originClientId": origin_client_id,
         "authorityClientId": source_client_id,
         "queueSongIds": list(context.get("queueSongIds") or []),
         "currentIndex": context.get("currentIndex", 0),
         "trackId": context.get("trackId"),
         "positionMs": context.get("positionMs", 0),
-        "state": context.get("state") or "stopped",
-        "queueRevision": context.get("queueRevision", 0),
         "controlVersion": control_version,
-        "serverTimeMs": now_ms,
-        "expiresAtServerMs": prepare_expires_at_ms,
     }
-    _send_playback_prepare(prepare, prepare_payload)
-    socketio.start_background_task(_expire_prepare_later, prepare_id)
+    if context.get("timelineId"):
+        prepare_payload["timelineId"] = context["timelineId"]
     _send_handoff_start_ack(request_id, handoff)
+    _run_post_commit_push(
+        "playback.handoff.start",
+        request_id,
+        lambda: _send_playback_prepare(prepare, prepare_payload),
+    )
+    _run_post_commit_push(
+        "playback.handoff.start",
+        request_id,
+        lambda: socketio.start_background_task(
+            _expire_prepare_later,
+            prepare_id,
+        ),
+    )
     return handoff
 
 
-def _handle_handoff_complete(current_user_name, current_client, payload, request_id):
+def _handle_handoff_complete(
+    current_user_name: str,
+    current_client: Optional[Dict[str, object]],
+    payload: Dict[str, object],
+    request_id: str,
+    request_sid: Optional[str] = None,
+) -> Dict[str, object]:
     if current_client is None:
         raise PermissionError("Register the device before completing handoff")
     _reject_session_id_for_strict_v2(
@@ -4171,13 +7688,90 @@ def _handle_handoff_complete(current_user_name, current_client, payload, request
     if handoff.get("targetClientId") != current_client.get("clientId"):
         raise PermissionError("playback.handoff.complete sender must be targetClientId")
 
+    strict_v2 = _is_strict_playback_context_v2(current_client)
+    if strict_v2:
+        playback_context_id = payload.get("playbackContextId")
+        if playback_context_id != handoff.get("playbackContextId"):
+            raise ValueError("playback.handoff.complete playbackContextId does not match")
+        playback_context = _get_or_restore_playback_context(playback_context_id)
+        if playback_context is None:
+            raise LookupError("Playback context not found")
+        _ensure_playback_context_for_user(playback_context, current_user_name)
+        _ensure_playback_context_active(playback_context)
+        snapshot = handoff.get("snapshot") or {}
+        target_device_session_id = current_client.get("deviceSessionId")
+        if target_device_session_id != snapshot.get("targetDeviceSessionId"):
+            raise PermissionError(
+                "playback.handoff.complete device does not match handoff target"
+            )
+        target_sid = snapshot.get("targetSid")
+        if target_sid is not None and request_sid != target_sid:
+            raise PermissionError(
+                "playback.handoff.complete socket does not match handoff target"
+            )
+        if handoff.get("status") not in (
+            "committed",
+            "committing",
+            "completed",
+        ):
+            raise ControlConflictError(
+                "Playback handoff is not committing",
+                current_control_version=handoff.get("controlVersion"),
+            )
+        try:
+            result = completeStrictPlaybackHandoff(
+                playback_context_id,
+                handoff_id,
+                current_user_name,
+                current_client.get("clientId"),
+                target_device_session_id,
+                position_ms=payload.get("positionMs"),
+            )
+        except ValueError as exc:
+            if str(exc) == "Playback handoff is not committing":
+                raise ControlConflictError(
+                    str(exc),
+                    current_control_version=handoff.get("controlVersion"),
+                )
+            raise
+        if result is None:
+            raise LookupError("Playback handoff not found")
+        updated_context, completed_handoff, device_state, _mutated = result
+        if result.retired_context is not None:
+            retired_context = result.retired_context
+            state.restore_playback_context(
+                retired_context["playbackContextId"],
+                retired_context,
+            )
+            completed_handoff["_retiredStandbyPlaybackContextId"] = (
+                retired_context["playbackContextId"]
+            )
+        if result.mutated:
+            completed_handoff["_bindingMutation"] = {
+                "mutated": result.mutated,
+                "affectedAuthorityPairs": result.affected_authority_pairs,
+            }
+        state.restore_playback_context(playback_context_id, updated_context)
+        if device_state is not None:
+            state.record_device_playback_state(
+                playback_context_id,
+                target_device_session_id,
+                current_client.get("clientId"),
+                current_user_name,
+                device_state,
+                is_authority=True,
+                mode="handoff",
+            )
+        state.update_playback_handoff(handoff_id, status="completed")
+        return completed_handoff
+
     playback_context_id = payload.get("playbackContextId") or handoff.get("playbackContextId")
     if playback_context_id != handoff.get("playbackContextId"):
         raise ValueError("playback.handoff.complete playbackContextId does not match")
-    control_version = payload.get("controlVersion")
     expected_control_version = handoff.get("controlVersion")
     if expected_control_version is None:
         expected_control_version = (handoff.get("snapshot") or {}).get("handoffControlVersion")
+    control_version = payload.get("controlVersion", expected_control_version)
     if control_version != expected_control_version:
         raise ControlConflictError(
             "Playback control version conflict",
@@ -4296,6 +7890,67 @@ def _handle_handoff_cancel(current_user_name, current_client, payload, request_i
     if handoff is None:
         raise LookupError("Playback handoff not found")
     _ensure_handoff_for_user(handoff, current_user_name)
+    strict_v2 = _is_strict_playback_context_v2(current_client)
+    if strict_v2:
+        if payload.get("playbackContextId") != handoff.get("playbackContextId"):
+            raise ValueError("playback.handoff.cancel playbackContextId does not match")
+        status = handoff.get("status")
+        if status == "cancelled":
+            _send_ack(request_id)
+            return handoff
+        if status in {"completed", "failed", "timed_out"}:
+            raise ControlConflictError(
+                "Playback handoff is already terminal",
+                current_control_version=handoff.get("controlVersion"),
+            )
+        if current_client.get("clientId") not in (
+            handoff.get("sourceClientId"),
+            handoff.get("targetClientId"),
+            handoff.get("originClientId"),
+        ):
+            raise PermissionError("Only handoff members can cancel handoff")
+        terminal_result = terminateStrictPlaybackHandoff(
+            handoff.get("playbackContextId"),
+            handoff_id,
+            current_user_name,
+            "cancelled",
+        )
+        if terminal_result is None:
+            raise LookupError("Playback handoff not found")
+        handoff, transitioned = terminal_result
+        if handoff.get("status") != "cancelled":
+            raise ControlConflictError(
+                "Playback handoff is already terminal",
+                current_control_version=handoff.get("controlVersion"),
+            )
+        state.update_playback_handoff(handoff_id, status="cancelled")
+        if handoff.get("prepareId"):
+            state.finish_prepare_if_preparing(
+                handoff["prepareId"],
+                "cancelled",
+            )
+        _send_ack(request_id)
+        if not transitioned:
+            return handoff
+        reason = payload.get("reason") or "cancelled"
+        _run_post_commit_push(
+            "playback.handoff.cancel",
+            request_id,
+            lambda: _broadcast_handoff_cancel(
+                handoff,
+                reason,
+                include_sid=request.sid,
+            ),
+        )
+        _run_post_commit_push(
+            "playback.handoff.cancel",
+            request_id,
+            lambda: _broadcast_handoff_status(
+                handoff,
+                include_sid=request.sid,
+            ),
+        )
+        return handoff
     if handoff.get("status") == "ready":
         expired_handoff = _expire_handoff_complete(handoff_id)
         if expired_handoff is not None:
@@ -4359,36 +8014,186 @@ class EmoNamespace(Namespace):
     def on_connect(self):
         if not current_app.config["WEBAPP"].get("emo_ws_enabled", True):
             return False
-        state.register_session(request.sid)
+        if not strict_v2_safety.accepts_connections():
+            return False
+        remote_address = request.remote_addr or "unknown"
+        session_info = state.try_register_session(
+            request.sid,
+            remote_address,
+            strict_v2_safety.limit("unauthenticated_connections_per_ip"),
+        )
+        if session_info is None:
+            _log_emo_event(
+                logging.WARNING,
+                "socket_connect",
+                result="rate_limited",
+            )
+            return False
         _log_socket_access("connect")
         _log_emo_event(logging.INFO, "socket_connect", sid=request.sid)
 
     def on_disconnect(self):
         session_info, client_info = state.unregister_session(request.sid)
+        if session_info is not None and session_info.get("connectionNonce"):
+            strict_request_cache.clear_connection(session_info["connectionNonce"])
+            state.clear_strict_feedback_connection(session_info["connectionNonce"])
+            strict_v2_safety.clear_connection(session_info["connectionNonce"])
         _log_socket_access("disconnect")
         _log_emo_event(logging.INFO, "socket_disconnect", sid=request.sid)
         if client_info is not None:
+            _settle_authority_connection_controls_unknown(
+                client_info.get("userName"),
+                client_info.get("clientId"),
+                client_info.get("deviceSessionId"),
+                (session_info or {}).get("connectionNonce"),
+            )
+            _suspend_strict_broadcasts_for_authority_disconnect(client_info)
+            for handoff in state.fail_playback_handoffs_for_disconnect(
+                client_info.get("clientId")
+            ):
+                terminal_result = terminateStrictPlaybackHandoff(
+                    handoff.get("playbackContextId"),
+                    handoff.get("handoffId"),
+                    handoff.get("userName"),
+                    handoff.get("status"),
+                    error_code=handoff.get("errorCode"),
+                    error_message=handoff.get("errorMessage"),
+                )
+                if terminal_result is None:
+                    continue
+                handoff, transitioned = terminal_result
+                state.update_playback_handoff(
+                    handoff.get("handoffId"),
+                    status=handoff.get("status"),
+                    error_code=handoff.get("errorCode"),
+                    error_message=handoff.get("errorMessage"),
+                )
+                if not transitioned:
+                    continue
+                if (handoff.get("snapshot") or {}).get("targetDeviceSessionId"):
+                    _run_post_commit_push(
+                        "playback.handoff.cancel",
+                        None,
+                        lambda: _broadcast_handoff_cancel(
+                            handoff,
+                            handoff.get("errorCode") or "disconnected",
+                        ),
+                    )
+                    include_sid = None
+                    for client_id in (
+                        handoff.get("targetClientId"),
+                        handoff.get("sourceClientId"),
+                        handoff.get("originClientId"),
+                    ):
+                        include_sid = state.get_sid_for_client(
+                            client_id,
+                            user_name=handoff.get("userName"),
+                        )
+                        if include_sid is not None:
+                            break
+                    _run_post_commit_push(
+                        "playback.handoff.cancel",
+                        None,
+                        lambda: _broadcast_handoff_status(
+                            handoff,
+                            include_sid=include_sid,
+                        ),
+                    )
             _broadcast_clients(client_info["userName"])
         elif session_info is not None and session_info.get("userName"):
             _broadcast_clients(session_info["userName"])
 
     def on_message(self, message):
+        g.emo_request_started_at = time.monotonic()
         if not isinstance(message, dict):
             _log_emo_event(logging.WARNING, "bad_message", result="bad_request", reason="message_not_object")
-            _send_error("bad_request", "Message must be a JSON object")
+            disconnect(sid=request.sid, namespace="/emo")
             return
 
         action = message.get("action")
         request_id = message.get("requestId")
-        if not isinstance(action, str) or not action:
+        if (
+            not isinstance(action, str)
+            or not action.strip()
+            or not isinstance(request_id, str)
+            or not request_id.strip()
+        ):
             _log_emo_event(
                 logging.WARNING,
                 "bad_message",
                 result="bad_request",
-                reason="missing_action",
-                client_request_id=request_id,
+                reason="invalid_correlation",
             )
-            _send_error("bad_request", "Missing message action", request_id)
+            disconnect(sid=request.sid, namespace="/emo")
+            return
+        g.emo_request_action = action
+
+        session_info = state.get_session(request.sid)
+        current_user_name = None if session_info is None else session_info.get("userName")
+        current_client = state.get_client_for_sid(request.sid)
+        unregistered_strict_business = (
+            current_client is None
+            and action in ACTION_SCHEMAS
+            and action not in {"auth.login", "device.register"}
+        )
+        strict_request = (
+            action == "auth.login"
+            or is_strict_registration_request(message)
+            or _is_strict_playback_context_v2(current_client)
+            or unregistered_strict_business
+            or action == "playback.context.list"
+        )
+        g.emo_strict_request = strict_request
+        if unregistered_strict_business:
+            if not _prepare_strict_request_cache(
+                message,
+                session_info,
+                action,
+                request_id,
+            ):
+                return
+            _log_emo_event(
+                logging.WARNING,
+                "unauthorized_action",
+                result="unauthorized",
+                action=action,
+                client_request_id=request_id,
+                reason="register_first",
+                sid=request.sid,
+            )
+            _send_error(
+                "unauthorized",
+                "Register the device before sending business requests",
+                request_id,
+            )
+            return
+        if strict_request:
+            try:
+                message = validate_strict_request(message)
+            except StrictRequestValidationError as exc:
+                _log_emo_event(
+                    logging.WARNING,
+                    "strict_v2_contract_rejected",
+                    result=exc.code,
+                    reason=str(exc),
+                    action=action,
+                    client_request_id=request_id,
+                    sid=request.sid,
+                )
+                if not exc.correlatable:
+                    disconnect(sid=request.sid, namespace="/emo")
+                else:
+                    _send_error(exc.code, str(exc), request_id)
+                return
+            action = message["action"]
+            request_id = message["requestId"]
+
+        if strict_request and not _prepare_strict_request_cache(
+            message,
+            session_info,
+            action,
+            request_id,
+        ):
             return
 
         payload = message.get("payload")
@@ -4407,36 +8212,57 @@ class EmoNamespace(Namespace):
             _send_error("bad_request", "Payload must be a JSON object", request_id)
             return
 
-        session_info = state.get_session(request.sid)
-        current_user_name = None if session_info is None else session_info.get("userName")
-        current_client = state.get_client_for_sid(request.sid)
+        strict_runtime_request = False
+        if strict_request:
+            strict_runtime_request = strict_v2_safety.begin_request()
+            if not strict_runtime_request:
+                _send_error(
+                    "internal_error",
+                    "Server is shutting down",
+                    request_id,
+                )
+                return
 
         state.touch_session(request.sid)
         state.prune_stale_clients(_get_client_stale_seconds())
 
         if action == "system.ping":
-            emit(
-                "message",
-                _build_message(
-                    "system",
-                    "system.pong",
-                    {"serverTimeMs": _server_time_ms()},
-                    requestId=request_id,
-                ),
-            )
+            try:
+                if current_client is None:
+                    _send_error(
+                        "unauthorized",
+                        "Register the device before sending heartbeat",
+                        request_id,
+                    )
+                    return
+                _emit_message(
+                    _build_message(
+                        "system",
+                        "system.pong",
+                        {"serverTimeMs": _server_time_ms()},
+                        requestId=request_id,
+                    )
+                )
+            finally:
+                if strict_runtime_request:
+                    strict_v2_safety.finish_request()
             return
 
         if (session_info is None or not session_info.get("authenticated")) and action not in ALLOWED_PRE_AUTH:
-            _log_emo_event(
-                logging.WARNING,
-                "unauthorized_action",
-                result="unauthorized",
-                action=action,
-                client_request_id=request_id,
-                reason="authenticate_first",
-                sid=request.sid,
-            )
-            _send_error("unauthorized", "Authenticate first", request_id)
+            try:
+                _log_emo_event(
+                    logging.WARNING,
+                    "unauthorized_action",
+                    result="unauthorized",
+                    action=action,
+                    client_request_id=request_id,
+                    reason="authenticate_first",
+                    sid=request.sid,
+                )
+                _send_error("unauthorized", "Authenticate first", request_id)
+            finally:
+                if strict_runtime_request:
+                    strict_v2_safety.finish_request()
             return
 
         try:
@@ -4449,12 +8275,26 @@ class EmoNamespace(Namespace):
                         result="failure",
                         user=payload.get("u"),
                         client_request_id=request_id,
+                        action=action,
                         reason="invalid_credentials",
                         sid=request.sid,
                     )
                     _send_error("unauthorized", "Invalid credentials", request_id)
                     return
-                state.authenticate_session(request.sid, user.name)
+                authenticated_session = state.try_authenticate_session(
+                    request.sid,
+                    user.name,
+                    strict_v2_safety.limit("authenticated_connections_per_user"),
+                )
+                if authenticated_session is None:
+                    _send_error(
+                        "rate_limited",
+                        "Authenticated connection limit exceeded",
+                        request_id,
+                        retryAfterMs=1000,
+                    )
+                    disconnect(sid=request.sid, namespace="/emo")
+                    return
                 current_user_name = user.name
                 _log_emo_event(
                     logging.INFO,
@@ -4462,13 +8302,43 @@ class EmoNamespace(Namespace):
                     result="success",
                     user=user.name,
                     client_request_id=request_id,
+                    action=action,
                     sid=request.sid,
                 )
-                _send_ack(request_id, {"authenticated": True, "userName": user.name})
+                _send_ack(
+                    request_id,
+                    {"authenticated": True, "userName": user.name},
+                )
             elif action == "device.register":
                 if not current_user_name:
                     raise PermissionError("Authenticate first")
+                previous_sid = state.get_sid_for_client(
+                    payload.get("clientId"),
+                    user_name=current_user_name,
+                )
+                previous_session = (
+                    state.get_session(previous_sid)
+                    if previous_sid is not None
+                    and previous_sid != request.sid
+                    else None
+                )
+                previous_client = (
+                    state.get_client_for_sid(previous_sid)
+                    if previous_session is not None
+                    else None
+                )
                 current_client = _register_device(request.sid, current_user_name, payload)
+                if previous_client is not None:
+                    _settle_authority_connection_controls_unknown(
+                        previous_client.get("userName"),
+                        previous_client.get("clientId"),
+                        previous_client.get("deviceSessionId"),
+                        previous_session.get("connectionNonce"),
+                    )
+                if _is_strict_playback_context_v2(current_client):
+                    _resume_strict_broadcast_authority_registration(
+                        current_client
+                    )
                 _log_emo_event(
                     logging.INFO,
                     "device_register",
@@ -4480,18 +8350,27 @@ class EmoNamespace(Namespace):
                     client_request_id=request_id,
                     sid=request.sid,
                 )
-                ack_payload = {"client": current_client}
+                ack_payload = {
+                    "clientId": current_client.get("clientId"),
+                    "deviceSessionId": current_client.get("deviceSessionId"),
+                }
                 if _is_strict_playback_context_v2(current_client):
+                    ack_payload["negotiatedCapabilities"] = dict(
+                        current_client.get("capabilities") or {}
+                    )
                     ack_payload["strictV2"] = get_strict_v2_registration_metadata(
                         session_info.get("connectionNonce") if session_info else None
                     )
+                else:
+                    ack_payload["client"] = current_client
                 _send_ack(request_id, ack_payload)
+                if previous_sid is not None and previous_sid != request.sid:
+                    socketio.server.disconnect(previous_sid, namespace="/emo")
                 _broadcast_clients(current_user_name)
                 if not _is_strict_playback_context_v2(current_client):
                     _restorePersistedState(request.sid, current_client.get("sessionId"))
             elif action == "device.list":
-                emit(
-                    "message",
+                _emit_message(
                     _build_message(
                         "state",
                         "device.list",
@@ -4501,7 +8380,71 @@ class EmoNamespace(Namespace):
                                 current_client,
                             )
                         },
+                        requestId=request_id,
                     ),
+                )
+            elif action == "device.setVolume":
+                _handle_device_set_volume(
+                    current_user_name,
+                    current_client,
+                    payload,
+                    request_id,
+                )
+                _log_emo_event(
+                    logging.INFO,
+                    "device_set_volume",
+                    result="success",
+                    user=current_user_name,
+                    client_request_id=request_id,
+                    source_client_id=None
+                    if current_client is None
+                    else current_client.get("clientId"),
+                    target_client_id=payload.get("targetClientId"),
+                    target_device_session_id=payload.get(
+                        "targetDeviceSessionId"
+                    ),
+                    volume=payload.get("volume"),
+                )
+            elif action == "device.volume.update":
+                volume_state = _handle_device_volume_update(
+                    current_user_name,
+                    current_client,
+                    payload,
+                    request_id,
+                )
+                _log_emo_event(
+                    logging.INFO,
+                    "device_volume_update",
+                    result="success",
+                    user=current_user_name,
+                    client_request_id=request_id,
+                    source_client_id=None
+                    if current_client is None
+                    else current_client.get("clientId"),
+                    device_session_id=payload.get("deviceSessionId"),
+                    volume=None
+                    if volume_state is None
+                    else volume_state.get("volume"),
+                    client_seq=payload.get("clientSeq"),
+                )
+            elif action == "playback.context.list":
+                bindings = _handle_playback_context_list(
+                    current_user_name,
+                    current_client,
+                    payload,
+                    request_id,
+                )
+                _log_emo_event(
+                    logging.INFO,
+                    "playback_context_list",
+                    result="success",
+                    user=current_user_name,
+                    client_request_id=request_id,
+                    source_client_id=None
+                    if current_client is None
+                    else current_client.get("clientId"),
+                    authority_client_id=payload.get("authorityClientId"),
+                    context_count=len(bindings),
                 )
             elif action in SESSION_ACTIONS:
                 if current_client is None:
@@ -4640,7 +8583,85 @@ class EmoNamespace(Namespace):
                         current_client,
                         payload,
                         request_id,
+                        request.sid,
                     )
+                    if _is_strict_playback_context_v2(current_client):
+                        handoff_status_message = _build_handoff_status_message(
+                            handoff
+                        )
+                        playback_context_id = handoff.get("playbackContextId")
+                        playback_context = state.get_playback_context(
+                            playback_context_id
+                        )
+                        if playback_context is None:
+                            raise LookupError("Playback context not found")
+                        context_status_message = (
+                            _build_playback_context_status_message(
+                                playback_context
+                            )
+                        )
+                        _store_event_confirmations(
+                            [handoff_status_message, context_status_message]
+                        )
+                        _run_post_commit_push(
+                            action,
+                            request_id,
+                            lambda: _broadcast_handoff_status(
+                                handoff,
+                                include_sid=request.sid,
+                            ),
+                        )
+                        _run_post_commit_push(
+                            action,
+                            request_id,
+                            lambda: _broadcast_playback_context_state_v2(
+                                current_user_name,
+                                playback_context_id,
+                            ),
+                        )
+                        _run_post_commit_push(
+                            action,
+                            request_id,
+                            lambda: _send_handoff_release(
+                                handoff,
+                                handoff.get("sourceClientId"),
+                                "handoff_completed",
+                                authority_client_id=handoff.get(
+                                    "targetClientId"
+                                ),
+                                source_client_id=handoff.get(
+                                    "targetClientId"
+                                ),
+                            ),
+                        )
+                        retired_standby_context_id = handoff.get(
+                            "_retiredStandbyPlaybackContextId"
+                        )
+                        if retired_standby_context_id:
+                            _run_post_commit_push(
+                                action,
+                                request_id,
+                                lambda: _broadcast_playback_context_closed_v2(
+                                    current_user_name,
+                                    retired_standby_context_id,
+                                ),
+                            )
+                        binding_mutation = handoff.get(
+                            "_bindingMutation"
+                        ) or {}
+                        if binding_mutation.get("mutated"):
+                            _run_post_commit_push(
+                                action,
+                                request_id,
+                                lambda: (
+                                    _broadcast_playback_context_bindings_changed(
+                                        current_user_name,
+                                        binding_mutation.get(
+                                            "affectedAuthorityPairs"
+                                        ) or (),
+                                    )
+                                ),
+                            )
                 else:
                     handoff = _handle_handoff_cancel(
                         current_user_name,
@@ -4664,6 +8685,36 @@ class EmoNamespace(Namespace):
                     payload,
                     request_id,
                 )
+                if _is_strict_playback_context_v2(current_client):
+                    prepare = state.get_prepare(payload.get("prepareId")) or {}
+                    commit_payload = (
+                        prepare.get("commitPayload")
+                        or (ready_result or {}).get("commitPayload")
+                        or {}
+                    )
+                    handoff_id = (
+                        payload.get("handoffId")
+                        or (ready_result or {}).get("handoffId")
+                        or commit_payload.get("handoffId")
+                    )
+                    handoff = (
+                        state.get_playback_handoff(handoff_id)
+                        or getPlaybackHandoff(handoff_id)
+                    )
+                    if handoff is None:
+                        raise LookupError("Playback handoff not found")
+                    handoff_status_message = _build_handoff_status_message(
+                        handoff
+                    )
+                    _store_event_confirmations([handoff_status_message])
+                    _run_post_commit_push(
+                        action,
+                        request_id,
+                        lambda: _broadcast_handoff_status(
+                            handoff,
+                            include_sid=request.sid,
+                        ),
+                    )
                 _log_emo_event(
                     logging.INFO,
                     "playback_ready",
@@ -4674,16 +8725,17 @@ class EmoNamespace(Namespace):
                     prepare_id=payload.get("prepareId"),
                     status=None if ready_result is None else ready_result.get("status"),
                 )
-            elif action == "playback.context.create":
-                playback_context = _handle_playback_context_create(
+            elif action == "playback.context.ensure":
+                playback_context = _handle_playback_context_ensure(
                     current_user_name,
                     current_client,
                     payload,
                     request_id,
+                    request.sid,
                 )
                 _log_emo_event(
                     logging.INFO,
-                    "playback_context_create",
+                    "playback_context_ensure",
                     result="success",
                     user=current_user_name,
                     client_request_id=request_id,
@@ -4693,6 +8745,42 @@ class EmoNamespace(Namespace):
                     playback_context_id=None
                     if playback_context is None
                     else playback_context.get("playbackContextId"),
+                )
+            elif action == "playback.context.prepare":
+                prepare = _handle_playback_context_prepare(
+                    current_user_name,
+                    current_client,
+                    payload,
+                    request_id,
+                )
+                _log_emo_event(
+                    logging.INFO,
+                    "playback_context_prepare",
+                    result=prepare.get("status"),
+                    user=current_user_name,
+                    client_request_id=request_id,
+                    source_client_id=None
+                    if current_client is None
+                    else current_client.get("clientId"),
+                    playback_context_id=prepare.get("playbackContextId"),
+                )
+            elif action == "playback.context.prepared":
+                prepare = _handle_playback_context_prepared(
+                    current_user_name,
+                    current_client,
+                    payload,
+                    request_id,
+                )
+                _log_emo_event(
+                    logging.INFO,
+                    "playback_context_prepared",
+                    result=prepare.get("status"),
+                    user=current_user_name,
+                    client_request_id=request_id,
+                    source_client_id=None
+                    if current_client is None
+                    else current_client.get("clientId"),
+                    playback_context_id=prepare.get("playbackContextId"),
                 )
             elif action == "playback.context.status":
                 playback_context = _handle_playback_context_status(
@@ -4776,6 +8864,30 @@ class EmoNamespace(Namespace):
                     if playback_context is None
                     else playback_context.get("playbackContextId"),
                 )
+            elif action == "playback.update" and _is_strict_playback_context_v2(
+                current_client
+            ):
+                result = _handle_strict_v2_playback_update(
+                    current_user_name,
+                    current_client,
+                    payload,
+                    request_id,
+                )
+                _log_emo_event(
+                    logging.INFO,
+                    "playback_update",
+                    result=payload["origin"],
+                    user=current_user_name,
+                    client_request_id=request_id,
+                    source_client_id=current_client.get("clientId"),
+                    playback_context_id=payload["playbackContextId"],
+                    command_control_version=payload.get(
+                        "commandControlVersion"
+                    ),
+                    applied_control_version=result["canonicalUpdate"].get(
+                        "appliedControlVersion"
+                    ),
+                )
             elif action == "playback.update":
                 if current_client is None:
                     raise PermissionError("Register the device before publishing state")
@@ -4785,6 +8897,11 @@ class EmoNamespace(Namespace):
                     payload,
                     strict_v2,
                 )
+                if strict_v2:
+                    if not isinstance(payload.get("state"), str) or not payload.get("state"):
+                        raise ValueError("playback.update requires a non-empty state")
+                    if not _is_non_negative_int(payload.get("positionMs")):
+                        raise ValueError("playback.update requires a non-negative positionMs")
                 payload_source_client_id = payload.get("sourceClientId")
                 if (
                     payload_source_client_id is not None
@@ -4863,6 +8980,20 @@ class EmoNamespace(Namespace):
                             current_user_name,
                             device_feedback,
                         )
+                        if strict_v2:
+                            update_message = _build_v2_playback_update_message(
+                                device_feedback
+                            )
+                            _store_event_confirmations([update_message])
+                            _run_post_commit_push(
+                                action,
+                                request_id,
+                                lambda: _broadcast_v2_playback_update(
+                                    current_user_name,
+                                    broadcast_playback_context_id,
+                                    device_feedback,
+                                ),
+                            )
                     _log_emo_event(
                         logging.INFO,
                         "playback_update",
@@ -4900,9 +9031,14 @@ class EmoNamespace(Namespace):
                     if context is None:
                         raise LookupError("Playback context not found")
                     _ensure_playback_context_for_user(context, current_user_name)
-                    authoritative_update = context.get("authorityClientId") in (
-                        None,
-                        current_client.get("clientId"),
+                    _ensure_playback_context_active(context)
+                    if strict_v2 and device_session_id != current_client.get("deviceSessionId"):
+                        raise PermissionError(
+                            "deviceSessionId does not match the registered device"
+                        )
+                    authoritative_update = (
+                        context.get("authorityClientId") == current_client.get("clientId")
+                        and context.get("authorityDeviceSessionId") == device_session_id
                     )
                     playback_payload = _normalize_v2_playback_update_payload(
                         playback_payload,
@@ -4910,32 +9046,72 @@ class EmoNamespace(Namespace):
                         authoritative=authoritative_update,
                     )
 
-                    authoritative_context, authoritative = state.apply_authority_playback_update(
-                        playback_context_id,
-                        device_session_id,
-                        current_client.get("clientId"),
-                        current_user_name,
-                        playback_payload,
-                        create_if_missing=False,
-                    )
-                    device_feedback = state.record_device_playback_state(
-                        playback_context_id,
-                        device_session_id,
-                        current_client.get("clientId"),
-                        current_user_name,
-                        playback_payload,
-                        is_authority=authoritative,
-                        mode=playback_payload.get("mode") or "normal",
-                    )
-                    if authoritative:
+                    if strict_v2:
+                        authoritative_context = context
+                        authoritative = authoritative_update
+                        device_feedback, feedback_created = (
+                            state.record_strict_device_playback_state(
+                                playback_context_id,
+                                device_session_id,
+                                current_client.get("clientId"),
+                                current_user_name,
+                                playback_payload,
+                                session_info.get("connectionNonce"),
+                                is_authority=authoritative,
+                            )
+                        )
+                    else:
+                        authoritative_context, authoritative = (
+                            state.apply_authority_playback_update(
+                                playback_context_id,
+                                device_session_id,
+                                current_client.get("clientId"),
+                                current_user_name,
+                                playback_payload,
+                                create_if_missing=False,
+                            )
+                        )
+                        device_feedback = state.record_device_playback_state(
+                            playback_context_id,
+                            device_session_id,
+                            current_client.get("clientId"),
+                            current_user_name,
+                            playback_payload,
+                            is_authority=authoritative,
+                            mode=playback_payload.get("mode") or "normal",
+                        )
+                        feedback_created = True
+                    if authoritative and not strict_v2:
                         _update_playback_context_snapshot(
                             current_user_name,
                             authoritative_context,
                         )
-                    _save_device_playback_state_snapshot(
-                        current_user_name,
-                        device_feedback,
-                    )
+                    if feedback_created:
+                        _save_device_playback_state_snapshot(
+                            current_user_name,
+                            device_feedback,
+                        )
+                    if strict_v2:
+                        active_broadcast_id = state.get_active_broadcast_for_client(
+                            current_client.get("clientId")
+                        )
+                        active_broadcast = (
+                            state.get_broadcast(active_broadcast_id)
+                            if active_broadcast_id is not None
+                            else None
+                        )
+                        if (
+                            active_broadcast is not None
+                            and active_broadcast.get("playbackContextId")
+                            == playback_context_id
+                        ):
+                            state.update_broadcast_participant_state(
+                                active_broadcast_id,
+                                current_client.get("clientId"),
+                                device_session_id,
+                                device_feedback,
+                                online=True,
+                            )
                     _log_emo_event(
                         logging.INFO,
                         "playback_update",
@@ -4967,7 +9143,37 @@ class EmoNamespace(Namespace):
                             else None
                         )
                     _send_ack(request_id, ack_payload)
-                    if authoritative:
+                    if strict_v2:
+                        update_message = _build_v2_playback_update_message(
+                            device_feedback
+                        )
+                        _store_event_confirmations([update_message])
+                        if not feedback_created:
+                            _run_post_commit_push(
+                                action,
+                                request_id,
+                                lambda: _emit_message(
+                                    update_message,
+                                    request.sid,
+                                ),
+                            )
+                        else:
+                            _run_post_commit_push(
+                                action,
+                                request_id,
+                                lambda: _broadcast_v2_playback_update(
+                                    current_user_name,
+                                    playback_context_id,
+                                    device_feedback,
+                                ),
+                            )
+                    else:
+                        update_message = _broadcast_v2_playback_update(
+                            current_user_name,
+                            playback_context_id,
+                            device_feedback,
+                        )
+                    if authoritative and not strict_v2:
                         _broadcast_playback_context_state_v2(
                             current_user_name,
                             playback_context_id,
@@ -5120,10 +9326,7 @@ class EmoNamespace(Namespace):
                     )
                 _send_ack(request_id, {"found": local_queue is not None})
                 if local_queue is not None:
-                    emit(
-                        "message",
-                        _build_message("state", "queue.local.set", local_queue),
-                    )
+                    _emit_message(_build_message("state", "queue.local.set", local_queue))
             elif action == "queue.local.set":
                 session_id, owner_client_id = _resolve_local_queue_owner(
                     current_user_name,
@@ -5188,6 +9391,7 @@ class EmoNamespace(Namespace):
                 if targetClientId is not None:
                     logger.info("Broadcasting local queue update to specific client %s", targetClientId)
                     _broadcast_local_queue_to_client(
+                        current_user_name,
                         targetClientId,
                         session_id,
                         owner_client_id,
@@ -5212,7 +9416,10 @@ class EmoNamespace(Namespace):
                 if not isinstance(current_client_id, str) or not current_client_id:
                     raise ValueError("queue.session.sync clientId must be a non-empty string")
                 if payload.get("clientId"):
-                    owner_client = state.get_client(current_client_id)
+                    owner_client = state.get_client(
+                        current_client_id,
+                        user_name=current_user_name,
+                    )
                     if owner_client is None:
                         raise LookupError("Queue owner client is offline")
                     if owner_client.get("userName") != current_user_name:
@@ -5367,6 +9574,108 @@ class EmoNamespace(Namespace):
                     source_client_id=None if current_client is None else current_client.get("clientId"),
                 )
                 _send_error("not_supported", f"Unsupported action: {action}", request_id)
+        except PlaybackContextStaleVersionError as exc:
+            playback_context = exc.playback_context or {}
+            fields = {
+                "playbackContextId": playback_context.get("playbackContextId"),
+            }
+            if exc.cursor_name == "controlVersion":
+                fields["currentControlVersion"] = playback_context.get(
+                    "controlVersion"
+                )
+            elif exc.cursor_name == "queueRevision":
+                fields["currentQueueRevision"] = playback_context.get(
+                    "queueRevision"
+                )
+            _send_error("stale_version", str(exc), request_id, **fields)
+        except PlaybackContextClosedError as exc:
+            playback_context = exc.playback_context or {}
+            _send_error(
+                "context_closed",
+                str(exc),
+                request_id,
+                playbackContextId=playback_context.get("playbackContextId")
+                or payload.get("playbackContextId"),
+            )
+        except PlaybackContextIntentConflictError as exc:
+            playback_context = exc.playback_context or {}
+            _send_error(
+                "conflict",
+                str(exc),
+                request_id,
+                playbackContextId=playback_context.get("playbackContextId"),
+                currentControlVersion=playback_context.get("controlVersion"),
+                currentQueueRevision=playback_context.get("queueRevision"),
+                currentVersion=playback_context.get("version"),
+            )
+        except PlaybackContextEnsureConflictError as exc:
+            playback_context = exc.playback_context or {}
+            _send_error(
+                "conflict",
+                str(exc),
+                request_id,
+                playbackContextId=playback_context.get("playbackContextId"),
+                currentControlVersion=playback_context.get("controlVersion"),
+                currentQueueRevision=playback_context.get("queueRevision"),
+                currentVersion=playback_context.get("version"),
+            )
+        except PlaybackContextQueueRequiredError as exc:
+            playback_context = exc.playback_context or {}
+            _send_error(
+                "queue_required",
+                str(exc),
+                request_id,
+                playbackContextId=playback_context.get("playbackContextId")
+                or payload.get("playbackContextId"),
+                currentControlVersion=playback_context.get("controlVersion"),
+                currentQueueRevision=playback_context.get("queueRevision"),
+                currentVersion=playback_context.get("version"),
+            )
+        except (
+            PlaybackPrepareAlreadyActiveError,
+            PlaybackPrepareTransactionConflictError,
+            PlaybackHandoffTargetConflictError,
+            PlaybackControlTransactionConflictError,
+            PlaybackLocalIntentConflictError,
+        ) as exc:
+            playback_context = getPlaybackContextState(
+                payload.get("playbackContextId")
+            ) or {}
+            _send_error(
+                "conflict",
+                str(exc),
+                request_id,
+                playbackContextId=playback_context.get("playbackContextId")
+                or payload.get("playbackContextId"),
+                currentControlVersion=playback_context.get("controlVersion"),
+                currentQueueRevision=playback_context.get("queueRevision"),
+                currentVersion=playback_context.get("version"),
+            )
+        except PlaybackClientSequenceConflictError as exc:
+            _send_error(
+                "client_sequence_conflict",
+                str(exc),
+                request_id,
+                playbackContextId=payload.get("playbackContextId"),
+                currentClientSeq=exc.current_client_seq,
+            )
+        except PlaybackContextAuthorityAmbiguousError as exc:
+            playback_context = exc.playback_context or {}
+            _send_error(
+                "conflict",
+                str(exc),
+                request_id,
+                playbackContextId=playback_context.get(
+                    "playbackContextId"
+                ) or payload.get("playbackContextId"),
+                currentControlVersion=playback_context.get(
+                    "controlVersion"
+                ),
+                currentQueueRevision=playback_context.get(
+                    "queueRevision"
+                ),
+                currentVersion=playback_context.get("version"),
+            )
         except QueueConflictError as exc:
             event_name = _get_action_event_name(action) or "bad_message"
             _log_emo_event(
@@ -5386,14 +9695,13 @@ class EmoNamespace(Namespace):
             error_payload = {"code": "conflict", "message": str(exc)}
             if exc.current_queue_revision is not None:
                 error_payload["currentQueueRevision"] = exc.current_queue_revision
-            emit(
-                "message",
+            _emit_message(
                 _build_message(
                     "system",
                     "system.error",
                     error_payload,
                     requestId=request_id,
-                ),
+                )
             )
         except ControlConflictError as exc:
             event_name = _get_action_event_name(action) or "bad_message"
@@ -5414,15 +9722,16 @@ class EmoNamespace(Namespace):
             error_payload = {"code": "conflict", "message": str(exc)}
             if exc.current_control_version is not None:
                 error_payload["currentControlVersion"] = exc.current_control_version
-            emit(
-                "message",
+            _emit_message(
                 _build_message(
                     "system",
                     "system.error",
                     error_payload,
                     requestId=request_id,
-                ),
+                )
             )
+        except FollowConflictError as exc:
+            _send_error("conflict", str(exc), request_id)
         except BroadcastConflictError as exc:
             event_name = _get_action_event_name(action) or "bad_message"
             _log_emo_event(
@@ -5444,20 +9753,23 @@ class EmoNamespace(Namespace):
                 error_payload["currentVersion"] = exc.current_version
             if exc.current_control_version is not None:
                 error_payload["currentControlVersion"] = exc.current_control_version
-            emit(
-                "message",
+            _emit_message(
                 _build_message(
                     "system",
                     "system.error",
                     error_payload,
                     requestId=request_id,
-                ),
+                )
             )
         except ClientSeqStaleError as exc:
+            strict_v2 = _is_strict_playback_context_v2(current_client)
+            error_code = (
+                "client_sequence_conflict" if strict_v2 else "stale_client_seq"
+            )
             _log_emo_event(
                 logging.WARNING,
                 _get_action_event_name(action) or "bad_message",
-                result="stale_client_seq",
+                result=error_code,
                 reason=str(exc),
                 **_build_action_log_context(
                     action,
@@ -5468,18 +9780,17 @@ class EmoNamespace(Namespace):
                     message,
                 ),
             )
-            emit(
-                "message",
+            _emit_message(
                 _build_message(
                     "system",
                     "system.error",
                     {
-                        "code": "stale_client_seq",
+                        "code": error_code,
                         "message": str(exc),
                         "currentClientSeq": exc.current_seq,
                     },
                     requestId=request_id,
-                ),
+                )
             )
         except FollowControlForbiddenError as exc:
             _log_emo_event(
@@ -5513,7 +9824,25 @@ class EmoNamespace(Namespace):
                     message,
                 ),
             )
-            _send_error("authority_offline", str(exc), request_id)
+            _send_error(
+                "authority_offline",
+                str(exc),
+                request_id,
+                playbackContextId=payload.get("playbackContextId"),
+            )
+        except CoreProfileNotReady as exc:
+            _log_emo_event(
+                logging.WARNING,
+                "device_register",
+                result="not_supported",
+                reason=str(exc),
+                action=action,
+                client_request_id=request_id,
+                sid=request.sid,
+            )
+            _send_error("not_supported", str(exc), request_id)
+        except CapabilityRequiredError as exc:
+            _send_error("capability_required", str(exc), request_id)
         except PermissionError as exc:
             _log_emo_event(
                 logging.WARNING,
@@ -5564,6 +9893,25 @@ class EmoNamespace(Namespace):
                 ),
             )
             _send_error("bad_request", str(exc), request_id)
+        except Exception as exc:
+            _log_emo_event(
+                logging.ERROR,
+                _get_action_event_name(action) or "strict_v2_internal_error",
+                result="internal_error",
+                exception_type=type(exc).__name__,
+                **_build_action_log_context(
+                    action,
+                    request_id,
+                    current_user_name,
+                    current_client,
+                    payload,
+                    message,
+                ),
+            )
+            _send_error("internal_error", "Internal server error", request_id)
+        finally:
+            if strict_runtime_request:
+                strict_v2_safety.finish_request()
 
 
 socketio.on_namespace(EmoNamespace("/emo"))
