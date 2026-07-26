@@ -1,6 +1,5 @@
 from typing import Dict, Mapping, Optional, Sequence
 
-from .strict_v2_conformance import get_code_conformance_readiness
 from .strict_v2_contract import STRICT_CAPABILITIES
 
 
@@ -10,7 +9,13 @@ PROFILE_CONFIG_KEYS = {
     "handoff": "emo_strict_v2_handoff_enabled",
     "broadcast": "emo_strict_v2_broadcast_enabled",
 }
-BROADCAST_IMPLEMENTATION_READY = False
+PROFILE_IMPLEMENTATION_READY = {
+    "core": True,
+    "follow": True,
+    "handoff": True,
+    "broadcast": True,
+}
+BROADCAST_IMPLEMENTATION_READY = True
 
 
 class CoreProfileNotReady(Exception):
@@ -56,26 +61,26 @@ def get_deployment_readiness(webapp_config: Mapping[str, object]) -> Dict[str, b
     }
 
 
+def get_code_conformance_readiness(
+    allow_local_test_evidence: bool = False,
+) -> Dict[str, bool]:
+    """Return implementation support without metadata or evidence gates."""
+    readiness = dict(PROFILE_IMPLEMENTATION_READY)
+    readiness["broadcast"] = bool(BROADCAST_IMPLEMENTATION_READY)
+    return readiness
+
+
 def get_effective_profile_readiness(
     webapp_config: Mapping[str, object],
     code_readiness: Optional[Mapping[str, bool]] = None,
     allow_local_test_evidence: Optional[bool] = None,
 ) -> Dict[str, bool]:
-    if allow_local_test_evidence is None:
-        allow_local_test_evidence = is_local_test_evidence_allowed(
-            webapp_config
+    code = dict(
+        code_readiness
+        or get_code_conformance_readiness(
+            bool(allow_local_test_evidence)
         )
-    local_override = bool(
-        allow_local_test_evidence
-        and is_local_test_evidence_requested(webapp_config)
     )
-    if code_readiness is None and local_override:
-        code = {profile: True for profile in PROFILE_CONFIG_KEYS}
-    else:
-        code = dict(
-            code_readiness
-            or get_code_conformance_readiness(allow_local_test_evidence)
-        )
     deployment = get_deployment_readiness(webapp_config)
     return {
         profile: bool(code.get(profile, False) and deployment[profile])
@@ -131,10 +136,18 @@ def negotiate_capabilities(
         and can_handoff_target
     )
 
-    can_use_broadcast = bool(role_set.intersection({"player", "controller"}))
+    can_execute_broadcast_audio = bool(
+        "player" in role_set
+        and negotiated["effectiveAtPlayback"]
+        and negotiated["canPlay"]
+        and negotiated["canPause"]
+        and negotiated["canSeek"]
+    )
+    can_use_broadcast = bool(
+        "controller" in role_set or can_execute_broadcast_audio
+    )
     negotiated["supportsBroadcast"] = bool(
-        BROADCAST_IMPLEMENTATION_READY
-        and readiness["broadcast"]
+        readiness["broadcast"]
         and negotiated["supportsBroadcast"]
         and can_use_broadcast
     )

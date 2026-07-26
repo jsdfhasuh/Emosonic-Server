@@ -90,7 +90,7 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
         )
         self.assertTrue(is_local_test_evidence_allowed({}, app_testing=True))
 
-    def test_development_gate_allows_local_test_evidence(self):
+    def test_evidence_switch_does_not_change_runtime_readiness(self):
         deployment = dict(
             self.deployment_enabled,
             emo_development_mode=True,
@@ -112,12 +112,12 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
                 deployment,
             )
 
-        readiness.assert_not_called()
+        self.assertEqual(readiness.call_count, 2)
         self.assertTrue(negotiated["playbackContextV2"])
         self.assertTrue(negotiated["supportsFollow"])
         self.assertTrue(negotiated["playbackPrepare"])
         self.assertTrue(negotiated["effectiveAtPlayback"])
-        self.assertFalse(negotiated["supportsBroadcast"])
+        self.assertTrue(negotiated["supportsBroadcast"])
 
     def test_core_not_ready_fails_closed(self):
         with self.assertRaises(CoreProfileNotReady):
@@ -144,7 +144,7 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
         self.assertFalse(negotiated["supportsFollow"])
         self.assertTrue(negotiated["playbackPrepare"])
         self.assertTrue(negotiated["effectiveAtPlayback"])
-        self.assertFalse(negotiated["supportsBroadcast"])
+        self.assertTrue(negotiated["supportsBroadcast"])
 
     def test_player_dependencies_gate_follow_and_handoff(self):
         negotiated = negotiate_capabilities(
@@ -157,7 +157,7 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
         self.assertFalse(negotiated["supportsFollow"])
         self.assertFalse(negotiated["playbackPrepare"])
         self.assertFalse(negotiated["effectiveAtPlayback"])
-        self.assertFalse(negotiated["supportsBroadcast"])
+        self.assertTrue(negotiated["supportsBroadcast"])
 
     def test_player_without_can_play_cannot_negotiate_follow_or_handoff(self):
         capabilities = dict(self.capabilities, canPlay=False)
@@ -172,6 +172,7 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
         self.assertFalse(negotiated["supportsFollow"])
         self.assertFalse(negotiated["playbackPrepare"])
         self.assertFalse(negotiated["effectiveAtPlayback"])
+        self.assertFalse(negotiated["supportsBroadcast"])
 
     def test_effective_at_is_independent_from_playback_prepare(self):
         capabilities = dict(

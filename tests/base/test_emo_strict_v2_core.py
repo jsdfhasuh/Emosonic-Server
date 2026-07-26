@@ -593,7 +593,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(error["payload"]["code"], "not_supported")
         self.assertIsNone(get_state().get_client("phone-1"))
 
-    def test_non_testing_deployment_requires_dual_local_evidence_gate(self):
+    def test_runtime_readiness_ignores_local_evidence_switch(self):
         client = self.connect()
         self.authenticate(client)
         self.app.testing = False
@@ -609,42 +609,20 @@ class StrictV2CoreTestCase(unittest.TestCase):
         )
 
         try:
-            rejected = self.register(
-                client,
-                "register-local-evidence-rejected",
-                self.strict_registration_payload(),
-            )
-            error = next(
-                message
-                for message in rejected
-                if message.get("requestId")
-                == "register-local-evidence-rejected"
-            )
-            self.assertEqual(error["action"], "system.error")
-            self.assertEqual(error["payload"]["code"], "not_supported")
-
-            self.app.config["WEBAPP"]["emo_development_mode"] = True
             accepted = self.register(
                 client,
-                "register-local-evidence-accepted",
+                "register-local-evidence-ignored",
                 self.strict_registration_payload(),
             )
             ack = next(
                 message
                 for message in accepted
                 if message.get("requestId")
-                == "register-local-evidence-accepted"
+                == "register-local-evidence-ignored"
             )
             self.assertEqual(ack["action"], "system.ack")
             negotiated = ack["payload"]["negotiatedCapabilities"]
-            self.assertFalse(negotiated["supportsBroadcast"])
-            self.assertTrue(
-                all(
-                    value
-                    for name, value in negotiated.items()
-                    if name != "supportsBroadcast"
-                )
-            )
+            self.assertTrue(all(negotiated.values()))
         finally:
             self.app.testing = True
 
@@ -3620,6 +3598,26 @@ class StrictV2CoreTestCase(unittest.TestCase):
             emo_ws._emit_message(invalid, target_sid)
 
         self.assertEqual(self.messages(client), [])
+
+    def test_strict_output_accepts_handoff_commit_without_server_time(self):
+        validate_strict_output(
+            {
+                "type": "command",
+                "action": "player.play",
+                "payload": {
+                    "playbackContextId": "context-1",
+                    "handoffId": "handoff-1",
+                    "controlVersion": 2,
+                    "sourceClientId": "phone-1",
+                    "effectiveAtServerMs": 1780000005000,
+                    "positionMs": 1200,
+                },
+                "timestamp": 1780000004.5,
+                "connectionNonce": "nonce-1",
+                "connectionEpoch": 1,
+            },
+            registered=True,
+        )
 
     def test_emit_buffer_limit_rejects_second_concurrent_socketio_send(self):
         client = self.ready_strict_client()

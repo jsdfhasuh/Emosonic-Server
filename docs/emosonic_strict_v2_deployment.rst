@@ -16,34 +16,29 @@ origins. A wildcard is rejected unless both ``emo_allowed_origins=*`` and
 ``emo_development_mode=true`` are explicitly configured; development wildcard
 mode emits a security warning.
 
-Development conformance evidence
---------------------------------
+Profile readiness
+-----------------
 
-Normal deployments reject conformance evidence prefixed with
-``local-test-only:`` even when the matching profile deployment switches are
-enabled. This prevents test results from silently becoming production
-readiness.
+Runtime capability negotiation is the intersection of server implementation
+support, the matching deployment switch, the capability requested by the
+client, and its role/execution abilities. Contract hashes, schema hashes,
+build commits, conformance manifests, and evidence files do not participate in
+connection or capability decisions.
 
-The packaged manifest may contain these local-test candidates so a personal
-development deployment can be started using configuration alone. They remain
-fail-closed in an ordinary or production deployment and do not make a profile
-ready unless the explicit development settings below are both enabled.
-
-An isolated development deployment may explicitly enable external Strict V2
-client integration with both settings:
+All deployment profile switches default to off. Enable only the profiles used
+by that deployment:
 
 .. code-block:: ini
 
    [webapp]
-   emo_development_mode = on
-   emo_strict_v2_allow_local_test_evidence = on
+   emo_strict_v2_core_enabled = on
+   emo_strict_v2_follow_enabled = on
+   emo_strict_v2_handoff_enabled = on
+   emo_strict_v2_broadcast_enabled = on
 
-The local-evidence switch is ignored unless development mode is also enabled,
-and enabling it emits a startup warning. It affects code-readiness evaluation
-only; the required ``emo_strict_v2_*_enabled`` profile switches must still be
-enabled independently. No external evidence manifest is needed for this local
-integration mode. Disable the local-evidence switch after testing, and never
-use it for a production rollout.
+Turning a profile off rejects new operations for that profile. Existing
+Broadcast terminal restore work continues until every frozen participant pair
+has completed recovery.
 
 Runtime limits
 --------------

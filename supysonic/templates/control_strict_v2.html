@@ -161,7 +161,6 @@
                   <button class="btn btn-outline-secondary" data-broadcast="broadcast.pause" type="button"><span data-i18n-en="Pause" data-i18n-zh="暂停">Pause</span></button>
                   <button class="btn btn-outline-secondary" id="strict-broadcast-seek-back" type="button">-15s</button>
                   <button class="btn btn-outline-secondary" id="strict-broadcast-seek-forward" type="button">+15s</button>
-                  <button class="btn btn-outline-secondary" id="strict-broadcast-queue-sync" type="button"><span data-i18n-en="Sync queue" data-i18n-zh="同步队列">Sync queue</span></button>
                   <button class="btn btn-outline-secondary" id="strict-broadcast-status-button" type="button"><span data-i18n-en="Refresh" data-i18n-zh="刷新状态">Refresh</span></button>
                 </div>
                 <button class="btn btn-outline-danger" data-broadcast="broadcast.stop" type="button"><span data-i18n-en="Stop broadcast" data-i18n-zh="停止群播">Stop broadcast</span></button>
@@ -384,7 +383,6 @@
     document.getElementById('strict-broadcast-status-button').disabled = !broadcastEnabled || !state.activeBroadcast || state.broadcastBusy;
     document.getElementById('strict-broadcast-seek-back').disabled = !broadcastEnabled || !state.activeBroadcast || state.broadcastBusy;
     document.getElementById('strict-broadcast-seek-forward').disabled = !broadcastEnabled || !state.activeBroadcast || state.broadcastBusy;
-    document.getElementById('strict-broadcast-queue-sync').disabled = !broadcastEnabled || !state.activeBroadcast || !state.context || state.broadcastBusy;
     const terminalHandoff = state.handoff
       && ['completed', 'failed', 'cancelled', 'timedOut'].includes(state.handoff.status);
     document.getElementById('strict-handoff-start').disabled = (
@@ -950,8 +948,8 @@
       return;
     }
     text('strict-broadcast-summary', i18n(
-      `${snapshot.state} · ${snapshot.participants.length} participants · queue r${snapshot.queueRevision} · control v${snapshot.controlVersion}`,
-      `${snapshot.state} · ${snapshot.participants.length} 台参与设备 · 队列 r${snapshot.queueRevision} · 控制 v${snapshot.controlVersion}`
+      `${snapshot.lifecycleState} · ${snapshot.state} · ${snapshot.participants.length} participants · Broadcast r${snapshot.broadcastRevision}`,
+      `${snapshot.lifecycleState} · ${snapshot.state} · ${snapshot.participants.length} 台参与设备 · 群播 r${snapshot.broadcastRevision}`
     ));
     state.participantStates.forEach((participant) => {
       const device = state.devices.find((item) => item.clientId === participant.clientId);
@@ -961,11 +959,11 @@
       const name = document.createElement('strong');
       name.textContent = device ? displayName(device) : participant.clientId;
       const detail = document.createElement('small');
-      detail.textContent = `${participant.clientId} · ${formatMs(participant.positionMs)}`;
+      detail.textContent = `${participant.clientId} · ${participant.syncStatus}`;
       copy.append(name, detail);
       const status = document.createElement('span');
-      status.className = `console-status status-${participant.online && ['playing', 'paused'].includes(participant.state) ? participant.state : 'unknown'}`;
-      status.textContent = participant.online ? participant.state : i18n('offline', '离线');
+      status.className = `console-status status-${participant.online && participant.syncStatus === 'applied' ? 'playing' : 'unknown'}`;
+      status.textContent = participant.online ? participant.syncStatus : i18n('offline', '离线');
       row.append(copy, status);
       participants.append(row);
     });
@@ -974,21 +972,25 @@
 
   async function startBroadcast() {
     if (!state.client.capability('supportsBroadcast')) throw new Error('capability_required: supportsBroadcast');
-    if (!state.context?.queueSongIds?.length) throw new Error('当前 Context 没有可群播队列');
     const participants = playerDevices()
-      .filter((device) => device.capabilities.supportsBroadcast)
+      .filter((device) => (
+        device.clientId !== state.context.authorityClientId
+        && device.capabilities.supportsBroadcast
+      ))
       .map((device) => device.clientId)
       .sort();
-    if (!participants.includes(state.context.authorityClientId)) participants.push(state.context.authorityClientId);
-    participants.sort();
+    const intentKey = `emosonic.webControl.broadcastIntent.v2:${state.selectedContextId}`;
+    const intentId = localStorage.getItem(intentKey) || (
+      globalThis.crypto?.randomUUID?.()
+      || `broadcast-intent:${clientId}:${Date.now()}:${Math.random().toString(16).slice(2)}`
+    );
+    localStorage.setItem(intentKey, intentId);
     const response = await state.client.request('broadcast.start', {
       playbackContextId: state.selectedContextId,
-      queueSongIds: state.context.queueSongIds.slice(),
-      currentIndex: state.context.currentIndex,
-      positionMs: projectedPosition(),
+      intentId,
       participants,
-      autoPlay: state.context.state === 'playing',
     });
+    localStorage.removeItem(intentKey);
     state.activeBroadcast = {
       playbackContextId: state.selectedContextId,
       broadcastId: response.payload.broadcastId,
@@ -1011,11 +1013,18 @@
   async function broadcastAction(action, extras = {}) {
     const snapshot = state.activeBroadcast;
     if (!snapshot?.broadcastId) throw new Error('没有活动 Broadcast');
-    await state.client.request(action, {
+    const payload = {
       playbackContextId: snapshot.playbackContextId,
       broadcastId: snapshot.broadcastId,
       ...extras,
-    });
+    };
+    if (['broadcast.play', 'broadcast.pause', 'broadcast.seek', 'broadcast.playItem'].includes(action)) {
+      payload.baseControlVersion = state.context.controlVersion;
+    }
+    if (action === 'broadcast.playItem') {
+      payload.baseQueueRevision = state.context.queueRevision;
+    }
+    await state.client.request(action, payload);
     if (action === 'broadcast.stop') {
       state.activeBroadcast = null;
       state.participantStates = [];
@@ -1033,34 +1042,12 @@
       playbackContextId: snapshot.playbackContextId,
       broadcastId: snapshot.broadcastId,
     });
-    state.activeBroadcast = response.payload.broadcast?.state === 'stopped'
+    state.activeBroadcast = response.payload.broadcast?.lifecycleState === 'stopped'
       ? null
       : response.payload.broadcast;
-    state.participantStates = response.payload.participantStates;
+    state.participantStates = response.payload.participantStates || [];
     renderBroadcast();
     renderContext().catch((error) => showError(error.message));
-  }
-
-  async function syncBroadcastQueue(retry = true) {
-    if (!state.activeBroadcast || !state.context) throw new Error('没有可同步的 Broadcast 或 Context');
-    try {
-      await state.client.request('broadcast.queue.sync', {
-        playbackContextId: state.activeBroadcast.playbackContextId,
-        broadcastId: state.activeBroadcast.broadcastId,
-        queueSongIds: state.context.queueSongIds.slice(),
-        currentIndex: state.context.currentIndex,
-        positionMs: projectedPosition(),
-        baseQueueRevision: state.activeBroadcast.queueRevision,
-        baseControlVersion: state.activeBroadcast.controlVersion,
-      });
-    } catch (error) {
-      if (retry && error.code === 'stale_version') {
-        await refreshBroadcast();
-        return syncBroadcastQueue(false);
-      }
-      throw error;
-    }
-    await refreshBroadcast();
   }
 
   function renderHandoff() {
@@ -1138,8 +1125,8 @@
     } else if (action === 'playback.context.closed' && message.payload.playbackContextId === state.selectedContextId) {
       state.client.forgetSubscription(message.payload.playbackContextId);
       unsubscribeSelected(true).then(refreshBindings);
-    } else if (action.startsWith('broadcast.') && action !== 'broadcast.status') {
-      state.activeBroadcast = action === 'broadcast.stop' || message.payload.state === 'stopped'
+    } else if (action.startsWith('broadcast.') && message.payload.lifecycleState) {
+      state.activeBroadcast = action === 'broadcast.stop' || message.payload.lifecycleState === 'stopped'
         ? null
         : message.payload;
       if (!state.activeBroadcast) state.participantStates = [];
@@ -1211,9 +1198,6 @@
       runBroadcastOperation(() => broadcastAction('broadcast.seek', { positionMs: projectedBroadcastPosition() + 15000 }))
         .catch((error) => showError(error.message));
     });
-    document.getElementById('strict-broadcast-queue-sync').addEventListener('click', () => {
-      runBroadcastOperation(syncBroadcastQueue).catch((error) => showError(error.message));
-    });
     document.getElementById('strict-handoff-start').addEventListener('click', () => startHandoff().catch((error) => showError(error.message)));
     document.getElementById('strict-handoff-cancel').addEventListener('click', () => cancelHandoff().catch((error) => showError(error.message)));
     document.getElementById('strict-handoff-target').addEventListener('change', updateCapabilityUi);
@@ -1275,8 +1259,9 @@
             controlVersion: state.context?.controlVersion ?? null,
             broadcastId: state.activeBroadcast?.broadcastId || null,
             broadcastState: state.activeBroadcast?.state || null,
-            broadcastControlVersion: state.activeBroadcast?.controlVersion ?? null,
-            broadcastQueueRevision: state.activeBroadcast?.queueRevision ?? null,
+            broadcastRevision: state.activeBroadcast?.broadcastRevision ?? null,
+            sourceControlVersion: state.activeBroadcast?.sourceControlVersion ?? null,
+            sourceQueueRevision: state.activeBroadcast?.sourceQueueRevision ?? null,
             broadcastBusy: state.broadcastBusy,
             handoffId: state.handoff?.handoffId || null,
             handoffStatus: state.handoff?.status || null,

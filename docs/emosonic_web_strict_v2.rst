@@ -74,22 +74,15 @@ offered only to targets that negotiated both ``playbackPrepare`` and
 or user-gesture requirements cannot be met.
 
 The optional profile implementations are present but their web registration
-flags remain fail-closed: ``supportsBroadcast``, ``supportsFollow``,
-``playbackPrepare``, and ``effectiveAtPlayback`` are ``false`` until the
-required two-browser checks and foreground Handoff timing samples are recorded.
-Core PlaybackContext operation is unaffected.
+flags default to off. ``supportsBroadcast``, ``supportsFollow``,
+``playbackPrepare``, and ``effectiveAtPlayback`` are advertised only when the
+matching web setting is enabled. Core PlaybackContext operation is unaffected.
 
 Acceptance deployments can enable the web capability advertisements with
 ``emo_web_strict_v2_broadcast_enabled``,
 ``emo_web_strict_v2_follow_enabled``, and
 ``emo_web_strict_v2_handoff_enabled``. These settings default to ``off`` and do
 not bypass the matching server readiness gates.
-
-When the packaged conformance evidence is marked ``local-test-only:``, a
-normally deployed integration server must additionally enable both
-``emo_development_mode`` and
-``emo_strict_v2_allow_local_test_evidence``. This development-only gate must
-remain disabled in production.
 
 Verification
 ------------

@@ -14,9 +14,9 @@ from typing import Dict, Mapping, Sequence
 
 
 FROZEN_CONTRACT_SHA256 = (
-    "4bf1a099fd3c060514215c202b7bb3c82b80e9c73959c39782541d8cda9dea96"
+    "2580851b2059d1d80b2059fe37f2b6e16d156787b741035436009baa3e8af90e"
 )
-FROZEN_PROTOCOL_VERSION = "2.4.0"
+FROZEN_PROTOCOL_VERSION = "2.8.0"
 PACKAGE_FILES = (
     "supysonic/emo/strict_v2_conformance.json",
     "supysonic/emo/strict_v2_registration_descriptor.json",

@@ -2351,7 +2351,12 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
         _validate_control_settled_output(payload)
         return None
     if action in {"player.play", "player.pause", "player.seek", "player.next", "player.prev"}:
-        if action == "player.play" and isinstance(payload, dict) and "handoffId" in payload:
+        handoff_commit = (
+            action == "player.play"
+            and isinstance(payload, dict)
+            and "handoffId" in payload
+        )
+        if handoff_commit:
             control = _output_object(
                 payload,
                 {
@@ -2391,7 +2396,9 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
             )
         if "positionMs" in control:
             _output_int(control["positionMs"], "%s positionMs" % action)
-        if "effectiveAtServerMs" in control or "serverTimeMs" in control:
+        if not handoff_commit and (
+            "effectiveAtServerMs" in control or "serverTimeMs" in control
+        ):
             if not {"effectiveAtServerMs", "serverTimeMs"}.issubset(control):
                 _output_error("%s timing fields must appear together" % action)
             effective_at = _output_int(

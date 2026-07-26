@@ -159,10 +159,8 @@ Configuration relative to the HTTP server.
    failure never causes an automatic runtime downgrade. Defaults to ``legacy``.
 
 ``emo_strict_v2_allow_local_test_evidence``
-   Allows a development deployment to use packaged ``local-test-only:``
-   conformance evidence for external client integration testing. This option
-   is effective only when ``emo_development_mode`` is also enabled. Both
-   settings must remain disabled in production. Defaults to ``off``.
+   Deprecated compatibility setting. It no longer affects connection or
+   capability negotiation. Defaults to ``off``.
 
 ``emo_browser_otp_ttl_seconds``
    Lifetime of the one-time, same-origin browser password used by the web
@@ -252,8 +250,7 @@ Sample configuration::
    ; Render both /player and /control with legacy or strict-v2 realtime logic.
    ;emo_web_realtime_protocol = legacy
 
-   ; Development-only gate for local-test-only conformance evidence.
-   ; Requires emo_development_mode = on. Never enable in production.
+   ; Deprecated compatibility setting; does not affect capability negotiation.
    ;emo_strict_v2_allow_local_test_evidence = off
 
    ; One-time browser Socket.IO password lifetime. Default: 60 seconds.

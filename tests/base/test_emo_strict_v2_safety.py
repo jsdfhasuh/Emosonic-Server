@@ -249,26 +249,18 @@ class StrictV2SafetyTestCase(unittest.TestCase):
             ready,
         )
 
-    def test_multi_process_check_honors_development_local_evidence_gate(self):
+    def test_multi_process_check_ignores_deprecated_local_evidence_switch(self):
         config = {
             "emo_strict_v2_core_enabled": True,
             "emo_development_mode": False,
             "emo_strict_v2_allow_local_test_evidence": True,
         }
-        with mock.patch(
-            "supysonic.emo.strict_v2_readiness.get_code_conformance_readiness",
-            side_effect=lambda allow_local_test_evidence=False: {
-                "core": bool(allow_local_test_evidence),
-                "follow": False,
-                "handoff": False,
-                "broadcast": False,
-            },
-        ):
+        with self.assertRaises(RuntimeError):
             validate_strict_v2_worker_count(2, config)
 
-            config["emo_development_mode"] = True
-            with self.assertRaises(RuntimeError):
-                validate_strict_v2_worker_count(2, config)
+        config["emo_development_mode"] = True
+        with self.assertRaises(RuntimeError):
+            validate_strict_v2_worker_count(2, config)
 
     def test_server_cli_fails_before_starting_multiple_ready_workers(self):
         readiness = {

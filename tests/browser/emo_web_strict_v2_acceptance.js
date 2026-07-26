@@ -173,7 +173,7 @@ async function runBroadcastMutation(control, selector, priorVersion) {
   ), null, { timeout: 15000 });
   const snapshot = await acceptanceSnapshot(control);
   assert.ok(
-    snapshot.broadcastControlVersion > priorVersion,
+    snapshot.broadcastRevision > priorVersion,
     JSON.stringify({
       selector,
       priorVersion,
@@ -181,7 +181,7 @@ async function runBroadcastMutation(control, selector, priorVersion) {
       error: await control.textContent('#strict-control-error'),
     }),
   );
-  return snapshot.broadcastControlVersion;
+  return snapshot.broadcastRevision;
 }
 
 async function addTracks(page, count) {
@@ -593,6 +593,15 @@ async function run() {
       playbackContextId: sourceContextId,
       clientId: playerOneIdentity.clientId,
     }, { timeout: 20000 });
+    await playerOne.locator('#strict-play').click();
+    await Promise.all([
+      playerOne.waitForFunction(() => (
+        window.__emoStrictV2Acceptance.snapshot().playbackState === 'playing'
+      ), null, { timeout: 15000 }),
+      control.waitForFunction(() => (
+        document.querySelector('#strict-selected-state')?.textContent === 'playing'
+      ), null, { timeout: 15000 }),
+    ]);
     const priorBroadcastError = await control.textContent('#strict-control-error');
     await clickEnabled(control, '#strict-broadcast-start');
     try {
@@ -617,7 +626,7 @@ async function run() {
       };
       throw new Error(`Broadcast did not reach both players: ${JSON.stringify(detail)}`);
     }
-    let broadcastVersion = (await acceptanceSnapshot(control)).broadcastControlVersion;
+    let broadcastVersion = (await acceptanceSnapshot(control)).broadcastRevision;
     broadcastVersion = await runBroadcastMutation(
       control, '[data-broadcast="broadcast.play"]', broadcastVersion,
     );
@@ -629,9 +638,6 @@ async function run() {
     );
     broadcastVersion = await runBroadcastMutation(
       control, '#strict-broadcast-seek-forward', broadcastVersion,
-    );
-    broadcastVersion = await runBroadcastMutation(
-      control, '#strict-broadcast-queue-sync', broadcastVersion,
     );
     await clickEnabled(control, '[data-broadcast="broadcast.stop"]');
     await Promise.all([
@@ -725,7 +731,7 @@ async function run() {
     await control.waitForFunction(() => (
       document.querySelector('#strict-control-error')?.textContent.includes('protocol error')
     ));
-    assert.match(await control.textContent('body'), /PlaybackContext strict-v2 2\.4\.0/);
+    assert.match(await control.textContent('body'), /PlaybackContext strict-v2 2\.8\.0/);
     assert.doesNotMatch(await control.textContent('body'), /Local queue editor/);
     completedSteps.push('protocol-error-no-fallback');
 

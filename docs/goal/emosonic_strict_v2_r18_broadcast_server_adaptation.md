@@ -1,6 +1,6 @@
 # Goal: EmoSonic strict-v2 2.8.0 / r18 群播服务端落地
 
-> 状态：In progress（Goal 0—10 已完成；Goal 11 待完成）
+> 状态：Completed（Goal 0—11 已完成）
 >
 > 制定日期：2026-07-23
 >
@@ -41,8 +41,8 @@ PlaybackContext 的派生镜像状态机。
 11. `supportsBroadcast:true` 只在 r18 全部状态机和验收通过后开放，中间实现始终协商为 false；
 12. `schemaHash` 只是可选诊断信息，缺失、变化或格式异常不得限制连接、Core 或任何 capability。
 
-当前实现与 r18 的差距是结构性的，不能继续在旧 `ws_state.py` Broadcast 字典上零散补字段。本
-Goal 采用“先持久化和原子边界，再接 handler 和推送，最后开放 capability”的顺序实施。
+实施前服务端与 r18 的差距是结构性的，因此没有在旧 `ws_state.py` Broadcast 字典上继续零散补字段。
+本 Goal 已按“先持久化和原子边界，再接 handler 和推送，最后开放 capability”的顺序完成。
 
 ---
 
@@ -899,6 +899,24 @@ terminal emit failure 收敛测试；`supportsBroadcast` 继续保持 false，�
 - `supportsBroadcast:true` 时 r18 全部 conformance 已通过；
 - profile 从 true 关闭后，已有 terminal drain 仍继续。
 
+完成记录（2026-07-26）：strict Broadcast dispatch 已直接进入 r18 持久化 handler，客户端发送旧
+`broadcast.queue.sync` 返回 `not_supported`，旧 `playback.update.broadcastId` 返回 `bad_request`，且
+不会创建旧内存 Broadcast 状态或持久化行。readiness 已收敛为实现支持、部署开关、客户端请求能力与
+角色/执行能力的求交集；固定 contract SHA、evidence manifest、`schemaHash` 和
+`serverBuildCommit` 均不参与连接或 capability 决策。`BROADCAST_IMPLEMENTATION_READY` 已设为 true，
+各部署 profile 默认仍关闭，关闭 Broadcast 后精确冻结 pair 的 terminal stop/restore 仍可继续排空。
+
+Web strict controller/player 和共享客户端 action inventory 已切换到 r18：start 只发送 Context、intent 和
+ordinary participants；控制使用 source Context base cursors；ordinary 只发送 event-confirmed
+`broadcast.feedback`；source lifecycle 不操作音频；terminal feedback 未确认前保留恢复记录；每条物理
+连接在 ready 前顺序完成 3 次 ping，effective-at 连接以 8 秒心跳维持 15 秒 freshness。Handoff commit
+输出校验按第 6.9 节专用闭合字段处理，不再错误要求普通控制的 `serverTimeMs`。
+
+最终专项回归 497 项通过，JS 客户端 21 项通过，两份 strict 页面内联脚本通过 `node --check`。真实
+Chromium 140 + Firefox 141 双播放器验收通过 start、play/pause/seek、stop、ordinary 原任务恢复、服务
+重启重连、30 次 Handoff 时序和 strict 不回退；Handoff 最大绝对误差 14.8ms。Goal 11 收尾按用户要求
+统一为一次提交、一次 push，不再用中间 push 反复触发 Actions。
+
 ---
 
 ## 九、接口和字段迁移清单
@@ -1176,9 +1194,9 @@ git diff --check
 
 ---
 
-## 十三、建议提交拆分
+## 十三、实施提交记录
 
-每个提交保持测试可解释，不混入无关重构：
+前序实施按下列边界保持测试可解释，不混入无关重构：
 
 1. `Promote split strict-v2 2.8 r18 contract`：把已确认入口和 19 个分卷整体提升到 `specs/`，同步 Goal；
 2. `Update strict-v2 2.8 core schemas`：metadata、validator、clock/sample/rate；
@@ -1190,8 +1208,8 @@ git diff --check
 8. `Compact terminal broadcast recovery`：7 天 retention、restore、restart sweeper；
 9. `Complete strict-v2 r18 conformance`：fixtures、Web client、acceptance、readiness cleanup。
 
-每次提交前执行受影响的最窄测试和 `git diff --check`；最后一次执行完整测试。实施请求明确授权时，
-完成后按本项目工作流提交并推送，无需增加额外 release ceremony。
+每次提交前执行受影响的最窄测试和 `git diff --check`；最后一次执行完整测试。Goal 11 和最终计划更新
+统一一次提交，并在全部验证完成后只 push 一次。
 
 ---
 
@@ -1199,31 +1217,31 @@ git diff --check
 
 只有同时满足以下条件，才允许把 Broadcast implementation readiness 标记为 true：
 
-- [ ] `specs/` 已成为修正后的 2.8.0/r18 唯一权威；
-- [ ] schemaHash 缺失、变化、格式异常均不限制连接或 capability；
-- [ ] 2.8 Core schema、mandatory pong、position sample 和 playbackRate 已完成；
-- [ ] Broadcast 不创建第二套 queue/Context/cursor；
-- [ ] start 只从 fresh、settled、playing source 派生；
-- [ ] source/ordinary/controller-only 三角色闭合；
-- [ ] source Context control 与 Broadcast revision 在同一事务；
-- [ ] ordinary suspended Context/binding 屏障覆盖全部 mutation；
-- [ ] restorePending ensure 返回无副作用 restore_in_progress；
-- [ ] stop 原子释放屏障、安装 restorePending 和 terminal outbox；
-- [ ] source stop 后没有额外 transport command；
-- [ ] ordinary playing/paused/stopped/idle 原任务恢复正确；
-- [ ] feedback applied/failed、deadline、status 和 clientSeq 闭合；
-- [ ] deliveryId/resync/rejection 后新 delivery 闭合；
-- [ ] waiting/resume/timeout 和不同 deviceSession 规则闭合；
-- [ ] terminal full replay、7 天 compact recovery 和 restore 闭合；
-- [ ] restart 把 active/waiting 原子转为 terminal；
-- [ ] 20/256/512/1024 上限和 retention 清理闭合；
-- [ ] SQLite/MySQL/PostgreSQL migration/schema parity 通过；
-- [ ] strict 自动化、完整 unittest、JS 测试全部通过；
-- [ ] 真实 source + ordinary 双客户端联调通过；
-- [ ] 日志可追踪状态机且不泄露凭据；
-- [ ] `supportsBroadcast:false` 到 true 的切换只发生在上述条件全部完成之后。
+- [x] `specs/` 已成为修正后的 2.8.0/r18 唯一权威；
+- [x] schemaHash 缺失、变化、格式异常均不限制连接或 capability；
+- [x] 2.8 Core schema、mandatory pong、position sample 和 playbackRate 已完成；
+- [x] Broadcast 不创建第二套 queue/Context/cursor；
+- [x] start 只从 fresh、settled、playing source 派生；
+- [x] source/ordinary/controller-only 三角色闭合；
+- [x] source Context control 与 Broadcast revision 在同一事务；
+- [x] ordinary suspended Context/binding 屏障覆盖全部 mutation；
+- [x] restorePending ensure 返回无副作用 restore_in_progress；
+- [x] stop 原子释放屏障、安装 restorePending 和 terminal outbox；
+- [x] source stop 后没有额外 transport command；
+- [x] ordinary playing/paused/stopped/idle 原任务恢复正确；
+- [x] feedback applied/failed、deadline、status 和 clientSeq 闭合；
+- [x] deliveryId/resync/rejection 后新 delivery 闭合；
+- [x] waiting/resume/timeout 和不同 deviceSession 规则闭合；
+- [x] terminal full replay、7 天 compact recovery 和 restore 闭合；
+- [x] restart 把 active/waiting 原子转为 terminal；
+- [x] 20/256/512/1024 上限和 retention 清理闭合；
+- [x] SQLite/MySQL/PostgreSQL migration/schema parity 通过；
+- [x] strict 自动化、完整 unittest、JS 测试全部通过；
+- [x] 真实 source + ordinary 双客户端联调通过；
+- [x] 日志可追踪状态机且不泄露凭据；
+- [x] `supportsBroadcast:false` 到 true 的切换只发生在上述条件全部完成之后。
 
-在此之前，服务端即使已经存在部分新 handler，也必须继续协商：
+未完成 Goal 11 时，服务端即使已经存在部分新 handler，也必须继续协商：
 
 ```json
 {"supportsBroadcast": false}

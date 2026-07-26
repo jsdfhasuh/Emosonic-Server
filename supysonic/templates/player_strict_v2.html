@@ -125,6 +125,14 @@
   const clientId = api.stableIdentity(localStorage, 'emosonic.webPlayer.clientId.v2', 'web-player-');
   const deviceSessionId = api.stableIdentity(localStorage, 'emosonic.webPlayer.deviceSessionId.v2', 'web-player-device:');
   const ownerToken = api.stableIdentity(sessionStorage, 'emosonic.webPlayer.ownerToken.v2', 'web-player-tab:');
+  let persistedBroadcastRecovery = null;
+  try {
+    persistedBroadcastRecovery = JSON.parse(
+      localStorage.getItem('emosonic.webPlayer.broadcastRecovery.v2') || 'null',
+    );
+  } catch (_error) {
+    localStorage.removeItem('emosonic.webPlayer.broadcastRecovery.v2');
+  }
   const lock = new api.PlayerOwnerLock({
     ownerToken,
     onLost() {
@@ -145,9 +153,13 @@
     userGestureSeen: false,
     followingContextId: null,
     followTimer: null,
-    activeBroadcastId: null,
-    broadcastContextId: null,
+    activeBroadcastId: persistedBroadcastRecovery?.broadcastId || null,
+    broadcastContextId: persistedBroadcastRecovery?.playbackContextId || null,
     broadcastCursor: null,
+    broadcastAppliedRevision:
+      persistedBroadcastRecovery?.lastAppliedBroadcastRevision || 0,
+    broadcastExecution: persistedBroadcastRecovery,
+    broadcastApplying: false,
     pendingPrepare: null,
     processedCommands: new Set(),
     contextSnapshots: new Map(),
@@ -162,7 +174,8 @@
   const capabilities = {
     playbackContextV2: true,
     playbackPrepare: true,
-    effectiveAtPlayback: optionalProfiles.handoff === true,
+    effectiveAtPlayback:
+      optionalProfiles.handoff === true || optionalProfiles.broadcast === true,
     canPlay: true,
     canPause: true,
     canSeek: true,
@@ -233,7 +246,10 @@
     if (state.contextId) localStorage.setItem('emosonic.webPlayer.playbackContextId.v2', state.contextId);
     else localStorage.removeItem('emosonic.webPlayer.playbackContextId.v2');
   }
-  function activeFeedbackContextId() { return state.broadcastContextId || state.followingContextId || state.contextId; }
+  function activeFeedbackContextId() {
+    if (state.broadcastExecution || state.broadcastApplying) return null;
+    return state.followingContextId || state.contextId;
+  }
   function alreadyProcessed(action, payload) {
     const signature = api.stableStringify({ action, payload });
     if (state.processedCommands.has(signature)) return true;
@@ -344,7 +360,7 @@
       ? await safePlay('需要用户播放手势')
       : true;
     if (!autoplay) audio.pause();
-    if (syncContext && state.contextId && !state.followingContextId && !state.activeBroadcastId) {
+    if (syncContext && state.contextId && !state.followingContextId && !state.broadcastExecution) {
       await syncAuthorityQueue();
     }
     if (sendUpdate) await reportFeedback();
@@ -359,7 +375,7 @@
     const trackId = state.queue[state.index];
     const lastApplied = state.appliedControlVersions.get(playbackContextId);
     if (!Number.isInteger(lastApplied)) {
-      log(`等待 ${playbackContextId} 的 appliedControlVersion 水合`, 'warning');
+      log(`等待 ${playbackContextId} 的 appliedControlVersion 加载完成`, 'warning');
       return;
     }
     const committed = terminal?.executionStatus === 'committed';
@@ -375,6 +391,8 @@
         ? (audio.paused ? (state.playbackState === 'stopped' ? 'stopped' : 'paused') : 'playing')
         : 'idle',
       positionMs: trackId ? currentPositionMs() : 0,
+      positionSampledAtServerMs: Math.round(state.client.serverNowMs()),
+      playbackRate: audio.playbackRate,
       clientSeq: state.client.nextClientSeq(),
       volume: Math.round(audio.volume * 100),
       muted: audio.muted,
@@ -471,6 +489,7 @@
       queueSongIds: state.queue.slice(),
       currentIndex: state.index,
       positionMs: currentPositionMs(),
+      positionSampledAtServerMs: Math.round(state.client.serverNowMs()),
       baseQueueRevision: cursor.queueRevision,
     };
     if (cursor.controlVersion) payload.baseControlVersion = cursor.controlVersion;
@@ -940,74 +959,160 @@
     text('strict-handoff-state', 'completed');
   }
 
+  async function sendBroadcastFeedback(snapshot, terminal, failure = null) {
+    if (!snapshot.deliveryId || !state.client || state.client.state !== 'ready') return;
+    const revision = snapshot.broadcastRevision ?? snapshot.terminalBroadcastRevision;
+    const payload = {
+      playbackContextId: snapshot.playbackContextId,
+      broadcastId: snapshot.broadcastId,
+      deviceSessionId,
+      deliveryId: snapshot.deliveryId,
+      executionStatus: failure ? 'failed' : 'applied',
+      clientSeq: state.client.nextClientSeq(),
+    };
+    if (failure) {
+      payload.failedBroadcastRevision = revision;
+      payload.lastAppliedBroadcastRevision = state.broadcastAppliedRevision;
+      payload.errorCode = failure.code || 'execution_failed';
+      payload.errorMessage = failure.message || 'Broadcast execution failed';
+    } else {
+      Object.assign(payload, {
+        appliedBroadcastRevision: revision,
+        queueIndex: snapshot.currentIndex ?? snapshot.queueIndex,
+        trackId: snapshot.trackId,
+        state: terminal ? 'stopped' : snapshot.state,
+        positionMs: terminal ? snapshot.positionMs : currentPositionMs(),
+        playbackRate: snapshot.playbackRate,
+      });
+      if (terminal) payload.restoreCompleted = true;
+    }
+    try {
+      const response = await state.client.request('broadcast.feedback', payload);
+      if (response.action !== 'broadcast.feedback') return false;
+      if (!failure) {
+        state.broadcastAppliedRevision = revision;
+        const recovery = JSON.parse(
+          localStorage.getItem('emosonic.webPlayer.broadcastRecovery.v2') || 'null',
+        );
+        if (recovery?.broadcastId === snapshot.broadcastId) {
+          recovery.lastAppliedBroadcastRevision = revision;
+          localStorage.setItem(
+            'emosonic.webPlayer.broadcastRecovery.v2',
+            JSON.stringify(recovery),
+          );
+        }
+      }
+      return true;
+    } catch (error) {
+      if (error.code === 'client_sequence_conflict') showError(error.message);
+      else log(error.message, 'error');
+      return false;
+    }
+  }
+
   async function applyBroadcast(message) {
+    if (['broadcast.feedback', 'broadcast.feedback.rejected'].includes(message.action)) return;
     if (alreadyProcessed(message.action, message.payload)) return;
-    if (!state.client.capability('supportsBroadcast')) return;
     const snapshot = message.payload;
-    const snapshotVersion = Number.isInteger(snapshot.version)
-      ? snapshot.version
-      : snapshot.controlVersion;
+    const terminal = (
+      message.action === 'broadcast.stop'
+      || message.action === 'broadcast.restore'
+      || snapshot.lifecycleState === 'stopped'
+    );
+    if (!state.client.capability('supportsBroadcast') && !terminal) return;
+    const revision = snapshot.broadcastRevision ?? snapshot.terminalBroadcastRevision;
     if (
       state.broadcastCursor
       && state.broadcastCursor.broadcastId === snapshot.broadcastId
-      && Number.isInteger(snapshotVersion)
-      && snapshotVersion < state.broadcastCursor.version
-    ) {
-      return;
+      && Number.isInteger(revision)
+      && revision < state.broadcastCursor.revision
+    ) return;
+    if (Number.isInteger(revision)) {
+      state.broadcastCursor = { broadcastId: snapshot.broadcastId, revision };
     }
-    if (Number.isInteger(snapshotVersion)) {
-      state.broadcastCursor = {
-        broadcastId: snapshot.broadcastId,
-        version: snapshotVersion,
-      };
+    const executesAudio = typeof snapshot.deliveryId === 'string';
+    if (!executesAudio) {
+      state.activeBroadcastId = terminal ? null : snapshot.broadcastId;
+      state.broadcastContextId = terminal ? null : snapshot.playbackContextId;
+      text(
+        'strict-broadcast-state',
+        terminal ? 'no broadcast' : `${snapshot.state} · ${snapshot.broadcastId}`,
+      );
+      return;
     }
     if (Number.isInteger(snapshot.effectiveAtServerMs)) {
       const delay = Math.max(0, snapshot.effectiveAtServerMs - state.client.serverNowMs());
       if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
     }
     if (
-      Number.isInteger(snapshotVersion)
+      Number.isInteger(revision)
       && (
         state.broadcastCursor?.broadcastId !== snapshot.broadcastId
-        || state.broadcastCursor.version !== snapshotVersion
+        || state.broadcastCursor.revision !== revision
       )
-    ) {
-      return;
-    }
-    const stopped = message.action === 'broadcast.stop' || snapshot.state === 'stopped';
-    state.activeBroadcastId = stopped ? null : snapshot.broadcastId;
-    state.broadcastContextId = stopped ? null : snapshot.playbackContextId;
-    text('strict-broadcast-state', state.activeBroadcastId ? `${snapshot.state} · ${snapshot.broadcastId}` : 'no broadcast');
-    if (stopped) {
-      audio.pause();
-      state.playbackState = 'stopped';
-      if (state.contextId) {
-        const contextId = state.contextId;
-        const response = await state.client.refreshContext(contextId).catch(() => null);
-        if (response && state.contextId === contextId) {
-          await applyContext(response.payload.playbackContext);
+    ) return;
+
+    state.broadcastApplying = true;
+    try {
+      if (terminal) {
+        audio.pause();
+        state.playbackState = 'stopped';
+        if (state.contextId) {
+          const contextId = state.contextId;
+          const response = await state.client.refreshContext(contextId).catch(() => null);
+          if (response && state.contextId === contextId) {
+            await applyContext(response.payload.playbackContext);
+          }
         }
-      } else {
-        state.queue = [];
-        state.index = 0;
-        audio.removeAttribute('src');
-        delete audio.dataset.trackId;
-        audio.load();
-        renderQueue();
+        const terminalConfirmed = await sendBroadcastFeedback(snapshot, true);
+        if (!terminalConfirmed) return;
+        localStorage.removeItem('emosonic.webPlayer.broadcastRecovery.v2');
+        state.broadcastExecution = null;
+        state.activeBroadcastId = null;
+        state.broadcastContextId = null;
+        text('strict-broadcast-state', 'no broadcast');
+        return;
       }
-      return;
+
+      state.activeBroadcastId = snapshot.broadcastId;
+      state.broadcastContextId = snapshot.playbackContextId;
+      state.broadcastExecution = {
+        broadcastId: snapshot.broadcastId,
+        deliveryId: snapshot.deliveryId,
+      };
+      localStorage.setItem(
+        'emosonic.webPlayer.broadcastRecovery.v2',
+        JSON.stringify({
+          broadcastId: snapshot.broadcastId,
+          playbackContextId: snapshot.playbackContextId,
+          suspendedPlaybackContextId: state.contextId,
+          lastAppliedBroadcastRevision: state.broadcastAppliedRevision,
+        }),
+      );
+      text('strict-broadcast-state', `${snapshot.state} · ${snapshot.broadcastId}`);
+      await ensureMeta(snapshot.queueSongIds || []);
+      state.queue = snapshot.queueSongIds.slice();
+      state.index = snapshot.currentIndex || 0;
+      loadRequiredCurrent(snapshot.positionMs || 0);
+      let playbackStarted = true;
+      if (snapshot.state === 'playing') {
+        playbackStarted = await safePlay('群播自动播放被阻止');
+      } else {
+        state.playbackState = 'paused';
+        audio.pause();
+      }
+      renderQueue();
+      if (!playbackStarted) {
+        await sendBroadcastFeedback(snapshot, false, {
+          code: 'execution_failed',
+          message: 'Browser playback did not start',
+        });
+        return;
+      }
+      await sendBroadcastFeedback(snapshot, false);
+    } finally {
+      state.broadcastApplying = false;
     }
-    await ensureMeta(snapshot.queueSongIds || []);
-    state.queue = snapshot.queueSongIds.slice();
-    state.index = snapshot.currentIndex || 0;
-    loadRequiredCurrent(snapshot.positionMs || 0);
-    if (snapshot.state === 'playing') await safePlay('群播自动播放被阻止');
-    else {
-      state.playbackState = 'paused';
-      audio.pause();
-    }
-    renderQueue();
-    await reportFeedback();
   }
 
   function onEvent(message) {
@@ -1083,7 +1188,7 @@
   }
 
   async function addTrack(track) {
-    if (state.followingContextId || state.activeBroadcastId) throw new Error('Follow/Broadcast 活动时不能修改 authority 队列');
+    if (state.followingContextId || state.broadcastExecution) throw new Error('Follow/Broadcast 活动时不能修改 authority 队列');
     if (state.queue.includes(track.id)) throw new Error('strict-v2 队列不支持重复曲目');
     state.trackMeta[track.id] = track;
     state.queue.push(track.id);
@@ -1230,7 +1335,7 @@
         if (['disconnected', 'offline', 'protocol_error'].includes(connectionState)) {
           clearTransientFollow('connection lost');
           clearPendingPrepare('connection lost');
-          if (state.activeBroadcastId) {
+          if (state.broadcastExecution) {
             audio.pause();
             state.playbackState = 'paused';
           }
@@ -1253,11 +1358,29 @@
           .then(reportDeviceVolume)
           .then(async () => {
             if (!state.activeBroadcastId || !state.broadcastContextId) return;
-            const response = await state.client.request('broadcast.status', {
-              playbackContextId: state.broadcastContextId,
-              broadcastId: state.activeBroadcastId,
-            });
-            await applyBroadcast({ action: 'broadcast.status', payload: response.payload.broadcast });
+            try {
+              const response = await state.client.request('broadcast.status', {
+                playbackContextId: state.broadcastContextId,
+                broadcastId: state.activeBroadcastId,
+              });
+              if (response.payload.recovery) {
+                await applyBroadcast({
+                  action: 'broadcast.restore',
+                  payload: response.payload.recovery,
+                });
+              } else if (response.payload.broadcast) {
+                await applyBroadcast({
+                  action: 'broadcast.status',
+                  payload: response.payload.broadcast,
+                });
+              }
+            } catch (error) {
+              if (error.code !== 'not_found') throw error;
+              localStorage.removeItem('emosonic.webPlayer.broadcastRecovery.v2');
+              state.activeBroadcastId = null;
+              state.broadcastContextId = null;
+              state.broadcastExecution = null;
+            }
           })
           .catch((error) => showError(error.message));
       },

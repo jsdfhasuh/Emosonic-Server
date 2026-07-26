@@ -372,6 +372,67 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         self.assertEqual(db.EmoBroadcastDelivery.select().count(), 1)
         self.assertEqual(db.EmoPlaybackContext.select().count(), 2)
 
+    def test_strict_client_cannot_enter_legacy_broadcast_mutation_paths(self):
+        authority, _participant, _controller = self.connect_broadcast_devices()
+        self.get_messages(authority)
+        authority.emit(
+            "message",
+            {
+                "type": "state",
+                "action": "broadcast.queue.sync",
+                "requestId": "legacy-broadcast-queue-sync-1",
+                "payload": {
+                    "playbackContextId": "context-broadcast-source",
+                    "broadcastId": "legacy-broadcast-1",
+                    "queueSongIds": ["legacy-song"],
+                    "currentIndex": 0,
+                    "positionMs": 0,
+                },
+            },
+            namespace="/emo",
+        )
+        self.assertEqual(
+            self.get_error(
+                self.get_messages(authority),
+                "legacy-broadcast-queue-sync-1",
+            )["payload"]["code"],
+            "not_supported",
+        )
+
+        authority.emit(
+            "message",
+            {
+                "type": "event",
+                "action": "playback.update",
+                "requestId": "legacy-broadcast-feedback-1",
+                "payload": {
+                    "playbackContextId": "context-broadcast-source",
+                    "broadcastId": "legacy-broadcast-1",
+                    "deviceSessionId": "device:authority-1",
+                    "origin": "passive",
+                    "state": "playing",
+                    "trackId": "source-song-1",
+                    "positionMs": 1000,
+                    "positionSampledAtServerMs": int(time.time() * 1000),
+                    "playbackRate": 1.0,
+                    "clientSeq": 2,
+                },
+            },
+            namespace="/emo",
+        )
+        self.assertEqual(
+            self.get_error(
+                self.get_messages(authority),
+                "legacy-broadcast-feedback-1",
+            )["payload"]["code"],
+            "bad_request",
+        )
+        self.assertEqual(db.EmoBroadcast.select().count(), 0)
+        self.assertEqual(
+            db.EmoBroadcastFeedbackSettlement.select().count(),
+            0,
+        )
+
     def test_status_returns_persisted_anchor_and_frozen_pair(self):
         authority, participant, controller = self.connect_broadcast_devices()
         ack = self.get_ack(

@@ -56,7 +56,7 @@
     'broadcast.pause': 'command',
     'broadcast.seek': 'command',
     'broadcast.playItem': 'command',
-    'broadcast.queue.sync': 'state',
+    'broadcast.feedback': 'event',
     'broadcast.stop': 'command',
   });
 
@@ -74,6 +74,7 @@
     'playback.update': 'playback.update',
     'playback.ready': 'playback.handoff.status',
     'playback.handoff.complete': 'playback.handoff.status',
+    'broadcast.feedback': ['broadcast.feedback', 'broadcast.feedback.rejected'],
   });
 
   const READY_BYPASS_ACTIONS = new Set([
@@ -337,6 +338,9 @@
         });
         this._notifyState('synchronizing');
         await this.request('device.list', {}, { allowBeforeReady: true });
+        for (let index = 0; index < 3; index += 1) {
+          await this.request('system.ping', {}, { allowBeforeReady: true });
+        }
         for (const playbackContextId of Array.from(this.subscriptions)) {
           try {
             await this.request(
@@ -576,9 +580,13 @@
 
     _startHeartbeat() {
       this._stopHeartbeat();
-      const heartbeatMs = Number.isFinite(this.options.heartbeatMs)
+      const effectiveAt = this.capability('effectiveAtPlayback');
+      const requestedHeartbeatMs = Number.isFinite(this.options.heartbeatMs)
         ? Math.max(1000, this.options.heartbeatMs)
-        : 30000;
+        : (effectiveAt ? 8000 : 30000);
+      const heartbeatMs = effectiveAt
+        ? Math.min(10000, requestedHeartbeatMs)
+        : requestedHeartbeatMs;
       this.heartbeatTimer = setInterval(() => {
         if (this.state !== 'ready' || !this.socket || !this.socket.connected) return;
         this.request('system.ping', {}).catch(() => {});
@@ -673,7 +681,14 @@
 
     _settleEventConfirmed(message) {
       for (const [pendingRequestId, pending] of this.pending.entries()) {
-        if (EVENT_CONFIRMED_ACTIONS[pending.action] !== message.action) {
+        const confirmationActions = EVENT_CONFIRMED_ACTIONS[pending.action];
+        if (
+          confirmationActions !== message.action
+          && !(
+            Array.isArray(confirmationActions)
+            && confirmationActions.includes(message.action)
+          )
+        ) {
           continue;
         }
         if (
@@ -719,6 +734,22 @@
           && (
             !message.payload
             || message.payload.handoffId !== pending.payload.handoffId
+          )
+        ) {
+          continue;
+        }
+        if (
+          pending.action === 'broadcast.feedback'
+          && (
+            !message.payload
+            || message.payload.clientSeq !== pending.payload.clientSeq
+            || message.payload.deviceSessionId !== pending.payload.deviceSessionId
+            || message.payload.deliveryId !== pending.payload.deliveryId
+            || message.payload.broadcastId !== pending.payload.broadcastId
+            || (
+              message.action === 'broadcast.feedback'
+              && message.payload.sourceClientId !== this.registration.clientId
+            )
           )
         ) {
           continue;

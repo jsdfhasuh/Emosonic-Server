@@ -3,6 +3,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -185,7 +186,9 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
         capabilities["supportsFollow"] = supports_follow
         capabilities["supportsBroadcast"] = supports_broadcast
         capabilities["playbackPrepare"] = supports_handoff
-        capabilities["effectiveAtPlayback"] = supports_handoff
+        capabilities["effectiveAtPlayback"] = (
+            supports_handoff or supports_broadcast
+        )
         client.emit("message", request_message, namespace="/emo")
         messages = self.messages(client)
         ack = next(
@@ -194,6 +197,18 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
             if message.get("requestId") == request_message["requestId"]
         )
         self.assertEqual(ack["action"], "system.ack")
+        for index in range(3):
+            client.emit(
+                "message",
+                {
+                    "type": "system",
+                    "action": "system.ping",
+                    "requestId": "clock-%s-%d" % (client_id, index),
+                    "payload": {},
+                },
+                namespace="/emo",
+            )
+            self.messages(client)
         return client
 
     def register_web_control(self, *, supports_broadcast=False):
@@ -826,12 +841,33 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
             "web-player-device:2",
             supports_broadcast=True,
         )
+        self.create_web_context(
+            player_two,
+            context_id="ctx-participant-original",
+            device_session_id="web-player-device:2",
+        )
         control = self.register_web_control(supports_broadcast=True)
         self.messages(player_one)
         self.messages(player_two)
 
+        source_feedback = self.fixture_message("playback.update")
+        source_feedback["payload"].update(
+            {
+                "playbackContextId": "ctx-1",
+                "deviceSessionId": "web-player-device:1",
+                "appliedControlVersion": context["controlVersion"],
+                "state": "playing",
+                "trackId": context["trackId"],
+                "positionMs": 2500,
+                "positionSampledAtServerMs": int(time.time() * 1000),
+                "clientSeq": 1,
+            }
+        )
+        player_one.emit("message", source_feedback, namespace="/emo")
+        self.messages(player_one)
+
         start = self.fixture_message("broadcast.start")
-        start["payload"]["autoPlay"] = False
+        start["payload"]["participants"] = ["web-player-2"]
         control.emit("message", start, namespace="/emo")
         control_messages = self.messages(control)
         start_ack = next(
@@ -839,10 +875,50 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
             for message in control_messages
             if message.get("requestId") == start["requestId"]
         )
-        self.assertEqual(start_ack["action"], "system.error")
-        self.assertEqual(start_ack["payload"]["code"], "capability_required")
-        self.assertEqual(self.messages(player_one), [])
-        self.assertEqual(self.messages(player_two), [])
+        broadcast_id = start_ack["payload"]["broadcastId"]
+        self.assertEqual(start_ack["action"], "system.ack")
+        self.assertEqual(start_ack["payload"]["participants"], ["web-player-2"])
+        source_start = next(
+            message
+            for message in self.messages(player_one)
+            if message["action"] == "broadcast.start"
+        )
+        participant_start = next(
+            message
+            for message in self.messages(player_two)
+            if message["action"] == "broadcast.start"
+        )
+        self.assertNotIn("deliveryId", source_start["payload"])
+        self.assertIn("deliveryId", participant_start["payload"])
+
+        feedback = {
+            "type": "event",
+            "action": "playback.update",
+            "requestId": "broadcast-feedback-player-2",
+            "payload": {
+                "playbackContextId": "ctx-1",
+                "deviceSessionId": "web-player-device:2",
+                "origin": "passive",
+                "appliedControlVersion": context["controlVersion"],
+                "state": "paused",
+                "positionMs": 12000,
+                "positionSampledAtServerMs": int(time.time() * 1000),
+                "playbackRate": 1.0,
+                "clientSeq": 1,
+                "trackId": context["trackId"],
+                "volume": 70,
+                "muted": False,
+            },
+        }
+        player_two.emit("message", feedback, namespace="/emo")
+        feedback_messages = self.messages(player_two)
+        self.assertTrue(
+            any(
+                message["action"] == "system.error"
+                and message["payload"]["code"] == "forbidden"
+                for message in feedback_messages
+            )
+        )
 
         status = self.fixture_message("broadcast.status")
         status["payload"]["broadcastId"] = broadcast_id
@@ -865,7 +941,7 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
         control.emit("message", play, namespace="/emo")
         self.messages(control)
         self.assertTrue(
-            any(message["action"] == "broadcast.play" for message in self.messages(player_one))
+            any(message["action"] == "player.play" for message in self.messages(player_one))
         )
         self.assertTrue(
             any(message["action"] == "broadcast.play" for message in self.messages(player_two))
@@ -997,11 +1073,15 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
         target.emit("message", ready, namespace="/emo")
         target_ready_messages = self.messages(target)
         commit = next(
-            message
-            for message in target_ready_messages
-            if message["action"] == "player.play"
-            and message["payload"].get("handoffId") == handoff_id
+            (
+                message
+                for message in target_ready_messages
+                if message["action"] == "player.play"
+                and message["payload"].get("handoffId") == handoff_id
+            ),
+            None,
         )
+        self.assertIsNotNone(commit, target_ready_messages)
         self.assertEqual(commit["payload"]["sourceClientId"], "web-player-source")
         self.assertGreater(commit["payload"]["effectiveAtServerMs"], 0)
 

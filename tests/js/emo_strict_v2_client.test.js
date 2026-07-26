@@ -314,6 +314,54 @@ test('event-confirmed playback feedback settles by context and clientSeq', async
   assert.equal(response.action, 'playback.update');
 });
 
+test('broadcast feedback settles on confirmation or canonical rejection', async () => {
+  for (const action of ['broadcast.feedback', 'broadcast.feedback.rejected']) {
+    const { client, socket } = readyClient();
+    const pending = client.request('broadcast.feedback', {
+      playbackContextId: 'ctx-source',
+      broadcastId: 'broadcast-1',
+      deviceSessionId: 'web-player-device:1',
+      deliveryId: 'delivery-1',
+      executionStatus: 'applied',
+      clientSeq: 1,
+      appliedBroadcastRevision: 2,
+      queueIndex: 0,
+      trackId: 'track-1',
+      state: 'playing',
+      positionMs: 1200,
+      playbackRate: 1,
+    });
+    assert.equal(socket.sent[0].type, 'event');
+    client._onMessage({
+      type: 'event',
+      action,
+      payload: action === 'broadcast.feedback'
+        ? {
+          ...socket.sent[0].payload,
+          sourceClientId: 'web-player-1',
+          serverUpdatedAtMs: 1780000000000,
+        }
+        : {
+          playbackContextId: 'ctx-source',
+          broadcastId: 'broadcast-1',
+          deviceSessionId: 'web-player-device:1',
+          deliveryId: 'delivery-1',
+          clientSeq: 1,
+          rejectedBroadcastRevision: 2,
+          currentBroadcastRevision: 1,
+          minimumRetainedBroadcastRevision: 1,
+          errorCode: 'revision_ahead',
+          serverUpdatedAtMs: 1780000000000,
+        },
+      timestamp: 1780000000,
+      connectionNonce: 'nonce-1',
+      connectionEpoch: 1,
+    });
+    const response = await pending;
+    assert.equal(response.action, action);
+  }
+});
+
 test('device volume commands and event confirmation use device identity', async () => {
   const { client, socket } = readyClient({
     registration: {
@@ -728,6 +776,20 @@ test('bootstrap fetches a fresh browser OTP and reaches ready with exact registr
     connectionNonce: 'nonce-1',
     connectionEpoch: 1,
   });
+  for (let index = 0; index < 3; index += 1) {
+    await waitFor(() => socket.sent.length === 4 + index, 'clock ping');
+    const ping = socket.sent[3 + index];
+    assert.equal(ping.action, 'system.ping');
+    client._onMessage({
+      type: 'system',
+      action: 'system.pong',
+      requestId: ping.requestId,
+      payload: { serverTimeMs: 1000 + index },
+      timestamp: 1,
+      connectionNonce: 'nonce-1',
+      connectionEpoch: 1,
+    });
+  }
   await waitFor(() => client.state === 'ready', 'ready state');
   assert.deepEqual(states.slice(0, 8), [
     'connected',
@@ -745,8 +807,8 @@ test('bootstrap fetches a fresh browser OTP and reaches ready with exact registr
   socket.connected = false;
   socket.trigger('disconnect', 'network');
   socket.connect();
-  await waitFor(() => socket.sent.length === 4, 'reconnect auth request');
-  const reconnectAuth = socket.sent[3];
+  await waitFor(() => socket.sent.length === 7, 'reconnect auth request');
+  const reconnectAuth = socket.sent[6];
   assert.equal(reconnectAuth.payload.p, 'browser-otp:credential-2');
   client._onMessage({
     type: 'system',
@@ -755,8 +817,8 @@ test('bootstrap fetches a fresh browser OTP and reaches ready with exact registr
     payload: { action: 'auth.login', authenticated: true, userName: 'alice' },
     timestamp: 2,
   });
-  await waitFor(() => socket.sent.length === 5, 'reconnect registration');
-  const reconnectRegistration = socket.sent[4];
+  await waitFor(() => socket.sent.length === 8, 'reconnect registration');
+  const reconnectRegistration = socket.sent[7];
   client._onMessage({
     type: 'system',
     action: 'system.ack',
@@ -778,8 +840,8 @@ test('bootstrap fetches a fresh browser OTP and reaches ready with exact registr
     connectionNonce: 'nonce-2',
     connectionEpoch: 1,
   });
-  await waitFor(() => socket.sent.length === 6, 'reconnect device list');
-  const reconnectList = socket.sent[5];
+  await waitFor(() => socket.sent.length === 9, 'reconnect device list');
+  const reconnectList = socket.sent[8];
   client._onMessage({
     type: 'state',
     action: 'device.list',
@@ -789,13 +851,27 @@ test('bootstrap fetches a fresh browser OTP and reaches ready with exact registr
     connectionNonce: 'nonce-2',
     connectionEpoch: 1,
   });
-  await waitFor(() => socket.sent.length === 7, 'closed subscription restore');
-  const closedSubscribe = socket.sent[6];
+  for (let index = 0; index < 3; index += 1) {
+    await waitFor(() => socket.sent.length === 10 + index, 'reconnect clock ping');
+    const ping = socket.sent[9 + index];
+    assert.equal(ping.action, 'system.ping');
+    client._onMessage({
+      type: 'system',
+      action: 'system.pong',
+      requestId: ping.requestId,
+      payload: { serverTimeMs: 2000 + index },
+      timestamp: 2,
+      connectionNonce: 'nonce-2',
+      connectionEpoch: 1,
+    });
+  }
+  await waitFor(() => socket.sent.length === 13, 'closed subscription restore');
+  const closedSubscribe = socket.sent[12];
   assert.equal(closedSubscribe.action, 'playback.context.subscribe');
   assert.equal(closedSubscribe.payload.playbackContextId, 'ctx-closed');
   client._onMessage(requestError(closedSubscribe, 'context_closed', 'nonce-2'));
-  await waitFor(() => socket.sent.length === 8, 'live subscription restore');
-  const subscribe = socket.sent[7];
+  await waitFor(() => socket.sent.length === 14, 'live subscription restore');
+  const subscribe = socket.sent[13];
   assert.equal(subscribe.action, 'playback.context.subscribe');
   assert.equal(subscribe.payload.playbackContextId, 'ctx-1');
   client._onMessage({
@@ -803,8 +879,8 @@ test('bootstrap fetches a fresh browser OTP and reaches ready with exact registr
     timestamp: 2,
     connectionNonce: 'nonce-2',
   });
-  await waitFor(() => socket.sent.length === 9, 'status restore');
-  const status = socket.sent[8];
+  await waitFor(() => socket.sent.length === 15, 'status restore');
+  const status = socket.sent[14];
   assert.equal(status.action, 'playback.context.status');
   client._onMessage({
     type: 'state',

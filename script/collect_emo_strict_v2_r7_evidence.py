@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect fail-closed automated evidence for one committed strict-v2 r11 build."""
+"""Collect offline automated evidence for one committed strict-v2 r18 build."""
 
 import argparse
 import hashlib
@@ -14,9 +14,9 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 FROZEN_CONTRACT_SHA256 = (
-    "4bf1a099fd3c060514215c202b7bb3c82b80e9c73959c39782541d8cda9dea96"
+    "2580851b2059d1d80b2059fe37f2b6e16d156787b741035436009baa3e8af90e"
 )
-FROZEN_PROTOCOL_VERSION = "2.4.0"
+FROZEN_PROTOCOL_VERSION = "2.8.0"
 PROFILES = ("core", "follow", "handoff", "broadcast")
 class EvidenceError(RuntimeError):
     """Raised when evidence cannot be bound safely to one build."""
@@ -66,9 +66,9 @@ def _validate_metadata(
     manifest: Mapping[str, object],
 ) -> Dict[str, object]:
     if contract_hash != FROZEN_CONTRACT_SHA256:
-        raise EvidenceError("Contract SHA-256 does not match frozen r11")
+        raise EvidenceError("Contract SHA-256 does not match frozen r18")
     if descriptor.get("protocolVersion") != FROZEN_PROTOCOL_VERSION:
-        raise EvidenceError("Registration descriptor is not protocol 2.4.0")
+        raise EvidenceError("Registration descriptor is not protocol 2.8.0")
     for label, value in (
         ("conformance", conformance.get("contractSha256")),
         ("manifest", manifest.get("contractSha256")),
@@ -76,7 +76,7 @@ def _validate_metadata(
         if value != FROZEN_CONTRACT_SHA256:
             raise EvidenceError("%s is bound to a different contract" % label)
     if manifest.get("protocolVersion") != FROZEN_PROTOCOL_VERSION:
-        raise EvidenceError("Executable manifest is not protocol 2.4.0")
+        raise EvidenceError("Executable manifest is not protocol 2.8.0")
 
     requirements = manifest.get("requirements")
     expected_requirements = {
