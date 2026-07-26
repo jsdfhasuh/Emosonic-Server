@@ -1122,6 +1122,49 @@ class StrictV2ContractTestCase(unittest.TestCase):
         with self.assertRaises(StrictOutputValidationError):
             validate_strict_output(invalid_rejected)
 
+    def test_validates_compact_broadcast_restore_output(self):
+        restore = self._output(
+            "event",
+            "broadcast.restore",
+            {
+                "playbackContextId": "context-source",
+                "broadcastId": "broadcast-1",
+                "deviceSessionId": "device:participant-1",
+                "terminalBroadcastRevision": 3,
+                "deliveryId": "delivery-restore-1",
+                "suspendedPlaybackContextId": "context-original",
+                "suspendedEpoch": 1,
+                "suspendedVersion": 2,
+                "suspendedQueueRevision": 2,
+                "suspendedControlVersion": 2,
+                "suspendedAppliedControlVersion": 2,
+                "lastAppliedBroadcastRevision": 2,
+                "queueIndex": 0,
+                "trackId": "song-1",
+                "state": "stopped",
+                "positionMs": 1200,
+                "playbackRate": 1.0,
+                "terminalAtServerMs": 30000,
+            },
+        )
+
+        self.assertEqual(validate_strict_output(restore), restore)
+        status = self._output(
+            "system",
+            "system.ack",
+            {
+                "action": "broadcast.status",
+                "serverTimeMs": 31000,
+                "recovery": dict(restore["payload"]),
+            },
+            "broadcast-status-recovery-1",
+        )
+        self.assertEqual(validate_strict_output(status), status)
+        invalid = copy.deepcopy(restore)
+        invalid["payload"]["state"] = "paused"
+        with self.assertRaises(StrictOutputValidationError):
+            validate_strict_output(invalid)
+
     def test_rejects_unknown_null_and_forbidden_output_fields(self):
         messages = [
             self._output(
@@ -1168,7 +1211,7 @@ class StrictV2ContractTestCase(unittest.TestCase):
             validate_strict_output(missing_provenance)
 
     def test_output_action_inventory_is_closed(self):
-        self.assertEqual(len(STRICT_OUTPUT_ACTIONS), 40)
+        self.assertEqual(len(STRICT_OUTPUT_ACTIONS), 41)
         self.assertIn("system.ack", STRICT_OUTPUT_ACTIONS)
         self.assertIn("device.setVolume", STRICT_OUTPUT_ACTIONS)
         self.assertIn("device.volume.update", STRICT_OUTPUT_ACTIONS)
@@ -1191,6 +1234,7 @@ class StrictV2ContractTestCase(unittest.TestCase):
         self.assertIn("broadcast.resync", STRICT_OUTPUT_ACTIONS)
         self.assertIn("broadcast.waiting", STRICT_OUTPUT_ACTIONS)
         self.assertIn("broadcast.resume", STRICT_OUTPUT_ACTIONS)
+        self.assertIn("broadcast.restore", STRICT_OUTPUT_ACTIONS)
         self.assertIn("broadcast.stop", STRICT_OUTPUT_ACTIONS)
 
 

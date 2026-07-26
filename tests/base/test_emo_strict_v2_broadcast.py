@@ -1249,6 +1249,625 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             0,
         )
 
+    def test_compact_restore_drains_when_broadcast_capability_is_false(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        self.sync_source_queue(
+            authority,
+            [],
+            position_ms=0,
+            request_id="source-clear-before-compaction-1",
+        )
+        self.get_messages(authority)
+        self._push(self.get_messages(participant), "broadcast.stop")
+        self.get_messages(controller)
+        emo_ws.compactExpiredBroadcastStates(now_ms=9999999999999)
+        self.assertIsNone(
+            emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        )
+        participant.disconnect(namespace="/emo")
+        reconnected = self.connect_authenticated_client(
+            "alice",
+            "Alic3",
+            request_id="auth-compact-restore-1",
+        )
+        register_messages = self.register_device(
+            reconnected,
+            "register-compact-restore-1",
+            {
+                "clientId": "participant-1",
+                "deviceSessionId": "device:participant-1",
+                "roles": ["player"],
+                "capabilities": {
+                    CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                    "effectiveAtPlayback": True,
+                    "supportsBroadcast": False,
+                },
+            },
+        )
+
+        register_ack = self.get_ack(
+            register_messages,
+            "register-compact-restore-1",
+        )
+        self.assertFalse(
+            register_ack["payload"]["negotiatedCapabilities"][
+                "supportsBroadcast"
+            ]
+        )
+        restore = self._push(register_messages, "broadcast.restore")
+        reconnected.emit(
+            "message",
+            {
+                "type": "event",
+                "action": "broadcast.feedback",
+                "requestId": "broadcast-feedback-compact-stale-1",
+                "payload": {
+                    "playbackContextId": "context-broadcast-source",
+                    "broadcastId": start_ack["broadcastId"],
+                    "deviceSessionId": "device:participant-1",
+                    "deliveryId": "stale-compact-delivery",
+                    "executionStatus": "applied",
+                    "appliedBroadcastRevision": restore["payload"][
+                        "terminalBroadcastRevision"
+                    ],
+                    "queueIndex": restore["payload"]["queueIndex"],
+                    "trackId": restore["payload"]["trackId"],
+                    "state": "stopped",
+                    "positionMs": restore["payload"]["positionMs"],
+                    "playbackRate": restore["payload"]["playbackRate"],
+                    "restoreCompleted": True,
+                    "clientSeq": 1,
+                },
+            },
+            namespace="/emo",
+        )
+        rejection_messages = self.get_messages(reconnected)
+        rejected = self._push(
+            rejection_messages,
+            "broadcast.feedback.rejected",
+        )
+        self.assertEqual(rejected["payload"]["errorCode"], "revision_unknown")
+        replacement_restore = self._push(
+            rejection_messages,
+            "broadcast.restore",
+        )
+        self.assertNotEqual(
+            replacement_restore["payload"]["deliveryId"],
+            restore["payload"]["deliveryId"],
+        )
+        restore = replacement_restore
+        reconnected.emit(
+            "message",
+            {
+                "type": "state",
+                "action": "broadcast.status",
+                "requestId": "broadcast-status-compact-1",
+                "payload": {
+                    "playbackContextId": "context-broadcast-source",
+                    "broadcastId": start_ack["broadcastId"],
+                },
+            },
+            namespace="/emo",
+        )
+        status_messages = self.get_messages(reconnected)
+        self.assertTrue(
+            any(
+                message["action"] == "system.ack"
+                and message.get("requestId")
+                == "broadcast-status-compact-1"
+                for message in status_messages
+            ),
+            status_messages,
+        )
+        recovery = self.get_ack(
+            status_messages,
+            "broadcast-status-compact-1",
+        )["payload"]["recovery"]
+        self.assertEqual(recovery, restore["payload"])
+
+        reconnected.emit(
+            "message",
+            {
+                "type": "event",
+                "action": "broadcast.feedback",
+                "requestId": "broadcast-feedback-compact-1",
+                "payload": {
+                    "playbackContextId": "context-broadcast-source",
+                    "broadcastId": start_ack["broadcastId"],
+                    "deviceSessionId": "device:participant-1",
+                    "deliveryId": restore["payload"]["deliveryId"],
+                    "executionStatus": "applied",
+                    "appliedBroadcastRevision": restore["payload"][
+                        "terminalBroadcastRevision"
+                    ],
+                    "queueIndex": restore["payload"]["queueIndex"],
+                    "trackId": restore["payload"]["trackId"],
+                    "state": "stopped",
+                    "positionMs": restore["payload"]["positionMs"],
+                    "playbackRate": restore["payload"]["playbackRate"],
+                    "restoreCompleted": True,
+                    "clientSeq": 2,
+                },
+            },
+            namespace="/emo",
+        )
+        confirmation = self._push(
+            self.get_messages(reconnected),
+            "broadcast.feedback",
+        )
+        self.assertTrue(confirmation["payload"]["restoreCompleted"])
+        self.assertEqual(
+            emo_ws.listTerminalRecoveries("alice"),
+            [],
+        )
+        self.assertEqual(
+            db.EmoBroadcastFence.select().where(
+                (db.EmoBroadcastFence.broadcast_id == start_ack["broadcastId"])
+                & (db.EmoBroadcastFence.role == "ordinary")
+            ).count(),
+            0,
+        )
+
+    def test_source_terminal_replay_clears_ui_without_feedback(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        self.sync_source_queue(
+            authority,
+            [],
+            position_ms=0,
+            request_id="source-clear-before-source-replay-1",
+        )
+        self.get_messages(authority)
+        self.get_messages(participant)
+        self.get_messages(controller)
+        authority.disconnect(namespace="/emo")
+        reconnected = self.connect_authenticated_client(
+            "alice",
+            "Alic3",
+            request_id="auth-source-terminal-replay-1",
+        )
+        messages = self.register_device(
+            reconnected,
+            "register-source-terminal-replay-1",
+            {
+                "clientId": "authority-1",
+                "deviceSessionId": "device:authority-1",
+                "roles": ["player"],
+                "capabilities": {
+                    CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                    "effectiveAtPlayback": True,
+                    "supportsBroadcast": False,
+                },
+            },
+        )
+
+        stop = self._push(messages, "broadcast.stop")
+        self.assertEqual(stop["payload"]["broadcastId"], start_ack["broadcastId"])
+        self.assertNotIn("deliveryId", stop["payload"])
+        second_register = self.register_device(
+            reconnected,
+            "register-source-terminal-replay-2",
+            {
+                "clientId": "authority-1",
+                "deviceSessionId": "device:authority-1",
+                "roles": ["player"],
+                "capabilities": {
+                    CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                    "effectiveAtPlayback": True,
+                    "supportsBroadcast": False,
+                },
+            },
+        )
+        self.assertFalse(
+            any(message["action"] == "broadcast.stop" for message in second_register)
+        )
+        persisted = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        self.assertTrue(persisted["participantStates"][0]["restorePending"])
+        self.assertEqual(
+            db.EmoBroadcastFeedbackSettlement.select().count(),
+            0,
+        )
+
+    def test_socketio_startup_terminals_persisted_active_broadcast_once(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        context_before = getPlaybackContextState("context-broadcast-source")
+
+        emo_ws.init_socketio(self.app)
+
+        persisted = emo_ws.getPersistentBroadcastState(
+            start_ack["broadcastId"]
+        )
+        self.assertEqual(persisted["lifecycleState"], "stopped")
+        self.assertEqual(persisted["snapshot"]["broadcastRevision"], 2)
+        self.assertTrue(persisted["participantStates"][0]["restorePending"])
+        self.assertEqual(
+            getPlaybackContextState("context-broadcast-source"),
+            context_before,
+        )
+
+        emo_ws.init_socketio(self.app)
+
+        replayed = emo_ws.getPersistentBroadcastState(
+            start_ack["broadcastId"]
+        )
+        self.assertEqual(replayed["snapshot"]["broadcastRevision"], 2)
+
+    def test_terminal_emit_failures_replay_to_source_and_ordinary_on_reconnect(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        failed_sids = {
+            get_state().get_sid_for_client("authority-1", user_name="alice"),
+            get_state().get_sid_for_client("participant-1", user_name="alice"),
+        }
+        real_emit = emo_ws.socketio.emit
+
+        def fail_initial_terminal(event, message, *args, **kwargs):
+            if (
+                kwargs.get("to") in failed_sids
+                and message.get("action") == "broadcast.stop"
+            ):
+                raise RuntimeError("injected terminal projection failure")
+            return real_emit(event, message, *args, **kwargs)
+
+        with mock.patch.object(
+            emo_ws.socketio,
+            "emit",
+            side_effect=fail_initial_terminal,
+        ):
+            controller.emit(
+                "message",
+                {
+                    "type": "command",
+                    "action": "broadcast.stop",
+                    "requestId": "broadcast-stop-emit-failure-1",
+                    "payload": {
+                        "playbackContextId": "context-broadcast-source",
+                        "broadcastId": start_ack["broadcastId"],
+                    },
+                },
+                namespace="/emo",
+            )
+
+        self.get_ack(
+            self.get_messages(controller),
+            "broadcast-stop-emit-failure-1",
+        )
+        self.assertEqual(self.get_messages(authority), [])
+        self.assertEqual(self.get_messages(participant), [])
+        persisted = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        self.assertEqual(persisted["snapshot"]["broadcastRevision"], 2)
+        self.assertTrue(persisted["participantStates"][0]["restorePending"])
+
+        authority.disconnect(namespace="/emo")
+        participant.disconnect(namespace="/emo")
+        reconnected_authority = self.connect_authenticated_client(
+            "alice",
+            "Alic3",
+            request_id="auth-source-terminal-after-failure-1",
+        )
+        source_messages = self.register_device(
+            reconnected_authority,
+            "register-source-terminal-after-failure-1",
+            {
+                "clientId": "authority-1",
+                "deviceSessionId": "device:authority-1",
+                "roles": ["player"],
+                "capabilities": {
+                    CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                    "supportsBroadcast": False,
+                },
+            },
+        )
+        source_stop = self._push(source_messages, "broadcast.stop")
+        self.assertNotIn("deliveryId", source_stop["payload"])
+
+        reconnected_participant = self.connect_authenticated_client(
+            "alice",
+            "Alic3",
+            request_id="auth-ordinary-terminal-after-failure-1",
+        )
+        ordinary_messages = self.register_device(
+            reconnected_participant,
+            "register-ordinary-terminal-after-failure-1",
+            {
+                "clientId": "participant-1",
+                "deviceSessionId": "device:participant-1",
+                "roles": ["player"],
+                "capabilities": {
+                    CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                    "supportsBroadcast": False,
+                },
+            },
+        )
+        ordinary_stop = self._push(ordinary_messages, "broadcast.stop")
+        self.assertNotEqual(
+            ordinary_stop["payload"]["deliveryId"],
+            persisted["participantStates"][0]["targetDeliveryId"],
+        )
+
+    def test_manual_stop_is_persistent_atomic_and_idempotent(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        context_before = getPlaybackContextState("context-broadcast-source")
+        stop_message = {
+            "type": "command",
+            "action": "broadcast.stop",
+            "requestId": "broadcast-stop-manual-1",
+            "payload": {
+                "playbackContextId": "context-broadcast-source",
+                "broadcastId": start_ack["broadcastId"],
+            },
+        }
+
+        controller.emit("message", stop_message, namespace="/emo")
+
+        self.get_ack(
+            self.get_messages(controller),
+            "broadcast-stop-manual-1",
+        )
+        self._push(self.get_messages(authority), "broadcast.stop")
+        self._push(self.get_messages(participant), "broadcast.stop")
+        persisted = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        self.assertEqual(persisted["lifecycleState"], "stopped")
+        self.assertEqual(persisted["snapshot"]["broadcastRevision"], 2)
+        self.assertEqual(
+            getPlaybackContextState("context-broadcast-source"),
+            context_before,
+        )
+
+        replay_message = dict(stop_message, requestId="broadcast-stop-manual-2")
+        controller.emit("message", replay_message, namespace="/emo")
+        replay_messages = self.get_messages(controller)
+        self.get_ack(replay_messages, "broadcast-stop-manual-2")
+        self.assertFalse(
+            any(
+                message["action"] == "broadcast.stop"
+                for message in replay_messages
+            )
+        )
+        self.assertEqual(self.get_messages(authority), [])
+        self.assertEqual(self.get_messages(participant), [])
+        self.assertEqual(
+            emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])[
+                "snapshot"
+            ]["broadcastRevision"],
+            2,
+        )
+
+    def test_compact_repeated_stop_replays_ack_only_to_owner_or_source_pair(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        stop_payload = {
+            "playbackContextId": "context-broadcast-source",
+            "broadcastId": start_ack["broadcastId"],
+        }
+        controller.emit(
+            "message",
+            {
+                "type": "command",
+                "action": "broadcast.stop",
+                "requestId": "broadcast-stop-before-compact-1",
+                "payload": stop_payload,
+            },
+            namespace="/emo",
+        )
+        self.get_ack(
+            self.get_messages(controller),
+            "broadcast-stop-before-compact-1",
+        )
+        self._push(self.get_messages(authority), "broadcast.stop")
+        self._push(self.get_messages(participant), "broadcast.stop")
+        emo_ws.compactExpiredBroadcastStates(now_ms=9999999999999)
+        self.assertIsNone(
+            emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        )
+
+        for client, request_id in (
+            (controller, "broadcast-stop-compact-owner-1"),
+            (authority, "broadcast-stop-compact-source-1"),
+        ):
+            client.emit(
+                "message",
+                {
+                    "type": "command",
+                    "action": "broadcast.stop",
+                    "requestId": request_id,
+                    "payload": stop_payload,
+                },
+                namespace="/emo",
+            )
+            ack = self.get_ack(self.get_messages(client), request_id)
+            self.assertEqual(ack["payload"], {"action": "broadcast.stop"})
+
+        participant.emit(
+            "message",
+            {
+                "type": "command",
+                "action": "broadcast.stop",
+                "requestId": "broadcast-stop-compact-ordinary-1",
+                "payload": stop_payload,
+            },
+            namespace="/emo",
+        )
+        self.assertEqual(
+            self.get_error(
+                self.get_messages(participant),
+                "broadcast-stop-compact-ordinary-1",
+            )["payload"]["code"],
+            "forbidden",
+        )
+        self.assertEqual(self.get_messages(participant), [])
+
+        different_source_pair = self.connect_device(
+            "alice",
+            "Alic3",
+            "authority-1",
+            "device:authority-replacement",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+            },
+        )
+        self.get_messages(different_source_pair)
+        different_source_pair.emit(
+            "message",
+            {
+                "type": "command",
+                "action": "broadcast.stop",
+                "requestId": "broadcast-stop-compact-wrong-source-pair-1",
+                "payload": stop_payload,
+            },
+            namespace="/emo",
+        )
+        self.assertEqual(
+            self.get_error(
+                self.get_messages(different_source_pair),
+                "broadcast-stop-compact-wrong-source-pair-1",
+            )["payload"]["code"],
+            "forbidden",
+        )
+        outcome = emo_ws.getBroadcastIntentOutcome(
+            "alice",
+            "context-broadcast-source",
+            "controller-1",
+            "intent-1",
+        )
+        self.assertEqual(outcome["terminalBroadcastRevision"], 2)
+        self.assertEqual(outcome["authorityClientId"], "authority-1")
+        self.assertEqual(
+            outcome["authorityDeviceSessionId"],
+            "device:authority-1",
+        )
+        self.assertIsNone(
+            emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        )
+
+    def test_full_terminal_replays_stop_before_ordinary_mutation(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        self.sync_source_queue(
+            authority,
+            [],
+            position_ms=0,
+            request_id="source-clear-before-full-replay-1",
+        )
+        self.get_messages(authority)
+        first_stop = self._push(
+            self.get_messages(participant),
+            "broadcast.stop",
+        )
+        self.get_messages(controller)
+        participant.disconnect(namespace="/emo")
+        reconnected = self.connect_authenticated_client(
+            "alice",
+            "Alic3",
+            request_id="auth-full-terminal-replay-1",
+        )
+        messages = self.register_device(
+            reconnected,
+            "register-full-terminal-replay-1",
+            {
+                "clientId": "participant-1",
+                "deviceSessionId": "device:participant-1",
+                "roles": ["player"],
+                "capabilities": {
+                    CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                    "supportsBroadcast": False,
+                },
+            },
+        )
+
+        register_ack = self.get_ack(
+            messages,
+            "register-full-terminal-replay-1",
+        )
+        replay = self._push(messages, "broadcast.stop")
+        self.assertLess(messages.index(register_ack), messages.index(replay))
+        self.assertNotEqual(
+            replay["payload"]["deliveryId"],
+            first_stop["payload"]["deliveryId"],
+        )
+        reconnected.emit(
+            "message",
+            {
+                "type": "command",
+                "action": "playback.context.ensure",
+                "requestId": "ordinary-ensure-before-full-restore-1",
+                "payload": {
+                    "deviceSessionId": "device:participant-1",
+                    "queueSongIds": ["replacement-song"],
+                    "currentIndex": 0,
+                    "positionMs": 0,
+                    "state": "paused",
+                },
+            },
+            namespace="/emo",
+        )
+        blocked = self.get_error(
+            self.get_messages(reconnected),
+            "ordinary-ensure-before-full-restore-1",
+        )
+        self.assertEqual(blocked["payload"]["code"], "restore_in_progress")
+
     def test_old_start_snapshot_fields_are_rejected(self):
         authority, _participant, _controller = self.connect_broadcast_devices()
         messages = self.start_strict_broadcast(

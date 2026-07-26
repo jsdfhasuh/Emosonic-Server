@@ -34,15 +34,21 @@ from .broadcast_store import (
     BroadcastRevisionConflictError,
     broadcastMutationLock,
     commitBroadcastRevisionInTransaction,
+    compactExpiredBroadcastStates,
     createBroadcastRegistrationReplay,
     createBroadcastState,
     getBroadcastIntentOutcome,
+    getBroadcastStopOutcome,
     getNonterminalBroadcastStateForContext,
     getBroadcastState as getPersistentBroadcastState,
+    listTerminalRecoveries,
+    listFullTerminalBroadcastsForSource,
     settleBroadcastFeedback,
+    stopNonterminalBroadcastsForRestart,
     suspendBroadcastForAuthorityDisconnect,
     sweepBroadcastAuthorityDisconnectDeadlines,
     sweepBroadcastFeedbackDeadlines,
+    terminalBroadcastState,
     terminalBroadcastStateInTransaction,
 )
 from .protocol_metadata import (
@@ -166,6 +172,8 @@ strict_request_cache = StrictRequestCache()
 _control_watchdog_lock = threading.RLock()
 _control_watchdog_generation = 0
 _control_watchdog_tokens = {}
+_source_terminal_replay_lock = threading.RLock()
+_source_terminal_replays = {}
 
 ALLOWED_PRE_AUTH = {"auth.login"}
 EVENT_CONFIRMED_ACTIONS = {
@@ -554,6 +562,12 @@ def init_socketio(app):
         logger.warning(
             "Marked %d active strict Emo broadcasts stopped after restart",
             len(stopped_broadcasts),
+        )
+    stopped_persistent_broadcasts = stopNonterminalBroadcastsForRestart()
+    if stopped_persistent_broadcasts:
+        logger.warning(
+            "Marked %d persistent strict Emo broadcasts stopped after restart",
+            len(stopped_persistent_broadcasts),
         )
     metadata = get_strict_v2_metadata()
     logger.warning(
@@ -2717,7 +2731,7 @@ def _resume_strict_broadcast_authority_registration(client_info):
 
 
 def _prepare_strict_broadcast_participant_registration(client_info):
-    if not _strict_broadcast_participant_eligible(client_info):
+    if client_info is None or not _has_role(client_info, "player"):
         return None
     session_info = state.get_session(request.sid) or {}
     connection_nonce = session_info.get("connectionNonce")
@@ -2729,6 +2743,9 @@ def _prepare_strict_broadcast_participant_registration(client_info):
         client_info["deviceSessionId"],
         connection_nonce,
         _server_time_ms(),
+        allow_nonterminal=_strict_broadcast_participant_eligible(
+            client_info
+        ),
     )
 
 
@@ -2744,6 +2761,48 @@ def _emit_strict_broadcast_participant_registration(replay):
         ),
         request.sid,
     )
+
+
+def _prepare_strict_broadcast_source_terminal_registration(client_info):
+    if client_info is None or not _has_role(client_info, "player"):
+        return []
+    session_info = state.get_session(request.sid) or {}
+    connection_nonce = session_info.get("connectionNonce")
+    if not isinstance(connection_nonce, str) or not connection_nonce:
+        return []
+    with _source_terminal_replay_lock:
+        seen = set(_source_terminal_replays.get(connection_nonce, ()))
+    return [
+        item
+        for item in listFullTerminalBroadcastsForSource(
+            client_info["userName"],
+            client_info["clientId"],
+            client_info["deviceSessionId"],
+        )
+        if item["broadcastId"] not in seen
+    ]
+
+
+def _emit_strict_broadcast_source_terminal_registration(replays):
+    if not replays:
+        return
+    session_info = state.get_session(request.sid) or {}
+    connection_nonce = session_info.get("connectionNonce")
+    for replay in replays:
+        _emit_message(
+            _build_message(
+                "event",
+                "broadcast.stop",
+                replay["snapshot"],
+            ),
+            request.sid,
+        )
+        if isinstance(connection_nonce, str) and connection_nonce:
+            with _source_terminal_replay_lock:
+                _source_terminal_replays.setdefault(
+                    connection_nonce,
+                    set(),
+                ).add(replay["broadcastId"])
 
 
 def _broadcast_to_participants(broadcast, action, msg_type, source_client_id, request_id=None, extra_payload=None):
@@ -5157,10 +5216,13 @@ def _require_strict_broadcast_control(
         broadcast.get("playbackContextId"),
     )
     client_id = current_client.get("clientId")
-    if client_id not in {
-        broadcast.get("ownerClientId"),
-        context.get("authorityClientId"),
-    }:
+    is_owner = client_id == broadcast.get("ownerClientId")
+    is_source = (
+        client_id == broadcast.get("authorityClientId")
+        and current_client.get("deviceSessionId")
+        == broadcast.get("authorityDeviceSessionId")
+    )
+    if not is_owner and not is_source:
         raise PermissionError("Broadcast control is not allowed")
     if require_authority_online:
         _get_online_strict_broadcast_authority(
@@ -5178,7 +5240,64 @@ def _handle_strict_broadcast_status(
 ):
     persisted = getPersistentBroadcastState(payload["broadcastId"])
     if persisted is None:
-        raise LookupError("Broadcast not found")
+        recoveries = listTerminalRecoveries(
+            current_user_name,
+            current_client.get("clientId"),
+            current_client.get("deviceSessionId"),
+        )
+        recovery = next(
+            (
+                item
+                for item in recoveries
+                if item["broadcastId"] == payload["broadcastId"]
+                and item["playbackContextId"]
+                == payload["playbackContextId"]
+            ),
+            None,
+        )
+        if recovery is None:
+            raise LookupError("Broadcast not found")
+        _send_ack(
+            request_id,
+            {
+                "serverTimeMs": _server_time_ms(),
+                "recovery": {
+                    "playbackContextId": recovery["playbackContextId"],
+                    "broadcastId": recovery["broadcastId"],
+                    "deviceSessionId": recovery["deviceSessionId"],
+                    "terminalBroadcastRevision": recovery[
+                        "terminalBroadcastRevision"
+                    ],
+                    "deliveryId": recovery["currentDeliveryId"],
+                    "suspendedPlaybackContextId": recovery[
+                        "suspendedPlaybackContextId"
+                    ],
+                    "suspendedEpoch": recovery["suspendedEpoch"],
+                    "suspendedVersion": recovery["suspendedVersion"],
+                    "suspendedQueueRevision": recovery[
+                        "suspendedQueueRevision"
+                    ],
+                    "suspendedControlVersion": recovery[
+                        "suspendedControlVersion"
+                    ],
+                    "suspendedAppliedControlVersion": recovery[
+                        "suspendedAppliedControlVersion"
+                    ],
+                    "lastAppliedBroadcastRevision": recovery[
+                        "lastAppliedBroadcastRevision"
+                    ] or 0,
+                    "queueIndex": recovery["terminalQueueIndex"],
+                    "trackId": recovery["terminalTrackId"],
+                    "state": "stopped",
+                    "positionMs": recovery["terminalPositionMs"],
+                    "playbackRate": recovery["terminalPlaybackRate"],
+                    "terminalAtServerMs": recovery[
+                        "terminalAtServerMs"
+                    ],
+                },
+            },
+        )
+        return {"recovery": recovery}
     snapshot = persisted["snapshot"]
     if (
         persisted["userName"] != current_user_name
@@ -5299,9 +5418,7 @@ def _handle_strict_broadcast_feedback(
     if not isinstance(connection_nonce, str) or not connection_nonce:
         raise PermissionError("Registered connection provenance is missing")
     persisted = getPersistentBroadcastState(payload["broadcastId"])
-    if persisted is None:
-        raise LookupError("Broadcast not found")
-    if (
+    if persisted is not None and (
         persisted["userName"] != current_user_name
         or persisted["playbackContextId"] != payload["playbackContextId"]
     ):
@@ -5375,38 +5492,86 @@ def _handle_strict_broadcast_stop(
     payload,
     request_id,
 ):
-    broadcast = _get_strict_broadcast_from_payload(
-        current_user_name,
-        payload,
-    )
+    persisted = getPersistentBroadcastState(payload["broadcastId"])
+    if persisted is None:
+        outcome = getBroadcastStopOutcome(
+            current_user_name,
+            payload["playbackContextId"],
+            payload["broadcastId"],
+        )
+        if outcome is None:
+            raise LookupError("Broadcast not found")
+        client_id = current_client.get("clientId")
+        is_owner = client_id == outcome["ownerClientId"]
+        is_source = (
+            client_id == outcome["authorityClientId"]
+            and current_client.get("deviceSessionId")
+            == outcome["authorityDeviceSessionId"]
+        )
+        if not is_owner and not is_source:
+            raise PermissionError("Broadcast stop access is not allowed")
+        _send_ack(request_id, outcome["stopAck"])
+        return {
+            "broadcastId": outcome["broadcastId"],
+            "lifecycleState": "stopped",
+            "broadcastRevision": outcome["terminalBroadcastRevision"],
+        }
+    broadcast = persisted["snapshot"]
+    if (
+        persisted["userName"] != current_user_name
+        or persisted["playbackContextId"] != payload["playbackContextId"]
+    ):
+        raise PermissionError("Broadcast stop access is not allowed")
     _require_strict_broadcast_control(
         current_user_name,
         current_client,
         broadcast,
         require_authority_online=False,
     )
-    if not state.is_broadcast_active(broadcast["broadcastId"]):
-        _send_ack(request_id)
-        return broadcast
-
-    updated = state.stop_broadcast(
+    server_time_ms = _server_time_ms()
+    terminal_snapshot = dict(broadcast)
+    if broadcast["lifecycleState"] != "stopped":
+        terminal_snapshot.update(
+            {
+                "lifecycleState": "stopped",
+                "broadcastRevision": broadcast["broadcastRevision"] + 1,
+                "serverUpdatedAtMs": server_time_ms,
+            }
+        )
+    deliveries = _build_r18_terminal_deliveries(
+        persisted,
+        terminal_snapshot,
+        server_time_ms,
+    ) if broadcast["lifecycleState"] != "stopped" else []
+    terminal = terminalBroadcastState(
         broadcast["broadcastId"],
-        current_client.get("clientId"),
-        increment_control_version=False,
+        terminal_snapshot,
+        {},
+        terminal_deliveries=deliveries,
+        expected_broadcast_revision=(
+            broadcast["broadcastRevision"]
+            if broadcast["lifecycleState"] != "stopped"
+            else None
+        ),
+        terminal_at_ms=server_time_ms,
     )
-    if updated is None:
-        raise LookupError("Broadcast not found")
-    _send_ack(request_id)
+    _send_ack(request_id, terminal["stopAck"])
+    if not terminal["created"]:
+        return getPersistentBroadcastState(broadcast["broadcastId"])
+    mutation = {
+        "broadcast": terminal["broadcast"],
+        "snapshot": terminal_snapshot,
+        "deliveries": deliveries,
+        "action": "broadcast.stop",
+        "serverTimeMs": server_time_ms,
+        "includeSource": True,
+    }
     _run_post_commit_push(
         "broadcast.stop",
         request_id,
-        lambda: _emit_strict_broadcast_to_participants(
-            updated,
-            "broadcast.stop",
-            "command",
-        ),
+        lambda: _emit_r18_broadcast_projection(mutation),
     )
-    return updated
+    return terminal["broadcast"]
 
 
 def _update_strict_broadcast_state(broadcast, current_client, **changes):
@@ -6276,6 +6441,50 @@ def _handle_broadcast_stop(current_user_name, current_client, payload, request_i
     return updated
 
 
+def _strict_terminal_drain_allowed(
+    user_name,
+    current_client,
+    action,
+    payload,
+):
+    if action not in {"broadcast.status", "broadcast.feedback"}:
+        return False
+    persisted = getPersistentBroadcastState(payload.get("broadcastId"))
+    if persisted is not None:
+        snapshot = persisted["snapshot"]
+        if (
+            persisted["userName"] != user_name
+            or persisted["playbackContextId"]
+            != payload.get("playbackContextId")
+            or snapshot["lifecycleState"] != "stopped"
+        ):
+            return False
+        client_id = current_client.get("clientId")
+        if action == "broadcast.status":
+            return client_id in {
+                snapshot["ownerClientId"],
+                snapshot["authorityClientId"],
+                *snapshot["participants"],
+            }
+        return any(
+            participant["clientId"] == client_id
+            and participant["deviceSessionId"]
+            == current_client.get("deviceSessionId")
+            and participant["restorePending"]
+            for participant in persisted.get("participantStates", ())
+        )
+    return any(
+        recovery["broadcastId"] == payload.get("broadcastId")
+        and recovery["playbackContextId"]
+        == payload.get("playbackContextId")
+        for recovery in listTerminalRecoveries(
+            user_name,
+            current_client.get("clientId"),
+            current_client.get("deviceSessionId"),
+        )
+    )
+
+
 def _handle_broadcast_action(current_user_name, current_client, action, payload, request_id):
     strict_v2 = _is_strict_playback_context_v2(current_client)
     if action == "broadcast.feedback" and not strict_v2:
@@ -6283,7 +6492,15 @@ def _handle_broadcast_action(current_user_name, current_client, action, payload,
             "broadcast.feedback requires strict-v2 Broadcast"
         )
     if strict_v2:
-        if not _client_supports(current_client, CAPABILITY_SUPPORTS_BROADCAST):
+        if (
+            not _client_supports(current_client, CAPABILITY_SUPPORTS_BROADCAST)
+            and not _strict_terminal_drain_allowed(
+                current_user_name,
+                current_client,
+                action,
+                payload,
+            )
+        ):
             raise CapabilityRequiredError("strict-v2 client does not support Broadcast")
         _reject_session_id_for_strict_v2(payload, strict_v2=True)
         if action != "broadcast.start" and not payload.get("playbackContextId"):
@@ -7314,6 +7531,10 @@ def _control_watchdog_sweep_later(generation: int) -> None:
                 _emit_r18_broadcast_projection(terminal_broadcast)
         except Exception:
             logger.exception("Strict Broadcast source timeout sweep failed")
+        try:
+            compactExpiredBroadcastStates()
+        except Exception:
+            logger.exception("Strict Broadcast terminal compaction failed")
 
 
 def _control_settled_payload(transaction, playback_context):
@@ -9392,9 +9613,12 @@ class EmoNamespace(Namespace):
     def on_disconnect(self):
         session_info, client_info = state.unregister_session(request.sid)
         if session_info is not None and session_info.get("connectionNonce"):
-            strict_request_cache.clear_connection(session_info["connectionNonce"])
-            state.clear_strict_feedback_connection(session_info["connectionNonce"])
-            strict_v2_safety.clear_connection(session_info["connectionNonce"])
+            connection_nonce = session_info["connectionNonce"]
+            strict_request_cache.clear_connection(connection_nonce)
+            state.clear_strict_feedback_connection(connection_nonce)
+            strict_v2_safety.clear_connection(connection_nonce)
+            with _source_terminal_replay_lock:
+                _source_terminal_replays.pop(connection_nonce, None)
         _log_socket_access("disconnect")
         _log_emo_event(logging.INFO, "socket_disconnect", sid=request.sid)
         if client_info is not None:
@@ -9687,6 +9911,7 @@ class EmoNamespace(Namespace):
                 )
                 current_client = _register_device(request.sid, current_user_name, payload)
                 broadcast_participant_replay = None
+                broadcast_source_terminal_replays = []
                 if previous_client is not None:
                     _settle_authority_connection_controls_unknown(
                         previous_client.get("userName"),
@@ -9700,6 +9925,11 @@ class EmoNamespace(Namespace):
                     )
                     broadcast_participant_replay = (
                         _prepare_strict_broadcast_participant_registration(
+                            current_client
+                        )
+                    )
+                    broadcast_source_terminal_replays = (
+                        _prepare_strict_broadcast_source_terminal_registration(
                             current_client
                         )
                     )
@@ -9733,6 +9963,13 @@ class EmoNamespace(Namespace):
                     request_id,
                     lambda: _emit_strict_broadcast_participant_registration(
                         broadcast_participant_replay
+                    ),
+                )
+                _run_post_commit_push(
+                    "broadcast.stop",
+                    request_id,
+                    lambda: _emit_strict_broadcast_source_terminal_registration(
+                        broadcast_source_terminal_replays
                     ),
                 )
                 if previous_sid is not None and previous_sid != request.sid:

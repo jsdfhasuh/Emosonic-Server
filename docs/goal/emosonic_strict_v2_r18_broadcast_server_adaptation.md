@@ -1,6 +1,6 @@
 # Goal: EmoSonic strict-v2 2.8.0 / r18 群播服务端落地
 
-> 状态：In progress（Goal 0—7、Goal 9 已完成；Goal 8 compact 依赖与 Goal 10—11 待完成）
+> 状态：In progress（Goal 0—10 已完成；Goal 11 待完成）
 >
 > 制定日期：2026-07-23
 >
@@ -781,7 +781,7 @@ restoreCompleted、清除 restorePending 并释放 pair fence。feedback、deadl
 BroadcastSnapshot、source Context、Broadcast/source cursors；三数据库 base schema 和 20260727 migration
 已同步。Goal 7 回归共 376 项通过、2 项按数据库环境跳过，`supportsBroadcast` 继续保持 false。
 
-### Goal 8：rejection、resync 和 ordinary 重连
+### Goal 8：rejection、resync 和 ordinary 重连（已完成）
 
 改动：
 
@@ -801,7 +801,7 @@ BroadcastSnapshot、source Context、Broadcast/source cursors；三数据库 bas
 - 其他 participants/source/controller 不收到 ordinary resync；
 - status 读取不能代替新 execution delivery。
 
-阶段记录（2026-07-26）：已实现 `revision_expired|revision_unknown|revision_ahead` 的
+完成记录（2026-07-26）：已实现 `revision_expired|revision_unknown|revision_ahead` 的
 `broadcast.feedback.rejected`，rejection 与 replacement delivery 在同一事务结算；相同
 clientSeq/content 重放首次 rejected event 和首次 deliveryId，不创建第二个 attempt，旧 deliveryId 只
 返回 conflict 且不能关闭新 deadline。active 的 playing/paused/stopped 均只向请求 pair 创建带新
@@ -809,8 +809,8 @@ effective-at 的 `broadcast.resync`，waitingForSource 创建无计划时间的 
 `broadcast.stop`；Snapshot、broadcastRevision 和 source cursors 全部不变。ordinary 新物理连接在
 register ACK 后、普通 Context mutation 前收到单 pair resync，同一 nonce 重复 register 不创建 delivery；
 status 读取不触发投递。Broadcast/store/contract/Core 共 409 项通过，`supportsBroadcast` 继续保持
-false。Goal 10 建立 compact TerminalRecoveryRecord 后仍需补 `broadcast.restore` replacement，故本 Goal
-在该依赖完成前不标记完全完成。
+false。Goal 10 已补齐 compact `broadcast.restore` 注册补发、status recovery one-of、stale feedback
+rejection 后 replacement restore 和 applied feedback 原子释放，因此本 Goal 的 compact 依赖已闭合。
 
 ### Goal 9：source waiting/resume 和 30 秒 timeout（已完成）
 
@@ -841,7 +841,7 @@ ordinary 断线只改变在线状态，不改变 lifecycle。相同 source pair 
 共同 terminal primitive 提交 stop、restorePending 和 fence 释放；之后旧 broadcastId 不可复活。
 Broadcast/store/contract/Core 共 414 项通过，`supportsBroadcast` 继续保持 false。
 
-### Goal 10：terminal、7 天 retention、compact restore 和重启
+### Goal 10：terminal、7 天 retention、compact restore 和重启（已完成）
 
 改动：
 
@@ -862,6 +862,23 @@ Broadcast/store/contract/Core 共 414 项通过，`supportsBroadcast` 继续保�
 - 未确认 ordinary pair 始终存在 full 或 compact 恢复路径；
 - `supportsBroadcast:false` 时仍能完成已存在 terminal drain；
 - 服务重启不会遗留 active/waiting fence。
+
+完成记录（2026-07-26）：手工 stop、source idle、30 秒 source timeout 和服务启动恢复均使用同一
+持久化 terminal primitive，先原子提交唯一 stopped Snapshot/revision、ordinary terminal delivery、
+restorePending fence 以及长期 stop ACK，再发送 ACK/push；重复 stop 不增加 revision、不重复释放资源，
+也不向 source 发送 transport command。完整记录保留期内，未确认 ordinary pair 每次新物理连接生成新
+deliveryId 并补发 `broadcast.stop`，source pair 每个新连接收到一次不要求 feedback 的 lifecycle-only
+stop；首次发送失败后重连仍可收敛，且 terminal drain 不受本次 `supportsBroadcast:false` 影响。
+
+7 天压缩在单事务内先为全部未确认 ordinary pair 写 `TerminalRecoveryRecord`，再删除 full Snapshot、
+delivery 和 participant ledger；失败会整体回滚。compact 注册补发、status recovery one-of、过期 feedback
+rejection/replacement 和 applied feedback 清理已闭合。长期 intent outcome 新增内部冻结 source
+`clientId/deviceSessionId`，三数据库 base schema 与 `20260728` migration 已同步，使 full 状态删除后仍只
+允许 owner 或精确 source pair 幂等重放首次 stop ACK；ordinary 或复用 source clientId 的其他设备被拒绝。
+watchdog 已重建 feedback deadline、source disconnect timeout 和 terminal compaction sweep，真实
+`init_socketio()` 启动测试证明 active/waiting 只 terminal 一次且 source Context 不变。Broadcast/store/
+Context store/contract/schema migration/Core 聚焦回归 474 项通过、2 项按外部数据库环境跳过，其中包含
+terminal emit failure 收敛测试；`supportsBroadcast` 继续保持 false，等待 Goal 11 最终审计。
 
 ### Goal 11：readiness、清理旧 strict 分支和最终开放
 

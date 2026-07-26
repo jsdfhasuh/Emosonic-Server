@@ -263,6 +263,8 @@ class EmoBroadcastIntentOutcome(_Model):
     user_name = CharField(64)
     playback_context_id = CharField(128)
     owner_client_id = CharField(128)
+    authority_client_id = CharField(128, null=True)
+    authority_device_session_id = CharField(128, null=True)
     intent_id = CharField(128)
     request_fingerprint = CharField(64)
     broadcast_id = CharField(128)

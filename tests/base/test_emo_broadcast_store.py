@@ -18,7 +18,6 @@ from supysonic.emo.broadcast_store import (
     BroadcastResourceConflictError,
     commitBroadcastRevision,
     compactExpiredBroadcastStates,
-    confirmBroadcastRestore,
     createBroadcastRegistrationReplay,
     createBroadcastState,
     getBroadcastFenceForContext,
@@ -28,6 +27,7 @@ from supysonic.emo.broadcast_store import (
     listTerminalRecoveries,
     saveBroadcastFeedbackSettlement,
     settleBroadcastFeedback,
+    stopNonterminalBroadcastsForRestart,
     suspendBroadcastForAuthorityDisconnect,
     sweepBroadcastAuthorityDisconnectDeadlines,
     sweepBroadcastFeedbackDeadlines,
@@ -231,6 +231,15 @@ class EmoBroadcastStoreTestCase(unittest.TestCase):
         self.assertEqual({x.phase for x in db.EmoBroadcastFence.select()},
                          {"restorePending"})
 
+        full_replay = createBroadcastRegistrationReplay(
+            "alice", "participant-1", "device:participant-1",
+            "nonce-terminal-2", 31000,
+        )
+        self.assertEqual(full_replay["delivery"]["action"], "stop")
+        self.assertEqual(full_replay["delivery"]["broadcastRevision"], 3)
+        self.assertNotEqual(
+            full_replay["delivery"]["deliveryId"], "terminal-delivery")
+
         compactExpiredBroadcastStates(now_ms=9999999999999)
         self.assertIsNone(getBroadcastState("broadcast-1"))
         self.assertIsNotNone(getBroadcastIntentOutcome(
@@ -238,9 +247,52 @@ class EmoBroadcastStoreTestCase(unittest.TestCase):
         recovery = listTerminalRecoveries(
             "alice", "participant-1", "device:participant-1")
         self.assertEqual(recovery[0]["terminalBroadcastRevision"], 3)
-        self.assertTrue(confirmBroadcastRestore(
-            "broadcast-1", "alice", "participant-1",
-            "device:participant-1", 3, "terminal-delivery"))
+        compact_replay = createBroadcastRegistrationReplay(
+            "alice", "participant-1", "device:participant-1",
+            "nonce-terminal-3", 32000,
+            allow_nonterminal=False,
+        )
+        self.assertEqual(compact_replay["delivery"]["action"], "restore")
+        self.assertEqual(
+            compact_replay["delivery"]["payload"][
+                "terminalBroadcastRevision"
+            ],
+            3,
+        )
+        self.assertEqual(
+            compact_replay["delivery"]["payload"]["state"], "stopped")
+        stale_feedback = self._applied_feedback(
+            revision=3,
+            delivery_id="stale-compact-delivery",
+            state="stopped",
+            restoreCompleted=True,
+        )
+        rejected = settleBroadcastFeedback(
+            "alice", "context-source", "broadcast-1",
+            "participant-1", "device:participant-1",
+            "nonce-terminal-3", 1, stale_feedback,
+            "compact-rejected", 32500,
+        )
+        self.assertEqual(
+            rejected["canonicalResult"]["errorCode"],
+            "revision_unknown",
+        )
+        self.assertEqual(rejected["followUpDelivery"]["action"], "restore")
+        replacement_delivery_id = rejected["followUpDelivery"]["deliveryId"]
+        compact_feedback = self._applied_feedback(
+            revision=3,
+            delivery_id=replacement_delivery_id,
+            client_seq=2,
+            state="stopped",
+            restoreCompleted=True,
+        )
+        settled = settleBroadcastFeedback(
+            "alice", "context-source", "broadcast-1",
+            "participant-1", "device:participant-1",
+            "nonce-terminal-3", 1, compact_feedback,
+            "compact-feedback", 33000,
+        )
+        self.assertEqual(settled["action"], "broadcast.feedback")
         self.assertEqual(listTerminalRecoveries("alice"), [])
         self.assertEqual(db.EmoBroadcastFence.select().count(), 0)
 
@@ -603,6 +655,49 @@ class EmoBroadcastStoreTestCase(unittest.TestCase):
             sweepBroadcastAuthorityDisconnectDeadlines(43000),
             [],
         )
+
+    def test_restart_terminals_waiting_broadcast_once(self):
+        self._create()
+        suspendBroadcastForAuthorityDisconnect(
+            "alice",
+            "source-1",
+            "device:source-1",
+            12000,
+            42000,
+        )
+
+        stopped = stopNonterminalBroadcastsForRestart(13000)
+
+        self.assertEqual(stopped, ["broadcast-1"])
+        persisted = getBroadcastState("broadcast-1")
+        self.assertEqual(persisted["lifecycleState"], "stopped")
+        self.assertEqual(persisted["broadcastRevision"], 3)
+        self.assertTrue(persisted["participantStates"][0]["restorePending"])
+        self.assertEqual(stopNonterminalBroadcastsForRestart(14000), [])
+
+    def test_compaction_failure_preserves_full_terminal_record(self):
+        self._create()
+        terminalBroadcastState(
+            "broadcast-1",
+            self._snapshot(revision=2, lifecycle="stopped"),
+            {"stopped": True},
+            [self._delivery("terminal-delivery", 2, "stop")],
+            terminal_at_ms=10000,
+        )
+
+        with mock.patch.object(
+            db.EmoBroadcastTerminalRecovery,
+            "create",
+            side_effect=RuntimeError("compact recovery failure"),
+        ):
+            with self.assertRaises(RuntimeError):
+                compactExpiredBroadcastStates(now_ms=9999999999999)
+
+        persisted = getBroadcastState("broadcast-1")
+        self.assertIsNotNone(persisted)
+        self.assertEqual(persisted["lifecycleState"], "stopped")
+        self.assertTrue(persisted["participantStates"][0]["restorePending"])
+        self.assertEqual(listTerminalRecoveries("alice"), [])
 
     def test_feedback_settlement_failure_rolls_back_participant(self):
         self._create()

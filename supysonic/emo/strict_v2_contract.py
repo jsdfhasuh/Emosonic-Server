@@ -723,6 +723,7 @@ STRICT_OUTPUT_ACTIONS = {
     "broadcast.resync",
     "broadcast.waiting",
     "broadcast.resume",
+    "broadcast.restore",
     "broadcast.stop",
 }
 
@@ -766,6 +767,7 @@ _OUTPUT_ACTION_TYPES = {
     "broadcast.resync": "event",
     "broadcast.waiting": "event",
     "broadcast.resume": "event",
+    "broadcast.restore": "event",
     "broadcast.stop": "event",
 }
 
@@ -1266,11 +1268,18 @@ def _validate_broadcast_snapshot(
 def _validate_broadcast_status_ack(payload: Dict[str, object]) -> None:
     status = _output_object(
         payload,
-        {"action", "serverTimeMs", "broadcast", "participantStates"},
-        set(),
+        {"action", "serverTimeMs"},
+        {"broadcast", "participantStates", "recovery"},
         "broadcast.status ACK payload",
     )
     _output_int(status["serverTimeMs"], "broadcast.status ACK serverTimeMs")
+    if "recovery" in status:
+        if "broadcast" in status or "participantStates" in status:
+            _output_error("broadcast.status recovery must be a one-of")
+        _validate_broadcast_restore_output(status["recovery"])
+        return
+    if "broadcast" not in status or "participantStates" not in status:
+        _output_error("broadcast.status full fields are required")
     broadcast = _validate_broadcast_snapshot(
         status["broadcast"],
         "broadcast.status ACK payload.broadcast",
@@ -1663,6 +1672,74 @@ def _validate_broadcast_feedback_rejected_output(payload: object) -> None:
         rejected["serverUpdatedAtMs"],
         "broadcast.feedback.rejected serverUpdatedAtMs",
     )
+
+
+def _validate_broadcast_restore_output(payload: object) -> None:
+    restore = _output_object(
+        payload,
+        {
+            "playbackContextId",
+            "broadcastId",
+            "deviceSessionId",
+            "terminalBroadcastRevision",
+            "deliveryId",
+            "suspendedPlaybackContextId",
+            "suspendedEpoch",
+            "suspendedVersion",
+            "suspendedQueueRevision",
+            "suspendedControlVersion",
+            "suspendedAppliedControlVersion",
+            "lastAppliedBroadcastRevision",
+            "queueIndex",
+            "trackId",
+            "state",
+            "positionMs",
+            "playbackRate",
+            "terminalAtServerMs",
+        },
+        set(),
+        "broadcast.restore payload",
+    )
+    for field_name in (
+        "playbackContextId",
+        "broadcastId",
+        "deviceSessionId",
+        "deliveryId",
+        "suspendedPlaybackContextId",
+        "trackId",
+    ):
+        _output_string(restore[field_name], "broadcast.restore " + field_name)
+    for field_name in (
+        "terminalBroadcastRevision",
+        "suspendedEpoch",
+        "suspendedVersion",
+        "suspendedQueueRevision",
+        "suspendedControlVersion",
+    ):
+        _output_int(restore[field_name], "broadcast.restore " + field_name, 1)
+    _output_int(
+        restore["suspendedAppliedControlVersion"],
+        "broadcast.restore suspendedAppliedControlVersion",
+    )
+    _output_int(
+        restore["lastAppliedBroadcastRevision"],
+        "broadcast.restore lastAppliedBroadcastRevision",
+    )
+    _output_int(restore["queueIndex"], "broadcast.restore queueIndex")
+    _output_int(restore["positionMs"], "broadcast.restore positionMs")
+    _output_int(
+        restore["terminalAtServerMs"],
+        "broadcast.restore terminalAtServerMs",
+    )
+    if restore["state"] != "stopped":
+        _output_error("broadcast.restore state must be stopped")
+    rate = _output_number(
+        restore["playbackRate"],
+        "broadcast.restore playbackRate",
+        positive=True,
+    )
+    if rate < 0.5 or rate > 2.0:
+        _output_error("broadcast.restore playbackRate is invalid")
 
 
 def _validate_output_ack(payload: object) -> str:
@@ -2500,6 +2577,9 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
         return None
     if action == "broadcast.feedback.rejected":
         _validate_broadcast_feedback_rejected_output(payload)
+        return None
+    if action == "broadcast.restore":
+        _validate_broadcast_restore_output(payload)
         return None
     if action in {
         "broadcast.start",

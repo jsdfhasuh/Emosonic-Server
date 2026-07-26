@@ -275,6 +275,8 @@ def _serialize_intent_record(
         "userName": record.user_name,
         "playbackContextId": record.playback_context_id,
         "ownerClientId": record.owner_client_id,
+        "authorityClientId": record.authority_client_id,
+        "authorityDeviceSessionId": record.authority_device_session_id,
         "intentId": record.intent_id,
         "requestFingerprint": record.request_fingerprint,
         "broadcastId": record.broadcast_id,
@@ -820,6 +822,10 @@ def createBroadcastState(
                         user_name=user_name,
                         playback_context_id=playback_context_id,
                         owner_client_id=owner_client_id,
+                        authority_client_id=authority_client_id,
+                        authority_device_session_id=(
+                            authority_device_session_id
+                        ),
                         intent_id=intent_id,
                         request_fingerprint=request_fingerprint,
                         broadcast_id=broadcast_id,
@@ -1124,6 +1130,32 @@ def getBroadcastIntentOutcome(
         close_connection()
 
 
+def getBroadcastStopOutcome(
+    user_name: str,
+    playback_context_id: str,
+    broadcast_id: str,
+) -> Optional[Dict[str, object]]:
+    open_connection(reuse=True)
+    try:
+        record = EmoBroadcastIntentOutcome.get_or_none(
+            (EmoBroadcastIntentOutcome.user_name == user_name)
+            & (
+                EmoBroadcastIntentOutcome.playback_context_id
+                == playback_context_id
+            )
+            & (EmoBroadcastIntentOutcome.broadcast_id == broadcast_id)
+        )
+        if (
+            record is None
+            or record.terminal_broadcast_revision is None
+            or record.stop_ack_json is None
+        ):
+            return None
+        return _serialize_intent_record(record)
+    finally:
+        close_connection()
+
+
 def _prune_revision_ledger(
     broadcast_id: str,
     current_revision: int,
@@ -1352,6 +1384,10 @@ def terminalBroadcastStateInTransaction(
     record.save()
     intent.terminal_broadcast_revision = next_revision
     intent.stop_ack_json = _canonical_json(stop_ack)
+    intent.authority_client_id = record.authority_client_id
+    intent.authority_device_session_id = (
+        record.authority_device_session_id
+    )
     intent.updated_at = now()
     intent.save()
     return {
@@ -1567,11 +1603,233 @@ def _feedback_settlement_result(
         )
         if delivery is not None:
             follow_up = _serialize_delivery_record(delivery)
+        else:
+            recovery = EmoBroadcastTerminalRecovery.get_or_none(
+                (
+                    EmoBroadcastTerminalRecovery.broadcast_id
+                    == settlement.broadcast_id
+                )
+                & (
+                    EmoBroadcastTerminalRecovery.client_id
+                    == settlement.client_id
+                )
+                & (
+                    EmoBroadcastTerminalRecovery.device_session_id
+                    == settlement.device_session_id
+                )
+                & (
+                    EmoBroadcastTerminalRecovery.current_delivery_id
+                    == settlement.follow_up_delivery_id
+                )
+            )
+            if recovery is not None:
+                follow_up = _serialize_compact_recovery_delivery(
+                    recovery,
+                    settlement.follow_up_delivery_id,
+                    settlement.connection_nonce,
+                    settlement.created_at_ms,
+                )
     return {
         "created": False,
         "action": action,
         "canonicalResult": canonical,
         "followUpDelivery": follow_up,
+    }
+
+
+def _serialize_compact_recovery_delivery(
+    recovery: EmoBroadcastTerminalRecovery,
+    delivery_id: str,
+    connection_nonce: str,
+    created_at_ms: int,
+) -> Dict[str, object]:
+    return {
+        "deliveryId": delivery_id,
+        "broadcastId": recovery.broadcast_id,
+        "broadcastRevision": recovery.terminal_broadcast_revision,
+        "clientId": recovery.client_id,
+        "deviceSessionId": recovery.device_session_id,
+        "action": "restore",
+        "payload": {
+            "playbackContextId": recovery.playback_context_id,
+            "broadcastId": recovery.broadcast_id,
+            "deviceSessionId": recovery.device_session_id,
+            "terminalBroadcastRevision": recovery.terminal_broadcast_revision,
+            "deliveryId": delivery_id,
+            "suspendedPlaybackContextId": (
+                recovery.suspended_playback_context_id
+            ),
+            "suspendedEpoch": recovery.suspended_epoch,
+            "suspendedVersion": recovery.suspended_version,
+            "suspendedQueueRevision": recovery.suspended_queue_revision,
+            "suspendedControlVersion": recovery.suspended_control_version,
+            "suspendedAppliedControlVersion": (
+                recovery.suspended_applied_control_version
+            ),
+            "lastAppliedBroadcastRevision": (
+                recovery.last_applied_broadcast_revision or 0
+            ),
+            "queueIndex": recovery.terminal_queue_index,
+            "trackId": recovery.terminal_track_id,
+            "state": "stopped",
+            "positionMs": recovery.terminal_position_ms,
+            "playbackRate": recovery.terminal_playback_rate,
+            "terminalAtServerMs": recovery.terminal_at_server_ms,
+        },
+        "connectionNonce": connection_nonce,
+        "isCurrent": True,
+        "deliveryStatus": "pending",
+        "createdAtMs": created_at_ms,
+    }
+
+
+def _settle_compact_broadcast_feedback(
+    recovery: EmoBroadcastTerminalRecovery,
+    payload: Dict[str, object],
+    request_fingerprint: str,
+    connection_nonce: str,
+    connection_epoch: int,
+    server_time_ms: int,
+    track_duration_ms: Optional[int],
+) -> Dict[str, object]:
+    execution_status = str(payload["executionStatus"])
+    revision = int(
+        payload[
+            "appliedBroadcastRevision"
+            if execution_status == "applied"
+            else "failedBroadcastRevision"
+        ]
+    )
+    expected_revision = int(recovery.terminal_broadcast_revision)
+    client_seq = int(payload["clientSeq"])
+    if (
+        revision != expected_revision
+        or payload["deliveryId"] != recovery.current_delivery_id
+    ):
+        if revision > expected_revision:
+            error_code = "revision_ahead"
+        elif revision < expected_revision:
+            error_code = "revision_expired"
+        else:
+            error_code = "revision_unknown"
+        rejection = {
+            "playbackContextId": recovery.playback_context_id,
+            "broadcastId": recovery.broadcast_id,
+            "deviceSessionId": recovery.device_session_id,
+            "clientSeq": client_seq,
+            "deliveryId": payload["deliveryId"],
+            "rejectedBroadcastRevision": revision,
+            "currentBroadcastRevision": expected_revision,
+            "minimumRetainedBroadcastRevision": expected_revision,
+            "errorCode": error_code,
+            "serverUpdatedAtMs": server_time_ms,
+        }
+        delivery_id = "delivery:%s" % uuid.uuid4()
+        recovery.current_delivery_id = delivery_id
+        recovery.updated_at = now()
+        recovery.save()
+        settlement = EmoBroadcastFeedbackSettlement.create(
+            playback_context_id=recovery.playback_context_id,
+            broadcast_id=recovery.broadcast_id,
+            client_id=recovery.client_id,
+            device_session_id=recovery.device_session_id,
+            connection_nonce=connection_nonce,
+            connection_epoch=connection_epoch,
+            client_seq=client_seq,
+            request_fingerprint=request_fingerprint,
+            canonical_result_json=_canonical_json(
+                {
+                    "action": "broadcast.feedback.rejected",
+                    "payload": rejection,
+                }
+            ),
+            follow_up_delivery_id=delivery_id,
+            created_at_ms=server_time_ms,
+        )
+        result = _feedback_settlement_result(settlement)
+        result["created"] = True
+        return result
+    last_applied = recovery.last_applied_broadcast_revision or 0
+    if execution_status == "applied":
+        if (
+            payload["queueIndex"] != recovery.terminal_queue_index
+            or payload["trackId"] != recovery.terminal_track_id
+            or payload["playbackRate"]
+            != recovery.terminal_playback_rate
+            or payload["state"] != "stopped"
+            or payload.get("restoreCompleted") is not True
+        ):
+            raise BroadcastResourceConflictError(
+                "Compact terminal feedback does not match recovery target"
+            )
+        if (
+            track_duration_ms is not None
+            and payload["positionMs"] > track_duration_ms
+        ):
+            raise ValueError(
+                "Broadcast feedback positionMs exceeds media duration"
+            )
+    elif payload["lastAppliedBroadcastRevision"] != last_applied:
+        raise BroadcastRevisionConflictError(last_applied)
+    canonical = {
+        "playbackContextId": recovery.playback_context_id,
+        "broadcastId": recovery.broadcast_id,
+        "sourceClientId": recovery.client_id,
+        "deviceSessionId": recovery.device_session_id,
+        "deliveryId": payload["deliveryId"],
+        "executionStatus": execution_status,
+        "clientSeq": client_seq,
+        "serverUpdatedAtMs": server_time_ms,
+    }
+    fields = (
+        (
+            "appliedBroadcastRevision",
+            "queueIndex",
+            "trackId",
+            "state",
+            "positionMs",
+            "playbackRate",
+            "restoreCompleted",
+        )
+        if execution_status == "applied"
+        else (
+            "failedBroadcastRevision",
+            "lastAppliedBroadcastRevision",
+            "errorCode",
+            "errorMessage",
+        )
+    )
+    for field_name in fields:
+        if field_name in payload:
+            canonical[field_name] = payload[field_name]
+    EmoBroadcastFeedbackSettlement.create(
+        playback_context_id=recovery.playback_context_id,
+        broadcast_id=recovery.broadcast_id,
+        client_id=recovery.client_id,
+        device_session_id=recovery.device_session_id,
+        connection_nonce=connection_nonce,
+        connection_epoch=connection_epoch,
+        client_seq=client_seq,
+        request_fingerprint=request_fingerprint,
+        canonical_result_json=_canonical_json(canonical),
+        created_at_ms=server_time_ms,
+    )
+    if execution_status == "applied":
+        EmoBroadcastFence.delete().where(
+            (EmoBroadcastFence.broadcast_id == recovery.broadcast_id)
+            & (EmoBroadcastFence.role == "ordinary")
+            & (EmoBroadcastFence.client_id == recovery.client_id)
+            & (
+                EmoBroadcastFence.device_session_id
+                == recovery.device_session_id
+            )
+        ).execute()
+        recovery.delete_instance()
+    return {
+        "created": True,
+        "action": "broadcast.feedback",
+        "canonicalResult": canonical,
+        "followUpDelivery": None,
     }
 
 
@@ -1640,7 +1898,39 @@ def settleBroadcastFeedback(
                     EmoBroadcast.broadcast_id == broadcast_id
                 )
                 if broadcast is None:
-                    raise BroadcastNotFoundError(broadcast_id)
+                    recovery = EmoBroadcastTerminalRecovery.get_or_none(
+                        (
+                            EmoBroadcastTerminalRecovery.broadcast_id
+                            == broadcast_id
+                        )
+                        & (
+                            EmoBroadcastTerminalRecovery.user_name
+                            == user_name
+                        )
+                        & (
+                            EmoBroadcastTerminalRecovery.client_id
+                            == client_id
+                        )
+                        & (
+                            EmoBroadcastTerminalRecovery.device_session_id
+                            == device_session_id
+                        )
+                    )
+                    if recovery is None:
+                        raise BroadcastNotFoundError(broadcast_id)
+                    if recovery.playback_context_id != playback_context_id:
+                        raise BroadcastResourceConflictError(
+                            "Broadcast feedback context does not match"
+                        )
+                    return _settle_compact_broadcast_feedback(
+                        recovery,
+                        payload,
+                        request_fingerprint,
+                        connection_nonce,
+                        connection_epoch,
+                        server_time_ms,
+                        track_duration_ms,
+                    )
                 if (
                     broadcast.user_name != user_name
                     or broadcast.playback_context_id
@@ -1950,6 +2240,7 @@ def createBroadcastRegistrationReplay(
     device_session_id: str,
     connection_nonce: str,
     server_time_ms: int,
+    allow_nonterminal: bool = True,
 ) -> Optional[Dict[str, object]]:
     open_connection(reuse=True)
     try:
@@ -1970,15 +2261,110 @@ def createBroadcastRegistrationReplay(
             broadcast = EmoBroadcast.get_or_none(
                 EmoBroadcast.broadcast_id == participant.broadcast_id
             )
+            if broadcast is None:
+                continue
             if (
-                broadcast is not None
+                broadcast.lifecycle_state == "stopped"
+                and participant.restore_pending == 1
+                and participant.terminal_confirmed == 0
+            ) or (
+                allow_nonterminal
                 and broadcast.lifecycle_state
                 in {"active", "waitingForSource"}
             ):
                 candidate_id = participant.broadcast_id
                 break
         if candidate_id is None:
-            return None
+            recovery = EmoBroadcastTerminalRecovery.get_or_none(
+                (EmoBroadcastTerminalRecovery.user_name == user_name)
+                & (EmoBroadcastTerminalRecovery.client_id == client_id)
+                & (
+                    EmoBroadcastTerminalRecovery.device_session_id
+                    == device_session_id
+                )
+            )
+            if recovery is None:
+                return None
+            resource_key = broadcastPairResourceKey(
+                user_name,
+                client_id,
+                device_session_id,
+            )
+            with strictAuthorityPairLockSet(
+                ((user_name, client_id, device_session_id),)
+            ), broadcastResourceLock((resource_key,)):
+                with broadcastTransaction():
+                    recovery = EmoBroadcastTerminalRecovery.get_or_none(
+                        (EmoBroadcastTerminalRecovery.user_name == user_name)
+                        & (EmoBroadcastTerminalRecovery.client_id == client_id)
+                        & (
+                            EmoBroadcastTerminalRecovery.device_session_id
+                            == device_session_id
+                        )
+                    )
+                    if recovery is None:
+                        return None
+                    delivery_id = "delivery:%s" % uuid.uuid4()
+                    recovery.current_delivery_id = delivery_id
+                    recovery.updated_at = now()
+                    recovery.save()
+                    return {
+                        "created": True,
+                        "broadcast": None,
+                        "delivery": {
+                            "deliveryId": delivery_id,
+                            "broadcastId": recovery.broadcast_id,
+                            "broadcastRevision": (
+                                recovery.terminal_broadcast_revision
+                            ),
+                            "clientId": client_id,
+                            "deviceSessionId": device_session_id,
+                            "action": "restore",
+                            "payload": {
+                                "playbackContextId": (
+                                    recovery.playback_context_id
+                                ),
+                                "broadcastId": recovery.broadcast_id,
+                                "deviceSessionId": device_session_id,
+                                "terminalBroadcastRevision": (
+                                    recovery.terminal_broadcast_revision
+                                ),
+                                "deliveryId": delivery_id,
+                                "suspendedPlaybackContextId": (
+                                    recovery.suspended_playback_context_id
+                                ),
+                                "suspendedEpoch": recovery.suspended_epoch,
+                                "suspendedVersion": recovery.suspended_version,
+                                "suspendedQueueRevision": (
+                                    recovery.suspended_queue_revision
+                                ),
+                                "suspendedControlVersion": (
+                                    recovery.suspended_control_version
+                                ),
+                                "suspendedAppliedControlVersion": (
+                                    recovery.suspended_applied_control_version
+                                ),
+                                "lastAppliedBroadcastRevision": (
+                                    recovery.last_applied_broadcast_revision
+                                    or 0
+                                ),
+                                "queueIndex": recovery.terminal_queue_index,
+                                "trackId": recovery.terminal_track_id,
+                                "state": "stopped",
+                                "positionMs": recovery.terminal_position_ms,
+                                "playbackRate": (
+                                    recovery.terminal_playback_rate
+                                ),
+                                "terminalAtServerMs": (
+                                    recovery.terminal_at_server_ms
+                                ),
+                            },
+                            "connectionNonce": connection_nonce,
+                            "isCurrent": True,
+                            "deliveryStatus": "pending",
+                            "createdAtMs": server_time_ms,
+                        },
+                    }
         with broadcastMutationLock(candidate_id):
             with broadcastTransaction():
                 broadcast = EmoBroadcast.get_or_none(
@@ -1995,8 +2381,18 @@ def createBroadcastRegistrationReplay(
                     broadcast is None
                     or participant is None
                     or broadcast.user_name != user_name
-                    or broadcast.lifecycle_state
-                    not in {"active", "waitingForSource"}
+                    or (
+                        broadcast.lifecycle_state == "stopped"
+                        and (
+                            participant.restore_pending != 1
+                            or participant.terminal_confirmed == 1
+                        )
+                    )
+                    or (
+                        broadcast.lifecycle_state
+                        in {"active", "waitingForSource"}
+                        and not allow_nonterminal
+                    )
                 ):
                     return None
                 current = EmoBroadcastDelivery.get_or_none(
@@ -2236,6 +2632,79 @@ def sweepBroadcastAuthorityDisconnectDeadlines(
         finally:
             close_connection()
     return terminal_mutations
+
+
+def stopNonterminalBroadcastsForRestart(
+    now_ms: Optional[int] = None,
+) -> List[str]:
+    stopped_at_ms = int(
+        now_ms if now_ms is not None else time.time() * 1000
+    )
+    open_connection(reuse=True)
+    try:
+        candidate_ids = [
+            item.broadcast_id
+            for item in EmoBroadcast.select(
+                EmoBroadcast.broadcast_id
+            ).where(EmoBroadcast.lifecycle_state != "stopped")
+        ]
+    finally:
+        close_connection()
+    stopped = []
+    for broadcast_id in candidate_ids:
+        open_connection(reuse=True)
+        try:
+            with broadcastMutationLock(broadcast_id):
+                with broadcastTransaction():
+                    record = EmoBroadcast.get_or_none(
+                        EmoBroadcast.broadcast_id == broadcast_id
+                    )
+                    if record is None or record.lifecycle_state == "stopped":
+                        continue
+                    previous = _load_json(record.snapshot_json, {})
+                    snapshot = dict(previous)
+                    snapshot.update(
+                        {
+                            "lifecycleState": "stopped",
+                            "broadcastRevision": int(record.broadcast_revision) + 1,
+                            "serverUpdatedAtMs": stopped_at_ms,
+                        }
+                    )
+                    deliveries = []
+                    for participant in EmoBroadcastParticipant.select().where(
+                        EmoBroadcastParticipant.broadcast_id == broadcast_id
+                    ):
+                        delivery_id = "delivery:%s" % uuid.uuid4()
+                        deliveries.append(
+                            {
+                                "deliveryId": delivery_id,
+                                "clientId": participant.client_id,
+                                "deviceSessionId": participant.device_session_id,
+                                "action": "stop",
+                                "deliveryPositionMs": snapshot["positionMs"],
+                                "feedbackDeadlineAtServerMs": stopped_at_ms + 8000,
+                                "payload": dict(
+                                    snapshot,
+                                    deliveryId=delivery_id,
+                                ),
+                                "connectionNonce": None,
+                                "createdAtMs": stopped_at_ms,
+                            }
+                        )
+                    terminalBroadcastStateInTransaction(
+                        broadcast_id,
+                        snapshot,
+                        {},
+                        terminal_deliveries=deliveries,
+                        expected_broadcast_revision=int(
+                            record.broadcast_revision
+                        ),
+                        terminal_at_ms=stopped_at_ms,
+                    )
+                    stopped.append(broadcast_id)
+        finally:
+            close_connection()
+    return stopped
 
 
 def sweepBroadcastFeedbackDeadlines(
@@ -2528,6 +2997,16 @@ def compactExpiredBroadcastStates(
                                 setattr(existing_recovery, key, value)
                             existing_recovery.updated_at = now()
                             existing_recovery.save()
+                    intent = EmoBroadcastIntentOutcome.get(
+                        EmoBroadcastIntentOutcome.broadcast_id
+                        == record.broadcast_id
+                    )
+                    intent.authority_client_id = record.authority_client_id
+                    intent.authority_device_session_id = (
+                        record.authority_device_session_id
+                    )
+                    intent.updated_at = now()
+                    intent.save()
                     EmoBroadcastDelivery.delete().where(
                         EmoBroadcastDelivery.broadcast_id == record.broadcast_id
                     ).execute()
@@ -2605,5 +3084,26 @@ def listTerminalRecoveries(
                 EmoBroadcastTerminalRecovery.terminal_at_server_ms
             )
         ]
+    finally:
+        close_connection()
+
+
+def listFullTerminalBroadcastsForSource(
+    user_name: str,
+    client_id: str,
+    device_session_id: str,
+) -> List[Dict[str, object]]:
+    open_connection(reuse=True)
+    try:
+        records = EmoBroadcast.select().where(
+            (EmoBroadcast.user_name == user_name)
+            & (EmoBroadcast.authority_client_id == client_id)
+            & (
+                EmoBroadcast.authority_device_session_id
+                == device_session_id
+            )
+            & (EmoBroadcast.lifecycle_state == "stopped")
+        )
+        return [_serialize_broadcast_record(record) for record in records]
     finally:
         close_connection()

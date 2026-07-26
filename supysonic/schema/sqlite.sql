@@ -589,6 +589,8 @@ CREATE TABLE IF NOT EXISTS emo_broadcast_intent_outcome (
     user_name VARCHAR(64) NOT NULL,
     playback_context_id VARCHAR(128) NOT NULL,
     owner_client_id VARCHAR(128) NOT NULL,
+    authority_client_id VARCHAR(128),
+    authority_device_session_id VARCHAR(128),
     intent_id VARCHAR(128) NOT NULL,
     request_fingerprint VARCHAR(64) NOT NULL,
     broadcast_id VARCHAR(128) NOT NULL,
