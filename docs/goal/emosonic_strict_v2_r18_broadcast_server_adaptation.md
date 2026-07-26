@@ -584,7 +584,7 @@ failed、timedOut 和非法 feedback 均不得清除 restorePending。
 实施阶段及目标测试模块的追踪表见
 `docs/verification/emosonic_strict_v2_r18_requirement_mapping.md`，后续 Goal 完成时继续填写实际测试方法。
 
-### Goal 1：2.8 Core schema 和 metadata
+### Goal 1：2.8 Core schema 和 metadata（已完成）
 
 改动：
 
@@ -602,6 +602,12 @@ failed、timedOut 和非法 feedback 均不得清除 restorePending。
 - schemaHash 缺失、变化、空值、类型或格式异常都不影响注册；
 - protocolVersion/capabilities 是唯一协商依据；
 - 2.8 Core request/output schema 全部闭合。
+
+完成记录（2026-07-26）：runtime/descriptor/Web strict client 已升级到 `2.8.0` 和固定 10 capability
+shape；`schemaHash` 缺失、空值、类型或格式变化不再阻断注册；`effectiveAtPlayback` 已与
+`playbackPrepare` 解耦；pong、queue position sample、playback position sample/rate 的请求、持久化和
+输出路径已闭合。`supportsBroadcast` 继续由独立实现门禁强制为 false。Python Core/Socket/store/Web
+回归及 20 项 JS strict client 测试通过。
 
 ### Goal 2：持久化模型和 store primitives
 

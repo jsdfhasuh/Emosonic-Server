@@ -5,8 +5,8 @@
 
 | REQ | 实施 Goal | 主要目标测试 | 状态 |
 | --- | --- | --- | --- |
-| REQ-001—REQ-009 | Goal 1 | `test_emo_strict_v2_contract`, `test_emo_protocol_metadata` | Planned |
-| REQ-010—REQ-014 | Goal 1, Goal 3 | `test_emo_strict_v2_contract`, Core Socket tests | Planned |
+| REQ-001—REQ-009 | Goal 1 | `test_emo_strict_v2_contract`, `test_emo_protocol_metadata`, Core Socket and JS client tests | Verified |
+| REQ-010—REQ-014 | Goal 1, Goal 3 | `test_emo_strict_v2_contract`, Core Socket tests | In progress |
 | REQ-015—REQ-022 | Goal 2, Goal 11 | readiness, persistence and overload tests | Planned |
 | REQ-023—REQ-038 | Goal 1, Goal 3, Goal 5, Goal 6 | Core Context, control and handoff tests | Planned |
 | REQ-039 | Goal 2, Goal 4, Goal 6 | source projection/store/Socket tests | Planned |

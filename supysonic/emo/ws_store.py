@@ -686,6 +686,8 @@ def _strict_playback_update_canonical(
         "appliedControlVersion": applied_control_version,
         "state": payload["state"],
         "positionMs": payload["positionMs"],
+        "positionSampledAtServerMs": payload["positionSampledAtServerMs"],
+        "playbackRate": payload["playbackRate"],
         "clientSeq": client_seq,
         "serverUpdatedAtMs": server_updated_at_ms,
     }
@@ -767,6 +769,10 @@ def _passive_correction_from_device(record, device_state):
         "appliedControlVersion": device_state.applied_control_version,
         "state": device_state.state,
         "positionMs": device_state.position_ms,
+        "positionSampledAtServerMs": persisted[
+            "positionSampledAtServerMs"
+        ],
+        "playbackRate": persisted["playbackRate"],
         "clientSeq": device_state.client_seq,
         "serverUpdatedAtMs": persisted["serverUpdatedAtMs"],
     }
@@ -786,6 +792,9 @@ def applyStrictPlaybackUpdate(
     payload,
     server_updated_at_ms,
 ):
+    payload = dict(payload)
+    payload.setdefault("positionSampledAtServerMs", 0)
+    payload.setdefault("playbackRate", 1.0)
     request_payload = dict(payload)
     request_fingerprint = _json_fingerprint(request_payload)
     open_connection(reuse=True)
@@ -824,6 +833,10 @@ def applyStrictPlaybackUpdate(
             )
             current_client_seq = existing.client_seq if same_scope else 0
             incoming_client_seq = payload["clientSeq"]
+            if payload["positionSampledAtServerMs"] > server_updated_at_ms + 1000:
+                raise ValueError(
+                    "positionSampledAtServerMs is too far in the future"
+                )
             if incoming_client_seq < current_client_seq:
                 raise PlaybackClientSequenceConflictError(current_client_seq)
             if incoming_client_seq == current_client_seq and current_client_seq > 0:
@@ -1647,6 +1660,11 @@ def serializeDevicePlaybackStateV2(device_state):
         "deviceSessionId": device_state.get("deviceSessionId"),
         "state": device_state.get("state"),
         "positionMs": device_state.get("positionMs", 0),
+        "positionSampledAtServerMs": device_state.get(
+            "positionSampledAtServerMs",
+            device_state.get("serverUpdatedAtMs"),
+        ),
+        "playbackRate": device_state.get("playbackRate", 1.0),
         "appliedControlVersion": device_state.get("appliedControlVersion"),
         "clientSeq": device_state.get("clientSeq"),
         "serverUpdatedAtMs": device_state.get("serverUpdatedAtMs"),
@@ -2388,6 +2406,7 @@ def mutateStrictPlaybackContextQueue(
     position_ms,
     base_queue_revision,
     base_control_version=None,
+    position_sampled_at_server_ms=None,
 ):
     queue_song_ids = list(queue_song_ids)
     open_connection(reuse=True)
@@ -2439,6 +2458,20 @@ def mutateStrictPlaybackContextQueue(
             record.current_index = next_index or 0
             record.track_id = next_track
             record.position_ms = position_ms
+            if position_sampled_at_server_ms is None:
+                position_sampled_at_server_ms = int(now().timestamp() * 1000)
+            playback_json = (
+                json.loads(record.playback_json)
+                if record.playback_json
+                else {}
+            )
+            playback_json["positionSampledAtServerMs"] = (
+                position_sampled_at_server_ms
+            )
+            record.playback_json = json.dumps(
+                playback_json,
+                ensure_ascii=True,
+            )
             if not queue_song_ids:
                 record.state = "idle"
                 record.position_ms = 0
@@ -3420,6 +3453,11 @@ def _device_playback_state_payload(record):
         }
     )
     payload.setdefault("serverUpdatedAtMs", int(record.updated_at.timestamp() * 1000))
+    payload.setdefault(
+        "positionSampledAtServerMs",
+        payload["serverUpdatedAtMs"],
+    )
+    payload.setdefault("playbackRate", 1.0)
     return payload
 
 

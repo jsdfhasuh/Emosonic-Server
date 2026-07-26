@@ -8,7 +8,7 @@
 }(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  const BASE_CAPABILITY_NAMES = Object.freeze([
+  const CAPABILITY_NAMES = Object.freeze([
     'playbackContextV2',
     'playbackPrepare',
     'effectiveAtPlayback',
@@ -18,11 +18,7 @@
     'canSetVolume',
     'supportsFollow',
     'supportsBroadcast',
-  ]);
-  const OPTIONAL_CAPABILITY_NAMES = Object.freeze(['remoteVolumeControl']);
-  const CAPABILITY_NAMES = Object.freeze([
-    ...BASE_CAPABILITY_NAMES,
-    ...OPTIONAL_CAPABILITY_NAMES,
+    'remoteVolumeControl',
   ]);
 
   const ACTION_TYPES = Object.freeze({
@@ -156,14 +152,12 @@
     return `${action}-${Date.now()}-${uuid()}`;
   }
 
-  function requireClosedCapabilities(value, label, includeExtensions) {
+  function requireClosedCapabilities(value, label) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       throw new StrictProtocolError(`${label} must be an object`);
     }
     const fields = Object.keys(value).sort();
-    const expected = (includeExtensions ? CAPABILITY_NAMES : BASE_CAPABILITY_NAMES)
-      .slice()
-      .sort();
+    const expected = CAPABILITY_NAMES.slice().sort();
     if (fields.length !== expected.length || fields.some((field, index) => field !== expected[index])) {
       throw new StrictProtocolError(`${label} must contain exactly the strict-v2 capabilities`);
     }
@@ -172,9 +166,6 @@
         throw new StrictProtocolError(`${label}.${capability} must be boolean`);
       }
     });
-    if (value.playbackPrepare !== value.effectiveAtPlayback) {
-      throw new StrictProtocolError('Handoff capabilities must be negotiated together');
-    }
     return cloneJson(value);
   }
 
@@ -439,14 +430,9 @@
         throw new StrictProtocolError('Registration ACK deviceSessionId does not match');
       }
       const requestedCapabilities = this.registration.capabilities || {};
-      const includeCapabilityExtensions = Object.prototype.hasOwnProperty.call(
-        requestedCapabilities,
-        'remoteVolumeControl',
-      );
       this.negotiatedCapabilities = requireClosedCapabilities(
         payload.negotiatedCapabilities,
         'negotiatedCapabilities',
-        includeCapabilityExtensions,
       );
       Object.keys(this.negotiatedCapabilities).forEach((capability) => {
         if (this.negotiatedCapabilities[capability] && requestedCapabilities[capability] !== true) {
@@ -461,16 +447,16 @@
         throw new StrictProtocolError('Registration ACK strictV2 metadata is missing');
       }
       const metadataFields = Object.keys(metadata).sort();
-      const expectedMetadataFields = [
+      const requiredMetadataFields = [
         'connectionEpoch',
         'connectionNonce',
         'protocolVersion',
-        'schemaHash',
         'serverBuildCommit',
       ];
+      const allowedMetadataFields = [...requiredMetadataFields, 'schemaHash'].sort();
       if (
-        metadataFields.length !== expectedMetadataFields.length
-        || metadataFields.some((field, index) => field !== expectedMetadataFields[index])
+        requiredMetadataFields.some((field) => !Object.prototype.hasOwnProperty.call(metadata, field))
+        || metadataFields.some((field) => !allowedMetadataFields.includes(field))
       ) {
         throw new StrictProtocolError('Registration ACK strictV2 metadata shape is not closed');
       }
@@ -481,12 +467,9 @@
       if (
         !versionMatch
         || Number(versionMatch[1]) !== 2
-        || Number(versionMatch[2]) < 2
+        || Number(versionMatch[2]) < 8
       ) {
         throw new StrictProtocolError(`Unsupported strict-v2 protocol version: ${String(version)}`);
-      }
-      if (typeof metadata.schemaHash !== 'string' || !/^[0-9a-f]{64}$/.test(metadata.schemaHash)) {
-        throw new StrictProtocolError('Registration metadata schemaHash is invalid');
       }
       if (
         typeof metadata.serverBuildCommit !== 'string'

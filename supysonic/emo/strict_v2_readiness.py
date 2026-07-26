@@ -1,7 +1,7 @@
 from typing import Dict, Mapping, Optional, Sequence
 
 from .strict_v2_conformance import get_code_conformance_readiness
-from .strict_v2_contract import BASE_STRICT_CAPABILITIES, STRICT_CAPABILITIES
+from .strict_v2_contract import STRICT_CAPABILITIES
 
 
 PROFILE_CONFIG_KEYS = {
@@ -10,6 +10,7 @@ PROFILE_CONFIG_KEYS = {
     "handoff": "emo_strict_v2_handoff_enabled",
     "broadcast": "emo_strict_v2_broadcast_enabled",
 }
+BROADCAST_IMPLEMENTATION_READY = False
 
 
 class CoreProfileNotReady(Exception):
@@ -90,16 +91,12 @@ def negotiate_capabilities(
     allow_local_test_evidence: Optional[bool] = None,
 ) -> Dict[str, bool]:
     capability_fields = set(client_capabilities)
-    if capability_fields not in (
-        set(BASE_STRICT_CAPABILITIES),
-        set(STRICT_CAPABILITIES),
-    ) or not all(
+    if capability_fields != set(STRICT_CAPABILITIES) or not all(
         isinstance(client_capabilities[name], bool)
         for name in capability_fields
     ):
         raise ValueError(
-            "client capabilities must contain the 9 base booleans "
-            "with optional remoteVolumeControl"
+            "client capabilities must contain exactly the 10 booleans"
         )
 
     role_set = set(roles)
@@ -114,7 +111,6 @@ def negotiate_capabilities(
     negotiated = {
         capability: bool(client_capabilities[capability])
         for capability in STRICT_CAPABILITIES
-        if capability in client_capabilities
     }
     negotiated["playbackContextV2"] = True
 
@@ -130,24 +126,23 @@ def negotiate_capabilities(
         and can_handoff_target
     )
     negotiated["effectiveAtPlayback"] = bool(
-        readiness["handoff"]
+        (readiness["handoff"] or readiness["broadcast"])
         and negotiated["effectiveAtPlayback"]
-        and negotiated["playbackPrepare"]
         and can_handoff_target
     )
 
     can_use_broadcast = bool(role_set.intersection({"player", "controller"}))
     negotiated["supportsBroadcast"] = bool(
-        readiness["broadcast"]
+        BROADCAST_IMPLEMENTATION_READY
+        and readiness["broadcast"]
         and negotiated["supportsBroadcast"]
         and can_use_broadcast
     )
-    if "remoteVolumeControl" in negotiated:
-        can_use_remote_volume = bool(
-            "controller" in role_set
-            or ("player" in role_set and negotiated["canSetVolume"])
-        )
-        negotiated["remoteVolumeControl"] = bool(
-            negotiated["remoteVolumeControl"] and can_use_remote_volume
-        )
+    can_use_remote_volume = bool(
+        "controller" in role_set
+        or ("player" in role_set and negotiated["canSetVolume"])
+    )
+    negotiated["remoteVolumeControl"] = bool(
+        negotiated["remoteVolumeControl"] and can_use_remote_volume
+    )
     return negotiated

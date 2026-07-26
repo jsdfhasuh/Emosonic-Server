@@ -1,4 +1,5 @@
 from copy import deepcopy
+import math
 import re
 from typing import Dict, NamedTuple, Optional, Set, Tuple
 
@@ -8,7 +9,7 @@ MAX_ACTION_BYTES = 64
 MAX_QUEUE_ITEMS = 1000
 MAX_PARTICIPANTS = 100
 
-BASE_STRICT_CAPABILITIES = (
+STRICT_CAPABILITIES = (
     "playbackContextV2",
     "playbackPrepare",
     "effectiveAtPlayback",
@@ -18,9 +19,12 @@ BASE_STRICT_CAPABILITIES = (
     "canSetVolume",
     "supportsFollow",
     "supportsBroadcast",
+    "remoteVolumeControl",
 )
-OPTIONAL_STRICT_CAPABILITIES = ("remoteVolumeControl",)
-STRICT_CAPABILITIES = BASE_STRICT_CAPABILITIES + OPTIONAL_STRICT_CAPABILITIES
+# Kept as aliases for callers that imported the old names. r18 has one fixed
+# capability shape: all ten booleans are mandatory.
+BASE_STRICT_CAPABILITIES = STRICT_CAPABILITIES
+OPTIONAL_STRICT_CAPABILITIES = ()
 
 
 class ActionSchema(NamedTuple):
@@ -85,6 +89,7 @@ ACTION_SCHEMAS = {
             "deviceSessionId",
             "queueSongIds",
             "positionMs",
+            "positionSampledAtServerMs",
             "baseQueueRevision",
         ),
         ("currentIndex", "baseControlVersion"),
@@ -102,6 +107,8 @@ ACTION_SCHEMAS = {
             "origin",
             "state",
             "positionMs",
+            "positionSampledAtServerMs",
+            "playbackRate",
             "clientSeq",
         ),
         (
@@ -192,6 +199,7 @@ _ID_FIELDS = {
 _NON_NEGATIVE_INT_FIELDS = {
     "currentIndex",
     "positionMs",
+    "positionSampledAtServerMs",
     "queueIndex",
     "baseQueueRevision",
     "baseControlVersion",
@@ -245,29 +253,18 @@ def _contains_key(value: object, forbidden: Set[str]) -> bool:
 
 def _validate_capabilities(value: object) -> Dict[str, bool]:
     fields = set(value) if isinstance(value, dict) else set()
-    allowed_fields = (
-        set(BASE_STRICT_CAPABILITIES),
-        set(STRICT_CAPABILITIES),
-    )
-    if not isinstance(value, dict) or fields not in allowed_fields:
+    if not isinstance(value, dict) or fields != set(STRICT_CAPABILITIES):
         raise StrictRequestValidationError(
-            "capabilities must contain the 9 base strict-v2 booleans "
-            "with optional remoteVolumeControl"
+            "capabilities must contain exactly the 10 strict-v2 booleans"
         )
     normalized = {}  # type: Dict[str, bool]
     for capability in STRICT_CAPABILITIES:
-        if capability not in value:
-            continue
         capability_value = value[capability]
         if not isinstance(capability_value, bool):
             raise StrictRequestValidationError("capabilities.%s must be a boolean" % capability)
         normalized[capability] = capability_value
     if not normalized["playbackContextV2"]:
         raise StrictRequestValidationError("capabilities.playbackContextV2 must be true")
-    if normalized["effectiveAtPlayback"] and not normalized["playbackPrepare"]:
-        raise StrictRequestValidationError(
-            "effectiveAtPlayback requires playbackPrepare"
-        )
     return normalized
 
 
@@ -306,6 +303,17 @@ def _validate_field(
     elif field_name == "volume":
         if not _is_int(value) or value < 0 or value > 100:
             raise StrictRequestValidationError("volume must be an integer from 0 to 100")
+    elif field_name == "playbackRate":
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value < 0.5
+            or value > 2.0
+        ):
+            raise StrictRequestValidationError(
+                "playbackRate must be a finite number from 0.5 to 2.0"
+            )
     elif field_name in _BOOLEAN_FIELDS:
         if not isinstance(value, bool):
             raise StrictRequestValidationError("%s must be a boolean" % field_name)
@@ -445,6 +453,8 @@ def _validate_action_combinations(action: str, payload: Dict[str, object]) -> No
             "origin",
             "state",
             "positionMs",
+            "positionSampledAtServerMs",
+            "playbackRate",
             "clientSeq",
         }
         missing = required - shape_fields
@@ -477,6 +487,9 @@ def _validate_action_combinations(action: str, payload: Dict[str, object]) -> No
                     "track_load_failed",
                     "seek_failed",
                     "execution_timeout",
+                    "effective_at_missed",
+                    "clock_unsynchronized",
+                    "rate_unsupported",
                 }:
                     raise StrictRequestValidationError(
                         "failed playback.update requires a stable errorCode"
@@ -679,6 +692,7 @@ _ERROR_CODES = {
     "context_closed",
     "authority_offline",
     "queue_required",
+    "restore_in_progress",
     "conflict",
     "stale_version",
     "client_sequence_conflict",
@@ -687,7 +701,12 @@ _ERROR_CODES = {
     "internal_error",
 }
 
-_RETRYABLE_ERROR_CODES = {"authority_offline", "rate_limited", "internal_error"}
+_RETRYABLE_ERROR_CODES = {
+    "authority_offline",
+    "restore_in_progress",
+    "rate_limited",
+    "internal_error",
+}
 
 
 def _output_error(message: str) -> None:
@@ -698,7 +717,10 @@ def _output_has_null(value: object) -> bool:
     if value is None:
         return True
     if isinstance(value, dict):
-        return any(_output_has_null(item) for item in value.values())
+        return any(
+            key != "schemaHash" and _output_has_null(item)
+            for key, item in value.items()
+        )
     if isinstance(value, list):
         return any(_output_has_null(item) for item in value)
     return False
@@ -739,7 +761,11 @@ def _output_int(value: object, label: str, minimum: int = 0) -> int:
 
 
 def _output_number(value: object, label: str, positive: bool = False) -> float:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+    ):
         _output_error("%s must be a number" % label)
     if positive and value <= 0:
         _output_error("%s must be greater than zero" % label)
@@ -770,15 +796,10 @@ def _output_string_array(
 
 def _validate_output_capabilities(value: object, label: str) -> None:
     fields = set(value) if isinstance(value, dict) else set()
-    if fields not in (set(BASE_STRICT_CAPABILITIES), set(STRICT_CAPABILITIES)):
-        _output_error(
-            "%s must contain the 9 base capabilities with optional "
-            "remoteVolumeControl" % label
-        )
+    if fields != set(STRICT_CAPABILITIES):
+        _output_error("%s must contain exactly the 10 capabilities" % label)
     capabilities = _output_object(value, fields, set(), label)
     for capability in STRICT_CAPABILITIES:
-        if capability not in capabilities:
-            continue
         _output_bool(capabilities[capability], "%s.%s" % (label, capability))
 
 
@@ -843,6 +864,7 @@ def _validate_context_snapshot(
     value: object,
     label: str,
     require_server_updated: bool = False,
+    require_position_sampled: bool = False,
 ) -> Dict[str, object]:
     required = {
         "playbackContextId",
@@ -856,6 +878,8 @@ def _validate_context_snapshot(
         "epoch",
     }
     optional = {"currentIndex", "trackId", "timelineId", "serverUpdatedAtMs"}
+    if require_position_sampled:
+        required.add("positionSampledAtServerMs")
     if require_server_updated:
         required.add("serverUpdatedAtMs")
         optional.remove("serverUpdatedAtMs")
@@ -867,6 +891,11 @@ def _validate_context_snapshot(
         label + ".queueSongIds",
     )
     _output_int(snapshot["positionMs"], label + ".positionMs")
+    if require_position_sampled:
+        _output_int(
+            snapshot["positionSampledAtServerMs"],
+            label + ".positionSampledAtServerMs",
+        )
     if queue:
         if "currentIndex" not in snapshot or "trackId" not in snapshot:
             _output_error(
@@ -909,6 +938,8 @@ def _validate_device_state(value: object, playback_context_id: str, label: str) 
             "deviceSessionId",
             "state",
             "positionMs",
+            "positionSampledAtServerMs",
+            "playbackRate",
             "appliedControlVersion",
             "clientSeq",
             "serverUpdatedAtMs",
@@ -923,6 +954,15 @@ def _validate_device_state(value: object, playback_context_id: str, label: str) 
     if state["state"] not in {"idle", "playing", "paused", "stopped"}:
         _output_error("%s.state is invalid" % label)
     _output_int(state["positionMs"], label + ".positionMs")
+    _output_int(
+        state["positionSampledAtServerMs"],
+        label + ".positionSampledAtServerMs",
+    )
+    playback_rate = _output_number(
+        state["playbackRate"], label + ".playbackRate"
+    )
+    if playback_rate < 0.5 or playback_rate > 2.0:
+        _output_error("%s.playbackRate must be from 0.5 to 2.0" % label)
     _output_int(
         state["appliedControlVersion"],
         label + ".appliedControlVersion",
@@ -967,11 +1007,25 @@ def _validate_registration_ack(payload: Dict[str, object]) -> None:
         ack["negotiatedCapabilities"],
         "system.ack payload.negotiatedCapabilities",
     )
+    metadata_value = ack["strictV2"]
+    if not isinstance(metadata_value, dict):
+        _output_error("system.ack payload.strictV2 must be an object")
+    if set(metadata_value) - {
+        "protocolVersion",
+        "schemaHash",
+        "serverBuildCommit",
+        "connectionNonce",
+        "connectionEpoch",
+    }:
+        _output_error("system.ack payload.strictV2 has unknown fields")
     metadata = _output_object(
-        ack["strictV2"],
+        {
+            key: value
+            for key, value in metadata_value.items()
+            if key != "schemaHash"
+        },
         {
             "protocolVersion",
-            "schemaHash",
             "serverBuildCommit",
             "connectionNonce",
             "connectionEpoch",
@@ -980,9 +1034,6 @@ def _validate_registration_ack(payload: Dict[str, object]) -> None:
         "system.ack payload.strictV2",
     )
     _output_string(metadata["protocolVersion"], "strictV2.protocolVersion")
-    schema_hash = _output_string(metadata["schemaHash"], "strictV2.schemaHash")
-    if re.fullmatch(r"[0-9a-f]{64}", schema_hash) is None:
-        _output_error("strictV2.schemaHash must be lowercase SHA-256")
     _output_string(metadata["serverBuildCommit"], "strictV2.serverBuildCommit")
     _output_string(metadata["connectionNonce"], "strictV2.connectionNonce")
     if metadata["connectionEpoch"] != 1 or isinstance(metadata["connectionEpoch"], bool):
@@ -1238,6 +1289,8 @@ def _validate_playback_update_output(payload: object) -> None:
         "appliedControlVersion",
         "state",
         "positionMs",
+        "positionSampledAtServerMs",
+        "playbackRate",
         "clientSeq",
         "serverUpdatedAtMs",
     }
@@ -1276,6 +1329,15 @@ def _validate_playback_update_output(payload: object) -> None:
     if update["state"] not in {"idle", "playing", "paused", "stopped"}:
         _output_error("playback.update state is invalid")
     _output_int(update["positionMs"], "playback.update positionMs")
+    _output_int(
+        update["positionSampledAtServerMs"],
+        "playback.update positionSampledAtServerMs",
+    )
+    playback_rate = _output_number(
+        update["playbackRate"], "playback.update playbackRate"
+    )
+    if playback_rate < 0.5 or playback_rate > 2.0:
+        _output_error("playback.update playbackRate must be from 0.5 to 2.0")
     _output_int(update["clientSeq"], "playback.update clientSeq", 1)
     _output_int(update["serverUpdatedAtMs"], "playback.update serverUpdatedAtMs")
     if "volume" in update:
@@ -1332,6 +1394,9 @@ def _validate_playback_update_output(payload: object) -> None:
                 "track_load_failed",
                 "seek_failed",
                 "execution_timeout",
+                "effective_at_missed",
+                "clock_unsynchronized",
+                "rate_unsupported",
             }:
                 _output_error("failed playback.update errorCode is invalid")
             if "errorMessage" in update:
@@ -1439,9 +1504,8 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
     if action == "system.error":
         return _validate_output_error(payload)
     if action == "system.pong":
-        pong = _output_object(payload, set(), {"serverTimeMs"}, "system.pong payload")
-        if "serverTimeMs" in pong:
-            _output_int(pong["serverTimeMs"], "system.pong serverTimeMs", 1)
+        pong = _output_object(payload, {"serverTimeMs"}, set(), "system.pong payload")
+        _output_int(pong["serverTimeMs"], "system.pong serverTimeMs")
         return None
     if action == "device.list":
         response = _output_object(payload, {"devices"}, set(), "device.list payload")
@@ -1666,6 +1730,7 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
         _validate_context_snapshot(
             payload,
             "queue.context.sync payload",
+            require_position_sampled=True,
         )
         return None
     if action == "playback.update":

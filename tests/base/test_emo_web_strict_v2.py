@@ -811,7 +811,7 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
         self.assertIn(b"device.volume.update", player_page.data)
         self.assertIn(b'id="strict-device-volume"', control_page.data)
         self.assertIn(b"device.setVolume", control_page.data)
-        self.assertIn(b"PlaybackContext strict-v2 2.4.0", control_page.data)
+        self.assertIn(b"PlaybackContext strict-v2 2.8.0", control_page.data)
 
     def test_exact_web_broadcast_rejects_non_authority_context_feedback(self):
         self.login()
@@ -839,50 +839,10 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
             for message in control_messages
             if message.get("requestId") == start["requestId"]
         )
-        broadcast_id = start_ack["payload"]["broadcastId"]
-        self.assertEqual(
-            start_ack["payload"]["participants"],
-            ["web-player-1", "web-player-2"],
-        )
-        first_start = next(
-            message
-            for message in self.messages(player_one)
-            if message["action"] == "broadcast.start"
-        )
-        second_start = next(
-            message
-            for message in self.messages(player_two)
-            if message["action"] == "broadcast.start"
-        )
-        self.assertEqual(first_start["payload"], second_start["payload"])
-        self.assertEqual(first_start["payload"]["broadcastId"], broadcast_id)
-
-        feedback = {
-            "type": "event",
-            "action": "playback.update",
-            "requestId": "broadcast-feedback-player-2",
-            "payload": {
-                "playbackContextId": "ctx-1",
-                "deviceSessionId": "web-player-device:2",
-                "origin": "passive",
-                "appliedControlVersion": 1,
-                "state": "paused",
-                "positionMs": 12000,
-                "clientSeq": 1,
-                "trackId": context["trackId"],
-                "volume": 70,
-                "muted": False,
-            },
-        }
-        player_two.emit("message", feedback, namespace="/emo")
-        feedback_messages = self.messages(player_two)
-        self.assertTrue(
-            any(
-                message["action"] == "system.error"
-                and message["payload"]["code"] == "forbidden"
-                for message in feedback_messages
-            )
-        )
+        self.assertEqual(start_ack["action"], "system.error")
+        self.assertEqual(start_ack["payload"]["code"], "capability_required")
+        self.assertEqual(self.messages(player_one), [])
+        self.assertEqual(self.messages(player_two), [])
 
         status = self.fixture_message("broadcast.status")
         status["payload"]["broadcastId"] = broadcast_id

@@ -39,6 +39,7 @@ class EmoRegistrationDescriptorTestCase(unittest.TestCase):
                     "canSetVolume": True,
                     "supportsFollow": True,
                     "supportsBroadcast": True,
+                    "remoteVolumeControl": True,
                 },
             },
         }
@@ -63,6 +64,7 @@ class EmoRegistrationDescriptorTestCase(unittest.TestCase):
                     "canSetVolume": True,
                     "supportsFollow": True,
                     "supportsBroadcast": True,
+                    "remoteVolumeControl": True,
                 },
                 "strictV2": get_strict_v2_registration_metadata(
                     "nonce-for-descriptor-test"
@@ -90,6 +92,15 @@ class EmoRegistrationDescriptorTestCase(unittest.TestCase):
         ack["payload"]["strictV2"]["unexpected"] = True
 
         self.assertFalse(self.validator.is_valid(ack))
+
+    def test_descriptor_treats_schema_hash_as_optional_observation(self):
+        missing = self._strict_register_ack()
+        del missing["payload"]["strictV2"]["schemaHash"]
+        malformed = self._strict_register_ack()
+        malformed["payload"]["strictV2"]["schemaHash"] = {"changed": True}
+
+        self.assertTrue(self.validator.is_valid(missing))
+        self.assertTrue(self.validator.is_valid(malformed))
 
     def test_descriptor_requires_connection_evidence(self):
         missing_nonce = self._strict_register_ack()

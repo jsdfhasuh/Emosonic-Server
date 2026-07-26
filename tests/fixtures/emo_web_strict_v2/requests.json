@@ -1,5 +1,5 @@
 {
-  "protocolVersion": "2.4.0",
+  "protocolVersion": "2.8.0",
   "forbiddenFields": ["sessionId", "sourceSessionId"],
   "forbiddenActions": [
     "player.setVolume",
@@ -27,8 +27,8 @@
     {"settlement": "ack", "message": {"type": "state", "action": "playback.context.unsubscribe", "requestId": "context-unsubscribe-1", "payload": {"playbackContextId": "ctx-1"}}},
     {"settlement": "direct", "message": {"type": "state", "action": "playback.context.status", "requestId": "context-status-1", "payload": {"playbackContextId": "ctx-1"}}},
     {"settlement": "ack", "message": {"type": "command", "action": "playback.context.close", "requestId": "context-close-1", "payload": {"playbackContextId": "ctx-1"}}},
-    {"settlement": "ack", "message": {"type": "state", "action": "queue.context.sync", "requestId": "queue-sync-1", "payload": {"playbackContextId": "ctx-1", "deviceSessionId": "web-player-device:1", "queueSongIds": ["track-1", "track-2"], "currentIndex": 1, "positionMs": 2500, "baseQueueRevision": 1, "baseControlVersion": 1}}},
-    {"settlement": "event-confirmed", "message": {"type": "event", "action": "playback.update", "requestId": "feedback-1", "payload": {"playbackContextId": "ctx-1", "deviceSessionId": "web-player-device:1", "origin": "passive", "appliedControlVersion": 1, "state": "playing", "positionMs": 2500, "clientSeq": 1, "trackId": "track-2", "volume": 70, "muted": false}}},
+    {"settlement": "ack", "message": {"type": "state", "action": "queue.context.sync", "requestId": "queue-sync-1", "payload": {"playbackContextId": "ctx-1", "deviceSessionId": "web-player-device:1", "queueSongIds": ["track-1", "track-2"], "currentIndex": 1, "positionMs": 2500, "positionSampledAtServerMs": 1780000000000, "baseQueueRevision": 1, "baseControlVersion": 1}}},
+    {"settlement": "event-confirmed", "message": {"type": "event", "action": "playback.update", "requestId": "feedback-1", "payload": {"playbackContextId": "ctx-1", "deviceSessionId": "web-player-device:1", "origin": "passive", "appliedControlVersion": 1, "state": "playing", "positionMs": 2500, "positionSampledAtServerMs": 1780000000000, "playbackRate": 1.0, "clientSeq": 1, "trackId": "track-2", "volume": 70, "muted": false}}},
     {"settlement": "ack", "message": {"type": "command", "action": "queue.playItem", "requestId": "play-item-1", "payload": {"playbackContextId": "ctx-1", "queueIndex": 1, "baseQueueRevision": 2, "baseControlVersion": 2}}},
     {"settlement": "ack", "message": {"type": "command", "action": "player.play", "requestId": "play-1", "payload": {"playbackContextId": "ctx-1", "baseControlVersion": 3, "positionMs": 3000}}},
     {"settlement": "ack", "message": {"type": "command", "action": "player.pause", "requestId": "pause-1", "payload": {"playbackContextId": "ctx-1", "baseControlVersion": 4, "positionMs": 4000}}},

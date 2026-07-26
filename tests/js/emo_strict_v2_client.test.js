@@ -30,6 +30,7 @@ const PLAYER_CAPABILITIES = {
   canSetVolume: true,
   supportsFollow: false,
   supportsBroadcast: false,
+  remoteVolumeControl: false,
 };
 const HANDOFF_CAPABILITIES = {
   ...PLAYER_CAPABILITIES,
@@ -537,7 +538,7 @@ test('unsubscribe failures and terminal Context events always clear local subscr
   assert.equal(client.subscriptions.has('ctx-released'), false);
 });
 
-test('registration evidence requires closed metadata, provenance, and paired handoff capabilities', () => {
+test('registration metadata uses 2.8 and treats schemaHash as optional observation', () => {
   const client = new StrictV2Client({
     registration: {
       clientId: 'web-player-1',
@@ -553,7 +554,7 @@ test('registration evidence requires closed metadata, provenance, and paired han
       deviceSessionId: 'web-player-device:1',
       negotiatedCapabilities: HANDOFF_CAPABILITIES,
       strictV2: {
-        protocolVersion: '2.2.0',
+        protocolVersion: '2.8.0',
         schemaHash: SCHEMA_HASH,
         serverBuildCommit: BUILD_COMMIT,
         connectionNonce: 'nonce-1',
@@ -566,9 +567,9 @@ test('registration evidence requires closed metadata, provenance, and paired han
   assert.doesNotThrow(() => client._acceptRegistration(message));
   const unpaired = JSON.parse(JSON.stringify(message));
   unpaired.payload.negotiatedCapabilities.effectiveAtPlayback = false;
-  assert.throws(() => client._acceptRegistration(unpaired), /negotiated together/);
+  assert.doesNotThrow(() => client._acceptRegistration(unpaired));
   const lowerMinor = JSON.parse(JSON.stringify(message));
-  lowerMinor.payload.strictV2.protocolVersion = '2.1.0';
+  lowerMinor.payload.strictV2.protocolVersion = '2.7.0';
   assert.throws(() => client._acceptRegistration(lowerMinor), /Unsupported/);
   const wrongMajor = JSON.parse(JSON.stringify(message));
   wrongMajor.payload.strictV2.protocolVersion = '3.0.0';
@@ -578,7 +579,13 @@ test('registration evidence requires closed metadata, provenance, and paired han
   assert.throws(() => client._acceptRegistration(openMetadata), /shape is not closed/);
   const badSchemaHash = JSON.parse(JSON.stringify(message));
   badSchemaHash.payload.strictV2.schemaHash = 'schema';
-  assert.throws(() => client._acceptRegistration(badSchemaHash), /schemaHash is invalid/);
+  assert.doesNotThrow(() => client._acceptRegistration(badSchemaHash));
+  const missingSchemaHash = JSON.parse(JSON.stringify(message));
+  delete missingSchemaHash.payload.strictV2.schemaHash;
+  assert.doesNotThrow(() => client._acceptRegistration(missingSchemaHash));
+  const typedSchemaHash = JSON.parse(JSON.stringify(message));
+  typedSchemaHash.payload.strictV2.schemaHash = { changed: true };
+  assert.doesNotThrow(() => client._acceptRegistration(typedSchemaHash));
   const badBuildCommit = JSON.parse(JSON.stringify(message));
   badBuildCommit.payload.strictV2.serverBuildCommit = 'build';
   assert.throws(() => client._acceptRegistration(badBuildCommit), /serverBuildCommit is invalid/);
@@ -589,7 +596,7 @@ test('registration evidence requires closed metadata, provenance, and paired han
   assert.throws(() => client._acceptRegistration(elevated), /elevated unrequested capability/);
 });
 
-test('registration accepts remote volume only when the client requested the extension', () => {
+test('registration requires the fixed remote volume capability field', () => {
   const extendedClient = new StrictV2Client({
     registration: {
       clientId: 'web-player-1',
@@ -605,7 +612,7 @@ test('registration accepts remote volume only when the client requested the exte
       deviceSessionId: 'web-player-device:1',
       negotiatedCapabilities: REMOTE_VOLUME_CAPABILITIES,
       strictV2: {
-        protocolVersion: '2.3.0',
+        protocolVersion: '2.8.0',
         schemaHash: SCHEMA_HASH,
         serverBuildCommit: BUILD_COMMIT,
         connectionNonce: 'nonce-1',
@@ -627,7 +634,7 @@ test('registration accepts remote volume only when the client requested the exte
   });
   assert.throws(
     () => baseClient._acceptRegistration(message),
-    /exactly the strict-v2 capabilities/,
+    /elevated unrequested capability/,
   );
 });
 
@@ -691,7 +698,7 @@ test('bootstrap fetches a fresh browser OTP and reaches ready with exact registr
       deviceSessionId: 'web-player-device:1',
       negotiatedCapabilities: PLAYER_CAPABILITIES,
       strictV2: {
-        protocolVersion: '2.2.0',
+        protocolVersion: '2.8.0',
         schemaHash: SCHEMA_HASH,
         serverBuildCommit: BUILD_COMMIT,
         connectionNonce: 'nonce-1',
@@ -760,7 +767,7 @@ test('bootstrap fetches a fresh browser OTP and reaches ready with exact registr
       deviceSessionId: 'web-player-device:1',
       negotiatedCapabilities: PLAYER_CAPABILITIES,
       strictV2: {
-        protocolVersion: '2.2.0',
+        protocolVersion: '2.8.0',
         schemaHash: 'c'.repeat(64),
         serverBuildCommit: 'd'.repeat(40),
         connectionNonce: 'nonce-2',

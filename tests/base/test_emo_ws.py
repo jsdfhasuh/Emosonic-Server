@@ -47,6 +47,7 @@ STRICT_V2_CAPABILITIES = {
   "canSetVolume": True,
   "supportsFollow": True,
   "supportsBroadcast": True,
+  "remoteVolumeControl": True,
 }
 
 
@@ -133,7 +134,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
 
   def test_socketio_initialization_logs_strict_v2_static_metadata(self):
     metadata = {
-      "protocolVersion": "2.4.0",
+      "protocolVersion": "2.8.0",
       "schemaHash": "a" * 64,
       "serverBuildCommit": "b" * 40,
     }
@@ -156,7 +157,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
       [
         "WARNING:supysonic.emo.ws:"
         "emo event=strict_v2_registration_metadata "
-        "protocol_version=2.4.0 "
+        "protocol_version=2.8.0 "
         f"schema_hash={'a' * 64} "
         f"server_build_commit={'b' * 40}",
       ],
@@ -478,7 +479,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertEqual(ack["payload"]["deviceSessionId"], "device:player-v2")
     self.assertNotIn("client", ack["payload"])
     self.assertNotIn("sessionId", ack["payload"])
-    self.assertEqual(len(ack["payload"]["negotiatedCapabilities"]), 9)
+    self.assertEqual(len(ack["payload"]["negotiatedCapabilities"]), 10)
 
   def test_v2_device_register_returns_strict_v2_metadata(self):
     client = self.connect_authenticated_client("alice", "Alic3", "auth-player-v2")
@@ -530,7 +531,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.assertEqual(strict_v2["serverBuildCommit"], commit)
     self.assertRegex(strict_v2["schemaHash"], r"^[0-9a-f]{64}$")
-    self.assertEqual(strict_v2["protocolVersion"], "2.4.0")
+    self.assertEqual(strict_v2["protocolVersion"], "2.8.0")
     self.assertIsInstance(strict_v2["connectionNonce"], str)
     self.assertTrue(strict_v2["connectionNonce"])
     self.assertEqual(strict_v2["connectionEpoch"], 1)
@@ -715,6 +716,8 @@ class EmoWebSocketTestCase(unittest.TestCase):
           "state": "playing",
           "trackId": "song-1",
           "positionMs": 1200,
+          "positionSampledAtServerMs": 1,
+          "playbackRate": 1.0,
           "clientSeq": 7,
         },
       },
@@ -746,6 +749,8 @@ class EmoWebSocketTestCase(unittest.TestCase):
         "appliedControlVersion": 1,
         "state": "playing",
         "positionMs": 1200,
+        "positionSampledAtServerMs": 1,
+        "playbackRate": 1.0,
         "trackId": "song-1",
         "clientSeq": 7,
         "serverUpdatedAtMs": feedback["payload"]["serverUpdatedAtMs"],
@@ -920,6 +925,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
           "canSetVolume",
           "supportsFollow",
           "supportsBroadcast",
+          "remoteVolumeControl",
         },
       )
     legacy_device = next(
@@ -968,7 +974,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.assertEqual(legacy_device["deviceSessionId"], "legacy-room")
     self.assertNotIn("sessionId", legacy_device)
-    self.assertEqual(len(legacy_device["capabilities"]), 9)
+    self.assertEqual(len(legacy_device["capabilities"]), 10)
     self.assertFalse(any(legacy_device["capabilities"].values()))
 
   def test_device_register_alias_strips_whitespace(self):
@@ -2861,6 +2867,8 @@ class EmoWebSocketTestCase(unittest.TestCase):
           "state": "playing",
           "trackId": "song-1",
           "positionMs": 500,
+          "positionSampledAtServerMs": 1,
+          "playbackRate": 1.0,
           "clientSeq": 1,
         },
       },
@@ -3005,6 +3013,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
           "queueSongIds": ["song-1", "song-2"],
           "currentIndex": 1,
           "positionMs": 250,
+          "positionSampledAtServerMs": 1,
           "baseQueueRevision": 1,
           "baseControlVersion": 1,
         },
@@ -3662,6 +3671,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
           "queueSongIds": ["song-1"],
           "currentIndex": 0,
           "positionMs": 0,
+          "positionSampledAtServerMs": 1,
           "baseQueueRevision": 1,
         },
       },
@@ -3706,6 +3716,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
           "queueSongIds": ["song-1"],
           "currentIndex": 0,
           "positionMs": 0,
+          "positionSampledAtServerMs": 1,
           "baseQueueRevision": 1,
         },
       },
@@ -3740,6 +3751,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
           "queueSongIds": ["song-1", "song-2"],
           "currentIndex": 1,
           "positionMs": 250,
+          "positionSampledAtServerMs": 1,
           "baseQueueRevision": 1,
           "baseControlVersion": 1,
         },
@@ -5087,6 +5099,8 @@ class EmoWebSocketTestCase(unittest.TestCase):
           "state": "playing",
           "trackId": "song-1",
           "positionMs": 100,
+          "positionSampledAtServerMs": 1,
+          "playbackRate": 1.0,
           "volume": 65,
           "muted": True,
           "clientSeq": 1,
@@ -5167,6 +5181,8 @@ class EmoWebSocketTestCase(unittest.TestCase):
           "state": "playing",
           "trackId": "song-1",
           "positionMs": 100,
+          "positionSampledAtServerMs": 1,
+          "playbackRate": 1.0,
           "clientSeq": 1,
         },
       },
@@ -5189,6 +5205,8 @@ class EmoWebSocketTestCase(unittest.TestCase):
           "state": "playing",
           "trackId": "song-1",
           "positionMs": 200,
+          "positionSampledAtServerMs": 2,
+          "playbackRate": 1.0,
           "clientSeq": 2,
         },
       },
@@ -6956,6 +6974,8 @@ class EmoWebSocketTestCase(unittest.TestCase):
           "state": "playing",
           "trackId": "song-source",
           "positionMs": 12300,
+          "positionSampledAtServerMs": 1,
+          "playbackRate": 1.0,
           "clientSeq": 1,
         },
       },

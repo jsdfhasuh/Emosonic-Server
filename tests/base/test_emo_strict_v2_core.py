@@ -122,6 +122,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
             "canSetVolume": True,
             "supportsFollow": True,
             "supportsBroadcast": True,
+            "remoteVolumeControl": True,
         }
         capabilities.update(capability_overrides or {})
         return {
@@ -218,6 +219,12 @@ class StrictV2CoreTestCase(unittest.TestCase):
         return self.messages(client)
 
     def emit_strict(self, client, message_type, action, request_id, payload):
+        payload = dict(payload)
+        if action == "playback.update":
+            payload.setdefault("positionSampledAtServerMs", 1)
+            payload.setdefault("playbackRate", 1.0)
+        elif action == "queue.context.sync":
+            payload.setdefault("positionSampledAtServerMs", 1)
         client.emit(
             "message",
             {
@@ -400,11 +407,13 @@ class StrictV2CoreTestCase(unittest.TestCase):
         base_player = self.ready_strict_client(
             client_id="player-1",
             device_session_id="device:player-1",
+            capability_overrides={"remoteVolumeControl": False},
         )
         base_controller = self.ready_strict_client(
             roles=["controller"],
             client_id="controller-1",
             device_session_id="device:controller-1",
+            capability_overrides={"remoteVolumeControl": False},
         )
         self.messages(base_player)
         self.messages(base_controller)
@@ -615,8 +624,14 @@ class StrictV2CoreTestCase(unittest.TestCase):
                 == "register-local-evidence-accepted"
             )
             self.assertEqual(ack["action"], "system.ack")
+            negotiated = ack["payload"]["negotiatedCapabilities"]
+            self.assertFalse(negotiated["supportsBroadcast"])
             self.assertTrue(
-                all(ack["payload"]["negotiatedCapabilities"].values())
+                all(
+                    value
+                    for name, value in negotiated.items()
+                    if name != "supportsBroadcast"
+                )
             )
         finally:
             self.app.testing = True
@@ -941,6 +956,8 @@ class StrictV2CoreTestCase(unittest.TestCase):
                 "appliedControlVersion": 1,
                 "state": "playing",
                 "positionMs": 10,
+                "positionSampledAtServerMs": 1,
+                "playbackRate": 1.0,
                 "clientSeq": 1,
                 "trackId": "song-1",
             },
@@ -981,6 +998,8 @@ class StrictV2CoreTestCase(unittest.TestCase):
                 "appliedControlVersion": 1,
                 "state": "playing",
                 "positionMs": 25,
+                "positionSampledAtServerMs": 1,
+                "playbackRate": 1.0,
                 "clientSeq": 1,
                 "trackId": "song-2",
             },
@@ -1036,6 +1055,8 @@ class StrictV2CoreTestCase(unittest.TestCase):
                 "appliedControlVersion": 1,
                 "state": "playing",
                 "positionMs": 10,
+                "positionSampledAtServerMs": 1,
+                "playbackRate": 1.0,
                 "clientSeq": 2,
                 "trackId": "song-2",
             },
@@ -3294,6 +3315,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
                 "queueSongIds": ["song-2", "song-3"],
                 "currentIndex": 0,
                 "positionMs": 1200,
+                "positionSampledAtServerMs": 1,
                 "baseQueueRevision": 1,
             },
         }
@@ -3403,6 +3425,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
                     "queueSongIds": ["song-3", "song-1"],
                     "currentIndex": 1,
                     "positionMs": 500,
+                    "positionSampledAtServerMs": 1,
                     "baseQueueRevision": 1,
                     "baseControlVersion": 1,
                 },
@@ -3439,6 +3462,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
                 "queueSongIds": ["song-3", "song-1"],
                 "currentIndex": 1,
                 "positionMs": 500,
+                "positionSampledAtServerMs": 1,
                 "baseQueueRevision": 1,
             },
         }
@@ -3680,6 +3704,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
                         "trackId",
                         "state",
                         "positionMs",
+                        "positionSampledAtServerMs",
                         "queueRevision",
                         "controlVersion",
                         "version",

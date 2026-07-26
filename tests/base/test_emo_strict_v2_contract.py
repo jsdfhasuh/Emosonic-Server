@@ -34,6 +34,7 @@ class StrictV2ContractTestCase(unittest.TestCase):
                     "canSetVolume": True,
                     "supportsFollow": False,
                     "supportsBroadcast": False,
+                    "remoteVolumeControl": False,
                 },
             },
         }
@@ -330,6 +331,8 @@ class StrictV2ContractTestCase(unittest.TestCase):
             "state": "playing",
             "trackId": "song-1",
             "positionMs": 100,
+            "positionSampledAtServerMs": 1000,
+            "playbackRate": 1.0,
             "clientSeq": 1,
         }
         payloads = [
@@ -480,6 +483,8 @@ class StrictV2ContractTestCase(unittest.TestCase):
                         "state": "playing",
                         "trackId": "song-1",
                         "positionMs": 1200,
+                        "positionSampledAtServerMs": 950,
+                        "playbackRate": 1.0,
                         "appliedControlVersion": 1,
                         "clientSeq": 1,
                         "serverUpdatedAtMs": 1000,
@@ -501,6 +506,8 @@ class StrictV2ContractTestCase(unittest.TestCase):
                 "state": "playing",
                 "trackId": "song-1",
                 "positionMs": 1200,
+                "positionSampledAtServerMs": 950,
+                "playbackRate": 1.0,
                 "clientSeq": 1,
                 "serverUpdatedAtMs": 1000,
             },
@@ -508,6 +515,34 @@ class StrictV2ContractTestCase(unittest.TestCase):
 
         self.assertEqual(validate_strict_output(status), status)
         self.assertEqual(validate_strict_output(feedback), feedback)
+
+    def test_registration_schema_hash_is_optional_and_non_gating(self):
+        metadata = {
+            "protocolVersion": "2.8.0",
+            "serverBuildCommit": "unknown",
+            "connectionNonce": "nonce-1",
+            "connectionEpoch": 1,
+        }
+        capabilities = self._register_request()["payload"]["capabilities"]
+        ack = self._output(
+            "system",
+            "system.ack",
+            {
+                "action": "device.register",
+                "clientId": "phone-1",
+                "deviceSessionId": "device:phone-1",
+                "negotiatedCapabilities": capabilities,
+                "strictV2": metadata,
+            },
+            "register-1",
+        )
+
+        self.assertEqual(validate_strict_output(ack), ack)
+        for value in ("", "changed", 7, None, {"any": "shape"}):
+            observed = copy.deepcopy(ack)
+            observed["payload"]["strictV2"]["schemaHash"] = value
+            with self.subTest(schema_hash=value):
+                self.assertEqual(validate_strict_output(observed), observed)
 
     def test_validates_idle_context_prepare_and_settled_outputs(self):
         idle = self._output(

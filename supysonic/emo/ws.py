@@ -1214,6 +1214,10 @@ def _build_context_queue_payload_v2(context):
         "queueSongIds": list(context.get("queueSongIds") or []),
         "state": context.get("state") or "idle",
         "positionMs": context.get("positionMs", 0),
+        "positionSampledAtServerMs": context.get(
+            "positionSampledAtServerMs",
+            context.get("serverUpdatedAtMs"),
+        ),
         "queueRevision": context.get("queueRevision", 1),
         "controlVersion": context.get("controlVersion", 1),
         "version": context.get("version", 1),
@@ -1286,6 +1290,8 @@ def _build_v2_playback_update_payload(device_state):
         "appliedControlVersion",
         "state",
         "positionMs",
+        "positionSampledAtServerMs",
+        "playbackRate",
         "clientSeq",
         "serverUpdatedAtMs",
     )
@@ -6767,6 +6773,9 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
     queue_song_ids, current_index, position_ms = _validate_playback_context_queue_payload(
         payload
     )
+    server_time_ms = _server_time_ms()
+    if payload["positionSampledAtServerMs"] > server_time_ms + 1000:
+        raise ValueError("positionSampledAtServerMs is too far in the future")
     updated_context = mutateStrictPlaybackContextQueue(
         playback_context_id,
         current_user_name,
@@ -6777,6 +6786,9 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
         position_ms,
         _get_base_queue_revision(payload),
         payload.get("baseControlVersion"),
+        position_sampled_at_server_ms=payload[
+            "positionSampledAtServerMs"
+        ],
     )
     if updated_context is None:
         raise LookupError("Playback context not found")

@@ -22,6 +22,7 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
             "canSetVolume": True,
             "supportsFollow": True,
             "supportsBroadcast": True,
+            "remoteVolumeControl": True,
         }
         self.code_ready = {
             "core": True,
@@ -116,7 +117,7 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
         self.assertTrue(negotiated["supportsFollow"])
         self.assertTrue(negotiated["playbackPrepare"])
         self.assertTrue(negotiated["effectiveAtPlayback"])
-        self.assertTrue(negotiated["supportsBroadcast"])
+        self.assertFalse(negotiated["supportsBroadcast"])
 
     def test_core_not_ready_fails_closed(self):
         with self.assertRaises(CoreProfileNotReady):
@@ -143,7 +144,7 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
         self.assertFalse(negotiated["supportsFollow"])
         self.assertTrue(negotiated["playbackPrepare"])
         self.assertTrue(negotiated["effectiveAtPlayback"])
-        self.assertTrue(negotiated["supportsBroadcast"])
+        self.assertFalse(negotiated["supportsBroadcast"])
 
     def test_player_dependencies_gate_follow_and_handoff(self):
         negotiated = negotiate_capabilities(
@@ -156,7 +157,7 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
         self.assertFalse(negotiated["supportsFollow"])
         self.assertFalse(negotiated["playbackPrepare"])
         self.assertFalse(negotiated["effectiveAtPlayback"])
-        self.assertTrue(negotiated["supportsBroadcast"])
+        self.assertFalse(negotiated["supportsBroadcast"])
 
     def test_player_without_can_play_cannot_negotiate_follow_or_handoff(self):
         capabilities = dict(self.capabilities, canPlay=False)
@@ -172,30 +173,38 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
         self.assertFalse(negotiated["playbackPrepare"])
         self.assertFalse(negotiated["effectiveAtPlayback"])
 
-    def test_remote_volume_extension_preserves_base_shape_and_role_gates(self):
-        base = negotiate_capabilities(
+    def test_effective_at_is_independent_from_playback_prepare(self):
+        capabilities = dict(
+            self.capabilities,
+            playbackPrepare=False,
+            effectiveAtPlayback=True,
+        )
+
+        negotiated = negotiate_capabilities(
+            capabilities,
+            ["player"],
+            self.deployment_enabled,
+            self.code_ready,
+        )
+
+        self.assertFalse(negotiated["playbackPrepare"])
+        self.assertTrue(negotiated["effectiveAtPlayback"])
+
+    def test_fixed_remote_volume_capability_is_role_gated(self):
+        player = negotiate_capabilities(
             self.capabilities,
             ["player"],
             self.deployment_enabled,
             self.code_ready,
         )
-        self.assertNotIn("remoteVolumeControl", base)
-
-        extended = dict(self.capabilities, remoteVolumeControl=True)
-        player = negotiate_capabilities(
-            extended,
-            ["player"],
-            self.deployment_enabled,
-            self.code_ready,
-        )
         controller = negotiate_capabilities(
-            dict(extended, canSetVolume=False),
+            dict(self.capabilities, canSetVolume=False),
             ["controller"],
             self.deployment_enabled,
             self.code_ready,
         )
         incapable_player = negotiate_capabilities(
-            dict(extended, canSetVolume=False),
+            dict(self.capabilities, canSetVolume=False),
             ["player"],
             self.deployment_enabled,
             self.code_ready,
