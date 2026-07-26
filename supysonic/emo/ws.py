@@ -34,6 +34,7 @@ from .broadcast_store import (
     BroadcastRevisionConflictError,
     broadcastMutationLock,
     commitBroadcastRevisionInTransaction,
+    createBroadcastRegistrationReplay,
     createBroadcastState,
     getBroadcastIntentOutcome,
     getNonterminalBroadcastStateForContext,
@@ -2697,6 +2698,36 @@ def _resume_strict_broadcast_authority_registration(client_info):
     return resumed
 
 
+def _prepare_strict_broadcast_participant_registration(client_info):
+    if not _strict_broadcast_participant_eligible(client_info):
+        return None
+    session_info = state.get_session(request.sid) or {}
+    connection_nonce = session_info.get("connectionNonce")
+    if not isinstance(connection_nonce, str) or not connection_nonce:
+        return None
+    return createBroadcastRegistrationReplay(
+        client_info["userName"],
+        client_info["clientId"],
+        client_info["deviceSessionId"],
+        connection_nonce,
+        _server_time_ms(),
+    )
+
+
+def _emit_strict_broadcast_participant_registration(replay):
+    if replay is None or not replay.get("created"):
+        return
+    delivery = replay["delivery"]
+    _emit_message(
+        _build_message(
+            "event",
+            "broadcast.%s" % delivery["action"],
+            delivery["payload"],
+        ),
+        request.sid,
+    )
+
+
 def _broadcast_to_participants(broadcast, action, msg_type, source_client_id, request_id=None, extra_payload=None):
     payload = _build_broadcast_core_payload(broadcast, extra_payload)
     for target_client_id in broadcast.get("participants") or []:
@@ -5233,18 +5264,33 @@ def _handle_strict_broadcast_feedback(
         raise BroadcastConflictError(str(exc)) from exc
     confirmation = _build_message(
         "event",
-        "broadcast.feedback",
+        result["action"],
         result["canonicalResult"],
     )
-    _store_event_confirmations([confirmation])
+    confirmations = [confirmation]
+    follow_up = result.get("followUpDelivery")
+    if follow_up is not None:
+        confirmations.append(
+            _build_message(
+                "event",
+                "broadcast.%s" % follow_up["action"],
+                follow_up["payload"],
+            )
+        )
+    _store_event_confirmations(confirmations)
+
+    def emit_confirmations():
+        for message in confirmations:
+            _emit_message(
+                message,
+                request.sid,
+                record_settlement=False,
+            )
+
     _run_post_commit_push(
         "broadcast.feedback",
         request_id,
-        lambda: _emit_message(
-            confirmation,
-            request.sid,
-            record_settlement=False,
-        ),
+        emit_confirmations,
     )
     return {
         "broadcastId": payload["broadcastId"],
@@ -9555,6 +9601,7 @@ class EmoNamespace(Namespace):
                     else None
                 )
                 current_client = _register_device(request.sid, current_user_name, payload)
+                broadcast_participant_replay = None
                 if previous_client is not None:
                     _settle_authority_connection_controls_unknown(
                         previous_client.get("userName"),
@@ -9565,6 +9612,11 @@ class EmoNamespace(Namespace):
                 if _is_strict_playback_context_v2(current_client):
                     _resume_strict_broadcast_authority_registration(
                         current_client
+                    )
+                    broadcast_participant_replay = (
+                        _prepare_strict_broadcast_participant_registration(
+                            current_client
+                        )
                     )
                 _log_emo_event(
                     logging.INFO,
@@ -9591,6 +9643,13 @@ class EmoNamespace(Namespace):
                 else:
                     ack_payload["client"] = current_client
                 _send_ack(request_id, ack_payload)
+                _run_post_commit_push(
+                    "broadcast.resync",
+                    request_id,
+                    lambda: _emit_strict_broadcast_participant_registration(
+                        broadcast_participant_replay
+                    ),
+                )
                 if previous_sid is not None and previous_sid != request.sid:
                     socketio.server.disconnect(previous_sid, namespace="/emo")
                 _broadcast_clients(current_user_name)

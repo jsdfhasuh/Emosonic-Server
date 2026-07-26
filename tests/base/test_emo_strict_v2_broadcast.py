@@ -591,6 +591,226 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             1,
         )
 
+    def test_feedback_rejection_replays_one_private_resync(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        delivery = self._push(
+            self.get_messages(participant),
+            "broadcast.start",
+        )["payload"]
+        self.get_messages(authority)
+        self.get_messages(controller)
+        invalid_delivery = dict(
+            delivery,
+            broadcastRevision=2,
+            deliveryId="unknown-delivery",
+        )
+
+        self.send_broadcast_feedback(
+            participant,
+            start_ack["broadcastId"],
+            invalid_delivery,
+            request_id="broadcast-feedback-ahead-1",
+        )
+
+        messages = self.get_messages(participant)
+        rejected = self._push(messages, "broadcast.feedback.rejected")
+        resync = self._push(messages, "broadcast.resync")
+        self.assertEqual(
+            [
+                message["action"]
+                for message in messages
+                if message["action"].startswith("broadcast.")
+            ],
+            ["broadcast.feedback.rejected", "broadcast.resync"],
+        )
+        self.assertNotIn("requestId", rejected)
+        self.assertEqual(rejected["payload"]["errorCode"], "revision_ahead")
+        self.assertEqual(rejected["payload"]["currentBroadcastRevision"], 1)
+        self.assertEqual(resync["payload"]["broadcastRevision"], 1)
+        self.assertNotEqual(
+            resync["payload"]["deliveryId"],
+            delivery["deliveryId"],
+        )
+        self.assertEqual(self.get_messages(authority), [])
+        self.assertEqual(self.get_messages(controller), [])
+
+        self.send_broadcast_feedback(
+            participant,
+            start_ack["broadcastId"],
+            invalid_delivery,
+            request_id="broadcast-feedback-ahead-replay-1",
+        )
+        replay_messages = self.get_messages(participant)
+        replay_rejected = self._push(
+            replay_messages,
+            "broadcast.feedback.rejected",
+        )
+        replay_resync = self._push(replay_messages, "broadcast.resync")
+        self.assertEqual(replay_rejected["payload"], rejected["payload"])
+        self.assertEqual(replay_resync["payload"], resync["payload"])
+        persisted = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        self.assertEqual(persisted["snapshot"]["broadcastRevision"], 1)
+        self.assertEqual(len(persisted["deliveries"]), 2)
+        self.assertEqual(
+            persisted["participantStates"][0]["targetDeliveryId"],
+            resync["payload"]["deliveryId"],
+        )
+
+        controller.emit(
+            "message",
+            {
+                "type": "state",
+                "action": "broadcast.status",
+                "requestId": "broadcast-status-after-rejection-1",
+                "payload": {
+                    "playbackContextId": "context-broadcast-source",
+                    "broadcastId": start_ack["broadcastId"],
+                },
+            },
+            namespace="/emo",
+        )
+        self.get_ack(
+            self.get_messages(controller),
+            "broadcast-status-after-rejection-1",
+        )
+        self.assertEqual(
+            len(
+                emo_ws.getPersistentBroadcastState(
+                    start_ack["broadcastId"]
+                )["deliveries"]
+            ),
+            2,
+        )
+
+    def test_ordinary_reconnect_gets_one_resync_before_context_mutation(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        initial_delivery = self._push(
+            self.get_messages(participant),
+            "broadcast.start",
+        )["payload"]
+        self.get_messages(authority)
+        self.get_messages(controller)
+        before = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+
+        participant.disconnect(namespace="/emo")
+        self.get_messages(authority)
+        self.get_messages(controller)
+        reconnected = self.connect_authenticated_client(
+            "alice",
+            "Alic3",
+            request_id="auth-participant-reconnect-1",
+        )
+        register_messages = self.register_device(
+            reconnected,
+            "register-participant-reconnect-1",
+            {
+                "clientId": "participant-1",
+                "deviceSessionId": "device:participant-1",
+                "roles": ["player"],
+                "capabilities": {
+                    CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                    "effectiveAtPlayback": True,
+                },
+            },
+        )
+
+        register_ack = self.get_ack(
+            register_messages,
+            "register-participant-reconnect-1",
+        )
+        resync = self._push(register_messages, "broadcast.resync")
+        self.assertLess(
+            register_messages.index(register_ack),
+            register_messages.index(resync),
+        )
+        self.assertEqual(resync["payload"]["broadcastRevision"], 1)
+        self.assertNotEqual(
+            resync["payload"]["deliveryId"],
+            initial_delivery["deliveryId"],
+        )
+        self.assertIn("effectiveAtServerMs", resync["payload"])
+        self.assertEqual(
+            [
+                message
+                for message in self.get_messages(authority)
+                if message["action"] == "broadcast.resync"
+            ],
+            [],
+        )
+        self.assertEqual(
+            [
+                message
+                for message in self.get_messages(controller)
+                if message["action"] == "broadcast.resync"
+            ],
+            [],
+        )
+        after = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        self.assertEqual(after["snapshot"], before["snapshot"])
+        self.assertEqual(after["snapshot"]["broadcastRevision"], 1)
+        self.assertEqual(len(after["deliveries"]), 2)
+
+        reconnected.emit(
+            "message",
+            {
+                "type": "command",
+                "action": "playback.context.ensure",
+                "requestId": "ordinary-ensure-after-resync-1",
+                "payload": {
+                    "deviceSessionId": "device:participant-1",
+                    "queueSongIds": ["replacement-song"],
+                    "currentIndex": 0,
+                    "positionMs": 0,
+                    "state": "paused",
+                },
+            },
+            namespace="/emo",
+        )
+        barrier = self.get_error(
+            self.get_messages(reconnected),
+            "ordinary-ensure-after-resync-1",
+        )
+        self.assertEqual(barrier["payload"]["code"], "conflict")
+        self.assertEqual(
+            len(
+                emo_ws.getPersistentBroadcastState(
+                    start_ack["broadcastId"]
+                )["deliveries"]
+            ),
+            2,
+        )
+
+        self.send_broadcast_feedback(
+            reconnected,
+            start_ack["broadcastId"],
+            initial_delivery,
+            request_id="broadcast-feedback-old-attempt-1",
+        )
+        conflict = self.get_error(
+            self.get_messages(reconnected),
+            "broadcast-feedback-old-attempt-1",
+        )
+        self.assertEqual(conflict["payload"]["code"], "conflict")
+        current = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        self.assertEqual(
+            current["participantStates"][0]["targetDeliveryId"],
+            resync["payload"]["deliveryId"],
+        )
+
     def test_feedback_failed_then_applied_converges_status(self):
         authority, participant, controller = self.connect_broadcast_devices()
         start_ack = self.get_ack(

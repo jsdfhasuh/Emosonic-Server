@@ -2,10 +2,11 @@ import hashlib
 import json
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
-from peewee import IntegrityError, SqliteDatabase
+from peewee import IntegrityError, SqliteDatabase, fn
 
 from ..db import (
     EmoBroadcast,
@@ -27,6 +28,7 @@ from ..db import (
     open_connection,
 )
 from .ws_store import strictAuthorityPairLockSet, strictPlaybackContextLockSet
+from .strict_v2_effective_at import projectBroadcastPositionMs
 
 
 MAX_BROADCAST_PARTICIPANTS = 20
@@ -1481,6 +1483,98 @@ def saveBroadcastFeedbackSettlement(
         close_connection()
 
 
+def _minimum_retained_broadcast_revision(broadcast_id: str) -> int:
+    minimum = (
+        EmoBroadcastRevision.select(
+            fn.MIN(EmoBroadcastRevision.broadcast_revision)
+        )
+        .where(EmoBroadcastRevision.broadcast_id == broadcast_id)
+        .scalar()
+    )
+    return 1 if minimum is None else int(minimum)
+
+
+def _build_pair_replacement_delivery(
+    broadcast: EmoBroadcast,
+    participant: EmoBroadcastParticipant,
+    connection_nonce: str,
+    server_time_ms: int,
+) -> Dict[str, object]:
+    snapshot = _load_json(broadcast.snapshot_json, {})
+    revision = int(broadcast.broadcast_revision)
+    lifecycle = broadcast.lifecycle_state
+    delivery_id = "delivery:%s" % uuid.uuid4()
+    payload = dict(snapshot)
+    payload["deliveryId"] = delivery_id
+    effective_at_server_ms = None
+    delivery_position_ms = int(snapshot["positionMs"])
+    action = "stop" if lifecycle == "stopped" else "resync"
+    if lifecycle == "active":
+        effective_at_server_ms = server_time_ms + 250
+        payload.update(
+            {
+                "effectiveAtServerMs": effective_at_server_ms,
+                "serverTimeMs": server_time_ms,
+            }
+        )
+        if snapshot["state"] == "playing":
+            delivery_position_ms = projectBroadcastPositionMs(
+                int(snapshot["positionMs"]),
+                int(snapshot["serverUpdatedAtMs"]),
+                effective_at_server_ms,
+                float(snapshot["playbackRate"]),
+            )
+    elif lifecycle not in {"waitingForSource", "stopped"}:
+        raise BroadcastResourceConflictError(
+            "Broadcast lifecycle cannot produce a replacement delivery"
+        )
+    return {
+        "deliveryId": delivery_id,
+        "clientId": participant.client_id,
+        "deviceSessionId": participant.device_session_id,
+        "action": action,
+        "effectiveAtServerMs": effective_at_server_ms,
+        "serverTimeMs": (
+            server_time_ms if effective_at_server_ms is not None else None
+        ),
+        "deliveryPositionMs": delivery_position_ms,
+        "feedbackDeadlineAtServerMs": (
+            (effective_at_server_ms or server_time_ms) + 8000
+        ),
+        "payload": payload,
+        "connectionNonce": connection_nonce,
+        "createdAtMs": server_time_ms,
+        "resetDeadline": True,
+        "broadcastRevision": revision,
+    }
+
+
+def _feedback_settlement_result(
+    settlement: EmoBroadcastFeedbackSettlement,
+) -> Dict[str, object]:
+    stored = _load_json(settlement.canonical_result_json, {})
+    if stored.get("action") == "broadcast.feedback.rejected":
+        canonical = stored.get("payload") or {}
+        action = "broadcast.feedback.rejected"
+    else:
+        canonical = stored
+        action = "broadcast.feedback"
+    follow_up = None
+    if settlement.follow_up_delivery_id is not None:
+        delivery = EmoBroadcastDelivery.get_or_none(
+            EmoBroadcastDelivery.delivery_id
+            == settlement.follow_up_delivery_id
+        )
+        if delivery is not None:
+            follow_up = _serialize_delivery_record(delivery)
+    return {
+        "created": False,
+        "action": action,
+        "canonicalResult": canonical,
+        "followUpDelivery": follow_up,
+    }
+
+
 def settleBroadcastFeedback(
     user_name: str,
     playback_context_id: str,
@@ -1528,13 +1622,7 @@ def settleBroadcastFeedback(
                         raise BroadcastFeedbackSequenceConflictError(
                             client_seq
                         )
-                    return {
-                        "created": False,
-                        "canonicalResult": _load_json(
-                            existing.canonical_result_json,
-                            {},
-                        ),
-                    }
+                    return _feedback_settlement_result(existing)
                 latest = (
                     EmoBroadcastFeedbackSettlement.select()
                     .where(scope)
@@ -1600,15 +1688,66 @@ def settleBroadcastFeedback(
                         EmoBroadcastDelivery.device_session_id
                         == device_session_id
                     )
-                    & (
-                        EmoBroadcastDelivery.delivery_id
-                        == payload["deliveryId"]
-                    )
                     & (EmoBroadcastDelivery.is_current == 1)
                 )
                 if delivery is None:
+                    current_revision = int(broadcast.broadcast_revision)
+                    minimum_revision = _minimum_retained_broadcast_revision(
+                        broadcast_id
+                    )
+                    if revision > current_revision:
+                        rejection_code = "revision_ahead"
+                    elif revision < minimum_revision:
+                        rejection_code = "revision_expired"
+                    else:
+                        rejection_code = "revision_unknown"
+                    rejection = {
+                        "playbackContextId": playback_context_id,
+                        "broadcastId": broadcast_id,
+                        "deviceSessionId": device_session_id,
+                        "clientSeq": client_seq,
+                        "deliveryId": payload["deliveryId"],
+                        "rejectedBroadcastRevision": revision,
+                        "currentBroadcastRevision": current_revision,
+                        "minimumRetainedBroadcastRevision": minimum_revision,
+                        "errorCode": rejection_code,
+                        "serverUpdatedAtMs": server_time_ms,
+                    }
+                    replacement = _build_pair_replacement_delivery(
+                        broadcast,
+                        participant,
+                        connection_nonce,
+                        server_time_ms,
+                    )
+                    replacement_record = _create_delivery(
+                        broadcast_id,
+                        current_revision,
+                        replacement,
+                    )
+                    settlement = EmoBroadcastFeedbackSettlement.create(
+                        playback_context_id=playback_context_id,
+                        broadcast_id=broadcast_id,
+                        client_id=client_id,
+                        device_session_id=device_session_id,
+                        connection_nonce=connection_nonce,
+                        connection_epoch=connection_epoch,
+                        client_seq=client_seq,
+                        request_fingerprint=request_fingerprint,
+                        canonical_result_json=_canonical_json(
+                            {
+                                "action": "broadcast.feedback.rejected",
+                                "payload": rejection,
+                            }
+                        ),
+                        follow_up_delivery_id=replacement_record.delivery_id,
+                        created_at_ms=server_time_ms,
+                    )
+                    result = _feedback_settlement_result(settlement)
+                    result["created"] = True
+                    return result
+                if delivery.delivery_id != payload["deliveryId"]:
                     raise BroadcastResourceConflictError(
-                        "Broadcast feedback delivery ledger does not match"
+                        "Broadcast feedback deliveryId is not current"
                     )
                 target = _load_json(delivery.payload_json, {})
                 terminal = (
@@ -1794,10 +1933,109 @@ def settleBroadcastFeedback(
                 )
                 return {
                     "created": True,
+                    "action": "broadcast.feedback",
                     "canonicalResult": canonical,
+                    "followUpDelivery": None,
                     "participantState": _serialize_participant_record(
                         participant
                     ),
+                }
+    finally:
+        close_connection()
+
+
+def createBroadcastRegistrationReplay(
+    user_name: str,
+    client_id: str,
+    device_session_id: str,
+    connection_nonce: str,
+    server_time_ms: int,
+) -> Optional[Dict[str, object]]:
+    open_connection(reuse=True)
+    try:
+        candidate_id = None
+        participants = (
+            EmoBroadcastParticipant.select()
+            .where(
+                (EmoBroadcastParticipant.user_name == user_name)
+                & (EmoBroadcastParticipant.client_id == client_id)
+                & (
+                    EmoBroadcastParticipant.device_session_id
+                    == device_session_id
+                )
+            )
+            .order_by(EmoBroadcastParticipant.updated_at.desc())
+        )
+        for participant in participants:
+            broadcast = EmoBroadcast.get_or_none(
+                EmoBroadcast.broadcast_id == participant.broadcast_id
+            )
+            if (
+                broadcast is not None
+                and broadcast.lifecycle_state
+                in {"active", "waitingForSource"}
+            ):
+                candidate_id = participant.broadcast_id
+                break
+        if candidate_id is None:
+            return None
+        with broadcastMutationLock(candidate_id):
+            with broadcastTransaction():
+                broadcast = EmoBroadcast.get_or_none(
+                    EmoBroadcast.broadcast_id == candidate_id
+                )
+                participant = EmoBroadcastParticipant.get_or_none(
+                    _participant_expression(
+                        candidate_id,
+                        client_id,
+                        device_session_id,
+                    )
+                )
+                if (
+                    broadcast is None
+                    or participant is None
+                    or broadcast.user_name != user_name
+                    or broadcast.lifecycle_state
+                    not in {"active", "waitingForSource"}
+                ):
+                    return None
+                current = EmoBroadcastDelivery.get_or_none(
+                    (EmoBroadcastDelivery.broadcast_id == candidate_id)
+                    & (
+                        EmoBroadcastDelivery.broadcast_revision
+                        == broadcast.broadcast_revision
+                    )
+                    & (EmoBroadcastDelivery.client_id == client_id)
+                    & (
+                        EmoBroadcastDelivery.device_session_id
+                        == device_session_id
+                    )
+                    & (EmoBroadcastDelivery.is_current == 1)
+                )
+                if (
+                    current is not None
+                    and current.connection_nonce == connection_nonce
+                ):
+                    return {
+                        "created": False,
+                        "broadcast": _serialize_broadcast_record(broadcast),
+                        "delivery": _serialize_delivery_record(current),
+                    }
+                replacement = _build_pair_replacement_delivery(
+                    broadcast,
+                    participant,
+                    connection_nonce,
+                    server_time_ms,
+                )
+                record = _create_delivery(
+                    candidate_id,
+                    int(broadcast.broadcast_revision),
+                    replacement,
+                )
+                return {
+                    "created": True,
+                    "broadcast": _serialize_broadcast_record(broadcast),
+                    "delivery": _serialize_delivery_record(record),
                 }
     finally:
         close_connection()

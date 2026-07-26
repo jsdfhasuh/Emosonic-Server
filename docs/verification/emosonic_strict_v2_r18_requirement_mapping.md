@@ -27,9 +27,9 @@
 | REQ-056 | Goal 6 | source queue clear, pre-idle terminal Snapshot and atomic rollback tests | Verified |
 | REQ-057 | Goal 4 | source/ordinary/controller-only priority and fanout tests | Verified |
 | REQ-058—REQ-059 | Goal 1, Goal 3 | nonce clock warm-up/expiry, Handoff gate and sampled-position persistence tests | Verified |
-| REQ-060 | Goal 7, Goal 8 | earliest-unconfirmed, timeout and feedback rebuild verified; physical-reconnect rebuild remains | In progress |
+| REQ-060 | Goal 7, Goal 8 | earliest-unconfirmed, timeout, legal-feedback and physical-reconnect deadline rebuild tests | Verified |
 | REQ-061—REQ-062 | Goal 2, Goal 10 | cursor-preserving compact recovery and 256/512/1024 bounds verified; Socket drain remains | In progress |
 | REQ-063—REQ-064 | Goal 6 | deterministic action/equal-commit and exact persisted status anchor tests | Verified |
-| REQ-065 | Goal 8 | per-pair delivery and resync tests | Planned |
+| REQ-065 | Goal 8 | new-nonce single-pair resync, active/waiting timing and superseded-delivery tests | Verified |
 | REQ-066 | Goal 7, Goal 10 | terminal feedback state domain and atomic fence release verified; original stopped-task restore remains | In progress |
-| REQ-067 | Goal 8 | expired-feedback rejection and replacement delivery tests | Planned |
+| REQ-067 | Goal 8, Goal 10 | three rejection classes and active/waiting/full-terminal replacement verified; compact restore remains | In progress |

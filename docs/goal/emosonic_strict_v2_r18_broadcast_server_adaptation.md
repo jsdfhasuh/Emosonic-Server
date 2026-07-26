@@ -801,6 +801,17 @@ BroadcastSnapshot、source Context、Broadcast/source cursors；三数据库 bas
 - 其他 participants/source/controller 不收到 ordinary resync；
 - status 读取不能代替新 execution delivery。
 
+阶段记录（2026-07-26）：已实现 `revision_expired|revision_unknown|revision_ahead` 的
+`broadcast.feedback.rejected`，rejection 与 replacement delivery 在同一事务结算；相同
+clientSeq/content 重放首次 rejected event 和首次 deliveryId，不创建第二个 attempt，旧 deliveryId 只
+返回 conflict 且不能关闭新 deadline。active 的 playing/paused/stopped 均只向请求 pair 创建带新
+effective-at 的 `broadcast.resync`，waitingForSource 创建无计划时间的 resync，full terminal 创建新的
+`broadcast.stop`；Snapshot、broadcastRevision 和 source cursors 全部不变。ordinary 新物理连接在
+register ACK 后、普通 Context mutation 前收到单 pair resync，同一 nonce 重复 register 不创建 delivery；
+status 读取不触发投递。Broadcast/store/contract/Core 共 409 项通过，`supportsBroadcast` 继续保持
+false。Goal 10 建立 compact TerminalRecoveryRecord 后仍需补 `broadcast.restore` replacement，故本 Goal
+在该依赖完成前不标记完全完成。
+
 ### Goal 9：source waiting/resume 和 30 秒 timeout
 
 改动：

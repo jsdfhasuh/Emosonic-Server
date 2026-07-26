@@ -1,4 +1,5 @@
 import concurrent.futures
+import json
 import os
 import tempfile
 import threading
@@ -18,6 +19,7 @@ from supysonic.emo.broadcast_store import (
     commitBroadcastRevision,
     compactExpiredBroadcastStates,
     confirmBroadcastRestore,
+    createBroadcastRegistrationReplay,
     createBroadcastState,
     getBroadcastFenceForContext,
     getBroadcastFenceForPair,
@@ -280,7 +282,6 @@ class EmoBroadcastStoreTestCase(unittest.TestCase):
         self._create()
         variants = (
             {"deliveryId": "wrong-delivery"},
-            {"appliedBroadcastRevision": 2},
             {"queueIndex": 1},
             {"trackId": "song-2"},
             {"state": "paused"},
@@ -310,6 +311,242 @@ class EmoBroadcastStoreTestCase(unittest.TestCase):
         self.assertEqual(participant["syncStatus"], "pending")
         self.assertIsNone(participant["appliedBroadcastRevision"])
         self.assertEqual(db.EmoBroadcastFeedbackSettlement.select().count(), 0)
+
+    def test_feedback_ahead_rejection_creates_one_replacement_delivery(self):
+        self._create()
+        snapshot_before = getBroadcastState("broadcast-1")["snapshot"]
+        payload = self._applied_feedback(
+            revision=2,
+            delivery_id="unknown-delivery",
+        )
+
+        first = self._settle(payload, "ahead-1", 11000)
+        replay = self._settle(payload, "ahead-1", 12000)
+
+        self.assertTrue(first["created"])
+        self.assertEqual(first["action"], "broadcast.feedback.rejected")
+        self.assertEqual(
+            first["canonicalResult"]["errorCode"],
+            "revision_ahead",
+        )
+        self.assertEqual(
+            first["canonicalResult"]["currentBroadcastRevision"],
+            1,
+        )
+        self.assertEqual(
+            first["canonicalResult"]["minimumRetainedBroadcastRevision"],
+            1,
+        )
+        replacement = first["followUpDelivery"]
+        self.assertEqual(replacement["action"], "resync")
+        self.assertEqual(replacement["broadcastRevision"], 1)
+        self.assertEqual(replacement["effectiveAtServerMs"], 11250)
+        self.assertEqual(
+            replacement["payload"]["serverUpdatedAtMs"],
+            10000,
+        )
+        self.assertEqual(
+            replacement["payload"]["positionMs"],
+            1200,
+        )
+        self.assertFalse(replay["created"])
+        self.assertEqual(
+            replay["canonicalResult"],
+            first["canonicalResult"],
+        )
+        self.assertEqual(
+            replay["followUpDelivery"]["deliveryId"],
+            replacement["deliveryId"],
+        )
+        with self.assertRaises(BroadcastFeedbackSequenceConflictError):
+            self._settle(
+                dict(payload, deliveryId="different-unknown-delivery"),
+                "ahead-conflict",
+                12500,
+            )
+        state = getBroadcastState("broadcast-1")
+        current = [
+            item for item in state["deliveries"] if item["isCurrent"]
+        ]
+        self.assertEqual(len(current), 1)
+        self.assertEqual(current[0]["deliveryId"], replacement["deliveryId"])
+        self.assertEqual(state["snapshot"], snapshot_before)
+        self.assertEqual(
+            state["participantStates"][0]["feedbackDeadlineAtServerMs"],
+            19250,
+        )
+
+        with self.assertRaises(BroadcastResourceConflictError):
+            self._settle(
+                self._applied_feedback(client_seq=2),
+                "superseded-delivery",
+                13000,
+            )
+
+    def test_feedback_unknown_revision_classification(self):
+        self._create()
+        db.EmoBroadcastDelivery.delete().where(
+            db.EmoBroadcastDelivery.delivery_id == "delivery-1"
+        ).execute()
+        unknown = self._settle(
+            self._applied_feedback(delivery_id="missing-delivery"),
+            "unknown-1",
+            11000,
+        )
+        self.assertEqual(
+            unknown["canonicalResult"]["errorCode"],
+            "revision_unknown",
+        )
+
+    def test_feedback_expired_revision_classification(self):
+        self._create()
+        commitBroadcastRevision(
+            "broadcast-1",
+            1,
+            self._snapshot(revision=2, updated_at_ms=12000),
+            "progress",
+            [self._delivery("delivery-2", 2, "progress", 12000)],
+        )
+        db.EmoBroadcastDelivery.delete().where(
+            db.EmoBroadcastDelivery.broadcast_revision == 1
+        ).execute()
+        db.EmoBroadcastRevision.delete().where(
+            db.EmoBroadcastRevision.broadcast_revision == 1
+        ).execute()
+        expired = self._settle(
+            self._applied_feedback(delivery_id="expired-delivery"),
+            "expired-1",
+            13000,
+        )
+        self.assertEqual(
+            expired["canonicalResult"]["errorCode"],
+            "revision_expired",
+        )
+        self.assertEqual(
+            expired["canonicalResult"]["minimumRetainedBroadcastRevision"],
+            2,
+        )
+
+    def test_registration_replay_uses_new_nonce_and_waiting_is_untimed(self):
+        self._create()
+        same_connection = createBroadcastRegistrationReplay(
+            "alice",
+            "participant-1",
+            "device:participant-1",
+            "nonce-1",
+            11000,
+        )
+        self.assertFalse(same_connection["created"])
+
+        active = createBroadcastRegistrationReplay(
+            "alice",
+            "participant-1",
+            "device:participant-1",
+            "nonce-2",
+            12000,
+        )
+        self.assertTrue(active["created"])
+        self.assertEqual(active["delivery"]["action"], "resync")
+        self.assertEqual(active["delivery"]["effectiveAtServerMs"], 12250)
+        self.assertEqual(active["delivery"]["connectionNonce"], "nonce-2")
+
+        for index, state_name in enumerate(("paused", "stopped"), 3):
+            active_snapshot = self._snapshot(updated_at_ms=12000 + index)
+            active_snapshot["state"] = state_name
+            db.EmoBroadcast.update(
+                snapshot_json=json.dumps(active_snapshot, sort_keys=True),
+            ).where(
+                db.EmoBroadcast.broadcast_id == "broadcast-1"
+            ).execute()
+            replay = createBroadcastRegistrationReplay(
+                "alice",
+                "participant-1",
+                "device:participant-1",
+                "nonce-%d" % index,
+                12000 + index,
+            )
+            self.assertEqual(
+                replay["delivery"]["effectiveAtServerMs"],
+                12250 + index,
+            )
+            self.assertEqual(
+                replay["delivery"]["payload"]["state"],
+                state_name,
+            )
+
+        waiting_snapshot = self._snapshot(
+            lifecycle="waitingForSource",
+            updated_at_ms=13000,
+        )
+        db.EmoBroadcast.update(
+            lifecycle_state="waitingForSource",
+            snapshot_json=json.dumps(waiting_snapshot, sort_keys=True),
+        ).where(
+            db.EmoBroadcast.broadcast_id == "broadcast-1"
+        ).execute()
+        waiting = createBroadcastRegistrationReplay(
+            "alice",
+            "participant-1",
+            "device:participant-1",
+            "nonce-5",
+            14000,
+        )
+        self.assertTrue(waiting["created"])
+        self.assertIsNone(waiting["delivery"]["effectiveAtServerMs"])
+        self.assertIsNone(waiting["delivery"]["serverTimeMs"])
+        self.assertNotIn(
+            "effectiveAtServerMs",
+            waiting["delivery"]["payload"],
+        )
+        participant = getBroadcastState("broadcast-1")[
+            "participantStates"
+        ][0]
+        self.assertEqual(participant["feedbackDeadlineAtServerMs"], 22000)
+
+    def test_terminal_rejection_replaces_stop_without_clearing_restore(self):
+        self._create()
+        terminal = self._snapshot(
+            revision=2,
+            lifecycle="stopped",
+            updated_at_ms=20000,
+        )
+        terminalBroadcastState(
+            "broadcast-1",
+            terminal,
+            {"stopped": True},
+            [self._delivery("terminal-delivery", 2, "stop", 20000)],
+            expected_broadcast_revision=1,
+            terminal_at_ms=20000,
+        )
+        db.EmoBroadcastDelivery.delete().where(
+            db.EmoBroadcastDelivery.delivery_id == "terminal-delivery"
+        ).execute()
+        feedback = self._applied_feedback(
+            revision=2,
+            delivery_id="missing-terminal-delivery",
+            state="stopped",
+            restoreCompleted=True,
+        )
+
+        rejected = self._settle(feedback, "terminal-unknown", 21000)
+
+        self.assertEqual(
+            rejected["canonicalResult"]["errorCode"],
+            "revision_unknown",
+        )
+        replacement = rejected["followUpDelivery"]
+        self.assertEqual(replacement["action"], "stop")
+        self.assertEqual(replacement["broadcastRevision"], 2)
+        self.assertNotIn("effectiveAtServerMs", replacement["payload"])
+        participant = getBroadcastState("broadcast-1")[
+            "participantStates"
+        ][0]
+        self.assertTrue(participant["restorePending"])
+        self.assertFalse(participant["terminalConfirmed"])
+        self.assertEqual(
+            participant["targetDeliveryId"],
+            replacement["deliveryId"],
+        )
 
     def test_feedback_settlement_failure_rolls_back_participant(self):
         self._create()

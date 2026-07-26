@@ -719,6 +719,8 @@ STRICT_OUTPUT_ACTIONS = {
     "broadcast.progress",
     "broadcast.state.sync",
     "broadcast.feedback",
+    "broadcast.feedback.rejected",
+    "broadcast.resync",
     "broadcast.stop",
 }
 
@@ -758,6 +760,8 @@ _OUTPUT_ACTION_TYPES = {
     "broadcast.progress": "event",
     "broadcast.state.sync": "event",
     "broadcast.feedback": "event",
+    "broadcast.feedback.rejected": "event",
+    "broadcast.resync": "event",
     "broadcast.stop": "event",
 }
 
@@ -1579,6 +1583,82 @@ def _validate_broadcast_feedback_output(payload: object) -> None:
             "broadcast.feedback forbids fields: %s"
             % ", ".join(sorted(forbidden))
         )
+
+
+def _validate_broadcast_feedback_rejected_output(payload: object) -> None:
+    rejected = _output_object(
+        payload,
+        {
+            "playbackContextId",
+            "broadcastId",
+            "deviceSessionId",
+            "clientSeq",
+            "deliveryId",
+            "rejectedBroadcastRevision",
+            "currentBroadcastRevision",
+            "minimumRetainedBroadcastRevision",
+            "errorCode",
+            "serverUpdatedAtMs",
+        },
+        set(),
+        "broadcast.feedback.rejected payload",
+    )
+    for field_name in (
+        "playbackContextId",
+        "broadcastId",
+        "deviceSessionId",
+        "deliveryId",
+    ):
+        _output_string(
+            rejected[field_name],
+            "broadcast.feedback.rejected " + field_name,
+        )
+    _output_int(
+        rejected["clientSeq"],
+        "broadcast.feedback.rejected clientSeq",
+        1,
+    )
+    rejected_revision = _output_int(
+        rejected["rejectedBroadcastRevision"],
+        "broadcast.feedback.rejected rejectedBroadcastRevision",
+        1,
+    )
+    current_revision = _output_int(
+        rejected["currentBroadcastRevision"],
+        "broadcast.feedback.rejected currentBroadcastRevision",
+        1,
+    )
+    minimum_revision = _output_int(
+        rejected["minimumRetainedBroadcastRevision"],
+        "broadcast.feedback.rejected minimumRetainedBroadcastRevision",
+        1,
+    )
+    if minimum_revision > current_revision:
+        _output_error(
+            "broadcast.feedback.rejected retained floor exceeds current revision"
+        )
+    error_code = _output_string(
+        rejected["errorCode"],
+        "broadcast.feedback.rejected errorCode",
+    )
+    valid_relation = (
+        error_code == "revision_ahead"
+        and rejected_revision > current_revision
+    ) or (
+        error_code == "revision_expired"
+        and rejected_revision < minimum_revision
+    ) or (
+        error_code == "revision_unknown"
+        and minimum_revision <= rejected_revision <= current_revision
+    )
+    if not valid_relation:
+        _output_error(
+            "broadcast.feedback.rejected revision relation is invalid"
+        )
+    _output_int(
+        rejected["serverUpdatedAtMs"],
+        "broadcast.feedback.rejected serverUpdatedAtMs",
+    )
 
 
 def _validate_output_ack(payload: object) -> str:
@@ -2414,6 +2494,9 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
     if action == "broadcast.feedback":
         _validate_broadcast_feedback_output(payload)
         return None
+    if action == "broadcast.feedback.rejected":
+        _validate_broadcast_feedback_rejected_output(payload)
+        return None
     if action in {
         "broadcast.start",
         "broadcast.play",
@@ -2423,15 +2506,30 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
         "broadcast.queue.sync",
         "broadcast.progress",
         "broadcast.state.sync",
+        "broadcast.resync",
         "broadcast.stop",
     }:
         _validate_broadcast_snapshot(
             payload,
             "%s payload" % action,
-            allow_untimed_delivery=action == "broadcast.stop",
+            allow_untimed_delivery=action
+            in {"broadcast.resync", "broadcast.stop"},
         )
         if action == "broadcast.stop" and payload["lifecycleState"] != "stopped":
             _output_error("broadcast.stop lifecycleState must be stopped")
+        if action == "broadcast.resync":
+            if payload["lifecycleState"] not in {
+                "active",
+                "waitingForSource",
+            }:
+                _output_error("broadcast.resync lifecycleState is invalid")
+            if "deliveryId" not in payload:
+                _output_error("broadcast.resync requires deliveryId")
+            if (
+                payload["lifecycleState"] == "active"
+                and "effectiveAtServerMs" not in payload
+            ):
+                _output_error("active broadcast.resync requires timing fields")
         return None
     _output_error("No strict output payload schema exists for %s" % action)
     return None
