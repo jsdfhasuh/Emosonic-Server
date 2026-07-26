@@ -1,12 +1,16 @@
 # Goal: EmoSonic strict-v2 2.8.0 / r18 群播服务端落地
 
-> 状态：Planned（仅完成契约审查和实施拆解，尚未修改服务端）
+> 状态：Planned（r18 来源包和实施拆解已完成；尚未提升到 `specs/`，尚未修改服务端）
 >
 > 制定日期：2026-07-23
 >
+> 最近同步：2026-07-26
+>
 > 目标协议：PlaybackContext strict-v2 `2.8.0` / contract r18
 >
-> 最终契约来源：`ref/emosonic_strict_v2_socketio_server_contract - 1901.md`
+> 已确认 r18 来源包入口：`ref/emosonic_strict_v2_socketio_server_contract.md`
+>
+> 已确认 r18 分卷目录：`ref/emosonic_strict_v2_contract/`（19 个分卷）
 >
 > 目标权威路径：`specs/emosonic_strict_v2_socketio_server_contract.md`
 >
@@ -46,9 +50,10 @@ Goal 采用“先持久化和原子边界，再接 handler 和推送，最后开
 
 ### 2.1 实施时的权威顺序
 
-1. Goal 0 提升并修正后的 `specs/emosonic_strict_v2_socketio_server_contract.md`；
+1. Goal 0 整体提升后的 `specs/emosonic_strict_v2_socketio_server_contract.md` 及其分卷目录；
 2. 本 Goal；
-3. `ref/emosonic_strict_v2_socketio_server_contract - 1901.md`；
+3. Goal 0 前使用已确认的 `ref/emosonic_strict_v2_socketio_server_contract.md` 入口及其列出的 19 个
+   分卷作为 r18 来源包；
 4. 当前服务端代码和测试；
 5. r11、r12 和其他历史 Goal、旧 Broadcast 文档。
 
@@ -57,8 +62,9 @@ payload 自动进入 legacy Broadcast handler。
 
 ### 2.2 schemaHash 的项目决定
 
-1901 文件第 3.3 和验收条款仍残留“schemaHash 必填、固定 64 位格式、非法时 fail-closed”的旧句子。
-它们与项目负责人已经明确的最终决定冲突。Goal 0 必须先把权威契约改成以下口径：
+历史 1901 单文件曾残留“schemaHash 必填、固定 64 位格式、非法时 fail-closed”的旧句子。已确认的
+r18 分包来源已在 2026-07-26 修正为以下口径；Goal 0 提升到 `specs/` 时必须原样保留，不能从历史
+单文件恢复旧限制：
 
 - `strictV2.schemaHash` 是可选部署观测字段；
 - 服务端可以继续生成并返回当前 hash；
@@ -71,6 +77,16 @@ payload 自动进入 legacy Broadcast handler。
 - production 仍按协议 schema、权限、cursor、身份和持久化规则失败闭合。
 
 该决定不是新的 Broadcast wire 字段，不需要提升 protocolVersion。
+
+### 2.3 分包读取规则
+
+- 所有任务先读取来源包入口，不能把单个分卷声明为独立协议；
+- 登录、注册、时钟、ACK、错误、幂等、cursor 和 schema 使用阶段 0 分卷；
+- Broadcast source/start/control 至少读取 `01—04、06a—06c、07—08、10、11a—11c`；
+- Broadcast ordinary/feedback/terminal 至少读取入口指定的 ordinary 最小集合；
+- 全量 conformance、readiness、最终审计和 `supportsBroadcast:true` 判断必须读取 `01—14`；
+- 重建完整章节时按文件编号 `01` 到 `14` 排序，不能按 phase 目录的字典顺序拼接；
+- Goal 0 必须整体移动入口和全部分卷，禁止只提升入口或只复制部分分卷。
 
 ---
 
@@ -119,6 +135,10 @@ payload 自动进入 legacy Broadcast handler。
 19. `schemaHash` 仍被输出 validator 和仓库内 Web strict client 当成必填固定格式；
 20. 当前 Broadcast 主状态仅在内存，重启无法满足 terminal 原子释放和恢复义务。
 
+2026-07-26 文档同步状态：r18 来源包已经完成分卷和 schemaHash 契约修正，但尚未提升到 `specs/`；
+第 19 项在契约文本层面已经解决，在服务端 output validator、注册描述符、仓库内 Web strict client、
+测试和 CI 中仍未实现，继续属于 Goal 1 的代码缺口。其余服务端差距不变。
+
 ### 3.3 制定时测试基线
 
 ```text
@@ -140,7 +160,7 @@ python -m unittest \
 
 ### 4.1 本 Goal 包含
 
-- 把 1901 最终契约提升到 `specs/`，并落实 schemaHash 项目决定；
+- 把已确认的 r18 入口和 19 个分卷整体提升到 `specs/`，并保留已经修正的 schemaHash 决定；
 - strict-v2 `2.8.0` 注册描述符、validator、action inventory 和 fixtures；
 - Core 的 `positionSampledAtServerMs`、`playbackRate`、mandatory pong 和 clock gate；
 - source-derived BroadcastSnapshot 和 source Context 原子耦合；
@@ -543,16 +563,21 @@ failed、timedOut 和非法 feedback 均不得清除 restorePending。
 
 改动：
 
-- 将 1901 内容提升到 `specs/emosonic_strict_v2_socketio_server_contract.md`；
-- 同步 schemaHash 项目决定；
+- 将 `ref/emosonic_strict_v2_socketio_server_contract.md` 提升为
+  `specs/emosonic_strict_v2_socketio_server_contract.md`；
+- 将 `ref/emosonic_strict_v2_contract/` 的 19 个分卷整体提升为
+  `specs/emosonic_strict_v2_contract/`，保持入口相对链接有效；
+- 保留来源包中已经修正的 schemaHash 可选观测语义，不从历史 1901 恢复 required/格式门禁；
 - 标记旧 ref/change、r11/r12 Goal 为历史资料，不改写其历史内容；
 - 建立 r18 REQ-001 至 REQ-067 对代码和测试的映射表。
 
 完成条件：
 
 - `specs/` 是唯一当前权威；
+- `specs/` 入口可以到达全部 19 个分卷，全部分卷可以返回该入口；
 - 契约内部不再同时出现“schemaHash 仅观测”和“非法 hash fail-closed”；
-- 后续实现不从 1901 临时文件或历史 Goal 推导 wire shape。
+- 后续实现只按 `specs/` 入口的最小读取集或完整 `01—14` 读取，不从 1901 临时文件或历史 Goal
+  推导 wire shape。
 
 ### Goal 1：2.8 Core schema 和 metadata
 
@@ -1045,7 +1070,7 @@ git diff --check
 
 每个提交保持测试可解释，不混入无关重构：
 
-1. `Document strict-v2 2.8 r18 server adaptation`：权威契约和 Goal；
+1. `Promote split strict-v2 2.8 r18 contract`：把已确认入口和 19 个分卷整体提升到 `specs/`，同步 Goal；
 2. `Update strict-v2 2.8 core schemas`：metadata、validator、clock/sample/rate；
 3. `Persist strict-v2 broadcast lifecycle`：models、schema、migration、store primitives；
 4. `Derive broadcast from source context`：start、roles、controls、source updates；
