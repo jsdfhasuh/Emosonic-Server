@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import threading
@@ -15,7 +16,12 @@ from flask import (
 )
 from flask_socketio import Namespace, SocketIO, disconnect
 
-from ..db import User, close_connection, open_connection
+from ..db import (
+    EmoPlaybackControlTransaction,
+    User,
+    close_connection,
+    open_connection,
+)
 from ..logging_utils import format_log_event
 from ..managers.user import UserManager
 from .browser_auth import BROWSER_OTP_PREFIX, browser_one_time_passwords
@@ -29,7 +35,9 @@ from .broadcast_store import (
     commitBroadcastRevisionInTransaction,
     createBroadcastState,
     getBroadcastIntentOutcome,
+    getNonterminalBroadcastStateForContext,
     getBroadcastState as getPersistentBroadcastState,
+    terminalBroadcastStateInTransaction,
 )
 from .protocol_metadata import (
     get_strict_v2_metadata,
@@ -665,6 +673,11 @@ def _message_for_recipient(message, target_sid):
             "broadcast.pause",
             "broadcast.seek",
             "broadcast.playItem",
+            "broadcast.queue.sync",
+            "broadcast.progress",
+            "broadcast.state.sync",
+            "broadcast.resume",
+            "broadcast.resync",
             "player.play",
             "player.pause",
             "player.seek",
@@ -4676,6 +4689,32 @@ def _build_r18_broadcast_deliveries(
     return deliveries
 
 
+def _build_r18_terminal_deliveries(
+    persisted: Dict[str, object],
+    snapshot: Dict[str, object],
+    server_time_ms: int,
+) -> List[Dict[str, object]]:
+    deliveries = []
+    for participant in persisted.get("participantStates", ()):
+        delivery_id = "delivery:%s" % uuid.uuid4()
+        payload = dict(snapshot)
+        payload["deliveryId"] = delivery_id
+        deliveries.append(
+            {
+                "deliveryId": delivery_id,
+                "clientId": participant["clientId"],
+                "deviceSessionId": participant["deviceSessionId"],
+                "action": "stop",
+                "deliveryPositionMs": snapshot["positionMs"],
+                "feedbackDeadlineAtServerMs": server_time_ms + 8000,
+                "payload": payload,
+                "connectionNonce": None,
+                "createdAtMs": server_time_ms,
+            }
+        )
+    return deliveries
+
+
 def _commit_r18_broadcast_projection(
     persisted: Dict[str, object],
     playback_context: Dict[str, object],
@@ -4719,6 +4758,174 @@ def _commit_r18_broadcast_projection(
     }
 
 
+def _commit_r18_broadcast_terminal(
+    persisted: Dict[str, object],
+    server_time_ms: int,
+) -> Dict[str, object]:
+    previous = persisted["snapshot"]
+    snapshot = dict(previous)
+    snapshot.update(
+        {
+            "lifecycleState": "stopped",
+            "broadcastRevision": previous["broadcastRevision"] + 1,
+            "serverUpdatedAtMs": server_time_ms,
+        }
+    )
+    deliveries = _build_r18_terminal_deliveries(
+        persisted,
+        snapshot,
+        server_time_ms,
+    )
+    terminal = terminalBroadcastStateInTransaction(
+        persisted["broadcastId"],
+        snapshot,
+        {},
+        terminal_deliveries=deliveries,
+        expected_broadcast_revision=previous["broadcastRevision"],
+        terminal_at_ms=server_time_ms,
+    )
+    return {
+        "broadcast": terminal["broadcast"],
+        "snapshot": snapshot,
+        "deliveries": deliveries,
+        "action": "broadcast.stop",
+        "serverTimeMs": server_time_ms,
+        "includeSource": True,
+    }
+
+
+def _r18_remote_update_matches_distributed_target(
+    payload: Dict[str, object],
+    playback_context: Dict[str, object],
+) -> Tuple[bool, Optional[str]]:
+    command_version = payload.get("commandControlVersion")
+    if not isinstance(command_version, int):
+        return False, None
+    transaction = EmoPlaybackControlTransaction.get_or_none(
+        (
+            EmoPlaybackControlTransaction.playback_context_id
+            == playback_context["playbackContextId"]
+        )
+        & (
+            EmoPlaybackControlTransaction.command_control_version
+            == command_version
+        )
+        & (EmoPlaybackControlTransaction.epoch == playback_context["epoch"])
+    )
+    if transaction is None:
+        return False, None
+    accepted = json.loads(transaction.accepted_target_json)
+    if "effectiveAtServerMs" not in accepted:
+        return False, transaction.action
+    matches = all(
+        payload.get(field_name) == accepted.get(field_name)
+        for field_name in ("state", "trackId", "positionMs")
+        if field_name in accepted
+    )
+    if "queueIndex" in accepted:
+        matches = matches and (
+            playback_context["currentIndex"] == accepted["queueIndex"]
+        )
+    return matches, transaction.action
+
+
+def _commit_r18_source_playback_update(
+    persisted: Dict[str, object],
+    result: Dict[str, object],
+    _previous_context: Dict[str, object],
+    _previous_device_state: Optional[Dict[str, object]],
+    payload: Dict[str, object],
+    server_time_ms: int,
+    track_duration_ms: Optional[int],
+) -> Optional[Dict[str, object]]:
+    playback_context = result["playbackContext"]
+    canonical = result["canonicalUpdate"]
+    previous_snapshot = persisted["snapshot"]
+    if canonical["state"] == "idle":
+        return _commit_r18_broadcast_terminal(persisted, server_time_ms)
+
+    queue_changed = (
+        playback_context["queueSongIds"] != previous_snapshot["queueSongIds"]
+        or playback_context["currentIndex"]
+        != previous_snapshot["currentIndex"]
+        or playback_context["trackId"] != previous_snapshot["trackId"]
+    )
+    previous_state = previous_snapshot["state"]
+    actual_state = canonical["state"]
+    origin = canonical["origin"]
+    remote_action = None
+    if origin == "remoteCommand" and payload.get("executionStatus") == "committed":
+        matches, remote_action = _r18_remote_update_matches_distributed_target(
+            payload,
+            playback_context,
+        )
+        if matches and not queue_changed:
+            return None
+
+    if queue_changed:
+        action = "broadcast.queue.sync"
+    elif previous_state in {"paused", "stopped"} and actual_state == "playing":
+        action = "broadcast.play"
+    elif previous_state == "playing" and actual_state in {"paused", "stopped"}:
+        action = "broadcast.pause"
+    elif origin == "localUser":
+        action = "broadcast.seek"
+    elif origin == "remoteCommand" and remote_action == "player.seek":
+        action = "broadcast.seek"
+    elif (
+        canonical["playbackRate"] != previous_snapshot["playbackRate"]
+        or actual_state != previous_state
+        or origin == "remoteCommand"
+    ):
+        action = "broadcast.state.sync"
+    elif origin == "passive" and actual_state == "playing":
+        action = "broadcast.progress"
+    else:
+        return None
+
+    if action == "broadcast.progress":
+        last_progress_ms = max(
+            (
+                revision["createdAtMs"]
+                for revision in persisted.get("revisions", ())
+                if revision.get("action") == "progress"
+            ),
+            default=0,
+        )
+        if server_time_ms - last_progress_ms < 1000:
+            return None
+
+    effective_at_server_ms = server_time_ms + 250
+    playback_rate = canonical["playbackRate"]
+    position_ms = canonical["positionMs"]
+    if actual_state == "playing":
+        sampled_at_ms = canonical["positionSampledAtServerMs"]
+        if (
+            sampled_at_ms > server_time_ms + 50
+            or server_time_ms - sampled_at_ms > 2000
+        ):
+            raise BroadcastConflictError(
+                "Source playback position sample is not fresh"
+            )
+        position_ms = projectBroadcastPositionMs(
+            canonical["positionMs"],
+            sampled_at_ms,
+            effective_at_server_ms,
+            playback_rate,
+            duration_ms=track_duration_ms,
+        )
+    return _commit_r18_broadcast_projection(
+        persisted,
+        playback_context,
+        action,
+        position_ms,
+        actual_state,
+        playback_rate,
+        server_time_ms,
+        effective_at_server_ms,
+    )
+
+
 def _emit_r18_broadcast_projection(mutation: Dict[str, object]) -> None:
     if not mutation:
         return
@@ -4728,6 +4935,32 @@ def _emit_r18_broadcast_projection(mutation: Dict[str, object]) -> None:
     action = mutation["action"]
     emitted_sids = set()
     participant_pairs = set()
+    if mutation.get("includeSource"):
+        source_client_id = snapshot["authorityClientId"]
+        source = state.get_client(source_client_id, user_name=user_name)
+        source_sid = state.get_sid_for_client(
+            source_client_id,
+            user_name=user_name,
+        )
+        if (
+            source is not None
+            and source.get("deviceSessionId")
+            == snapshot["authorityDeviceSessionId"]
+            and source_sid is not None
+        ):
+            try:
+                _emit_message(
+                    _build_message("event", action, snapshot),
+                    source_sid,
+                )
+                emitted_sids.add(source_sid)
+            except Exception:
+                logger.exception(
+                    "Failed to emit Broadcast source lifecycle broadcast=%s revision=%s sid=%s",
+                    snapshot["broadcastId"],
+                    snapshot["broadcastRevision"],
+                    source_sid,
+                )
     for delivery in mutation["deliveries"]:
         pair = (delivery["clientId"], delivery["deviceSessionId"])
         participant_pairs.add(pair)
@@ -4773,14 +5006,15 @@ def _emit_r18_broadcast_projection(mutation: Dict[str, object]) -> None:
         and _has_role(owner, "controller")
     ):
         observer_payload = dict(snapshot)
-        observer_payload.update(
-            {
-                "effectiveAtServerMs": mutation[
-                    "effectiveAtServerMs"
-                ],
-                "serverTimeMs": mutation["serverTimeMs"],
-            }
-        )
+        if "effectiveAtServerMs" in mutation:
+            observer_payload.update(
+                {
+                    "effectiveAtServerMs": mutation[
+                        "effectiveAtServerMs"
+                    ],
+                    "serverTimeMs": mutation["serverTimeMs"],
+                }
+            )
         try:
             _emit_message(
                 _build_message("event", action, observer_payload),
@@ -7451,20 +7685,96 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
     server_time_ms = _server_time_ms()
     if payload["positionSampledAtServerMs"] > server_time_ms + 1000:
         raise ValueError("positionSampledAtServerMs is too far in the future")
-    updated_context = mutateStrictPlaybackContextQueue(
-        playback_context_id,
+    persisted_broadcast = getNonterminalBroadcastStateForContext(
         current_user_name,
-        current_client.get("clientId"),
-        device_session_id,
-        queue_song_ids,
-        current_index,
-        position_ms,
-        _get_base_queue_revision(payload),
-        payload.get("baseControlVersion"),
-        position_sampled_at_server_ms=payload[
-            "positionSampledAtServerMs"
-        ],
+        playback_context_id,
     )
+    next_track_id = (
+        queue_song_ids[current_index]
+        if queue_song_ids and current_index is not None
+        else None
+    )
+    track_duration_ms = getTrackDurationMs(next_track_id)
+    broadcast_mutation = None
+
+    def projection_hook(_record, result, _previous):
+        if not queue_song_ids:
+            return _commit_r18_broadcast_terminal(
+                persisted_broadcast,
+                server_time_ms,
+            )
+        effective_at_server_ms = server_time_ms + 250
+        playback_rate = persisted_broadcast["snapshot"]["playbackRate"]
+        projected_position_ms = result["positionMs"]
+        if result["state"] == "playing":
+            sampled_at_ms = payload["positionSampledAtServerMs"]
+            if (
+                sampled_at_ms > server_time_ms + 50
+                or server_time_ms - sampled_at_ms > 2000
+            ):
+                raise BroadcastConflictError(
+                    "Source queue position sample is not fresh"
+                )
+            projected_position_ms = projectBroadcastPositionMs(
+                result["positionMs"],
+                sampled_at_ms,
+                effective_at_server_ms,
+                playback_rate,
+                duration_ms=track_duration_ms,
+            )
+        return _commit_r18_broadcast_projection(
+            persisted_broadcast,
+            result,
+            "broadcast.queue.sync",
+            projected_position_ms,
+            result["state"],
+            playback_rate,
+            server_time_ms,
+            effective_at_server_ms,
+        )
+
+    try:
+        if persisted_broadcast is None:
+            updated_context = mutateStrictPlaybackContextQueue(
+                playback_context_id,
+                current_user_name,
+                current_client.get("clientId"),
+                device_session_id,
+                queue_song_ids,
+                current_index,
+                position_ms,
+                _get_base_queue_revision(payload),
+                payload.get("baseControlVersion"),
+                position_sampled_at_server_ms=payload[
+                    "positionSampledAtServerMs"
+                ],
+            )
+        else:
+            with broadcastMutationLock(persisted_broadcast["broadcastId"]):
+                updated_context = mutateStrictPlaybackContextQueue(
+                    playback_context_id,
+                    current_user_name,
+                    current_client.get("clientId"),
+                    device_session_id,
+                    queue_song_ids,
+                    current_index,
+                    position_ms,
+                    _get_base_queue_revision(payload),
+                    payload.get("baseControlVersion"),
+                    position_sampled_at_server_ms=payload[
+                        "positionSampledAtServerMs"
+                    ],
+                    post_mutation_hook=projection_hook,
+                )
+                broadcast_mutation = updated_context.pop(
+                    "_broadcastMutation"
+                )
+    except (
+        BroadcastNotFoundError,
+        BroadcastResourceConflictError,
+        BroadcastRevisionConflictError,
+    ) as exc:
+        raise BroadcastConflictError(str(exc)) from exc
     if updated_context is None:
         raise LookupError("Playback context not found")
 
@@ -7477,6 +7787,8 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
         )
 
     state.restore_playback_context(playback_context_id, updated_context)
+    if broadcast_mutation is not None:
+        _emit_r18_broadcast_projection(broadcast_mutation)
     _send_ack(request_id)
     for canonical_result in settled_prepares:
         _run_post_commit_push(
@@ -7513,18 +7825,61 @@ def _handle_strict_v2_playback_update(
     connection_nonce = session_info.get("connectionNonce")
     if not isinstance(connection_nonce, str) or not connection_nonce:
         raise PermissionError("Registered connection provenance is missing")
-
-    result = applyStrictPlaybackUpdate(
-        payload["playbackContextId"],
+    server_time_ms = _server_time_ms()
+    persisted_broadcast = getNonterminalBroadcastStateForContext(
         current_user_name,
-        current_client.get("clientId"),
-        payload["deviceSessionId"],
-        connection_nonce,
-        payload,
-        _server_time_ms(),
+        payload["playbackContextId"],
     )
+    track_duration_ms = getTrackDurationMs(payload.get("trackId"))
+
+    def projection_hook(
+        _record,
+        hook_result,
+        previous_context,
+        previous_device_state,
+    ):
+        return _commit_r18_source_playback_update(
+            persisted_broadcast,
+            hook_result,
+            previous_context,
+            previous_device_state,
+            payload,
+            server_time_ms,
+            track_duration_ms,
+        )
+
+    try:
+        if persisted_broadcast is None:
+            result = applyStrictPlaybackUpdate(
+                payload["playbackContextId"],
+                current_user_name,
+                current_client.get("clientId"),
+                payload["deviceSessionId"],
+                connection_nonce,
+                payload,
+                server_time_ms,
+            )
+        else:
+            with broadcastMutationLock(persisted_broadcast["broadcastId"]):
+                result = applyStrictPlaybackUpdate(
+                    payload["playbackContextId"],
+                    current_user_name,
+                    current_client.get("clientId"),
+                    payload["deviceSessionId"],
+                    connection_nonce,
+                    payload,
+                    server_time_ms,
+                    post_mutation_hook=projection_hook,
+                )
+    except (
+        BroadcastNotFoundError,
+        BroadcastResourceConflictError,
+        BroadcastRevisionConflictError,
+    ) as exc:
+        raise BroadcastConflictError(str(exc)) from exc
     if result is None:
         raise LookupError("Playback context not found")
+    broadcast_mutation = result.pop("_broadcastMutation", None)
     playback_context = result["playbackContext"]
     for command_control_version in result.get(
         "terminalControlVersions",
@@ -7543,6 +7898,8 @@ def _handle_strict_v2_playback_update(
         result["canonicalUpdate"]
     )
     _store_event_confirmations([confirmation])
+    if broadcast_mutation is not None:
+        _emit_r18_broadcast_projection(broadcast_mutation)
     if result["sourceOnly"]:
         _run_post_commit_push(
             "playback.update",

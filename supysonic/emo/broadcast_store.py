@@ -994,6 +994,33 @@ def getBroadcastState(
         close_connection()
 
 
+def getNonterminalBroadcastStateForContext(
+    user_name: str,
+    playback_context_id: str,
+) -> Optional[Dict[str, object]]:
+    open_connection(reuse=True)
+    try:
+        record = (
+            EmoBroadcast.select(EmoBroadcast.broadcast_id)
+            .where(
+                (EmoBroadcast.user_name == user_name)
+                & (
+                    EmoBroadcast.playback_context_id
+                    == playback_context_id
+                )
+                & (EmoBroadcast.lifecycle_state != "stopped")
+            )
+            .order_by(EmoBroadcast.created_at.desc())
+            .first()
+        )
+        broadcast_id = None if record is None else record.broadcast_id
+    finally:
+        close_connection()
+    if broadcast_id is None:
+        return None
+    return getBroadcastState(broadcast_id)
+
+
 def getBroadcastFenceForContext(
     user_name: str,
     playback_context_id: str,
@@ -1228,6 +1255,95 @@ def commitBroadcastRevision(
         close_connection()
 
 
+def terminalBroadcastStateInTransaction(
+    broadcast_id: str,
+    snapshot: Dict[str, object],
+    stop_ack: Dict[str, object],
+    terminal_deliveries: Sequence[Dict[str, object]] = (),
+    expected_broadcast_revision: Optional[int] = None,
+    terminal_at_ms: Optional[int] = None,
+) -> Dict[str, object]:
+    record = EmoBroadcast.get_or_none(
+        EmoBroadcast.broadcast_id == broadcast_id
+    )
+    if record is None:
+        raise BroadcastNotFoundError(broadcast_id)
+    intent = EmoBroadcastIntentOutcome.get(
+        EmoBroadcastIntentOutcome.broadcast_id == broadcast_id
+    )
+    if record.lifecycle_state == "stopped":
+        return {
+            "created": False,
+            "broadcast": _serialize_broadcast_record(record),
+            "stopAck": _load_json(intent.stop_ack_json, {}),
+        }
+    if (
+        expected_broadcast_revision is not None
+        and record.broadcast_revision != expected_broadcast_revision
+    ):
+        raise BroadcastRevisionConflictError(record.broadcast_revision)
+    next_revision = record.broadcast_revision + 1
+    if (
+        snapshot.get("broadcastId") != broadcast_id
+        or snapshot.get("broadcastRevision") != next_revision
+        or snapshot.get("lifecycleState") != "stopped"
+    ):
+        raise ValueError(
+            "Terminal snapshot must carry stopped and next revision"
+        )
+    committed_at_ms = int(
+        terminal_at_ms
+        if terminal_at_ms is not None
+        else time.time() * 1000
+    )
+    EmoBroadcastRevision.create(
+        broadcast_id=broadcast_id,
+        broadcast_revision=next_revision,
+        snapshot_json=_canonical_json(snapshot),
+        canonical_action="stop",
+        created_at_ms=committed_at_ms,
+    )
+    for delivery in terminal_deliveries:
+        _create_delivery(broadcast_id, next_revision, delivery)
+    EmoBroadcastFence.delete().where(
+        (EmoBroadcastFence.broadcast_id == broadcast_id)
+        & (EmoBroadcastFence.role == "source")
+    ).execute()
+    EmoBroadcastFence.update(
+        phase="restorePending",
+        updated_at=now(),
+    ).where(
+        (EmoBroadcastFence.broadcast_id == broadcast_id)
+        & (EmoBroadcastFence.role == "ordinary")
+    ).execute()
+    EmoBroadcastParticipant.update(
+        restore_pending=1,
+        terminal_confirmed=0,
+        updated_at=now(),
+    ).where(
+        EmoBroadcastParticipant.broadcast_id == broadcast_id
+    ).execute()
+    record.lifecycle_state = "stopped"
+    record.broadcast_revision = next_revision
+    record.snapshot_json = _canonical_json(snapshot)
+    record.authority_disconnect_deadline_ms = None
+    record.terminal_at_ms = committed_at_ms
+    record.full_expires_at_ms = (
+        committed_at_ms + BROADCAST_FULL_RETENTION_MS
+    )
+    record.updated_at = now()
+    record.save()
+    intent.terminal_broadcast_revision = next_revision
+    intent.stop_ack_json = _canonical_json(stop_ack)
+    intent.updated_at = now()
+    intent.save()
+    return {
+        "created": True,
+        "broadcast": _serialize_broadcast_record(record),
+        "stopAck": dict(stop_ack),
+    }
+
+
 def terminalBroadcastState(
     broadcast_id: str,
     snapshot: Dict[str, object],
@@ -1258,92 +1374,14 @@ def terminalBroadcastState(
             authority_pairs
         ), broadcastResourceLock(resource_keys):
             with broadcastTransaction():
-                record = EmoBroadcast.get_or_none(
-                    EmoBroadcast.broadcast_id == broadcast_id
+                return terminalBroadcastStateInTransaction(
+                    broadcast_id,
+                    snapshot,
+                    stop_ack,
+                    terminal_deliveries=terminal_deliveries,
+                    expected_broadcast_revision=expected_broadcast_revision,
+                    terminal_at_ms=terminal_at_ms,
                 )
-                if record is None:
-                    raise BroadcastNotFoundError(broadcast_id)
-                intent = EmoBroadcastIntentOutcome.get(
-                    EmoBroadcastIntentOutcome.broadcast_id == broadcast_id
-                )
-                if record.lifecycle_state == "stopped":
-                    return {
-                        "created": False,
-                        "broadcast": _serialize_broadcast_record(record),
-                        "stopAck": _load_json(intent.stop_ack_json, {}),
-                    }
-                if (
-                    expected_broadcast_revision is not None
-                    and record.broadcast_revision
-                    != expected_broadcast_revision
-                ):
-                    raise BroadcastRevisionConflictError(
-                        record.broadcast_revision
-                    )
-                next_revision = record.broadcast_revision + 1
-                if (
-                    snapshot.get("broadcastId") != broadcast_id
-                    or snapshot.get("broadcastRevision") != next_revision
-                    or snapshot.get("lifecycleState") != "stopped"
-                ):
-                    raise ValueError(
-                        "Terminal snapshot must carry stopped and next revision"
-                    )
-                committed_at_ms = int(
-                    terminal_at_ms
-                    if terminal_at_ms is not None
-                    else time.time() * 1000
-                )
-                EmoBroadcastRevision.create(
-                    broadcast_id=broadcast_id,
-                    broadcast_revision=next_revision,
-                    snapshot_json=_canonical_json(snapshot),
-                    canonical_action="stop",
-                    created_at_ms=committed_at_ms,
-                )
-                for delivery in terminal_deliveries:
-                    _create_delivery(
-                        broadcast_id,
-                        next_revision,
-                        delivery,
-                    )
-                EmoBroadcastFence.delete().where(
-                    (EmoBroadcastFence.broadcast_id == broadcast_id)
-                    & (EmoBroadcastFence.role == "source")
-                ).execute()
-                EmoBroadcastFence.update(
-                    phase="restorePending",
-                    updated_at=now(),
-                ).where(
-                    (EmoBroadcastFence.broadcast_id == broadcast_id)
-                    & (EmoBroadcastFence.role == "ordinary")
-                ).execute()
-                EmoBroadcastParticipant.update(
-                    restore_pending=1,
-                    terminal_confirmed=0,
-                    updated_at=now(),
-                ).where(
-                    EmoBroadcastParticipant.broadcast_id == broadcast_id
-                ).execute()
-                record.lifecycle_state = "stopped"
-                record.broadcast_revision = next_revision
-                record.snapshot_json = _canonical_json(snapshot)
-                record.authority_disconnect_deadline_ms = None
-                record.terminal_at_ms = committed_at_ms
-                record.full_expires_at_ms = (
-                    committed_at_ms + BROADCAST_FULL_RETENTION_MS
-                )
-                record.updated_at = now()
-                record.save()
-                intent.terminal_broadcast_revision = next_revision
-                intent.stop_ack_json = _canonical_json(stop_ack)
-                intent.updated_at = now()
-                intent.save()
-                return {
-                    "created": True,
-                    "broadcast": _serialize_broadcast_record(record),
-                    "stopAck": dict(stop_ack),
-                }
     finally:
         close_connection()
 

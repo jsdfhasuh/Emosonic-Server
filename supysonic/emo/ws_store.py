@@ -902,6 +902,7 @@ def applyStrictPlaybackUpdate(
     connection_nonce,
     payload,
     server_updated_at_ms,
+    post_mutation_hook=None,
 ):
     payload = dict(payload)
     payload.setdefault("positionSampledAtServerMs", 0)
@@ -1331,6 +1332,11 @@ def applyStrictPlaybackUpdate(
                     superseded_through_control_version=superseded_through,
                 )
 
+            previous_device_state = (
+                _device_playback_state_payload(existing)
+                if existing is not None
+                else None
+            )
             saved_device = _save_strict_device_state_record(
                 record,
                 existing,
@@ -1341,7 +1347,7 @@ def applyStrictPlaybackUpdate(
                 request_fingerprint,
                 canonical,
             )
-            return {
+            result = {
                 "playbackContext": _playback_context_payload(record),
                 "deviceState": _device_playback_state_payload(saved_device),
                 "canonicalUpdate": canonical,
@@ -1350,6 +1356,14 @@ def applyStrictPlaybackUpdate(
                 "dependencySettlements": dependency_records,
                 "terminalControlVersions": terminal_control_versions,
             }
+            if post_mutation_hook is not None:
+                result["_broadcastMutation"] = post_mutation_hook(
+                    record,
+                    result,
+                    current,
+                    previous_device_state,
+                )
+            return result
     finally:
         close_connection()
 
@@ -2588,6 +2602,7 @@ def mutateStrictPlaybackContextQueue(
     base_queue_revision,
     base_control_version=None,
     position_sampled_at_server_ms=None,
+    post_mutation_hook=None,
 ):
     queue_song_ids = list(queue_song_ids)
     open_connection(reuse=True)
@@ -2664,7 +2679,14 @@ def mutateStrictPlaybackContextQueue(
                 record.control_version += 1
             record.updated_at = now()
             record.save()
-            return _playback_context_payload(record)
+            result = _playback_context_payload(record)
+            if post_mutation_hook is not None:
+                result["_broadcastMutation"] = post_mutation_hook(
+                    record,
+                    result,
+                    current,
+                )
+            return result
     finally:
         close_connection()
 

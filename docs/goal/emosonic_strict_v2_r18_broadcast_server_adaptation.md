@@ -1,6 +1,6 @@
 # Goal: EmoSonic strict-v2 2.8.0 / r18 群播服务端落地
 
-> 状态：In progress（Goal 0—5 已完成；正在实施 Goal 6—11）
+> 状态：In progress（Goal 0—6 已完成；正在实施 Goal 7—11）
 >
 > 制定日期：2026-07-23
 >
@@ -718,7 +718,7 @@ currentVersion/currentQueueRevision/currentControlVersion，且不修改或重�
 standby Context、start/terminal/restore fence 转换也进入同一 Context/pair 临界区。ws_store、contract、
 Socket 与继承 WebSocket 回归共 212 项通过，`supportsBroadcast` 继续保持 false。
 
-### Goal 6：Broadcast control 与 source 派生更新
+### Goal 6：Broadcast control 与 source 派生更新（已完成）
 
 改动：
 
@@ -737,6 +737,17 @@ Socket 与继承 WebSocket 回归共 212 项通过，`supportsBroadcast` 继续�
 - 不通过位置差值或漂移阈值猜 seek/progress；
 - source command 和 ordinary mirror 时间值逐值相等；
 - status 返回 immutable Snapshot anchor。
+
+完成记录（2026-07-26）：play/pause/seek/playItem 已在 source Context transaction 中创建普通 control
+transaction，并在同一数据库事务内提交 Broadcast revision/delivery；source command 与 ordinary mirror
+共享同一计划时间。source `queue.context.sync` 非空更新只派生一个 `broadcast.queue.sync`，清空 queue
+则以清空前非空 Snapshot/cursors 原子进入 terminal、释放 source fence、安装 ordinary
+restorePending，再提交 source idle，故障注入验证全部回滚。source `playback.update` 已按固定优先级派生
+play/pause/seek/queue.sync/progress/state.sync；等值 remote committed 只结算普通 control transaction，
+不重复增加 Broadcast revision。playing progress 每个 Broadcast 最多每秒实际提交一次，未发送时不加
+revision；每次实际 target 的 position/serverUpdatedAtMs 都锚定同一 effectiveAtServerMs。status 逐字段
+返回持久化 Snapshot，不进行动态位置改写。Broadcast Socket 271 项、ws_store 45 项、strict contract
+30 项通过，`supportsBroadcast` 继续保持 false。
 
 ### Goal 7：feedback、participantStates 和 deadline
 

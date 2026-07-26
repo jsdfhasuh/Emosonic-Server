@@ -619,6 +619,8 @@ STRICT_OUTPUT_ACTIONS = {
     "broadcast.seek",
     "broadcast.playItem",
     "broadcast.queue.sync",
+    "broadcast.progress",
+    "broadcast.state.sync",
     "broadcast.stop",
 }
 
@@ -655,6 +657,8 @@ _OUTPUT_ACTION_TYPES = {
     "broadcast.seek": "event",
     "broadcast.playItem": "event",
     "broadcast.queue.sync": "event",
+    "broadcast.progress": "event",
+    "broadcast.state.sync": "event",
     "broadcast.stop": "event",
 }
 
@@ -1049,6 +1053,7 @@ def _validate_registration_ack(payload: Dict[str, object]) -> None:
 def _validate_broadcast_snapshot(
     value: object,
     label: str,
+    allow_untimed_delivery: bool = False,
 ) -> Dict[str, object]:
     required = {
         "playbackContextId",
@@ -1135,7 +1140,11 @@ def _validate_broadcast_snapshot(
         "serverTimeMs",
     }:
         _output_error("%s timing fields must appear together" % label)
-    if "deliveryId" in snapshot and not timing_fields:
+    if (
+        "deliveryId" in snapshot
+        and not timing_fields
+        and not allow_untimed_delivery
+    ):
         _output_error("%s deliveryId requires timing fields" % label)
     if "deliveryId" in snapshot:
         _output_string(snapshot["deliveryId"], label + ".deliveryId")
@@ -2042,11 +2051,14 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
         "broadcast.seek",
         "broadcast.playItem",
         "broadcast.queue.sync",
+        "broadcast.progress",
+        "broadcast.state.sync",
         "broadcast.stop",
     }:
         _validate_broadcast_snapshot(
             payload,
             "%s payload" % action,
+            allow_untimed_delivery=action == "broadcast.stop",
         )
         if action == "broadcast.stop" and payload["lifecycleState"] != "stopped":
             _output_error("broadcast.stop lifecycleState must be stopped")

@@ -907,14 +907,37 @@ class StrictV2ContractTestCase(unittest.TestCase):
             effectiveAtServerMs=1250,
             serverTimeMs=1000,
         )
-        push = self._output(
+        pushes = [
+            self._output("event", action, timed_snapshot)
+            for action in (
+                "broadcast.play",
+                "broadcast.progress",
+                "broadcast.state.sync",
+            )
+        ]
+        terminal_snapshot = dict(
+            snapshot,
+            lifecycleState="stopped",
+            broadcastRevision=3,
+            deliveryId="terminal-delivery-1",
+        )
+        terminal_push = self._output(
             "event",
-            "broadcast.play",
-            timed_snapshot,
+            "broadcast.stop",
+            terminal_snapshot,
+        )
+        untimed_progress = self._output(
+            "event",
+            "broadcast.progress",
+            dict(snapshot, deliveryId="untimed-delivery-1"),
         )
 
         self.assertEqual(validate_strict_output(status), status)
-        self.assertEqual(validate_strict_output(push), push)
+        for push in pushes:
+            self.assertEqual(validate_strict_output(push), push)
+        self.assertEqual(validate_strict_output(terminal_push), terminal_push)
+        with self.assertRaises(StrictOutputValidationError):
+            validate_strict_output(untimed_progress)
 
     def test_rejects_unknown_null_and_forbidden_output_fields(self):
         messages = [
@@ -962,7 +985,7 @@ class StrictV2ContractTestCase(unittest.TestCase):
             validate_strict_output(missing_provenance)
 
     def test_output_action_inventory_is_closed(self):
-        self.assertEqual(len(STRICT_OUTPUT_ACTIONS), 33)
+        self.assertEqual(len(STRICT_OUTPUT_ACTIONS), 35)
         self.assertIn("system.ack", STRICT_OUTPUT_ACTIONS)
         self.assertIn("device.setVolume", STRICT_OUTPUT_ACTIONS)
         self.assertIn("device.volume.update", STRICT_OUTPUT_ACTIONS)
@@ -978,6 +1001,8 @@ class StrictV2ContractTestCase(unittest.TestCase):
         )
         self.assertIn("playback.context.status", STRICT_OUTPUT_ACTIONS)
         self.assertIn("playback.handoff.status", STRICT_OUTPUT_ACTIONS)
+        self.assertIn("broadcast.progress", STRICT_OUTPUT_ACTIONS)
+        self.assertIn("broadcast.state.sync", STRICT_OUTPUT_ACTIONS)
         self.assertIn("broadcast.stop", STRICT_OUTPUT_ACTIONS)
 
 
