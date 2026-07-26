@@ -1,6 +1,6 @@
 # Goal: EmoSonic strict-v2 2.8.0 / r18 群播服务端落地
 
-> 状态：Planned（r18 来源包和实施拆解已完成；尚未提升到 `specs/`，尚未修改服务端）
+> 状态：In progress（Goal 0 已完成；正在实施 Goal 1—11）
 >
 > 制定日期：2026-07-23
 >
@@ -559,7 +559,7 @@ failed、timedOut 和非法 feedback 均不得清除 restorePending。
 
 ## 八、分阶段实施计划
 
-### Goal 0：冻结权威输入
+### Goal 0：冻结权威输入（已完成）
 
 改动：
 
@@ -578,6 +578,11 @@ failed、timedOut 和非法 feedback 均不得清除 restorePending。
 - 契约内部不再同时出现“schemaHash 仅观测”和“非法 hash fail-closed”；
 - 后续实现只按 `specs/` 入口的最小读取集或完整 `01—14` 读取，不从 1901 临时文件或历史 Goal
   推导 wire shape。
+
+完成记录（2026-07-26）：r18 入口和 19 个分卷已整体迁移到 `specs/`，`ref/` 原入口已改为
+迁移指针；REQ-001—REQ-067 连续性、相对链接、返回入口链接和 Markdown code fence 已校验。需求到
+实施阶段及目标测试模块的追踪表见
+`docs/verification/emosonic_strict_v2_r18_requirement_mapping.md`，后续 Goal 完成时继续填写实际测试方法。
 
 ### Goal 1：2.8 Core schema 和 metadata
 
