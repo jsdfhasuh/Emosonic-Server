@@ -1,6 +1,6 @@
 # Goal: EmoSonic strict-v2 2.8.0 / r18 群播服务端落地
 
-> 状态：In progress（Goal 0—2 已完成；正在实施 Goal 3—11）
+> 状态：In progress（Goal 0—3 已完成；正在实施 Goal 4—11）
 >
 > 制定日期：2026-07-23
 >
@@ -635,7 +635,7 @@ model/schema parity 已运行通过；MySQL/PostgreSQL base/migration/model 字�
 环境未配置两种外部数据库 URI，运行时 migration 用例按测试设计跳过。`supportsBroadcast` 仍保持
 false，Socket handler 尚未切换到新 store。
 
-### Goal 3：clock、采样时间和 source eligibility
+### Goal 3：clock、采样时间和 source eligibility（已完成）
 
 改动：
 
@@ -651,6 +651,15 @@ false，Socket handler 尚未切换到新 store。
 - 少于 3 次 ping 或最近 ping 超过 15 秒不能进入 effective-at 角色；
 - source start 同时检查 serverUpdatedAtMs 和 positionSampledAtServerMs 不超过 2000ms；
 - playing position 只从采样时间投影。
+
+完成记录（2026-07-26）：session state 已按当前 connectionNonce 保存合法 ping 计数和最近处理时间，
+注册、连接替换与断开均不会继承旧 gate；少于 3 次或最近一次超过 15 秒的连接不能进入 effective-at
+角色。新增统一 eligibility helper，验证 player capability、source Context/authority pair/epoch、非空队列、
+applied controlVersion、track、playing 状态、`0.5..2.0` playbackRate，以及
+serverUpdatedAtMs/positionSampledAtServerMs 双 2000ms freshness 和 effective-at 使用时的未来 50ms
+上限；position 投影只从 sample time 计算，并支持按已知 Track duration 截断和 feedback 位置上限校验。
+strict Handoff target 也已接入同一 clock gate。相关 effective-at/state/Core/Handoff/WebSocket 回归共
+268 项通过。
 
 ### Goal 4：source-derived start 和角色 fanout
 

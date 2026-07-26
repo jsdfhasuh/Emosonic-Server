@@ -226,6 +226,19 @@ class EmoWebSocketTestCase(unittest.TestCase):
       namespace="/emo",
     )
     client.get_received("/emo")
+    if register_payload["capabilities"].get(CAPABILITY_PLAYBACK_CONTEXT_V2) is True:
+      for index in range(3):
+        client.emit(
+          "message",
+          {
+            "type": "system",
+            "action": "system.ping",
+            "requestId": f"clock-{client_id}-{index}",
+            "payload": {},
+          },
+          namespace="/emo",
+        )
+        client.get_received("/emo")
     return client
 
   def get_messages(self, client):
@@ -1161,6 +1174,9 @@ class EmoWebSocketTestCase(unittest.TestCase):
       any(message["action"] == "system.pong" and message["requestId"] == "ping-1" for message in messages)
     )
     self.assertGreater(state.get_client("player-1")["lastSeenAt"], 1)
+    clock_gate = state.get_clock_gate_for_client("alice", "player-1")
+    self.assertEqual(clock_gate["clockPingCount"], 1)
+    self.assertIsInstance(clock_gate["lastClockPingAtMs"], int)
 
   def test_forward_queue_play_item_for_session_queue(self):
     player = self.connect_device("alice", "Alic3", "player-1", "sess-1", ["player"])

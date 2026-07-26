@@ -186,6 +186,8 @@ class WebSocketState:
                 "userName": None,
                 "clientId": None,
                 "remoteAddress": remote_address,
+                "clockPingCount": 0,
+                "lastClockPingAtMs": None,
             }
 
     def try_register_session(
@@ -214,6 +216,8 @@ class WebSocketState:
                 "userName": None,
                 "clientId": None,
                 "remoteAddress": remote_address,
+                "clockPingCount": 0,
+                "lastClockPingAtMs": None,
             }
             return dict(self._sessions[sid])
 
@@ -300,10 +304,46 @@ class WebSocketState:
             if session_info is not None:
                 session_info["clientId"] = client_id
                 session_info["lastSeenAt"] = now
+                session_info["clockPingCount"] = 0
+                session_info["lastClockPingAtMs"] = None
                 if client_info.get("userName"):
                     session_info["userName"] = client_info["userName"]
                     session_info["authenticated"] = True
         return dict(client_info)
+
+    def record_clock_ping(self, sid, now=None):
+        now = time.time() if now is None else now
+        with self._lock:
+            session_info = self._sessions.get(sid)
+            if session_info is None or not session_info.get("clientId"):
+                return None
+            session_info["clockPingCount"] = (
+                _int_or_default(session_info.get("clockPingCount")) + 1
+            )
+            session_info["lastClockPingAtMs"] = _timestamp_ms(now)
+            return {
+                "connectionNonce": session_info.get("connectionNonce"),
+                "clockPingCount": session_info["clockPingCount"],
+                "lastClockPingAtMs": session_info["lastClockPingAtMs"],
+            }
+
+    def get_clock_gate_for_client(self, user_name, client_id):
+        with self._lock:
+            client_key = self._client_key(user_name, client_id)
+            sid = self._client_to_sid.get(client_key)
+            session_info = None if sid is None else self._sessions.get(sid)
+            if session_info is None:
+                return None
+            return {
+                "sid": sid,
+                "connectionNonce": session_info.get("connectionNonce"),
+                "clockPingCount": _int_or_default(
+                    session_info.get("clockPingCount")
+                ),
+                "lastClockPingAtMs": session_info.get(
+                    "lastClockPingAtMs"
+                ),
+            }
 
     def touch_session(self, sid, now=None):
         now = time.time() if now is None else now

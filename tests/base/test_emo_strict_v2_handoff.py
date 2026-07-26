@@ -314,6 +314,44 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         self.assertEqual(replayed_context["version"], 2)
         self.assertEqual(replayed_context["epoch"], 2)
 
+    def test_handoff_target_requires_three_current_connection_pings(self):
+        _source, target, controller = self.connect_handoff_devices()
+        state = get_state()
+        target_sid = state.get_sid_for_client("target-1", user_name="alice")
+        with state._lock:
+            state._sessions[target_sid]["clockPingCount"] = 2
+            state._sessions[target_sid]["lastClockPingAtMs"] = int(
+                time.time() * 1000
+            )
+
+        rejected = self.start_handoff(
+            controller,
+            request_id="handoff-clock-rejected",
+        )
+        error = next(
+            message
+            for message in rejected
+            if message["action"] == "system.error"
+        )
+        self.assertEqual(error["payload"]["code"], "conflict")
+
+        target.emit(
+            "message",
+            {
+                "type": "system",
+                "action": "system.ping",
+                "requestId": "handoff-clock-third",
+                "payload": {},
+            },
+            namespace="/emo",
+        )
+        self.get_messages(target)
+        accepted = self.start_handoff(
+            controller,
+            request_id="handoff-clock-accepted",
+        )
+        self.get_ack(accepted, "handoff-clock-accepted")
+
     def test_start_rejects_target_context_that_is_no_longer_idle(self):
         source, target, controller = self.connect_handoff_devices()
         target.emit(
@@ -328,6 +366,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
                     "queueSongIds": ["target-song-1"],
                     "currentIndex": 0,
                     "positionMs": 0,
+                    "positionSampledAtServerMs": int(time.time() * 1000),
                     "baseQueueRevision": 1,
                     "baseControlVersion": 1,
                 },

@@ -66,6 +66,54 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
         self.assertEqual(removed["deviceName"], "Living Room")
         self.assertIsNone(self.state.get_sid_for_client("player-1"))
 
+    def test_clock_gate_is_connection_scoped_and_registration_resets_it(self):
+        self.state.register_session("sid-1", now=100)
+        self.state.authenticate_session("sid-1", "alice")
+        self.assertIsNone(self.state.record_clock_ping("sid-1", now=100))
+        self.state.register_client(
+            "sid-1",
+            "player-1",
+            {"userName": "alice", "roles": ["player"]},
+            now=100,
+        )
+        for offset in (0.1, 0.2, 0.3):
+            self.state.record_clock_ping("sid-1", now=100 + offset)
+        gate = self.state.get_clock_gate_for_client("alice", "player-1")
+        self.assertEqual(gate["clockPingCount"], 3)
+        self.assertEqual(gate["lastClockPingAtMs"], 100300)
+
+        self.state.register_client(
+            "sid-1",
+            "player-1",
+            {"userName": "alice", "roles": ["player"]},
+            now=101,
+        )
+        reset = self.state.get_clock_gate_for_client("alice", "player-1")
+        self.assertEqual(reset["clockPingCount"], 0)
+        self.assertIsNone(reset["lastClockPingAtMs"])
+
+    def test_replacement_connection_does_not_inherit_clock_gate(self):
+        for sid in ("sid-old", "sid-new"):
+            self.state.register_session(sid, now=100)
+            self.state.authenticate_session(sid, "alice")
+        self.state.register_client(
+            "sid-old",
+            "player-1",
+            {"userName": "alice", "roles": ["player"]},
+            now=100,
+        )
+        for offset in (0.1, 0.2, 0.3):
+            self.state.record_clock_ping("sid-old", now=100 + offset)
+        self.state.register_client(
+            "sid-new",
+            "player-1",
+            {"userName": "alice", "roles": ["player"]},
+            now=101,
+        )
+        gate = self.state.get_clock_gate_for_client("alice", "player-1")
+        self.assertEqual(gate["sid"], "sid-new")
+        self.assertEqual(gate["clockPingCount"], 0)
+
     def test_same_client_id_is_isolated_by_authenticated_user(self):
         for sid, user_name in (("sid-alice", "alice"), ("sid-bob", "bob")):
             self.state.register_session(sid, now=100)

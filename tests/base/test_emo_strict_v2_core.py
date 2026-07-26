@@ -185,6 +185,18 @@ class StrictV2CoreTestCase(unittest.TestCase):
                     capability_overrides=capability_overrides,
                 ),
             )
+        for index in range(3):
+            client.emit(
+                "message",
+                {
+                    "type": "system",
+                    "action": "system.ping",
+                    "requestId": "clock-%s-%d" % (client_id, index),
+                    "payload": {},
+                },
+                namespace="/emo",
+            )
+            self.messages(client)
         self.messages(client)
         return client
 
@@ -1031,6 +1043,9 @@ class StrictV2CoreTestCase(unittest.TestCase):
         )
         self.assertEqual(feedback["positionMs"], 25)
         self.assertEqual(feedback["clientSeq"], 1)
+        self.assertEqual(feedback["positionSampledAtServerMs"], 1)
+        self.assertEqual(feedback["playbackRate"], 1.0)
+        self.assertGreater(feedback["serverUpdatedAtMs"], 1)
 
         client.emit("message", update, namespace="/emo")
         replay = self.messages(client)

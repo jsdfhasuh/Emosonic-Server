@@ -31,6 +31,10 @@ from .strict_v2_contract import (
     validate_strict_output,
     validate_strict_request,
 )
+from .strict_v2_effective_at import (
+    EffectiveAtEligibilityError,
+    requireEffectiveAtPlayer,
+)
 from .strict_v2_readiness import (
     CoreProfileNotReady,
     is_local_test_evidence_allowed,
@@ -7125,6 +7129,7 @@ def _require_online_handoff_target(handoff):
         raise PermissionError("Cross-user handoff is not allowed")
     if not _has_role(target_client, "player"):
         raise PermissionError("Handoff target must be a player")
+    strict_v2 = _is_strict_playback_context_v2(target_client)
     if strict_v2:
         if not (
             _client_supports(target_client, CAPABILITY_EFFECTIVE_AT)
@@ -7134,6 +7139,24 @@ def _require_online_handoff_target(handoff):
             raise CapabilityRequiredError(
                 "Handoff target requires playbackPrepare, effectiveAtPlayback, and canPlay"
             )
+        try:
+            requireEffectiveAtPlayer(
+                state,
+                handoff.get("userName"),
+                target_client_id,
+                require_broadcast=False,
+                required_capabilities=(
+                    CAPABILITY_PLAYBACK_CONTEXT_V2,
+                    CAPABILITY_PLAYBACK_PREPARE,
+                    CAPABILITY_EFFECTIVE_AT,
+                    CAPABILITY_CAN_PLAY,
+                ),
+            )
+        except EffectiveAtEligibilityError as exc:
+            raise ControlConflictError(
+                str(exc),
+                current_control_version=handoff.get("baseControlVersion"),
+            ) from exc
     elif not (
         _client_supports(target_client, CAPABILITY_EFFECTIVE_AT)
         and _client_supports(target_client, CAPABILITY_PLAYBACK_PREPARE)
@@ -7548,6 +7571,24 @@ def _handle_handoff_start(current_user_name, current_client, payload, request_id
             raise CapabilityRequiredError(
                 "Handoff target requires playbackPrepare, effectiveAtPlayback, and canPlay"
             )
+        try:
+            requireEffectiveAtPlayer(
+                state,
+                current_user_name,
+                target_client_id,
+                require_broadcast=False,
+                required_capabilities=(
+                    CAPABILITY_PLAYBACK_CONTEXT_V2,
+                    CAPABILITY_PLAYBACK_PREPARE,
+                    CAPABILITY_EFFECTIVE_AT,
+                    CAPABILITY_CAN_PLAY,
+                ),
+            )
+        except EffectiveAtEligibilityError as exc:
+            raise ControlConflictError(
+                str(exc),
+                current_control_version=context.get("controlVersion", 0),
+            ) from exc
     elif not (
         _client_supports(target_client, CAPABILITY_EFFECTIVE_AT)
         and _client_supports(target_client, CAPABILITY_PLAYBACK_PREPARE)
@@ -8247,6 +8288,7 @@ class EmoNamespace(Namespace):
                         request_id,
                     )
                     return
+                state.record_clock_ping(request.sid)
                 _emit_message(
                     _build_message(
                         "system",
