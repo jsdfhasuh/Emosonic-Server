@@ -7,7 +7,7 @@ from typing import Dict, NamedTuple, Optional, Set, Tuple
 MAX_ID_BYTES = 128
 MAX_ACTION_BYTES = 64
 MAX_QUEUE_ITEMS = 1000
-MAX_PARTICIPANTS = 100
+MAX_PARTICIPANTS = 20
 
 STRICT_CAPABILITIES = (
     "playbackContextV2",
@@ -161,22 +161,29 @@ ACTION_SCHEMAS = {
     ),
     "broadcast.start": ActionSchema(
         "command",
-        ("playbackContextId", "queueSongIds", "currentIndex", "positionMs"),
-        ("participants", "autoPlay"),
+        ("playbackContextId", "intentId"),
+        ("participants",),
     ),
     "broadcast.status": ActionSchema("state", ("playbackContextId", "broadcastId")),
-    "broadcast.play": ActionSchema("command", ("playbackContextId", "broadcastId")),
-    "broadcast.pause": ActionSchema("command", ("playbackContextId", "broadcastId")),
+    "broadcast.play": ActionSchema(
+        "command", ("playbackContextId", "broadcastId", "baseControlVersion")
+    ),
+    "broadcast.pause": ActionSchema(
+        "command", ("playbackContextId", "broadcastId", "baseControlVersion")
+    ),
     "broadcast.seek": ActionSchema(
-        "command", ("playbackContextId", "broadcastId", "positionMs")
+        "command",
+        ("playbackContextId", "broadcastId", "positionMs", "baseControlVersion"),
     ),
     "broadcast.playItem": ActionSchema(
-        "command", ("playbackContextId", "broadcastId", "queueIndex")
-    ),
-    "broadcast.queue.sync": ActionSchema(
-        "state",
-        ("playbackContextId", "broadcastId", "queueSongIds", "currentIndex", "positionMs"),
-        ("baseQueueRevision", "baseControlVersion"),
+        "command",
+        (
+            "playbackContextId",
+            "broadcastId",
+            "queueIndex",
+            "baseQueueRevision",
+            "baseControlVersion",
+        ),
     ),
     "broadcast.stop": ActionSchema("command", ("playbackContextId", "broadcastId")),
 }  # type: Dict[str, ActionSchema]
@@ -335,7 +342,9 @@ def _validate_field(
         )
     elif field_name == "participants":
         payload[field_name] = list(
-            _normalize_string_array(value, field_name, MAX_PARTICIPANTS)
+            # An explicit list may contain the source, which is removed before
+            # applying the 20 ordinary-participant limit.
+            _normalize_string_array(value, field_name, MAX_PARTICIPANTS + 1)
         )
     elif field_name == "roles":
         payload[field_name] = list(_validate_roles(value))
@@ -352,9 +361,6 @@ def _validate_field(
 
 
 def _validate_action_combinations(action: str, payload: Dict[str, object]) -> None:
-    if action in {"broadcast.start", "broadcast.queue.sync"}:
-        if payload["currentIndex"] >= len(payload["queueSongIds"]):
-            raise StrictRequestValidationError("currentIndex is outside queueSongIds")
     if action in {"playback.context.ensure", "queue.context.sync"}:
         queue = payload["queueSongIds"]
         if queue:
@@ -643,13 +649,13 @@ _OUTPUT_ACTION_TYPES = {
     "playback.handoff.release": "command",
     "playback.handoff.status": "state",
     "playback.handoff.cancel": "command",
-    "broadcast.start": "command",
-    "broadcast.play": "command",
-    "broadcast.pause": "command",
-    "broadcast.seek": "command",
-    "broadcast.playItem": "command",
-    "broadcast.queue.sync": "state",
-    "broadcast.stop": "command",
+    "broadcast.start": "event",
+    "broadcast.play": "event",
+    "broadcast.pause": "event",
+    "broadcast.seek": "event",
+    "broadcast.playItem": "event",
+    "broadcast.queue.sync": "event",
+    "broadcast.stop": "event",
 }
 
 _DIRECT_RESPONSE_ACTIONS = {
@@ -1043,34 +1049,39 @@ def _validate_registration_ack(payload: Dict[str, object]) -> None:
 def _validate_broadcast_snapshot(
     value: object,
     label: str,
-    timed: bool = False,
 ) -> Dict[str, object]:
     required = {
         "playbackContextId",
         "broadcastId",
+        "intentId",
         "ownerClientId",
         "authorityClientId",
+        "authorityDeviceSessionId",
+        "lifecycleState",
+        "broadcastRevision",
         "queueSongIds",
         "currentIndex",
+        "trackId",
         "positionMs",
         "state",
-        "version",
-        "queueRevision",
-        "controlVersion",
-        "epoch",
-        "serverUpdatedAtMs",
         "playbackRate",
+        "sourceVersion",
+        "sourceQueueRevision",
+        "sourceControlVersion",
+        "sourceEpoch",
+        "serverUpdatedAtMs",
         "participants",
     }
-    optional = {"trackId"}
-    if timed:
-        required.update({"effectiveAtServerMs", "serverTimeMs"})
+    optional = {"deliveryId", "effectiveAtServerMs", "serverTimeMs"}
     snapshot = _output_object(value, required, optional, label)
     for field_name in (
         "playbackContextId",
         "broadcastId",
+        "intentId",
         "ownerClientId",
         "authorityClientId",
+        "authorityDeviceSessionId",
+        "trackId",
     ):
         _output_string(snapshot[field_name], "%s.%s" % (label, field_name))
     queue = _output_string_array(
@@ -1081,38 +1092,68 @@ def _validate_broadcast_snapshot(
     current_index = _output_int(snapshot["currentIndex"], label + ".currentIndex")
     if current_index >= len(queue):
         _output_error("%s.currentIndex is outside queueSongIds" % label)
+    if snapshot["trackId"] != queue[current_index]:
+        _output_error("%s.trackId must match the current queue item" % label)
+    if snapshot["lifecycleState"] not in {
+        "active",
+        "waitingForSource",
+        "stopped",
+    }:
+        _output_error("%s.lifecycleState is invalid" % label)
     if snapshot["state"] not in {"playing", "paused", "stopped"}:
         _output_error("%s.state is invalid" % label)
     _output_int(snapshot["positionMs"], label + ".positionMs")
-    for field_name in ("version", "queueRevision", "controlVersion", "epoch"):
+    for field_name in (
+        "broadcastRevision",
+        "sourceVersion",
+        "sourceQueueRevision",
+        "sourceControlVersion",
+        "sourceEpoch",
+    ):
         _output_int(snapshot[field_name], "%s.%s" % (label, field_name), 1)
     _output_int(snapshot["serverUpdatedAtMs"], label + ".serverUpdatedAtMs")
-    _output_number(snapshot["playbackRate"], label + ".playbackRate", positive=True)
+    playback_rate = _output_number(
+        snapshot["playbackRate"],
+        label + ".playbackRate",
+        positive=True,
+    )
+    if playback_rate < 0.5 or playback_rate > 2.0:
+        _output_error("%s.playbackRate must be within 0.5..2.0" % label)
     participants = _output_string_array(
         snapshot["participants"],
         label + ".participants",
-        non_empty=True,
         sorted_values=True,
     )
-    if snapshot["authorityClientId"] not in participants:
-        _output_error("%s.participants must include authorityClientId" % label)
-    if "trackId" in snapshot:
-        _output_string(snapshot["trackId"], label + ".trackId")
-        if snapshot["trackId"] != queue[current_index]:
-            _output_error("%s.trackId must match the current queue item" % label)
-    if timed:
+    if snapshot["authorityClientId"] in participants:
+        _output_error("%s.participants must exclude authorityClientId" % label)
+    delivery_fields = {
+        "deliveryId",
+        "effectiveAtServerMs",
+        "serverTimeMs",
+    }.intersection(snapshot)
+    if delivery_fields and delivery_fields != {
+        "deliveryId",
+        "effectiveAtServerMs",
+        "serverTimeMs",
+    }:
+        _output_error("%s delivery fields must appear together" % label)
+    if delivery_fields:
+        _output_string(snapshot["deliveryId"], label + ".deliveryId")
         _output_int(snapshot["effectiveAtServerMs"], label + ".effectiveAtServerMs", 1)
-        _output_int(snapshot["serverTimeMs"], label + ".serverTimeMs", 1)
+        _output_int(snapshot["serverTimeMs"], label + ".serverTimeMs")
+        if snapshot["effectiveAtServerMs"] - snapshot["serverTimeMs"] < 250:
+            _output_error("%s effective-at lead must be at least 250ms" % label)
     return snapshot
 
 
 def _validate_broadcast_status_ack(payload: Dict[str, object]) -> None:
     status = _output_object(
         payload,
-        {"action", "broadcast", "participantStates"},
+        {"action", "serverTimeMs", "broadcast", "participantStates"},
         set(),
         "broadcast.status ACK payload",
     )
+    _output_int(status["serverTimeMs"], "broadcast.status ACK serverTimeMs")
     broadcast = _validate_broadcast_snapshot(
         status["broadcast"],
         "broadcast.status ACK payload.broadcast",
@@ -1125,25 +1166,39 @@ def _validate_broadcast_status_ack(payload: Dict[str, object]) -> None:
         label = "broadcast.status participantStates[%d]" % index
         participant = _output_object(
             value,
-            {"broadcastId", "clientId", "state", "positionMs", "online"},
-            {"clientSeq", "serverUpdatedAtMs"},
+            {
+                "broadcastId",
+                "clientId",
+                "deviceSessionId",
+                "targetBroadcastRevision",
+                "targetDeliveryId",
+                "deadlineBroadcastRevision",
+                "syncStatus",
+                "feedbackDeadlineAtServerMs",
+                "online",
+            },
+            set(),
             label,
         )
-        _output_string(participant["broadcastId"], label + ".broadcastId")
-        client_id = _output_string(participant["clientId"], label + ".clientId")
+        for field_name in (
+            "broadcastId",
+            "clientId",
+            "deviceSessionId",
+            "targetDeliveryId",
+        ):
+            _output_string(participant[field_name], label + "." + field_name)
+        client_id = participant["clientId"]
         if participant["broadcastId"] != broadcast["broadcastId"]:
             _output_error("%s.broadcastId does not match" % label)
-        if participant["state"] not in {"playing", "paused", "stopped"}:
-            _output_error("%s.state is invalid" % label)
-        _output_int(participant["positionMs"], label + ".positionMs")
+        for field_name in (
+            "targetBroadcastRevision",
+            "deadlineBroadcastRevision",
+            "feedbackDeadlineAtServerMs",
+        ):
+            _output_int(participant[field_name], label + "." + field_name, 1)
+        if participant["syncStatus"] != "pending":
+            _output_error("%s initial syncStatus must be pending" % label)
         _output_bool(participant["online"], label + ".online")
-        has_client_seq = "clientSeq" in participant
-        has_updated = "serverUpdatedAtMs" in participant
-        if has_client_seq != has_updated:
-            _output_error("%s feedback fields must appear together" % label)
-        if has_client_seq:
-            _output_int(participant["clientSeq"], label + ".clientSeq", 1)
-            _output_int(participant["serverUpdatedAtMs"], label + ".serverUpdatedAtMs")
         client_ids.append(client_id)
     if client_ids != list(broadcast["participants"]):
         _output_error("broadcast.status participantStates must cover sorted participants")
@@ -1195,17 +1250,24 @@ def _validate_output_ack(payload: object) -> str:
     elif request_action == "broadcast.start":
         ack = _output_object(
             payload,
-            {"action", "started", "broadcastId", "participants", "skippedClientIds"},
+            {
+                "action",
+                "started",
+                "intentId",
+                "broadcastId",
+                "participants",
+                "skippedClientIds",
+            },
             set(),
             "broadcast.start ACK payload",
         )
         if ack["started"] is not True:
             _output_error("broadcast.start ACK started must be true")
+        _output_string(ack["intentId"], "broadcast.start ACK intentId")
         _output_string(ack["broadcastId"], "broadcast.start ACK broadcastId")
         _output_string_array(
             ack["participants"],
             "broadcast.start ACK participants",
-            non_empty=True,
             sorted_values=True,
         )
         _output_string_array(
@@ -1941,15 +2003,9 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
         _validate_broadcast_snapshot(
             payload,
             "%s payload" % action,
-            timed=action in {
-                "broadcast.play",
-                "broadcast.pause",
-                "broadcast.seek",
-                "broadcast.playItem",
-            },
         )
-        if action == "broadcast.stop" and payload["state"] != "stopped":
-            _output_error("broadcast.stop state must be stopped")
+        if action == "broadcast.stop" and payload["lifecycleState"] != "stopped":
+            _output_error("broadcast.stop lifecycleState must be stopped")
         return None
     _output_error("No strict output payload schema exists for %s" % action)
     return None

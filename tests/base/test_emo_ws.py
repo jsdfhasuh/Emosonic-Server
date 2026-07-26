@@ -831,9 +831,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
         "requestId": "broadcast-no-capability-1",
         "payload": {
           "playbackContextId": "playback:alice:main",
-          "queueSongIds": ["song-1"],
-          "currentIndex": 0,
-          "positionMs": 0,
+          "intentId": "broadcast-no-capability-intent-1",
           "participants": ["source-1"],
         },
       },

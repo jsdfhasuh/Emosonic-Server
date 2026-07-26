@@ -221,6 +221,15 @@ def _strict_playback_context_lock_set(
 
 
 @contextmanager
+def strictPlaybackContextLockSet(
+    playback_context_ids: Iterable[str],
+) -> Iterator[None]:
+    """Serialize a cross-store mutation over a deterministic Context set."""
+    with _strict_playback_context_lock_set(playback_context_ids):
+        yield
+
+
+@contextmanager
 def _strict_stable_client_lock(user_name, client_id):
     key = (user_name, client_id)
     with _strict_stable_client_locks_guard:

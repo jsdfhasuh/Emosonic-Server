@@ -19,6 +19,14 @@ from ..db import User, close_connection, open_connection
 from ..logging_utils import format_log_event
 from ..managers.user import UserManager
 from .browser_auth import BROWSER_OTP_PREFIX, browser_one_time_passwords
+from .broadcast_store import (
+    BroadcastIntentConflictError,
+    BroadcastLimitError,
+    BroadcastResourceConflictError,
+    createBroadcastState,
+    getBroadcastIntentOutcome,
+    getBroadcastState as getPersistentBroadcastState,
+)
 from .protocol_metadata import (
     get_strict_v2_metadata,
     get_strict_v2_registration_metadata,
@@ -33,7 +41,10 @@ from .strict_v2_contract import (
 )
 from .strict_v2_effective_at import (
     EffectiveAtEligibilityError,
+    getTrackDurationMs,
+    projectBroadcastPositionMs,
     requireEffectiveAtPlayer,
+    validateBroadcastSourceState,
 )
 from .strict_v2_readiness import (
     CoreProfileNotReady,
@@ -261,6 +272,12 @@ class BroadcastConflictError(Exception):
         super().__init__(message)
         self.current_version = current_version
         self.current_control_version = current_control_version
+
+
+class BroadcastRateLimitedError(Exception):
+    def __init__(self, message, retry_after_ms=1000):
+        super().__init__(message)
+        self.retry_after_ms = retry_after_ms
 
 
 class QueueConflictError(Exception):
@@ -593,8 +610,11 @@ def _build_message(msg_type, action, payload=None, **extra):
                 "retryable",
                 message_payload.get("code") in retryable_codes,
             )
-        if "serverUpdatedAtMs" in message_payload:
-            message_payload["serverTimeMs"] = int(timestamp * 1000)
+        if (
+            "serverUpdatedAtMs" in message_payload
+            and not action.startswith("broadcast.")
+        ):
+            message_payload.setdefault("serverTimeMs", int(timestamp * 1000))
     message = {
         "type": msg_type,
         "action": action,
@@ -623,9 +643,14 @@ def _message_for_recipient(message, target_sid):
     outgoing_payload = _strip_strict_transport_fields(outgoing.get("payload"))
     if (
         isinstance(outgoing_payload, dict)
+        and not (
+            outgoing.get("action") == "system.ack"
+            and outgoing_payload.get("action") == "broadcast.status"
+        )
         and outgoing.get("action")
         not in {
             "system.pong",
+            "broadcast.start",
             "broadcast.play",
             "broadcast.pause",
             "broadcast.seek",
@@ -2412,43 +2437,99 @@ def _resolve_strict_broadcast_start_participants(
     context,
     payload,
 ):
-    authority = _get_online_strict_broadcast_authority(
-        current_user_name,
-        context,
-    )
+    authority = _get_online_strict_broadcast_authority(current_user_name, context)
     authority_client_id = authority["clientId"]
     requested_participants = payload.get("participants")
-    participants = {authority_client_id}
+    participants = []
     skipped_client_ids = set()
-
-    if requested_participants is None:
-        for client in _list_clients(user_name=current_user_name):
-            client_id = client.get("clientId")
-            if not client_id or not _strict_broadcast_participant_eligible(client):
-                continue
-            if _strict_broadcast_client_online(current_user_name, client_id):
-                participants.add(client_id)
-        return sorted(participants), []
-
-    for client_id in requested_participants:
+    explicit = requested_participants is not None
+    candidate_ids = (
+        requested_participants
+        if explicit
+        else [
+            client.get("clientId")
+            for client in _list_clients(user_name=current_user_name)
+            if client.get("clientId")
+        ]
+    )
+    candidate_ids = sorted(set(candidate_ids) - {authority_client_id})
+    if explicit and len(candidate_ids) > 20:
+        raise ValueError("Broadcast participants exceeds 20 ordinary devices")
+    for client_id in sorted(set(candidate_ids)):
+        if client_id == authority_client_id:
+            continue
         client = state.get_client(client_id, user_name=current_user_name)
         if client is None:
             other_user_client = state.get_client(client_id)
             if other_user_client is not None:
                 raise PermissionError("Cross-user broadcast target is not allowed")
-            skipped_client_ids.add(client_id)
+            if explicit:
+                skipped_client_ids.add(client_id)
             continue
         if client.get("userName") != current_user_name:
             raise PermissionError("Cross-user broadcast target is not allowed")
-        if not _strict_broadcast_participant_eligible(client):
-            skipped_client_ids.add(client_id)
-            continue
         if not _strict_broadcast_client_online(current_user_name, client_id):
-            skipped_client_ids.add(client_id)
+            if explicit:
+                skipped_client_ids.add(client_id)
             continue
-        participants.add(client_id)
+        try:
+            requireEffectiveAtPlayer(
+                state,
+                current_user_name,
+                client_id,
+            )
+        except EffectiveAtEligibilityError:
+            if explicit:
+                skipped_client_ids.add(client_id)
+            continue
+        bindings = listActivePlaybackContextBindings(
+            current_user_name,
+            client_id,
+            client.get("deviceSessionId"),
+        )
+        if len(bindings) != 1:
+            if explicit:
+                skipped_client_ids.add(client_id)
+            continue
+        suspended_context_id = bindings[0]["playbackContextId"]
+        if suspended_context_id == context["playbackContextId"]:
+            continue
+        suspended = getPlaybackContextState(suspended_context_id)
+        if suspended is None or suspended.get("lifecycle") != "active":
+            if explicit:
+                skipped_client_ids.add(client_id)
+            continue
+        device_state = getDevicePlaybackState(suspended_context_id, client_id)
+        applied_control_version = (
+            0
+            if device_state is None
+            or device_state.get("contextEpoch") != suspended.get("epoch")
+            else device_state.get("appliedControlVersion", 0)
+        )
+        participants.append(
+            {
+                "clientId": client_id,
+                "deviceSessionId": client.get("deviceSessionId"),
+                "suspendedPlaybackContextId": suspended_context_id,
+                "suspendedEpoch": suspended["epoch"],
+                "suspendedVersion": suspended["version"],
+                "suspendedQueueRevision": suspended["queueRevision"],
+                "suspendedControlVersion": suspended["controlVersion"],
+                "suspendedAppliedControlVersion": applied_control_version,
+            }
+        )
 
-    return sorted(participants), sorted(skipped_client_ids - participants)
+    if not explicit and len(participants) > 20:
+        skipped_client_ids.update(
+            item["clientId"] for item in participants[20:]
+        )
+        participants = participants[:20]
+    if not participants:
+        raise ValueError(
+            "Broadcast start requires at least one eligible ordinary participant"
+        )
+    participant_ids = [item["clientId"] for item in participants]
+    return participants, sorted(skipped_client_ids - set(participant_ids))
 
 
 def _get_strict_broadcast_from_payload(current_user_name, payload):
@@ -4283,81 +4364,223 @@ def _handle_strict_broadcast_start(
         raise PermissionError(
             "Broadcast start requires Context authority or controller"
         )
-
-    active_broadcast = state.get_broadcast_by_playback_context(
-        playback_context_id
+    start_fingerprint = request_fingerprint(
+        "command",
+        "broadcast.start",
+        payload,
     )
-    if active_broadcast is not None and state.is_broadcast_active(
-        active_broadcast.get("broadcastId")
-    ):
-        raise BroadcastConflictError("Playback context already has an active Broadcast")
-
-    queue_song_ids = list(payload["queueSongIds"])
-    current_index = payload["currentIndex"]
-    position_ms = payload["positionMs"]
-    auto_play = payload.get("autoPlay", False)
-    participant_ids, skipped_client_ids = (
+    existing_intent = getBroadcastIntentOutcome(
+        current_user_name,
+        playback_context_id,
+        client_id,
+        payload["intentId"],
+    )
+    if existing_intent is not None:
+        if existing_intent["requestFingerprint"] != start_fingerprint:
+            raise BroadcastConflictError(
+                "Broadcast intentId was reused with different content"
+            )
+        _send_ack(request_id, existing_intent["startAck"])
+        return getPersistentBroadcastState(existing_intent["broadcastId"])
+    authority = _get_online_strict_broadcast_authority(
+        current_user_name,
+        context,
+    )
+    try:
+        requireEffectiveAtPlayer(
+            state,
+            current_user_name,
+            authority["clientId"],
+        )
+    except EffectiveAtEligibilityError as exc:
+        if exc.reason == "capability_required":
+            raise CapabilityRequiredError(str(exc)) from exc
+        raise BroadcastConflictError(str(exc)) from exc
+    source_device_state = getDevicePlaybackState(
+        playback_context_id,
+        authority["clientId"],
+    )
+    server_time_ms = _server_time_ms()
+    try:
+        source_anchor = validateBroadcastSourceState(
+            context,
+            source_device_state,
+            now_ms=server_time_ms,
+            has_unsettled_controls=bool(
+                listPendingPlaybackControlTransactions(
+                    playback_context_id,
+                    context["epoch"],
+                )
+            ),
+        )
+    except EffectiveAtEligibilityError as exc:
+        raise BroadcastConflictError(str(exc)) from exc
+    participant_records, skipped_client_ids = (
         _resolve_strict_broadcast_start_participants(
             current_user_name,
             context,
             payload,
         )
     )
-    try:
-        broadcast = state.create_broadcast(
-            _new_broadcast_id(),
-            current_user_name,
-            client_id,
-            participant_ids,
-            queue_song_ids,
-            current_index,
-            position_ms,
-            "playing" if auto_play else "paused",
-            "owner_only",
-            client_id,
-            playback_context_id=playback_context_id,
-            authority_client_id=context.get("authorityClientId"),
-            require_context_available=True,
-        )
-    except PlaybackContextConflictError:
-        raise BroadcastConflictError(
-            "Playback context already has an active Broadcast"
-        )
-    for participant_id in participant_ids:
-        participant = state.get_client(
-            participant_id,
-            user_name=current_user_name,
-        )
-        state.update_broadcast_participant_state(
-            broadcast["broadcastId"],
-            participant_id,
-            None if participant is None else participant.get("deviceSessionId"),
-            {
-                "state": broadcast["state"],
-                "positionMs": broadcast["positionMs"],
-            },
-            online=True,
-        )
-
-    _send_ack(
-        request_id,
-        {
-            "started": True,
-            "broadcastId": broadcast["broadcastId"],
-            "participants": participant_ids,
-            "skippedClientIds": skipped_client_ids,
-        },
+    participant_ids = sorted(
+        item["clientId"] for item in participant_records
     )
+    effective_at_server_ms = server_time_ms + 250
+    duration_ms = getTrackDurationMs(source_anchor["trackId"])
+    position_ms = projectBroadcastPositionMs(
+        source_anchor["positionMs"],
+        source_anchor["positionSampledAtServerMs"],
+        effective_at_server_ms,
+        source_anchor["playbackRate"],
+        duration_ms=duration_ms,
+    )
+    broadcast_id = _new_broadcast_id()
+    snapshot = {
+        "playbackContextId": playback_context_id,
+        "broadcastId": broadcast_id,
+        "intentId": payload["intentId"],
+        "ownerClientId": client_id,
+        "authorityClientId": context["authorityClientId"],
+        "authorityDeviceSessionId": context[
+            "authorityDeviceSessionId"
+        ],
+        "lifecycleState": "active",
+        "broadcastRevision": 1,
+        "queueSongIds": source_anchor["queueSongIds"],
+        "currentIndex": source_anchor["currentIndex"],
+        "trackId": source_anchor["trackId"],
+        "positionMs": position_ms,
+        "state": "playing",
+        "playbackRate": source_anchor["playbackRate"],
+        "sourceVersion": source_anchor["sourceVersion"],
+        "sourceQueueRevision": source_anchor["sourceQueueRevision"],
+        "sourceControlVersion": source_anchor["sourceControlVersion"],
+        "sourceEpoch": source_anchor["sourceEpoch"],
+        "serverUpdatedAtMs": effective_at_server_ms,
+        "participants": participant_ids,
+    }
+    deliveries = []
+    for participant in participant_records:
+        delivery_id = "delivery:%s" % uuid.uuid4()
+        execution_payload = dict(snapshot)
+        execution_payload.update(
+            {
+                "deliveryId": delivery_id,
+                "effectiveAtServerMs": effective_at_server_ms,
+                "serverTimeMs": server_time_ms,
+            }
+        )
+        deliveries.append(
+            {
+                "deliveryId": delivery_id,
+                "clientId": participant["clientId"],
+                "deviceSessionId": participant["deviceSessionId"],
+                "action": "start",
+                "effectiveAtServerMs": effective_at_server_ms,
+                "serverTimeMs": server_time_ms,
+                "deliveryPositionMs": position_ms,
+                "feedbackDeadlineAtServerMs": (
+                    effective_at_server_ms + 8000
+                ),
+                "payload": execution_payload,
+                "connectionNonce": (
+                    state.get_clock_gate_for_client(
+                        current_user_name,
+                        participant["clientId"],
+                    )
+                    or {}
+                ).get("connectionNonce"),
+                "createdAtMs": server_time_ms,
+            }
+        )
+    start_ack = {
+        "started": True,
+        "intentId": payload["intentId"],
+        "broadcastId": broadcast_id,
+        "participants": participant_ids,
+        "skippedClientIds": skipped_client_ids,
+    }
+    try:
+        created = createBroadcastState(
+            dict(snapshot, userName=current_user_name),
+            participant_records,
+            start_fingerprint,
+            start_ack,
+            skipped_client_ids=skipped_client_ids,
+            initial_deliveries=deliveries,
+            source_device_state=source_device_state,
+            skip_unavailable_participants=True,
+        )
+    except BroadcastIntentConflictError as exc:
+        raise BroadcastConflictError(str(exc)) from exc
+    except BroadcastLimitError as exc:
+        raise BroadcastRateLimitedError(str(exc)) from exc
+    except BroadcastResourceConflictError as exc:
+        raise BroadcastConflictError(str(exc)) from exc
+    if not created["created"]:
+        replay_ack = created["intentOutcome"]["startAck"]
+        _send_ack(request_id, replay_ack)
+        return created["broadcast"]
+    start_ack = created["intentOutcome"]["startAck"]
+    persisted = getPersistentBroadcastState(broadcast_id)
+    if persisted is None:
+        raise RuntimeError("Committed Broadcast could not be reloaded")
     _run_post_commit_push(
         "broadcast.start",
         request_id,
-        lambda: _emit_strict_broadcast_to_participants(
-            broadcast,
-            "broadcast.start",
-            "command",
-        ),
+        lambda: _emit_r18_broadcast_start(persisted),
     )
-    return broadcast
+    _send_ack(request_id, start_ack)
+    return persisted
+
+
+def _emit_r18_broadcast_start(persisted):
+    snapshot = persisted["snapshot"]
+    user_name = persisted["userName"]
+    authority_client_id = snapshot["authorityClientId"]
+    authority_sid = state.get_sid_for_client(
+        authority_client_id,
+        user_name=user_name,
+    )
+    emitted_sids = set()
+    if authority_sid is not None:
+        _emit_message(
+            _build_message("event", "broadcast.start", snapshot),
+            authority_sid,
+        )
+        emitted_sids.add(authority_sid)
+    current_deliveries = {
+        (item["clientId"], item["deviceSessionId"]): item
+        for item in persisted.get("deliveries", ())
+        if item.get("isCurrent")
+        and item.get("broadcastRevision") == snapshot["broadcastRevision"]
+    }
+    for participant in persisted.get("participantStates", ()):
+        pair = (participant["clientId"], participant["deviceSessionId"])
+        delivery = current_deliveries.get(pair)
+        client = state.get_client(pair[0], user_name=user_name)
+        sid = state.get_sid_for_client(pair[0], user_name=user_name)
+        if (
+            delivery is None
+            or client is None
+            or client.get("deviceSessionId") != pair[1]
+            or sid is None
+        ):
+            continue
+        _emit_message(
+            _build_message("event", "broadcast.start", delivery["payload"]),
+            sid,
+        )
+        emitted_sids.add(sid)
+    owner_sid = state.get_sid_for_client(
+        snapshot["ownerClientId"],
+        user_name=user_name,
+    )
+    if owner_sid is not None and owner_sid not in emitted_sids:
+        _emit_message(
+            _build_message("event", "broadcast.start", snapshot),
+            owner_sid,
+        )
 
 
 def _require_strict_broadcast_status_access(current_client, broadcast):
@@ -4400,13 +4623,57 @@ def _handle_strict_broadcast_status(
     payload,
     request_id,
 ):
-    broadcast = _get_strict_broadcast_from_payload(
-        current_user_name,
-        payload,
+    persisted = getPersistentBroadcastState(payload["broadcastId"])
+    if persisted is None:
+        raise LookupError("Broadcast not found")
+    snapshot = persisted["snapshot"]
+    if (
+        persisted["userName"] != current_user_name
+        or snapshot["playbackContextId"] != payload["playbackContextId"]
+    ):
+        raise PermissionError("Broadcast status access is not allowed")
+    _require_strict_broadcast_status_access(current_client, snapshot)
+    participant_states = []
+    for participant in persisted.get("participantStates", ()):
+        client = state.get_client(
+            participant["clientId"],
+            user_name=current_user_name,
+        )
+        status = {
+            "broadcastId": participant["broadcastId"],
+            "clientId": participant["clientId"],
+            "deviceSessionId": participant["deviceSessionId"],
+            "targetBroadcastRevision": participant[
+                "targetBroadcastRevision"
+            ],
+            "targetDeliveryId": participant["targetDeliveryId"],
+            "deadlineBroadcastRevision": participant[
+                "deadlineBroadcastRevision"
+            ],
+            "syncStatus": participant["syncStatus"],
+            "feedbackDeadlineAtServerMs": participant[
+                "feedbackDeadlineAtServerMs"
+            ],
+            "online": bool(
+                client is not None
+                and client.get("deviceSessionId")
+                == participant["deviceSessionId"]
+                and _strict_broadcast_client_online(
+                    current_user_name,
+                    participant["clientId"],
+                )
+            ),
+        }
+        participant_states.append(status)
+    _send_ack(
+        request_id,
+        {
+            "serverTimeMs": _server_time_ms(),
+            "broadcast": snapshot,
+            "participantStates": participant_states,
+        },
     )
-    _require_strict_broadcast_status_access(current_client, broadcast)
-    _send_ack(request_id, _build_strict_broadcast_status_payload(broadcast))
-    return broadcast
+    return persisted
 
 
 def _handle_strict_broadcast_stop(
@@ -9814,6 +10081,13 @@ class EmoNamespace(Namespace):
                     error_payload,
                     requestId=request_id,
                 )
+            )
+        except BroadcastRateLimitedError as exc:
+            _send_error(
+                "rate_limited",
+                str(exc),
+                request_id,
+                retryAfterMs=exc.retry_after_ms,
             )
         except ClientSeqStaleError as exc:
             strict_v2 = _is_strict_playback_context_v2(current_client)

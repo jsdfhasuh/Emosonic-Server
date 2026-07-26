@@ -16,11 +16,17 @@ from ..db import (
     EmoBroadcastParticipant,
     EmoBroadcastRevision,
     EmoBroadcastTerminalRecovery,
+    EmoDevicePlaybackState,
+    EmoPlaybackHandoff,
+    EmoPlaybackControlTransaction,
+    EmoPlaybackPrepareTransaction,
+    EmoPlaybackContext,
     close_connection,
     db,
     now,
     open_connection,
 )
+from .ws_store import strictPlaybackContextLockSet
 
 
 MAX_BROADCAST_PARTICIPANTS = 20
@@ -96,6 +102,10 @@ def broadcastPairResourceKey(
     device_session_id: str,
 ) -> str:
     return _resource_key("pair", user_name, client_id, device_session_id)
+
+
+def broadcastUserRecoveryResourceKey(user_name: str) -> str:
+    return _resource_key("recovery-slots", user_name)
 
 
 @contextmanager
@@ -303,6 +313,191 @@ def _normalize_delivery(delivery: Dict[str, object]) -> Dict[str, object]:
     return dict(delivery)
 
 
+def _validate_start_source_records(
+    snapshot: Dict[str, object],
+    source_device_state: Dict[str, object],
+) -> None:
+    context = EmoPlaybackContext.get_or_none(
+        EmoPlaybackContext.playback_context_id
+        == snapshot["playbackContextId"]
+    )
+    if context is None or context.user_name != snapshot["userName"]:
+        raise BroadcastResourceConflictError(
+            "Source PlaybackContext changed before Broadcast start"
+        )
+    expected_context = {
+        "authority_client_id": snapshot["authorityClientId"],
+        "authority_device_session_id": snapshot[
+            "authorityDeviceSessionId"
+        ],
+        "lifecycle": "active",
+        "version": snapshot["sourceVersion"],
+        "queue_revision": snapshot["sourceQueueRevision"],
+        "control_version": snapshot["sourceControlVersion"],
+        "epoch": snapshot["sourceEpoch"],
+        "current_index": snapshot["currentIndex"],
+        "track_id": snapshot["trackId"],
+    }
+    if any(
+        getattr(context, field_name) != expected
+        for field_name, expected in expected_context.items()
+    ) or json.loads(context.queue_json) != snapshot["queueSongIds"]:
+        raise BroadcastResourceConflictError(
+            "Source PlaybackContext changed before Broadcast start"
+        )
+    device = EmoDevicePlaybackState.get_or_none(
+        (
+            EmoDevicePlaybackState.playback_context_id
+            == snapshot["playbackContextId"]
+        )
+        & (
+            EmoDevicePlaybackState.owner_client_id
+            == snapshot["authorityClientId"]
+        )
+    )
+    if device is None:
+        raise BroadcastResourceConflictError(
+            "Source DevicePlaybackState is no longer available"
+        )
+    persisted = json.loads(device.playback_json) if device.playback_json else {}
+    current_time_ms = int(time.time() * 1000)
+    for field_name in ("serverUpdatedAtMs", "positionSampledAtServerMs"):
+        timestamp_ms = persisted.get(field_name)
+        if (
+            not isinstance(timestamp_ms, int)
+            or timestamp_ms > current_time_ms + 50
+            or current_time_ms - timestamp_ms > 2000
+        ):
+            raise BroadcastResourceConflictError(
+                "Source DevicePlaybackState is no longer fresh"
+            )
+    if (
+        EmoPlaybackControlTransaction.select()
+        .where(
+            (
+                EmoPlaybackControlTransaction.playback_context_id
+                == snapshot["playbackContextId"]
+            )
+            & (EmoPlaybackControlTransaction.epoch == snapshot["sourceEpoch"])
+            & (EmoPlaybackControlTransaction.status == "pending")
+        )
+        .exists()
+    ):
+        raise BroadcastResourceConflictError(
+            "Source PlaybackContext has unsettled controls"
+        )
+    comparisons = {
+        "deviceSessionId": device.device_session_id,
+        "contextEpoch": device.context_epoch,
+        "appliedControlVersion": device.applied_control_version,
+        "state": device.state,
+        "trackId": device.track_id,
+        "positionMs": device.position_ms,
+        "positionSampledAtServerMs": persisted.get(
+            "positionSampledAtServerMs"
+        ),
+        "serverUpdatedAtMs": persisted.get("serverUpdatedAtMs"),
+        "playbackRate": persisted.get("playbackRate"),
+    }
+    if any(
+        source_device_state.get(field_name) != actual
+        for field_name, actual in comparisons.items()
+    ):
+        raise BroadcastResourceConflictError(
+            "Source DevicePlaybackState changed before Broadcast start"
+        )
+
+
+def _validate_start_participant_records(
+    user_name: str,
+    participants: Sequence[Dict[str, object]],
+) -> None:
+    for participant in participants:
+        context = EmoPlaybackContext.get_or_none(
+            EmoPlaybackContext.playback_context_id
+            == participant["suspendedPlaybackContextId"]
+        )
+        if (
+            context is None
+            or context.user_name != user_name
+            or context.lifecycle != "active"
+            or context.authority_client_id != participant["clientId"]
+            or context.authority_device_session_id
+            != participant["deviceSessionId"]
+            or context.epoch != participant["suspendedEpoch"]
+            or context.version != participant["suspendedVersion"]
+            or context.queue_revision
+            != participant["suspendedQueueRevision"]
+            or context.control_version
+            != participant["suspendedControlVersion"]
+        ):
+            raise BroadcastResourceConflictError(
+                "Ordinary participant Context changed before Broadcast start"
+            )
+        device = EmoDevicePlaybackState.get_or_none(
+            (
+                EmoDevicePlaybackState.playback_context_id
+                == participant["suspendedPlaybackContextId"]
+            )
+            & (
+                EmoDevicePlaybackState.owner_client_id
+                == participant["clientId"]
+            )
+        )
+        applied = (
+            0
+            if device is None or device.context_epoch != context.epoch
+            else device.applied_control_version
+        )
+        if applied != participant["suspendedAppliedControlVersion"]:
+            raise BroadcastResourceConflictError(
+                "Ordinary participant applied cursor changed before start"
+            )
+
+
+def _start_participant_is_available(
+    user_name: str,
+    participant: Dict[str, object],
+) -> bool:
+    context_id = str(participant["suspendedPlaybackContextId"])
+    client_id = str(participant["clientId"])
+    context_key = broadcastContextResourceKey(user_name, context_id)
+    pair_key = broadcastPairResourceKey(
+        user_name,
+        client_id,
+        str(participant["deviceSessionId"]),
+    )
+    if (
+        EmoBroadcastFence.select()
+        .where(EmoBroadcastFence.resource_key.in_((context_key, pair_key)))
+        .exists()
+    ):
+        return False
+    if (
+        EmoPlaybackPrepareTransaction.select()
+        .where(
+            (EmoPlaybackPrepareTransaction.playback_context_id == context_id)
+            & (EmoPlaybackPrepareTransaction.status == "preparing")
+        )
+        .exists()
+    ):
+        return False
+    return not (
+        EmoPlaybackHandoff.select()
+        .where(
+            (EmoPlaybackHandoff.user_name == user_name)
+            & EmoPlaybackHandoff.status.in_(
+                ("preparing", "ready", "committed", "committing")
+            )
+            & (
+                (EmoPlaybackHandoff.playback_context_id == context_id)
+                | (EmoPlaybackHandoff.target_client_id == client_id)
+            )
+        )
+        .exists()
+    )
+
+
 def _create_delivery(
     broadcast_id: str,
     broadcast_revision: int,
@@ -369,6 +564,8 @@ def createBroadcastState(
     start_ack: Dict[str, object],
     skipped_client_ids: Sequence[str] = (),
     initial_deliveries: Sequence[Dict[str, object]] = (),
+    source_device_state: Optional[Dict[str, object]] = None,
+    skip_unavailable_participants: bool = False,
 ) -> Dict[str, object]:
     participant_payloads = [_normalize_participant(item) for item in participants]
     if len(participant_payloads) > MAX_BROADCAST_PARTICIPANTS:
@@ -417,6 +614,9 @@ def createBroadcastState(
     authority_device_session_id = str(
         snapshot["authorityDeviceSessionId"]
     )
+    snapshot_payload = dict(snapshot)
+    start_ack_payload = dict(start_ack)
+    skipped_ids = set(skipped_client_ids)
     resource_keys = {
         broadcastContextResourceKey(user_name, playback_context_id),
         broadcastPairResourceKey(
@@ -424,6 +624,7 @@ def createBroadcastState(
             authority_client_id,
             authority_device_session_id,
         ),
+        broadcastUserRecoveryResourceKey(user_name),
     }
     for participant in participant_payloads:
         resource_keys.add(
@@ -440,9 +641,17 @@ def createBroadcastState(
             )
         )
 
+    context_ids = [playback_context_id]
+    context_ids.extend(
+        str(item["suspendedPlaybackContextId"])
+        for item in participant_payloads
+    )
+
     open_connection(reuse=True)
     try:
-        with broadcastResourceLock(resource_keys):
+        with strictPlaybackContextLockSet(context_ids), broadcastResourceLock(
+            resource_keys
+        ):
             try:
                 with broadcastTransaction():
                     existing_intent = EmoBroadcastIntentOutcome.get_or_none(
@@ -502,6 +711,26 @@ def createBroadcastState(
                         raise BroadcastResourceConflictError(
                             "Source Context already has a nonterminal Broadcast"
                         )
+                    selected_participants = list(participant_payloads)
+                    if skip_unavailable_participants:
+                        selected_participants = []
+                        for participant in participant_payloads:
+                            if _start_participant_is_available(
+                                user_name,
+                                participant,
+                            ):
+                                selected_participants.append(participant)
+                            else:
+                                skipped_ids.add(str(participant["clientId"]))
+                    if source_device_state is not None:
+                        _validate_start_source_records(
+                            snapshot,
+                            source_device_state,
+                        )
+                        _validate_start_participant_records(
+                            user_name,
+                            selected_participants,
+                        )
                     reserved = (
                         EmoBroadcastFence.select()
                         .where(
@@ -510,14 +739,54 @@ def createBroadcastState(
                         )
                         .count()
                     )
-                    if (
-                        reserved + len(participant_payloads)
-                        > MAX_USER_RECOVERY_SLOTS
-                    ):
-                        raise BroadcastLimitError(
-                            "user_recovery_slots",
-                            MAX_USER_RECOVERY_SLOTS,
+                    available_slots = max(0, MAX_USER_RECOVERY_SLOTS - reserved)
+                    if len(selected_participants) > available_slots:
+                        if not skip_unavailable_participants:
+                            raise BroadcastLimitError(
+                                "user_recovery_slots",
+                                MAX_USER_RECOVERY_SLOTS,
+                            )
+                        for participant in selected_participants[available_slots:]:
+                            skipped_ids.add(str(participant["clientId"]))
+                        selected_participants = selected_participants[:available_slots]
+                    if not selected_participants:
+                        if participant_payloads and available_slots == 0:
+                            raise BroadcastLimitError(
+                                "user_recovery_slots",
+                                MAX_USER_RECOVERY_SLOTS,
+                            )
+                        raise ValueError(
+                            "Broadcast start requires at least one eligible ordinary participant"
                         )
+
+                    participant_payloads = selected_participants
+                    selected_client_ids = sorted(
+                        str(item["clientId"]) for item in participant_payloads
+                    )
+                    snapshot_payload["participants"] = selected_client_ids
+                    if "participants" in start_ack_payload:
+                        start_ack_payload["participants"] = selected_client_ids
+                    if "skippedClientIds" in start_ack_payload:
+                        start_ack_payload["skippedClientIds"] = sorted(skipped_ids)
+                    selected_pairs = {
+                        (str(item["clientId"]), str(item["deviceSessionId"]))
+                        for item in participant_payloads
+                    }
+                    selected_deliveries = []
+                    for delivery in initial_deliveries:
+                        pair = (
+                            str(delivery["clientId"]),
+                            str(delivery["deviceSessionId"]),
+                        )
+                        if pair not in selected_pairs:
+                            continue
+                        selected_delivery = dict(delivery)
+                        selected_payload = dict(selected_delivery["payload"])
+                        selected_payload["participants"] = selected_client_ids
+                        selected_delivery["payload"] = selected_payload
+                        selected_deliveries.append(selected_delivery)
+                    stored_snapshot = dict(snapshot_payload)
+                    stored_snapshot.pop("userName", None)
 
                     intent = EmoBroadcastIntentOutcome.create(
                         user_name=user_name,
@@ -527,12 +796,12 @@ def createBroadcastState(
                         request_fingerprint=request_fingerprint,
                         broadcast_id=broadcast_id,
                         final_participants_json=_canonical_json(
-                            sorted(item["clientId"] for item in participant_payloads)
+                            selected_client_ids
                         ),
                         skipped_client_ids_json=_canonical_json(
-                            sorted(skipped_client_ids)
+                            sorted(skipped_ids)
                         ),
-                        start_ack_json=_canonical_json(start_ack),
+                        start_ack_json=_canonical_json(start_ack_payload),
                     )
                     record = EmoBroadcast.create(
                         broadcast_id=broadcast_id,
@@ -544,17 +813,17 @@ def createBroadcastState(
                         authority_device_session_id=(
                             authority_device_session_id
                         ),
-                        lifecycle_state=snapshot["lifecycleState"],
+                        lifecycle_state=snapshot_payload["lifecycleState"],
                         broadcast_revision=revision,
-                        snapshot_json=_canonical_json(snapshot),
-                        authority_disconnect_deadline_ms=snapshot.get(
+                        snapshot_json=_canonical_json(stored_snapshot),
+                        authority_disconnect_deadline_ms=snapshot_payload.get(
                             "authorityDisconnectDeadlineMs"
                         ),
                     )
                     EmoBroadcastRevision.create(
                         broadcast_id=broadcast_id,
                         broadcast_revision=revision,
-                        snapshot_json=_canonical_json(snapshot),
+                        snapshot_json=_canonical_json(stored_snapshot),
                         canonical_action="start",
                         created_at_ms=int(
                             snapshot.get("serverUpdatedAtMs")
@@ -645,7 +914,7 @@ def createBroadcastState(
                             device_session_id=device_session_id,
                             recovery_slot_reserved=1,
                         )
-                    for delivery in initial_deliveries:
+                    for delivery in selected_deliveries:
                         _create_delivery(broadcast_id, revision, delivery)
                     return {
                         "created": True,

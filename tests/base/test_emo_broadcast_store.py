@@ -243,6 +243,51 @@ class EmoBroadcastStoreTestCase(unittest.TestCase):
             20,
         )
 
+    def test_start_atomically_skips_participants_without_recovery_slots(self):
+        for index in range(MAX_USER_RECOVERY_SLOTS - 1):
+            db.EmoBroadcastFence.create(
+                resource_key="reserved:%d" % index,
+                broadcast_id="old:%d" % index,
+                user_name="alice",
+                role="ordinary",
+                phase="restorePending",
+                recovery_slot_reserved=1,
+            )
+        participants = [
+            self._participant(
+                "participant-%d" % index,
+                "device:participant-%d" % index,
+                "context-participant-%d" % index,
+            )
+            for index in range(2)
+        ]
+        snapshot = self._snapshot()
+        snapshot["participants"] = [item["clientId"] for item in participants]
+        start_ack = {
+            "participants": list(snapshot["participants"]),
+            "skippedClientIds": [],
+        }
+        result = createBroadcastState(
+            snapshot,
+            participants,
+            "slot-fingerprint",
+            start_ack,
+            skip_unavailable_participants=True,
+        )
+        self.assertTrue(result["created"])
+        self.assertEqual(
+            result["intentOutcome"]["startAck"]["participants"],
+            ["participant-0"],
+        )
+        self.assertEqual(
+            result["intentOutcome"]["startAck"]["skippedClientIds"],
+            ["participant-1"],
+        )
+        self.assertEqual(
+            result["broadcast"]["snapshot"]["participants"],
+            ["participant-0"],
+        )
+
     def test_1024_intent_limit_replays_old_first(self):
         for index in range(MAX_CONTEXT_BROADCAST_INTENTS):
             db.EmoBroadcastIntentOutcome.create(

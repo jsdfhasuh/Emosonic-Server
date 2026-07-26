@@ -1,6 +1,6 @@
 # Goal: EmoSonic strict-v2 2.8.0 / r18 群播服务端落地
 
-> 状态：In progress（Goal 0—3 已完成；正在实施 Goal 4—11）
+> 状态：In progress（Goal 0—4 已完成；正在实施 Goal 5—11）
 >
 > 制定日期：2026-07-23
 >
@@ -661,7 +661,7 @@ serverUpdatedAtMs/positionSampledAtServerMs 双 2000ms freshness 和 effective-a
 strict Handoff target 也已接入同一 clock gate。相关 effective-at/state/Core/Handoff/WebSocket 回归共
 268 项通过。
 
-### Goal 4：source-derived start 和角色 fanout
+### Goal 4：source-derived start 和角色 fanout（已完成）
 
 改动：
 
@@ -679,6 +679,17 @@ strict Handoff target 也已接入同一 clock gate。相关 effective-at/state/
 - source 不在 participants/participantStates；
 - controller-only 不产生 delivery；
 - 相同 intent 跨 Socket 重放首次 ACK，不重发 start。
+
+完成记录（2026-07-26）：strict `broadcast.start` 已收敛为
+`playbackContextId/intentId/participants?`，旧 queue/index/position/autoPlay 字段按未知字段拒绝；初始
+Snapshot 只从 source Context 与 fresh、playing、settled DevicePlaybackState 派生，并在同一组 Context
+锁和数据库事务内重新核对 source、ordinary frozen pair、pending control、prepare/Handoff/fence 与
+recovery slot。source 不进入 participants、不产生 delivery 或重新执行音频的命令；ordinary 获得独立
+deliveryId/effective-at target；controller-only 只获得无 delivery 的观察副本。最终 ordinary 为空时不
+创建 Broadcast；显式 participant 上限在移除 source 后应用，隐式选择按 clientId 取前 20 个，事务内
+不可占用的 ordinary 与 recovery slot 超额目标进入 skippedClientIds，全部 slot 耗尽返回
+rate_limited。start intent 可跨 Socket 重放首次 ACK 且不重发 push。store、contract、Socket 和继承
+WebSocket 回归共 172 项通过，`supportsBroadcast` 继续保持 false。
 
 ### Goal 5：Context 屏障和 source ownership
 

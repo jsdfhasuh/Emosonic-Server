@@ -146,13 +146,11 @@ class StrictV2ContractTestCase(unittest.TestCase):
             "requestId": "broadcast-1",
             "payload": {
                 "playbackContextId": "context-1",
-                "queueSongIds": ["song-1"],
-                "currentIndex": 0,
-                "positionMs": 0,
-                "participants": ["client-%d" % index for index in range(101)],
+                "intentId": "intent-1",
+                "participants": ["client-%d" % index for index in range(22)],
             },
         }
-        with self.assertRaisesRegex(StrictRequestValidationError, "100"):
+        with self.assertRaisesRegex(StrictRequestValidationError, "21"):
             validate_strict_request(broadcast)
 
     def test_rejects_invalid_ready_field_combinations(self):
@@ -861,33 +859,42 @@ class StrictV2ContractTestCase(unittest.TestCase):
         snapshot = {
             "playbackContextId": "context-1",
             "broadcastId": "broadcast-1",
+            "intentId": "intent-1",
             "ownerClientId": "controller-1",
             "authorityClientId": "player-1",
+            "authorityDeviceSessionId": "device:player-1",
+            "lifecycleState": "active",
+            "broadcastRevision": 2,
             "queueSongIds": ["song-1"],
             "currentIndex": 0,
             "trackId": "song-1",
             "positionMs": 0,
             "state": "playing",
-            "version": 2,
-            "queueRevision": 1,
-            "controlVersion": 2,
-            "epoch": 1,
+            "sourceVersion": 2,
+            "sourceQueueRevision": 1,
+            "sourceControlVersion": 2,
+            "sourceEpoch": 1,
             "serverUpdatedAtMs": 1000,
             "playbackRate": 1.0,
-            "participants": ["player-1"],
+            "participants": ["participant-1"],
         }
         status = self._output(
             "system",
             "system.ack",
             {
                 "action": "broadcast.status",
+                "serverTimeMs": 1100,
                 "broadcast": snapshot,
                 "participantStates": [
                     {
                         "broadcastId": "broadcast-1",
-                        "clientId": "player-1",
-                        "state": "playing",
-                        "positionMs": 0,
+                        "clientId": "participant-1",
+                        "deviceSessionId": "device:participant-1",
+                        "targetBroadcastRevision": 2,
+                        "targetDeliveryId": "delivery-1",
+                        "deadlineBroadcastRevision": 2,
+                        "syncStatus": "pending",
+                        "feedbackDeadlineAtServerMs": 9250,
                         "online": True,
                     }
                 ],
@@ -896,11 +903,12 @@ class StrictV2ContractTestCase(unittest.TestCase):
         )
         timed_snapshot = dict(
             snapshot,
+            deliveryId="delivery-1",
             effectiveAtServerMs=1250,
             serverTimeMs=1000,
         )
         push = self._output(
-            "command",
+            "event",
             "broadcast.play",
             timed_snapshot,
         )
