@@ -990,6 +990,21 @@ class StrictV2ContractTestCase(unittest.TestCase):
                 deliveryId="resync-delivery-2",
             ),
         )
+        waiting_push = self._output(
+            "event",
+            "broadcast.waiting",
+            dict(
+                snapshot,
+                lifecycleState="waitingForSource",
+                state="paused",
+                deliveryId="waiting-delivery-1",
+            ),
+        )
+        resume_push = self._output(
+            "event",
+            "broadcast.resume",
+            dict(timed_snapshot, deliveryId="resume-delivery-1"),
+        )
         untimed_progress = self._output(
             "event",
             "broadcast.progress",
@@ -1024,6 +1039,8 @@ class StrictV2ContractTestCase(unittest.TestCase):
         self.assertEqual(validate_strict_output(terminal_push), terminal_push)
         self.assertEqual(validate_strict_output(active_resync), active_resync)
         self.assertEqual(validate_strict_output(waiting_resync), waiting_resync)
+        self.assertEqual(validate_strict_output(waiting_push), waiting_push)
+        self.assertEqual(validate_strict_output(resume_push), resume_push)
         with self.assertRaises(StrictOutputValidationError):
             validate_strict_output(untimed_progress)
         untimed_active_resync = copy.deepcopy(active_resync)
@@ -1151,7 +1168,7 @@ class StrictV2ContractTestCase(unittest.TestCase):
             validate_strict_output(missing_provenance)
 
     def test_output_action_inventory_is_closed(self):
-        self.assertEqual(len(STRICT_OUTPUT_ACTIONS), 38)
+        self.assertEqual(len(STRICT_OUTPUT_ACTIONS), 40)
         self.assertIn("system.ack", STRICT_OUTPUT_ACTIONS)
         self.assertIn("device.setVolume", STRICT_OUTPUT_ACTIONS)
         self.assertIn("device.volume.update", STRICT_OUTPUT_ACTIONS)
@@ -1172,6 +1189,8 @@ class StrictV2ContractTestCase(unittest.TestCase):
         self.assertIn("broadcast.feedback", STRICT_OUTPUT_ACTIONS)
         self.assertIn("broadcast.feedback.rejected", STRICT_OUTPUT_ACTIONS)
         self.assertIn("broadcast.resync", STRICT_OUTPUT_ACTIONS)
+        self.assertIn("broadcast.waiting", STRICT_OUTPUT_ACTIONS)
+        self.assertIn("broadcast.resume", STRICT_OUTPUT_ACTIONS)
         self.assertIn("broadcast.stop", STRICT_OUTPUT_ACTIONS)
 
 

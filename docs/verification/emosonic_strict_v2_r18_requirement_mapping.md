@@ -13,7 +13,7 @@
 | REQ-040 | Goal 7 | feedback schema, target validation, no-side-effect settlement, canonical replay and Socket role tests | Verified |
 | REQ-041 | Goal 5, Goal 10 | Context/binding/source barriers verified; terminal transaction remains | In progress |
 | REQ-042 | Goal 4, Goal 10 | start role fanout verified; terminal and restore remain | In progress |
-| REQ-043 | Goal 9 | source reconnect and actual-state tests | Planned |
+| REQ-043 | Goal 9 | exact-pair waiting, fresh actual-state resume, cursor preservation and timeout terminal tests | Verified |
 | REQ-044 | Goal 2, Goal 10 | store terminal transaction/idempotency verified; Socket/restart remains | In progress |
 | REQ-045—REQ-046 | Goal 3, Goal 6 | rate/effective-at eligibility, anchored progress, throttle and single-revision tests | Verified |
 | REQ-047 | Goal 5, Goal 10 | restorePending ensure and no-side-effect replay verified; terminal drain remains | In progress |

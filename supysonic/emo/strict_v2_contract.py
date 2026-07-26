@@ -721,6 +721,8 @@ STRICT_OUTPUT_ACTIONS = {
     "broadcast.feedback",
     "broadcast.feedback.rejected",
     "broadcast.resync",
+    "broadcast.waiting",
+    "broadcast.resume",
     "broadcast.stop",
 }
 
@@ -762,6 +764,8 @@ _OUTPUT_ACTION_TYPES = {
     "broadcast.feedback": "event",
     "broadcast.feedback.rejected": "event",
     "broadcast.resync": "event",
+    "broadcast.waiting": "event",
+    "broadcast.resume": "event",
     "broadcast.stop": "event",
 }
 
@@ -2507,13 +2511,19 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
         "broadcast.progress",
         "broadcast.state.sync",
         "broadcast.resync",
+        "broadcast.waiting",
+        "broadcast.resume",
         "broadcast.stop",
     }:
         _validate_broadcast_snapshot(
             payload,
             "%s payload" % action,
             allow_untimed_delivery=action
-            in {"broadcast.resync", "broadcast.stop"},
+            in {
+                "broadcast.resync",
+                "broadcast.waiting",
+                "broadcast.stop",
+            },
         )
         if action == "broadcast.stop" and payload["lifecycleState"] != "stopped":
             _output_error("broadcast.stop lifecycleState must be stopped")
@@ -2530,6 +2540,16 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
                 and "effectiveAtServerMs" not in payload
             ):
                 _output_error("active broadcast.resync requires timing fields")
+        if (
+            action == "broadcast.waiting"
+            and payload["lifecycleState"] != "waitingForSource"
+        ):
+            _output_error("broadcast.waiting lifecycleState is invalid")
+        if (
+            action == "broadcast.resume"
+            and payload["lifecycleState"] != "active"
+        ):
+            _output_error("broadcast.resume lifecycleState is invalid")
         return None
     _output_error("No strict output payload schema exists for %s" % action)
     return None

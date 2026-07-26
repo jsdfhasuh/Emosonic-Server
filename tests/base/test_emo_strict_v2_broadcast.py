@@ -811,6 +811,231 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             resync["payload"]["deliveryId"],
         )
 
+    def test_source_disconnect_waits_then_fresh_update_resumes(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        context_before = getPlaybackContextState("context-broadcast-source")
+
+        authority.disconnect(namespace="/emo")
+
+        waiting = self._push(
+            self.get_messages(participant),
+            "broadcast.waiting",
+        )
+        observer_waiting = self._push(
+            self.get_messages(controller),
+            "broadcast.waiting",
+        )
+        self.assertEqual(waiting["payload"]["lifecycleState"], "waitingForSource")
+        self.assertEqual(waiting["payload"]["state"], "paused")
+        self.assertEqual(waiting["payload"]["broadcastRevision"], 2)
+        self.assertEqual(
+            observer_waiting["payload"]["broadcastRevision"],
+            2,
+        )
+        self.assertEqual(
+            getPlaybackContextState("context-broadcast-source"),
+            context_before,
+        )
+
+        reconnected = self.connect_device(
+            "alice",
+            "Alic3",
+            "authority-1",
+            "device:authority-1",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+            },
+        )
+        self.assertFalse(
+            any(
+                message["action"] == "broadcast.resume"
+                for message in self.get_messages(participant)
+            )
+        )
+        self.sync_source_queue(
+            reconnected,
+            ["source-song-1", "source-song-2"],
+            current_index=0,
+            position_ms=1100,
+            request_id="source-queue-while-waiting-1",
+        )
+        blocked = self.get_error(
+            self.get_messages(reconnected),
+            "source-queue-while-waiting-1",
+        )
+        self.assertEqual(blocked["payload"]["code"], "conflict")
+        self.assertEqual(
+            emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])[
+                "snapshot"
+            ]["broadcastRevision"],
+            2,
+        )
+        self.report_source_state(reconnected, client_seq=1)
+
+        source_messages = self.get_messages(reconnected)
+        source_resume = self._push(source_messages, "broadcast.resume")
+        ordinary_resume = self._push(
+            self.get_messages(participant),
+            "broadcast.resume",
+        )
+        observer_resume = self._push(
+            self.get_messages(controller),
+            "broadcast.resume",
+        )
+        for message in (source_resume, ordinary_resume, observer_resume):
+            self.assertEqual(message["payload"]["lifecycleState"], "active")
+            self.assertEqual(message["payload"]["broadcastRevision"], 3)
+            self.assertEqual(message["payload"]["state"], "playing")
+        persisted = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        self.assertEqual(persisted["snapshot"]["lifecycleState"], "active")
+        self.assertIsNone(persisted["authorityDisconnectDeadlineMs"])
+        context_after = getPlaybackContextState("context-broadcast-source")
+        self.assertEqual(
+            (
+                context_after["epoch"],
+                context_after["version"],
+                context_after["queueRevision"],
+                context_after["controlVersion"],
+            ),
+            (
+                context_before["epoch"],
+                context_before["version"],
+                context_before["queueRevision"],
+                context_before["controlVersion"],
+            ),
+        )
+
+    def test_owner_and_ordinary_disconnect_do_not_change_lifecycle(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+
+        controller.disconnect(namespace="/emo")
+        participant.disconnect(namespace="/emo")
+
+        persisted = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        self.assertEqual(persisted["lifecycleState"], "active")
+        self.assertEqual(persisted["snapshot"]["broadcastRevision"], 1)
+        self.assertIsNone(persisted["authorityDisconnectDeadlineMs"])
+        self.assertFalse(
+            any(
+                message["action"] in {
+                    "broadcast.waiting",
+                    "broadcast.stop",
+                }
+                for message in self.get_messages(authority)
+            )
+        )
+
+    def test_different_source_device_session_cannot_resume_waiting(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        authority.disconnect(namespace="/emo")
+        self.get_messages(participant)
+        self.get_messages(controller)
+        replacement = self.connect_device(
+            "alice",
+            "Alic3",
+            "authority-1",
+            "device:authority-replacement",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+            },
+        )
+
+        self.report_source_state(replacement, client_seq=1)
+
+        error = self.get_error(
+            self.get_messages(replacement),
+            "source-state-1",
+        )
+        self.assertEqual(error["payload"]["code"], "forbidden")
+        persisted = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        self.assertEqual(persisted["lifecycleState"], "waitingForSource")
+        self.assertEqual(persisted["snapshot"]["broadcastRevision"], 2)
+
+    def test_source_disconnect_timeout_terminals_and_cannot_revive(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        authority.disconnect(namespace="/emo")
+        self._push(self.get_messages(participant), "broadcast.waiting")
+        self._push(self.get_messages(controller), "broadcast.waiting")
+        waiting = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+
+        terminal = emo_ws.sweepBroadcastAuthorityDisconnectDeadlines(
+            waiting["authorityDisconnectDeadlineMs"]
+        )
+        self.assertEqual(len(terminal), 1)
+        emo_ws._emit_r18_broadcast_projection(terminal[0])
+
+        ordinary_stop = self._push(
+            self.get_messages(participant),
+            "broadcast.stop",
+        )
+        observer_stop = self._push(
+            self.get_messages(controller),
+            "broadcast.stop",
+        )
+        self.assertEqual(ordinary_stop["payload"]["broadcastRevision"], 3)
+        self.assertEqual(observer_stop["payload"]["lifecycleState"], "stopped")
+        reconnected = self.connect_device(
+            "alice",
+            "Alic3",
+            "authority-1",
+            "device:authority-1",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+            },
+        )
+        self.report_source_state(reconnected, client_seq=1)
+        self.assertFalse(
+            any(
+                message["action"] == "broadcast.resume"
+                for message in self.get_messages(reconnected)
+            )
+        )
+        persisted = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        self.assertEqual(persisted["lifecycleState"], "stopped")
+        self.assertEqual(persisted["snapshot"]["broadcastRevision"], 3)
+
     def test_feedback_failed_then_applied_converges_status(self):
         authority, participant, controller = self.connect_broadcast_devices()
         start_ack = self.get_ack(

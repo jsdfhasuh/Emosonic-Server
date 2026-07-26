@@ -1,6 +1,6 @@
 # Goal: EmoSonic strict-v2 2.8.0 / r18 群播服务端落地
 
-> 状态：In progress（Goal 0—7 已完成；正在实施 Goal 8—11）
+> 状态：In progress（Goal 0—7、Goal 9 已完成；Goal 8 compact 依赖与 Goal 10—11 待完成）
 >
 > 制定日期：2026-07-23
 >
@@ -812,7 +812,7 @@ status 读取不触发投递。Broadcast/store/contract/Core 共 409 项通过�
 false。Goal 10 建立 compact TerminalRecoveryRecord 后仍需补 `broadcast.restore` replacement，故本 Goal
 在该依赖完成前不标记完全完成。
 
-### Goal 9：source waiting/resume 和 30 秒 timeout
+### Goal 9：source waiting/resume 和 30 秒 timeout（已完成）
 
 改动：
 
@@ -830,6 +830,16 @@ false。Goal 10 建立 compact TerminalRecoveryRecord 后仍需补 `broadcast.re
 - waiting/resume 只改变 Broadcast revision，不改变 source cursor；
 - source resume 不要求手工 broadcast.play；
 - timeout 后旧 broadcastId 不可复活。
+
+完成记录（2026-07-26）：source authority 精确 client/device pair 断线后，服务端原子提交唯一
+`waitingForSource` revision，把 playing anchor 投影到断线时刻并设为 paused，只向 ordinary 和
+controller-only observer 推送 `broadcast.waiting`；source Context 内容和四个 cursor 不变。owner 或
+ordinary 断线只改变在线状态，不改变 lifecycle。相同 source pair 重连仅完成 register 不会恢复，waiting
+期间 queue mutation 继续被屏障拒绝；只有新连接合法、fresh、appliedControlVersion 已追平的
+`playback.update` 才按实际 playing/paused/stopped 自动提交唯一 `broadcast.resume`，不要求手工
+`broadcast.play`，不同 deviceSessionId 无法继承。持久化 watchdog 每秒检查 30 秒 deadline，到期使用
+共同 terminal primitive 提交 stop、restorePending 和 fence 释放；之后旧 broadcastId 不可复活。
+Broadcast/store/contract/Core 共 414 项通过，`supportsBroadcast` 继续保持 false。
 
 ### Goal 10：terminal、7 天 retention、compact restore 和重启
 

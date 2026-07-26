@@ -40,6 +40,8 @@ from .broadcast_store import (
     getNonterminalBroadcastStateForContext,
     getBroadcastState as getPersistentBroadcastState,
     settleBroadcastFeedback,
+    suspendBroadcastForAuthorityDisconnect,
+    sweepBroadcastAuthorityDisconnectDeadlines,
     sweepBroadcastFeedbackDeadlines,
     terminalBroadcastStateInTransaction,
 )
@@ -2641,6 +2643,22 @@ def _suspend_strict_broadcasts_for_authority_disconnect(client_info):
     client_id = client_info.get("clientId")
     user_name = client_info.get("userName")
     device_session_id = client_info.get("deviceSessionId")
+    server_time_ms = _server_time_ms()
+    deadline_ms = server_time_ms + BROADCAST_AUTHORITY_DISCONNECT_TIMEOUT_MS
+    persisted = suspendBroadcastForAuthorityDisconnect(
+        user_name,
+        client_id,
+        device_session_id,
+        server_time_ms,
+        deadline_ms,
+    )
+    if persisted is not None:
+        _run_post_commit_push(
+            "broadcast.waiting",
+            None,
+            lambda: _emit_r18_broadcast_projection(persisted),
+        )
+        return [persisted]
     for broadcast in state.list_broadcasts(user_name=user_name):
         if broadcast.get("authorityClientId") != client_id:
             continue
@@ -4879,6 +4897,59 @@ def _commit_r18_source_playback_update(
     previous_snapshot = persisted["snapshot"]
     if canonical["state"] == "idle":
         return _commit_r18_broadcast_terminal(persisted, server_time_ms)
+
+    if previous_snapshot["lifecycleState"] == "waitingForSource":
+        if any(
+            playback_context[field_name]
+            != previous_snapshot[snapshot_field]
+            for field_name, snapshot_field in (
+                ("epoch", "sourceEpoch"),
+                ("version", "sourceVersion"),
+                ("queueRevision", "sourceQueueRevision"),
+                ("controlVersion", "sourceControlVersion"),
+            )
+        ):
+            raise BroadcastConflictError(
+                "Source Context cursors changed while waiting"
+            )
+        if (
+            canonical.get("appliedControlVersion", 0)
+            < playback_context["controlVersion"]
+        ):
+            raise BroadcastConflictError(
+                "Source control reconciliation is not settled"
+            )
+        effective_at_server_ms = server_time_ms + 250
+        actual_state = canonical["state"]
+        position_ms = canonical["positionMs"]
+        if actual_state == "playing":
+            sampled_at_ms = canonical["positionSampledAtServerMs"]
+            if (
+                sampled_at_ms > server_time_ms + 50
+                or server_time_ms - sampled_at_ms > 2000
+            ):
+                raise BroadcastConflictError(
+                    "Source resume position sample is not fresh"
+                )
+            position_ms = projectBroadcastPositionMs(
+                position_ms,
+                sampled_at_ms,
+                effective_at_server_ms,
+                canonical["playbackRate"],
+                duration_ms=track_duration_ms,
+            )
+        resumed = _commit_r18_broadcast_projection(
+            persisted,
+            playback_context,
+            "broadcast.resume",
+            position_ms,
+            actual_state,
+            canonical["playbackRate"],
+            server_time_ms,
+            effective_at_server_ms,
+        )
+        resumed["includeSource"] = True
+        return resumed
 
     queue_changed = (
         playback_context["queueSongIds"] != previous_snapshot["queueSongIds"]
@@ -7237,6 +7308,12 @@ def _control_watchdog_sweep_later(generation: int) -> None:
             sweepBroadcastFeedbackDeadlines()
         except Exception:
             logger.exception("Strict Broadcast feedback deadline sweep failed")
+        try:
+            terminal_broadcasts = sweepBroadcastAuthorityDisconnectDeadlines()
+            for terminal_broadcast in terminal_broadcasts:
+                _emit_r18_broadcast_projection(terminal_broadcast)
+        except Exception:
+            logger.exception("Strict Broadcast source timeout sweep failed")
 
 
 def _control_settled_payload(transaction, playback_context):
@@ -7880,6 +7957,14 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
         current_user_name,
         playback_context_id,
     )
+    if (
+        persisted_broadcast is not None
+        and persisted_broadcast["snapshot"]["lifecycleState"]
+        == "waitingForSource"
+    ):
+        raise BroadcastConflictError(
+            "Source queue mutation is blocked while waiting for playback state"
+        )
     next_track_id = (
         queue_song_ids[current_index]
         if queue_song_ids and current_index is not None

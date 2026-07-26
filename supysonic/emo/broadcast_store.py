@@ -2041,6 +2041,203 @@ def createBroadcastRegistrationReplay(
         close_connection()
 
 
+def suspendBroadcastForAuthorityDisconnect(
+    user_name: str,
+    client_id: str,
+    device_session_id: str,
+    server_time_ms: int,
+    deadline_ms: int,
+) -> Optional[Dict[str, object]]:
+    open_connection(reuse=True)
+    try:
+        candidate = (
+            EmoBroadcast.select(EmoBroadcast.broadcast_id)
+            .where(
+                (EmoBroadcast.user_name == user_name)
+                & (EmoBroadcast.authority_client_id == client_id)
+                & (
+                    EmoBroadcast.authority_device_session_id
+                    == device_session_id
+                )
+                & (EmoBroadcast.lifecycle_state == "active")
+            )
+            .first()
+        )
+        if candidate is None:
+            return None
+        broadcast_id = candidate.broadcast_id
+        with broadcastMutationLock(broadcast_id):
+            with broadcastTransaction():
+                record = EmoBroadcast.get_or_none(
+                    EmoBroadcast.broadcast_id == broadcast_id
+                )
+                if (
+                    record is None
+                    or record.lifecycle_state != "active"
+                    or record.authority_client_id != client_id
+                    or record.authority_device_session_id
+                    != device_session_id
+                ):
+                    return None
+                previous = _load_json(record.snapshot_json, {})
+                position_ms = int(previous["positionMs"])
+                if previous["state"] == "playing":
+                    position_ms = projectBroadcastPositionMs(
+                        position_ms,
+                        int(previous["serverUpdatedAtMs"]),
+                        server_time_ms,
+                        float(previous["playbackRate"]),
+                    )
+                snapshot = dict(previous)
+                snapshot.update(
+                    {
+                        "lifecycleState": "waitingForSource",
+                        "broadcastRevision": int(record.broadcast_revision) + 1,
+                        "positionMs": position_ms,
+                        "state": "paused",
+                        "serverUpdatedAtMs": server_time_ms,
+                    }
+                )
+                deliveries = []
+                participants = EmoBroadcastParticipant.select().where(
+                    EmoBroadcastParticipant.broadcast_id == broadcast_id
+                )
+                for participant in participants:
+                    delivery_id = "delivery:%s" % uuid.uuid4()
+                    payload = dict(snapshot, deliveryId=delivery_id)
+                    deliveries.append(
+                        {
+                            "deliveryId": delivery_id,
+                            "clientId": participant.client_id,
+                            "deviceSessionId": participant.device_session_id,
+                            "action": "waiting",
+                            "deliveryPositionMs": position_ms,
+                            "feedbackDeadlineAtServerMs": server_time_ms + 8000,
+                            "payload": payload,
+                            "connectionNonce": None,
+                            "createdAtMs": server_time_ms,
+                        }
+                    )
+                committed = commitBroadcastRevisionInTransaction(
+                    broadcast_id,
+                    int(record.broadcast_revision),
+                    snapshot,
+                    "waiting",
+                    deliveries,
+                    server_time_ms,
+                )
+                EmoBroadcast.update(
+                    authority_disconnect_deadline_ms=deadline_ms,
+                    updated_at=now(),
+                ).where(
+                    EmoBroadcast.broadcast_id == broadcast_id
+                ).execute()
+                committed["authorityDisconnectDeadlineMs"] = deadline_ms
+                return {
+                    "broadcast": committed,
+                    "snapshot": snapshot,
+                    "deliveries": deliveries,
+                    "action": "broadcast.waiting",
+                    "serverTimeMs": server_time_ms,
+                }
+    finally:
+        close_connection()
+
+
+def sweepBroadcastAuthorityDisconnectDeadlines(
+    now_ms: Optional[int] = None,
+) -> List[Dict[str, object]]:
+    sweep_time_ms = int(
+        now_ms if now_ms is not None else time.time() * 1000
+    )
+    open_connection(reuse=True)
+    try:
+        candidates = list(
+            EmoBroadcast.select(
+                EmoBroadcast.broadcast_id,
+                EmoBroadcast.authority_disconnect_deadline_ms,
+            ).where(
+                (EmoBroadcast.lifecycle_state == "waitingForSource")
+                & (
+                    EmoBroadcast.authority_disconnect_deadline_ms
+                    <= sweep_time_ms
+                )
+            )
+        )
+    finally:
+        close_connection()
+    terminal_mutations = []
+    for candidate in candidates:
+        open_connection(reuse=True)
+        try:
+            with broadcastMutationLock(candidate.broadcast_id):
+                with broadcastTransaction():
+                    record = EmoBroadcast.get_or_none(
+                        EmoBroadcast.broadcast_id == candidate.broadcast_id
+                    )
+                    if (
+                        record is None
+                        or record.lifecycle_state != "waitingForSource"
+                        or record.authority_disconnect_deadline_ms is None
+                        or record.authority_disconnect_deadline_ms
+                        > sweep_time_ms
+                    ):
+                        continue
+                    previous = _load_json(record.snapshot_json, {})
+                    snapshot = dict(previous)
+                    snapshot.update(
+                        {
+                            "lifecycleState": "stopped",
+                            "broadcastRevision": int(record.broadcast_revision) + 1,
+                            "serverUpdatedAtMs": sweep_time_ms,
+                        }
+                    )
+                    deliveries = []
+                    participants = EmoBroadcastParticipant.select().where(
+                        EmoBroadcastParticipant.broadcast_id
+                        == candidate.broadcast_id
+                    )
+                    for participant in participants:
+                        delivery_id = "delivery:%s" % uuid.uuid4()
+                        payload = dict(snapshot, deliveryId=delivery_id)
+                        deliveries.append(
+                            {
+                                "deliveryId": delivery_id,
+                                "clientId": participant.client_id,
+                                "deviceSessionId": participant.device_session_id,
+                                "action": "stop",
+                                "deliveryPositionMs": snapshot["positionMs"],
+                                "feedbackDeadlineAtServerMs": sweep_time_ms + 8000,
+                                "payload": payload,
+                                "connectionNonce": None,
+                                "createdAtMs": sweep_time_ms,
+                            }
+                        )
+                    terminal = terminalBroadcastStateInTransaction(
+                        candidate.broadcast_id,
+                        snapshot,
+                        {},
+                        terminal_deliveries=deliveries,
+                        expected_broadcast_revision=int(
+                            record.broadcast_revision
+                        ),
+                        terminal_at_ms=sweep_time_ms,
+                    )
+                    terminal_mutations.append(
+                        {
+                            "broadcast": terminal["broadcast"],
+                            "snapshot": snapshot,
+                            "deliveries": deliveries,
+                            "action": "broadcast.stop",
+                            "serverTimeMs": sweep_time_ms,
+                            "includeSource": True,
+                        }
+                    )
+        finally:
+            close_connection()
+    return terminal_mutations
+
+
 def sweepBroadcastFeedbackDeadlines(
     now_ms: Optional[int] = None,
 ) -> List[Dict[str, object]]:

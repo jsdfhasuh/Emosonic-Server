@@ -28,6 +28,8 @@ from supysonic.emo.broadcast_store import (
     listTerminalRecoveries,
     saveBroadcastFeedbackSettlement,
     settleBroadcastFeedback,
+    suspendBroadcastForAuthorityDisconnect,
+    sweepBroadcastAuthorityDisconnectDeadlines,
     sweepBroadcastFeedbackDeadlines,
     terminalBroadcastState,
 )
@@ -546,6 +548,60 @@ class EmoBroadcastStoreTestCase(unittest.TestCase):
         self.assertEqual(
             participant["targetDeliveryId"],
             replacement["deliveryId"],
+        )
+
+    def test_source_disconnect_waiting_and_timeout_share_terminal_state(self):
+        self._create()
+        before = getBroadcastState("broadcast-1")
+
+        waiting = suspendBroadcastForAuthorityDisconnect(
+            "alice",
+            "source-1",
+            "device:source-1",
+            12000,
+            42000,
+        )
+
+        self.assertEqual(waiting["action"], "broadcast.waiting")
+        self.assertEqual(waiting["snapshot"]["broadcastRevision"], 2)
+        self.assertEqual(
+            waiting["snapshot"]["lifecycleState"],
+            "waitingForSource",
+        )
+        self.assertEqual(waiting["snapshot"]["state"], "paused")
+        for field_name in (
+            "sourceEpoch",
+            "sourceVersion",
+            "sourceQueueRevision",
+            "sourceControlVersion",
+        ):
+            self.assertEqual(
+                waiting["snapshot"][field_name],
+                before["snapshot"][field_name],
+            )
+        self.assertEqual(
+            getBroadcastState("broadcast-1")[
+                "authorityDisconnectDeadlineMs"
+            ],
+            42000,
+        )
+        self.assertEqual(
+            sweepBroadcastAuthorityDisconnectDeadlines(41999),
+            [],
+        )
+
+        terminal = sweepBroadcastAuthorityDisconnectDeadlines(42000)
+
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0]["action"], "broadcast.stop")
+        self.assertEqual(terminal[0]["snapshot"]["broadcastRevision"], 3)
+        persisted = getBroadcastState("broadcast-1")
+        self.assertEqual(persisted["lifecycleState"], "stopped")
+        self.assertIsNone(persisted["authorityDisconnectDeadlineMs"])
+        self.assertTrue(persisted["participantStates"][0]["restorePending"])
+        self.assertEqual(
+            sweepBroadcastAuthorityDisconnectDeadlines(43000),
+            [],
         )
 
     def test_feedback_settlement_failure_rolls_back_participant(self):
