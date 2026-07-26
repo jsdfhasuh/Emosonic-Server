@@ -383,6 +383,56 @@ class StrictV2ContractTestCase(unittest.TestCase):
         with self.assertRaises(StrictRequestValidationError):
             validate_strict_request(invalid)
 
+    def test_validates_broadcast_feedback_request_shapes(self):
+        common = {
+            "playbackContextId": "context-1",
+            "broadcastId": "broadcast-1",
+            "deviceSessionId": "device:participant-1",
+            "deliveryId": "delivery-1",
+            "clientSeq": 1,
+        }
+        applied = dict(
+            common,
+            executionStatus="applied",
+            appliedBroadcastRevision=2,
+            queueIndex=0,
+            trackId="song-1",
+            state="playing",
+            positionMs=1250,
+            playbackRate=1.0,
+        )
+        failed = dict(
+            common,
+            executionStatus="failed",
+            failedBroadcastRevision=2,
+            lastAppliedBroadcastRevision=1,
+            errorCode="track_load_failed",
+            errorMessage="Unable to load target",
+        )
+        for index, payload in enumerate((applied, failed), 1):
+            request = {
+                "type": "event",
+                "action": "broadcast.feedback",
+                "requestId": "broadcast-feedback-%d" % index,
+                "payload": payload,
+            }
+            self.assertEqual(validate_strict_request(request), request)
+
+        invalid = {
+            "type": "event",
+            "action": "broadcast.feedback",
+            "requestId": "broadcast-feedback-invalid-1",
+            "payload": dict(applied, errorCode="execution_failed"),
+        }
+        with self.assertRaises(StrictRequestValidationError):
+            validate_strict_request(invalid)
+        invalid["payload"] = dict(
+            failed,
+            lastAppliedBroadcastRevision=2,
+        )
+        with self.assertRaises(StrictRequestValidationError):
+            validate_strict_request(invalid)
+
     def test_client_cannot_send_server_only_settled(self):
         request = {
             "type": "event",
@@ -933,11 +983,85 @@ class StrictV2ContractTestCase(unittest.TestCase):
         )
 
         self.assertEqual(validate_strict_output(status), status)
+        failed_status = copy.deepcopy(status)
+        failed_status["payload"]["participantStates"][0].update(
+            {
+                "syncStatus": "failed",
+                "failedBroadcastRevision": 2,
+                "errorCode": "track_load_failed",
+                "errorMessage": "Unable to load target",
+            }
+        )
+        self.assertEqual(validate_strict_output(failed_status), failed_status)
+        invalid_failed_status = copy.deepcopy(failed_status)
+        invalid_failed_status["payload"]["participantStates"][0][
+            "failedBroadcastRevision"
+        ] = True
+        with self.assertRaises(StrictOutputValidationError):
+            validate_strict_output(invalid_failed_status)
+        invalid_failed_status = copy.deepcopy(failed_status)
+        invalid_failed_status["payload"]["participantStates"][0][
+            "errorCode"
+        ] = "database_error"
+        with self.assertRaises(StrictOutputValidationError):
+            validate_strict_output(invalid_failed_status)
         for push in pushes:
             self.assertEqual(validate_strict_output(push), push)
         self.assertEqual(validate_strict_output(terminal_push), terminal_push)
         with self.assertRaises(StrictOutputValidationError):
             validate_strict_output(untimed_progress)
+
+    def test_validates_broadcast_feedback_confirmation_output(self):
+        applied = self._output(
+            "event",
+            "broadcast.feedback",
+            {
+                "playbackContextId": "context-1",
+                "broadcastId": "broadcast-1",
+                "sourceClientId": "participant-1",
+                "deviceSessionId": "device:participant-1",
+                "deliveryId": "delivery-1",
+                "executionStatus": "applied",
+                "clientSeq": 1,
+                "serverUpdatedAtMs": 1000,
+                "appliedBroadcastRevision": 2,
+                "queueIndex": 0,
+                "trackId": "song-1",
+                "state": "stopped",
+                "positionMs": 1250,
+                "playbackRate": 1.0,
+                "restoreCompleted": True,
+            },
+        )
+        failed = self._output(
+            "event",
+            "broadcast.feedback",
+            {
+                "playbackContextId": "context-1",
+                "broadcastId": "broadcast-1",
+                "sourceClientId": "participant-1",
+                "deviceSessionId": "device:participant-1",
+                "deliveryId": "delivery-1",
+                "executionStatus": "failed",
+                "clientSeq": 2,
+                "serverUpdatedAtMs": 1100,
+                "failedBroadcastRevision": 2,
+                "lastAppliedBroadcastRevision": 1,
+                "errorCode": "track_load_failed",
+                "errorMessage": "Unable to load target",
+            },
+        )
+
+        self.assertEqual(validate_strict_output(applied), applied)
+        self.assertEqual(validate_strict_output(failed), failed)
+        invalid_applied = copy.deepcopy(applied)
+        invalid_applied["payload"]["restoreCompleted"] = False
+        with self.assertRaises(StrictOutputValidationError):
+            validate_strict_output(invalid_applied)
+        invalid_failed = copy.deepcopy(failed)
+        invalid_failed["payload"]["errorCode"] = "database_error"
+        with self.assertRaises(StrictOutputValidationError):
+            validate_strict_output(invalid_failed)
 
     def test_rejects_unknown_null_and_forbidden_output_fields(self):
         messages = [
@@ -985,7 +1109,7 @@ class StrictV2ContractTestCase(unittest.TestCase):
             validate_strict_output(missing_provenance)
 
     def test_output_action_inventory_is_closed(self):
-        self.assertEqual(len(STRICT_OUTPUT_ACTIONS), 35)
+        self.assertEqual(len(STRICT_OUTPUT_ACTIONS), 36)
         self.assertIn("system.ack", STRICT_OUTPUT_ACTIONS)
         self.assertIn("device.setVolume", STRICT_OUTPUT_ACTIONS)
         self.assertIn("device.volume.update", STRICT_OUTPUT_ACTIONS)
@@ -1003,6 +1127,7 @@ class StrictV2ContractTestCase(unittest.TestCase):
         self.assertIn("playback.handoff.status", STRICT_OUTPUT_ACTIONS)
         self.assertIn("broadcast.progress", STRICT_OUTPUT_ACTIONS)
         self.assertIn("broadcast.state.sync", STRICT_OUTPUT_ACTIONS)
+        self.assertIn("broadcast.feedback", STRICT_OUTPUT_ACTIONS)
         self.assertIn("broadcast.stop", STRICT_OUTPUT_ACTIONS)
 
 

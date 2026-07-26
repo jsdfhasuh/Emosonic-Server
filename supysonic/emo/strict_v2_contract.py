@@ -185,6 +185,30 @@ ACTION_SCHEMAS = {
             "baseControlVersion",
         ),
     ),
+    "broadcast.feedback": ActionSchema(
+        "event",
+        (
+            "playbackContextId",
+            "broadcastId",
+            "deviceSessionId",
+            "deliveryId",
+            "executionStatus",
+            "clientSeq",
+        ),
+        (
+            "appliedBroadcastRevision",
+            "queueIndex",
+            "trackId",
+            "state",
+            "positionMs",
+            "playbackRate",
+            "restoreCompleted",
+            "failedBroadcastRevision",
+            "lastAppliedBroadcastRevision",
+            "errorCode",
+            "errorMessage",
+        ),
+    ),
     "broadcast.stop": ActionSchema("command", ("playbackContextId", "broadcastId")),
 }  # type: Dict[str, ActionSchema]
 
@@ -202,6 +226,7 @@ _ID_FIELDS = {
     "targetDeviceSessionId",
     "trackId",
     "intentId",
+    "deliveryId",
 }
 _NON_NEGATIVE_INT_FIELDS = {
     "currentIndex",
@@ -210,14 +235,27 @@ _NON_NEGATIVE_INT_FIELDS = {
     "queueIndex",
     "baseQueueRevision",
     "baseControlVersion",
+    "lastAppliedBroadcastRevision",
 }
 _POSITIVE_INT_FIELDS = {
     "epoch",
     "commandControlVersion",
     "appliedControlVersion",
     "observedControlVersion",
+    "appliedBroadcastRevision",
+    "failedBroadcastRevision",
 }
-_BOOLEAN_FIELDS = {"ready", "muted", "autoPlay"}
+_BOOLEAN_FIELDS = {"ready", "muted", "autoPlay", "restoreCompleted"}
+
+_BROADCAST_FEEDBACK_ERROR_CODES = {
+    "track_load_failed",
+    "queue_apply_failed",
+    "effective_at_missed",
+    "clock_unsynchronized",
+    "rate_unsupported",
+    "restore_failed",
+    "execution_failed",
+}
 
 
 def _is_int(value: object) -> bool:
@@ -354,7 +392,12 @@ def _validate_field(
         if value not in {"passive", "remoteCommand", "localUser"}:
             raise StrictRequestValidationError("origin is invalid")
     elif field_name == "executionStatus":
-        if value not in {"committed", "failed"}:
+        allowed_statuses = (
+            {"applied", "failed"}
+            if action == "broadcast.feedback"
+            else {"committed", "failed"}
+        )
+        if value not in allowed_statuses:
             raise StrictRequestValidationError("executionStatus is invalid")
     else:
         raise StrictRequestValidationError("No validator exists for %s" % field_name)
@@ -509,6 +552,60 @@ def _validate_action_combinations(action: str, payload: Dict[str, object]) -> No
                 raise StrictRequestValidationError(
                     "localUser playback.update cannot be idle"
                 )
+    if action == "broadcast.feedback":
+        applied_fields = {
+            "appliedBroadcastRevision",
+            "queueIndex",
+            "trackId",
+            "state",
+            "positionMs",
+            "playbackRate",
+        }
+        failed_fields = {
+            "failedBroadcastRevision",
+            "lastAppliedBroadcastRevision",
+            "errorCode",
+        }
+        shape_fields = set(payload) - {
+            "playbackContextId",
+            "broadcastId",
+            "deviceSessionId",
+            "deliveryId",
+            "executionStatus",
+            "clientSeq",
+        }
+        if payload["executionStatus"] == "applied":
+            missing = applied_fields - shape_fields
+            forbidden = shape_fields - applied_fields - {"restoreCompleted"}
+            if payload.get("state") == "idle":
+                raise StrictRequestValidationError(
+                    "broadcast.feedback applied state cannot be idle"
+                )
+        else:
+            missing = failed_fields - shape_fields
+            forbidden = shape_fields - failed_fields - {"errorMessage"}
+            if (
+                not missing
+                and payload["lastAppliedBroadcastRevision"]
+                >= payload["failedBroadcastRevision"]
+            ):
+                raise StrictRequestValidationError(
+                    "lastAppliedBroadcastRevision must be below failedBroadcastRevision"
+                )
+            if payload.get("errorCode") not in _BROADCAST_FEEDBACK_ERROR_CODES:
+                raise StrictRequestValidationError(
+                    "broadcast.feedback failed errorCode is invalid"
+                )
+        if missing:
+            raise StrictRequestValidationError(
+                "broadcast.feedback is missing fields: %s"
+                % ", ".join(sorted(missing))
+            )
+        if forbidden:
+            raise StrictRequestValidationError(
+                "broadcast.feedback forbids fields: %s"
+                % ", ".join(sorted(forbidden))
+            )
     if action == "playback.ready":
         if payload["ready"]:
             if "errorCode" in payload or "errorMessage" in payload:
@@ -621,6 +718,7 @@ STRICT_OUTPUT_ACTIONS = {
     "broadcast.queue.sync",
     "broadcast.progress",
     "broadcast.state.sync",
+    "broadcast.feedback",
     "broadcast.stop",
 }
 
@@ -659,6 +757,7 @@ _OUTPUT_ACTION_TYPES = {
     "broadcast.queue.sync": "event",
     "broadcast.progress": "event",
     "broadcast.state.sync": "event",
+    "broadcast.feedback": "event",
     "broadcast.stop": "event",
 }
 
@@ -1187,7 +1286,22 @@ def _validate_broadcast_status_ack(payload: Dict[str, object]) -> None:
                 "feedbackDeadlineAtServerMs",
                 "online",
             },
-            set(),
+            {
+                "appliedBroadcastRevision",
+                "queueIndex",
+                "trackId",
+                "state",
+                "positionMs",
+                "playbackRate",
+                "appliedAtServerMs",
+                "lastFeedbackClientSeq",
+                "lastFeedbackAtServerMs",
+                "failedBroadcastRevision",
+                "errorCode",
+                "errorMessage",
+                "timedOutBroadcastRevision",
+                "restoreCompleted",
+            },
             label,
         )
         for field_name in (
@@ -1206,12 +1320,265 @@ def _validate_broadcast_status_ack(payload: Dict[str, object]) -> None:
             "feedbackDeadlineAtServerMs",
         ):
             _output_int(participant[field_name], label + "." + field_name, 1)
-        if participant["syncStatus"] != "pending":
-            _output_error("%s initial syncStatus must be pending" % label)
+        sync_status = participant["syncStatus"]
+        if sync_status not in {
+            "pending",
+            "applied",
+            "lagging",
+            "failed",
+            "timedOut",
+        }:
+            _output_error("%s.syncStatus is invalid" % label)
         _output_bool(participant["online"], label + ".online")
+        applied_fields = {
+            "appliedBroadcastRevision",
+            "queueIndex",
+            "trackId",
+            "state",
+            "positionMs",
+            "playbackRate",
+            "appliedAtServerMs",
+        }
+        present_applied = applied_fields.intersection(participant)
+        if present_applied and present_applied != applied_fields:
+            _output_error("%s applied fields must appear together" % label)
+        if present_applied:
+            applied_revision = _output_int(
+                participant["appliedBroadcastRevision"],
+                label + ".appliedBroadcastRevision",
+                1,
+            )
+            if applied_revision > participant["targetBroadcastRevision"]:
+                _output_error("%s applied revision exceeds target" % label)
+            _output_int(participant["queueIndex"], label + ".queueIndex")
+            _output_string(participant["trackId"], label + ".trackId")
+            if participant["state"] not in {"playing", "paused", "stopped"}:
+                _output_error("%s.state is invalid" % label)
+            _output_int(participant["positionMs"], label + ".positionMs")
+            rate = _output_number(
+                participant["playbackRate"],
+                label + ".playbackRate",
+                positive=True,
+            )
+            if rate < 0.5 or rate > 2.0:
+                _output_error("%s.playbackRate is invalid" % label)
+            _output_int(
+                participant["appliedAtServerMs"],
+                label + ".appliedAtServerMs",
+            )
+        feedback_fields = {
+            "lastFeedbackClientSeq",
+            "lastFeedbackAtServerMs",
+        }
+        present_feedback = feedback_fields.intersection(participant)
+        if present_feedback and present_feedback != feedback_fields:
+            _output_error("%s feedback fields must appear together" % label)
+        if present_feedback:
+            _output_int(
+                participant["lastFeedbackClientSeq"],
+                label + ".lastFeedbackClientSeq",
+                1,
+            )
+            _output_int(
+                participant["lastFeedbackAtServerMs"],
+                label + ".lastFeedbackAtServerMs",
+            )
+        if sync_status == "lagging":
+            if not present_applied or (
+                participant["appliedBroadcastRevision"]
+                >= participant["targetBroadcastRevision"]
+            ):
+                _output_error("%s lagging requires a lower applied revision" % label)
+        if sync_status == "failed":
+            if (
+                "failedBroadcastRevision" not in participant
+                or "errorCode" not in participant
+            ):
+                _output_error("%s failed fields are required" % label)
+            failed_revision = _output_int(
+                participant["failedBroadcastRevision"],
+                label + ".failedBroadcastRevision",
+                1,
+            )
+            if failed_revision != participant["targetBroadcastRevision"]:
+                _output_error("%s failed revision must equal target" % label)
+            error_code = _output_string(
+                participant["errorCode"],
+                label + ".errorCode",
+            )
+            if error_code not in _BROADCAST_FEEDBACK_ERROR_CODES:
+                _output_error("%s.errorCode is invalid" % label)
+            if "errorMessage" in participant:
+                _output_string(
+                    participant["errorMessage"],
+                    label + ".errorMessage",
+                    512,
+                )
+        elif sync_status == "timedOut":
+            if "timedOutBroadcastRevision" not in participant:
+                _output_error("%s timedOut revision is required" % label)
+            timed_out_revision = _output_int(
+                participant["timedOutBroadcastRevision"],
+                label + ".timedOutBroadcastRevision",
+                1,
+            )
+            if (
+                timed_out_revision != participant["deadlineBroadcastRevision"]
+                or participant.get("errorCode") != "feedback_timeout"
+                or "errorMessage" in participant
+            ):
+                _output_error("%s timedOut fields are invalid" % label)
+        elif {
+            "failedBroadcastRevision",
+            "timedOutBroadcastRevision",
+            "errorCode",
+            "errorMessage",
+        }.intersection(participant):
+            _output_error("%s error fields do not match syncStatus" % label)
+        if "restoreCompleted" in participant:
+            if (
+                participant["restoreCompleted"] is not True
+                or sync_status != "applied"
+                or broadcast["lifecycleState"] != "stopped"
+            ):
+                _output_error("%s restoreCompleted is invalid" % label)
         client_ids.append(client_id)
     if client_ids != list(broadcast["participants"]):
         _output_error("broadcast.status participantStates must cover sorted participants")
+
+
+def _validate_broadcast_feedback_output(payload: object) -> None:
+    required = {
+        "playbackContextId",
+        "broadcastId",
+        "sourceClientId",
+        "deviceSessionId",
+        "deliveryId",
+        "executionStatus",
+        "clientSeq",
+        "serverUpdatedAtMs",
+    }
+    optional = {
+        "appliedBroadcastRevision",
+        "queueIndex",
+        "trackId",
+        "state",
+        "positionMs",
+        "playbackRate",
+        "restoreCompleted",
+        "failedBroadcastRevision",
+        "lastAppliedBroadcastRevision",
+        "errorCode",
+        "errorMessage",
+    }
+    feedback = _output_object(
+        payload,
+        required,
+        optional,
+        "broadcast.feedback payload",
+    )
+    for field_name in (
+        "playbackContextId",
+        "broadcastId",
+        "sourceClientId",
+        "deviceSessionId",
+        "deliveryId",
+    ):
+        _output_string(
+            feedback[field_name],
+            "broadcast.feedback " + field_name,
+        )
+    _output_int(feedback["clientSeq"], "broadcast.feedback clientSeq", 1)
+    _output_int(
+        feedback["serverUpdatedAtMs"],
+        "broadcast.feedback serverUpdatedAtMs",
+    )
+    common = required - {"executionStatus"}
+    shape_fields = set(feedback) - common - {"executionStatus"}
+    if feedback["executionStatus"] == "applied":
+        applied_fields = {
+            "appliedBroadcastRevision",
+            "queueIndex",
+            "trackId",
+            "state",
+            "positionMs",
+            "playbackRate",
+        }
+        missing = applied_fields - shape_fields
+        forbidden = shape_fields - applied_fields - {"restoreCompleted"}
+        if not missing:
+            _output_int(
+                feedback["appliedBroadcastRevision"],
+                "broadcast.feedback appliedBroadcastRevision",
+                1,
+            )
+            _output_int(feedback["queueIndex"], "broadcast.feedback queueIndex")
+            _output_string(feedback["trackId"], "broadcast.feedback trackId")
+            if feedback["state"] not in {"playing", "paused", "stopped"}:
+                _output_error("broadcast.feedback state is invalid")
+            _output_int(feedback["positionMs"], "broadcast.feedback positionMs")
+            rate = _output_number(
+                feedback["playbackRate"],
+                "broadcast.feedback playbackRate",
+                positive=True,
+            )
+            if rate < 0.5 or rate > 2.0:
+                _output_error("broadcast.feedback playbackRate is invalid")
+            if "restoreCompleted" in feedback:
+                _output_bool(
+                    feedback["restoreCompleted"],
+                    "broadcast.feedback restoreCompleted",
+                )
+                if feedback["restoreCompleted"] is not True:
+                    _output_error(
+                        "broadcast.feedback restoreCompleted must be true"
+                    )
+    elif feedback["executionStatus"] == "failed":
+        failed_fields = {
+            "failedBroadcastRevision",
+            "lastAppliedBroadcastRevision",
+            "errorCode",
+        }
+        missing = failed_fields - shape_fields
+        forbidden = shape_fields - failed_fields - {"errorMessage"}
+        if not missing:
+            failed_revision = _output_int(
+                feedback["failedBroadcastRevision"],
+                "broadcast.feedback failedBroadcastRevision",
+                1,
+            )
+            last_applied = _output_int(
+                feedback["lastAppliedBroadcastRevision"],
+                "broadcast.feedback lastAppliedBroadcastRevision",
+            )
+            if last_applied >= failed_revision:
+                _output_error(
+                    "broadcast.feedback lastAppliedBroadcastRevision is invalid"
+                )
+            error_code = _output_string(
+                feedback["errorCode"],
+                "broadcast.feedback errorCode",
+            )
+            if error_code not in _BROADCAST_FEEDBACK_ERROR_CODES:
+                _output_error("broadcast.feedback errorCode is invalid")
+            if "errorMessage" in feedback:
+                _output_string(
+                    feedback["errorMessage"],
+                    "broadcast.feedback errorMessage",
+                    512,
+                )
+    else:
+        _output_error("broadcast.feedback executionStatus is invalid")
+    if missing:
+        _output_error(
+            "broadcast.feedback is missing fields: %s"
+            % ", ".join(sorted(missing))
+        )
+    if forbidden:
+        _output_error(
+            "broadcast.feedback forbids fields: %s"
+            % ", ".join(sorted(forbidden))
+        )
 
 
 def _validate_output_ack(payload: object) -> str:
@@ -2043,6 +2410,9 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
             _output_string(cancel["errorCode"], "handoff cancel errorCode")
         if "errorMessage" in cancel:
             _output_string(cancel["errorMessage"], "handoff cancel errorMessage", 512)
+        return None
+    if action == "broadcast.feedback":
+        _validate_broadcast_feedback_output(payload)
         return None
     if action in {
         "broadcast.start",

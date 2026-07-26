@@ -26,6 +26,7 @@ from ..logging_utils import format_log_event
 from ..managers.user import UserManager
 from .browser_auth import BROWSER_OTP_PREFIX, browser_one_time_passwords
 from .broadcast_store import (
+    BroadcastFeedbackSequenceConflictError,
     BroadcastIntentConflictError,
     BroadcastLimitError,
     BroadcastNotFoundError,
@@ -37,6 +38,8 @@ from .broadcast_store import (
     getBroadcastIntentOutcome,
     getNonterminalBroadcastStateForContext,
     getBroadcastState as getPersistentBroadcastState,
+    settleBroadcastFeedback,
+    sweepBroadcastFeedbackDeadlines,
     terminalBroadcastStateInTransaction,
 )
 from .protocol_metadata import (
@@ -194,6 +197,7 @@ BROADCAST_ACTIONS = {
     "broadcast.pause",
     "broadcast.seek",
     "broadcast.status",
+    "broadcast.feedback",
 }
 ACTION_EVENT_NAMES = {
     "auth.login": "auth_login",
@@ -230,6 +234,7 @@ ACTION_EVENT_NAMES = {
     "broadcast.pause": "broadcast_pause",
     "broadcast.seek": "broadcast_seek",
     "broadcast.status": "broadcast_status",
+    "broadcast.feedback": "broadcast_feedback",
 }
 
 CONTROL_POLICIES = {
@@ -5110,6 +5115,58 @@ def _handle_strict_broadcast_status(
                 )
             ),
         }
+        applied_revision = participant.get("appliedBroadcastRevision")
+        if applied_revision is not None:
+            status.update(
+                {
+                    "appliedBroadcastRevision": applied_revision,
+                    "queueIndex": participant["appliedQueueIndex"],
+                    "trackId": participant["appliedTrackId"],
+                    "state": participant["appliedState"],
+                    "positionMs": participant["appliedPositionMs"],
+                    "playbackRate": participant[
+                        "appliedPlaybackRate"
+                    ],
+                    "appliedAtServerMs": participant[
+                        "appliedAtServerMs"
+                    ],
+                }
+            )
+        if participant.get("lastFeedbackClientSeq") is not None:
+            status.update(
+                {
+                    "lastFeedbackClientSeq": participant[
+                        "lastFeedbackClientSeq"
+                    ],
+                    "lastFeedbackAtServerMs": participant[
+                        "lastFeedbackAtMs"
+                    ],
+                }
+            )
+        if participant["syncStatus"] == "failed":
+            status.update(
+                {
+                    "failedBroadcastRevision": participant[
+                        "failedBroadcastRevision"
+                    ],
+                    "errorCode": participant["failedErrorCode"],
+                }
+            )
+            if participant.get("failedErrorMessage") is not None:
+                status["errorMessage"] = participant[
+                    "failedErrorMessage"
+                ]
+        elif participant["syncStatus"] == "timedOut":
+            status.update(
+                {
+                    "timedOutBroadcastRevision": participant[
+                        "timedOutBroadcastRevision"
+                    ],
+                    "errorCode": "feedback_timeout",
+                }
+            )
+        if participant.get("restoreCompleted"):
+            status["restoreCompleted"] = True
         participant_states.append(status)
     _send_ack(
         request_id,
@@ -5120,6 +5177,79 @@ def _handle_strict_broadcast_status(
         },
     )
     return persisted
+
+
+def _handle_strict_broadcast_feedback(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+):
+    if current_client is None or not _has_role(current_client, "player"):
+        raise PermissionError(
+            "broadcast.feedback requires an ordinary participant player"
+        )
+    if payload["deviceSessionId"] != current_client.get("deviceSessionId"):
+        raise PermissionError("broadcast.feedback deviceSessionId mismatch")
+    session_info = state.get_session(request.sid) or {}
+    connection_nonce = session_info.get("connectionNonce")
+    connection_epoch = session_info.get("connectionEpoch", 1)
+    if not isinstance(connection_nonce, str) or not connection_nonce:
+        raise PermissionError("Registered connection provenance is missing")
+    persisted = getPersistentBroadcastState(payload["broadcastId"])
+    if persisted is None:
+        raise LookupError("Broadcast not found")
+    if (
+        persisted["userName"] != current_user_name
+        or persisted["playbackContextId"] != payload["playbackContextId"]
+    ):
+        raise PermissionError("Broadcast feedback access is not allowed")
+    track_duration_ms = getTrackDurationMs(payload.get("trackId"))
+    fingerprint = request_fingerprint(
+        "event",
+        "broadcast.feedback",
+        payload,
+    )
+    try:
+        result = settleBroadcastFeedback(
+            current_user_name,
+            payload["playbackContextId"],
+            payload["broadcastId"],
+            current_client["clientId"],
+            payload["deviceSessionId"],
+            connection_nonce,
+            connection_epoch,
+            payload,
+            fingerprint,
+            _server_time_ms(),
+            track_duration_ms=track_duration_ms,
+        )
+    except BroadcastNotFoundError as exc:
+        raise LookupError("Broadcast not found") from exc
+    except (
+        BroadcastResourceConflictError,
+        BroadcastRevisionConflictError,
+    ) as exc:
+        raise BroadcastConflictError(str(exc)) from exc
+    confirmation = _build_message(
+        "event",
+        "broadcast.feedback",
+        result["canonicalResult"],
+    )
+    _store_event_confirmations([confirmation])
+    _run_post_commit_push(
+        "broadcast.feedback",
+        request_id,
+        lambda: _emit_message(
+            confirmation,
+            request.sid,
+            record_settlement=False,
+        ),
+    )
+    return {
+        "broadcastId": payload["broadcastId"],
+        "feedbackCreated": result["created"],
+    }
 
 
 def _handle_strict_broadcast_stop(
@@ -6031,6 +6161,10 @@ def _handle_broadcast_stop(current_user_name, current_client, payload, request_i
 
 def _handle_broadcast_action(current_user_name, current_client, action, payload, request_id):
     strict_v2 = _is_strict_playback_context_v2(current_client)
+    if action == "broadcast.feedback" and not strict_v2:
+        raise CapabilityRequiredError(
+            "broadcast.feedback requires strict-v2 Broadcast"
+        )
     if strict_v2:
         if not _client_supports(current_client, CAPABILITY_SUPPORTS_BROADCAST):
             raise CapabilityRequiredError("strict-v2 client does not support Broadcast")
@@ -6041,6 +6175,13 @@ def _handle_broadcast_action(current_user_name, current_client, action, payload,
         return _handle_broadcast_start(current_user_name, current_client, payload, request_id)
     if action == "broadcast.status":
         return _handle_broadcast_status(current_user_name, current_client, payload, request_id)
+    if action == "broadcast.feedback":
+        return _handle_strict_broadcast_feedback(
+            current_user_name,
+            current_client,
+            payload,
+            request_id,
+        )
     if action == "broadcast.queue.sync":
         return _handle_broadcast_queue_sync(current_user_name, current_client, payload, request_id)
     if action == "broadcast.playItem":
@@ -7046,6 +7187,10 @@ def _control_watchdog_sweep_later(generation: int) -> None:
             _sweep_expired_control_transactions()
         except Exception:
             logger.exception("Strict playback control watchdog sweep failed")
+        try:
+            sweepBroadcastFeedbackDeadlines()
+        except Exception:
+            logger.exception("Strict Broadcast feedback deadline sweep failed")
 
 
 def _control_settled_payload(transaction, playback_context):
@@ -10746,6 +10891,14 @@ class EmoNamespace(Namespace):
                 currentControlVersion=playback_context.get("controlVersion"),
                 currentQueueRevision=playback_context.get("queueRevision"),
                 currentVersion=playback_context.get("version"),
+            )
+        except BroadcastFeedbackSequenceConflictError as exc:
+            _send_error(
+                "client_sequence_conflict",
+                str(exc),
+                request_id,
+                playbackContextId=payload.get("playbackContextId"),
+                currentClientSeq=exc.current_seq,
             )
         except PlaybackClientSequenceConflictError as exc:
             _send_error(

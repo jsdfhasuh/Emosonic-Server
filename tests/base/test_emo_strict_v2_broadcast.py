@@ -209,6 +209,60 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             namespace="/emo",
         )
 
+    def send_broadcast_feedback(
+        self,
+        client,
+        broadcast_id,
+        delivery_payload,
+        request_id="broadcast-feedback-1",
+        client_seq=1,
+        execution_status="applied",
+        **extra,
+    ):
+        payload = {
+            "playbackContextId": "context-broadcast-source",
+            "broadcastId": broadcast_id,
+            "deviceSessionId": "device:participant-1",
+            "deliveryId": delivery_payload["deliveryId"],
+            "executionStatus": execution_status,
+            "clientSeq": client_seq,
+        }
+        if execution_status == "applied":
+            payload.update(
+                {
+                    "appliedBroadcastRevision": delivery_payload[
+                        "broadcastRevision"
+                    ],
+                    "queueIndex": delivery_payload["currentIndex"],
+                    "trackId": delivery_payload["trackId"],
+                    "state": delivery_payload["state"],
+                    "positionMs": delivery_payload["positionMs"],
+                    "playbackRate": delivery_payload["playbackRate"],
+                }
+            )
+        else:
+            payload.update(
+                {
+                    "failedBroadcastRevision": delivery_payload[
+                        "broadcastRevision"
+                    ],
+                    "lastAppliedBroadcastRevision": 0,
+                    "errorCode": "execution_failed",
+                }
+            )
+        payload.update(extra)
+        client.emit(
+            "message",
+            {
+                "type": "event",
+                "action": "broadcast.feedback",
+                "requestId": request_id,
+                "payload": payload,
+            },
+            namespace="/emo",
+        )
+        return payload
+
     def start_strict_broadcast(
         self,
         client,
@@ -360,6 +414,395 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         )
         self.assertEqual(participant_state["syncStatus"], "pending")
         self.assertTrue(participant_state["online"])
+
+    def test_feedback_applied_confirms_only_requesting_participant(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        delivery = self._push(
+            self.get_messages(participant),
+            "broadcast.start",
+        )["payload"]
+        self.get_messages(authority)
+        self.get_messages(controller)
+        context_before = getPlaybackContextState("context-broadcast-source")
+        snapshot_before = emo_ws.getPersistentBroadcastState(
+            start_ack["broadcastId"]
+        )["snapshot"]
+        request_payload = self.send_broadcast_feedback(
+            participant,
+            start_ack["broadcastId"],
+            delivery,
+            positionMs=1234,
+        )
+
+        messages = self.get_messages(participant)
+        confirmation = self._push(messages, "broadcast.feedback")
+        self.assertFalse(
+            any(message["action"] == "system.ack" for message in messages)
+        )
+        self.assertNotIn("requestId", confirmation)
+        self.assertEqual(
+            confirmation["payload"]["sourceClientId"],
+            "participant-1",
+        )
+        for field_name in (
+            "deliveryId",
+            "executionStatus",
+            "appliedBroadcastRevision",
+            "queueIndex",
+            "trackId",
+            "state",
+            "positionMs",
+            "playbackRate",
+            "clientSeq",
+        ):
+            self.assertEqual(
+                confirmation["payload"][field_name],
+                request_payload[field_name],
+            )
+        self.assertEqual(self.get_messages(authority), [])
+        self.assertEqual(self.get_messages(controller), [])
+        persisted_after = emo_ws.getPersistentBroadcastState(
+            start_ack["broadcastId"]
+        )
+        self.assertEqual(persisted_after["snapshot"], snapshot_before)
+        self.assertEqual(
+            getPlaybackContextState("context-broadcast-source"),
+            context_before,
+        )
+
+        controller.emit(
+            "message",
+            {
+                "type": "state",
+                "action": "broadcast.status",
+                "requestId": "broadcast-status-feedback-1",
+                "payload": {
+                    "playbackContextId": "context-broadcast-source",
+                    "broadcastId": start_ack["broadcastId"],
+                },
+            },
+            namespace="/emo",
+        )
+        status = self.get_ack(
+            self.get_messages(controller),
+            "broadcast-status-feedback-1",
+        )["payload"]["participantStates"][0]
+        self.assertEqual(status["syncStatus"], "applied")
+        self.assertEqual(status["appliedBroadcastRevision"], 1)
+        self.assertEqual(status["positionMs"], 1234)
+        self.assertEqual(status["lastFeedbackClientSeq"], 1)
+        self.assertEqual(
+            status["appliedAtServerMs"],
+            status["lastFeedbackAtServerMs"],
+        )
+
+        self.send_broadcast_feedback(
+            participant,
+            start_ack["broadcastId"],
+            delivery,
+            request_id="broadcast-feedback-replay-1",
+            positionMs=1234,
+        )
+        replay = self._push(
+            self.get_messages(participant),
+            "broadcast.feedback",
+        )
+        self.assertEqual(replay["payload"], confirmation["payload"])
+
+        self.send_broadcast_feedback(
+            participant,
+            start_ack["broadcastId"],
+            delivery,
+            request_id="broadcast-feedback-conflict-1",
+            positionMs=1235,
+        )
+        conflict = self.get_error(
+            self.get_messages(participant),
+            "broadcast-feedback-conflict-1",
+        )
+        self.assertEqual(
+            conflict["payload"]["code"],
+            "client_sequence_conflict",
+        )
+        self.assertEqual(conflict["payload"]["currentClientSeq"], 1)
+
+    def test_feedback_confirmation_emit_failure_replays_cached_result(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        delivery = self._push(
+            self.get_messages(participant),
+            "broadcast.start",
+        )["payload"]
+        self.get_messages(authority)
+        self.get_messages(controller)
+
+        with mock.patch.object(
+            emo_ws,
+            "_emit_message",
+            side_effect=RuntimeError("injected feedback confirmation failure"),
+        ):
+            request_payload = self.send_broadcast_feedback(
+                participant,
+                start_ack["broadcastId"],
+                delivery,
+                request_id="broadcast-feedback-emit-failure-1",
+                positionMs=1234,
+            )
+
+        self.assertEqual(self.get_messages(participant), [])
+        self.assertEqual(
+            db.EmoBroadcastFeedbackSettlement.select().count(),
+            1,
+        )
+        persisted = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        self.assertEqual(
+            persisted["participantStates"][0]["appliedPositionMs"],
+            1234,
+        )
+
+        self.send_broadcast_feedback(
+            participant,
+            start_ack["broadcastId"],
+            delivery,
+            request_id="broadcast-feedback-emit-failure-1",
+            positionMs=1234,
+        )
+        replay = self._push(
+            self.get_messages(participant),
+            "broadcast.feedback",
+        )
+        for field_name, field_value in request_payload.items():
+            self.assertEqual(replay["payload"][field_name], field_value)
+        self.assertEqual(
+            db.EmoBroadcastFeedbackSettlement.select().count(),
+            1,
+        )
+
+    def test_feedback_failed_then_applied_converges_status(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        delivery = self._push(
+            self.get_messages(participant),
+            "broadcast.start",
+        )["payload"]
+        self.get_messages(authority)
+        self.get_messages(controller)
+
+        self.send_broadcast_feedback(
+            participant,
+            start_ack["broadcastId"],
+            delivery,
+            execution_status="failed",
+            errorCode="track_load_failed",
+            errorMessage="Unable to load target",
+        )
+        failed = self._push(
+            self.get_messages(participant),
+            "broadcast.feedback",
+        )
+        self.assertEqual(failed["payload"]["executionStatus"], "failed")
+        persisted = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        failed_state = persisted["participantStates"][0]
+        self.assertEqual(failed_state["syncStatus"], "failed")
+        self.assertEqual(failed_state["failedErrorCode"], "track_load_failed")
+        controller.emit(
+            "message",
+            {
+                "type": "state",
+                "action": "broadcast.status",
+                "requestId": "broadcast-status-failed-1",
+                "payload": {
+                    "playbackContextId": "context-broadcast-source",
+                    "broadcastId": start_ack["broadcastId"],
+                },
+            },
+            namespace="/emo",
+        )
+        failed_status = self.get_ack(
+            self.get_messages(controller),
+            "broadcast-status-failed-1",
+        )["payload"]["participantStates"][0]
+        self.assertEqual(failed_status["syncStatus"], "failed")
+        self.assertEqual(failed_status["failedBroadcastRevision"], 1)
+        self.assertEqual(failed_status["errorCode"], "track_load_failed")
+        self.assertEqual(
+            failed_status["errorMessage"],
+            "Unable to load target",
+        )
+
+        self.send_broadcast_feedback(
+            participant,
+            start_ack["broadcastId"],
+            delivery,
+            request_id="broadcast-feedback-applied-2",
+            client_seq=2,
+            positionMs=1300,
+        )
+        applied = self._push(
+            self.get_messages(participant),
+            "broadcast.feedback",
+        )
+        self.assertEqual(applied["payload"]["executionStatus"], "applied")
+        converged = emo_ws.getPersistentBroadcastState(
+            start_ack["broadcastId"]
+        )["participantStates"][0]
+        self.assertEqual(converged["syncStatus"], "applied")
+        self.assertIsNone(converged["failedBroadcastRevision"])
+        self.assertIsNone(converged["failedErrorCode"])
+
+    def test_feedback_deadline_timeout_preserves_snapshot_and_deadline(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        before = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        participant_before = before["participantStates"][0]
+
+        timed_out = emo_ws.sweepBroadcastFeedbackDeadlines(
+            participant_before["feedbackDeadlineAtServerMs"]
+        )
+
+        self.assertEqual(len(timed_out), 1)
+        after = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        participant_after = after["participantStates"][0]
+        self.assertEqual(after["snapshot"], before["snapshot"])
+        self.assertEqual(participant_after["syncStatus"], "timedOut")
+        self.assertEqual(
+            participant_after["timedOutBroadcastRevision"],
+            participant_before["deadlineBroadcastRevision"],
+        )
+        self.assertEqual(
+            participant_after["feedbackDeadlineAtServerMs"],
+            participant_before["feedbackDeadlineAtServerMs"],
+        )
+        controller.emit(
+            "message",
+            {
+                "type": "state",
+                "action": "broadcast.status",
+                "requestId": "broadcast-status-timeout-1",
+                "payload": {
+                    "playbackContextId": "context-broadcast-source",
+                    "broadcastId": start_ack["broadcastId"],
+                },
+            },
+            namespace="/emo",
+        )
+        status = self.get_ack(
+            self.get_messages(controller),
+            "broadcast-status-timeout-1",
+        )["payload"]["participantStates"][0]
+        self.assertEqual(status["syncStatus"], "timedOut")
+        self.assertEqual(status["errorCode"], "feedback_timeout")
+        self.assertEqual(
+            status["timedOutBroadcastRevision"],
+            status["deadlineBroadcastRevision"],
+        )
+
+    def test_source_cannot_send_broadcast_feedback(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        delivery = self._push(
+            self.get_messages(participant),
+            "broadcast.start",
+        )["payload"]
+        self.get_messages(authority)
+        self.get_messages(controller)
+        source_delivery = dict(delivery)
+        self.send_broadcast_feedback(
+            authority,
+            start_ack["broadcastId"],
+            source_delivery,
+            request_id="broadcast-feedback-source-1",
+            deviceSessionId="device:authority-1",
+        )
+        error = self.get_error(
+            self.get_messages(authority),
+            "broadcast-feedback-source-1",
+        )
+        self.assertEqual(error["payload"]["code"], "forbidden")
+
+    def test_terminal_feedback_confirms_restore_and_releases_pair_fence(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        self.sync_source_queue(
+            authority,
+            [],
+            position_ms=0,
+            request_id="source-clear-terminal-feedback-1",
+        )
+        self.get_messages(authority)
+        terminal_delivery = self._push(
+            self.get_messages(participant),
+            "broadcast.stop",
+        )["payload"]
+        self.get_messages(controller)
+
+        self.send_broadcast_feedback(
+            participant,
+            start_ack["broadcastId"],
+            terminal_delivery,
+            request_id="broadcast-terminal-feedback-1",
+            state="stopped",
+            restoreCompleted=True,
+        )
+
+        confirmation = self._push(
+            self.get_messages(participant),
+            "broadcast.feedback",
+        )
+        self.assertEqual(confirmation["payload"]["state"], "stopped")
+        self.assertTrue(confirmation["payload"]["restoreCompleted"])
+        persisted = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        participant_state = persisted["participantStates"][0]
+        self.assertFalse(participant_state["restorePending"])
+        self.assertTrue(participant_state["terminalConfirmed"])
+        self.assertEqual(
+            db.EmoBroadcastFence.select().where(
+                (db.EmoBroadcastFence.broadcast_id == start_ack["broadcastId"])
+                & (db.EmoBroadcastFence.role == "ordinary")
+            ).count(),
+            0,
+        )
 
     def test_old_start_snapshot_fields_are_rejected(self):
         authority, _participant, _controller = self.connect_broadcast_devices()

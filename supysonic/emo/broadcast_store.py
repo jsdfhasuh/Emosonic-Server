@@ -55,6 +55,12 @@ class BroadcastResourceConflictError(BroadcastStoreError):
     pass
 
 
+class BroadcastFeedbackSequenceConflictError(BroadcastStoreError):
+    def __init__(self, current_seq: int):
+        super().__init__("broadcast.feedback clientSeq conflicts")
+        self.current_seq = current_seq
+
+
 class BroadcastRevisionConflictError(BroadcastStoreError):
     def __init__(self, current_revision: int):
         super().__init__("Broadcast revision is stale")
@@ -225,11 +231,14 @@ def _serialize_participant_record(
         "appliedPositionMs": record.applied_position_ms,
         "appliedState": record.applied_state,
         "appliedPlaybackRate": record.applied_playback_rate,
+        "appliedAtServerMs": record.applied_at_server_ms,
         "failedBroadcastRevision": record.failed_broadcast_revision,
         "failedLastAppliedBroadcastRevision": (
             record.failed_last_applied_broadcast_revision
         ),
         "failedErrorCode": record.failed_error_code,
+        "failedErrorMessage": record.failed_error_message,
+        "timedOutBroadcastRevision": record.timed_out_broadcast_revision,
         "lastFeedbackClientSeq": record.last_feedback_client_seq,
         "lastFeedbackAtMs": record.last_feedback_at_ms,
         "restoreCompleted": bool(record.restore_completed),
@@ -546,7 +555,13 @@ def _create_delivery(
         )
     participant.target_broadcast_revision = broadcast_revision
     participant.target_delivery_id = record.delivery_id
-    if payload.get("resetDeadline", True):
+    reset_deadline = payload.get("resetDeadline")
+    if reset_deadline is None:
+        reset_deadline = (
+            participant.deadline_broadcast_revision is None
+            or participant.sync_status in ("applied", "failed")
+        )
+    if reset_deadline:
         participant.deadline_broadcast_revision = broadcast_revision
         participant.feedback_deadline_at_server_ms = payload.get(
             "feedbackDeadlineAtServerMs"
@@ -1464,6 +1479,393 @@ def saveBroadcastFeedbackSettlement(
                 }
     finally:
         close_connection()
+
+
+def settleBroadcastFeedback(
+    user_name: str,
+    playback_context_id: str,
+    broadcast_id: str,
+    client_id: str,
+    device_session_id: str,
+    connection_nonce: str,
+    connection_epoch: int,
+    payload: Dict[str, object],
+    request_fingerprint: str,
+    server_time_ms: int,
+    track_duration_ms: Optional[int] = None,
+) -> Dict[str, object]:
+    client_seq = int(payload["clientSeq"])
+    scope = (
+        (EmoBroadcastFeedbackSettlement.playback_context_id == playback_context_id)
+        & (EmoBroadcastFeedbackSettlement.broadcast_id == broadcast_id)
+        & (EmoBroadcastFeedbackSettlement.client_id == client_id)
+        & (
+            EmoBroadcastFeedbackSettlement.device_session_id
+            == device_session_id
+        )
+        & (
+            EmoBroadcastFeedbackSettlement.connection_nonce
+            == connection_nonce
+        )
+        & (
+            EmoBroadcastFeedbackSettlement.connection_epoch
+            == connection_epoch
+        )
+    )
+    open_connection(reuse=True)
+    try:
+        with broadcastMutationLock(broadcast_id):
+            with broadcastTransaction():
+                existing = EmoBroadcastFeedbackSettlement.get_or_none(
+                    scope
+                    & (
+                        EmoBroadcastFeedbackSettlement.client_seq
+                        == client_seq
+                    )
+                )
+                if existing is not None:
+                    if existing.request_fingerprint != request_fingerprint:
+                        raise BroadcastFeedbackSequenceConflictError(
+                            client_seq
+                        )
+                    return {
+                        "created": False,
+                        "canonicalResult": _load_json(
+                            existing.canonical_result_json,
+                            {},
+                        ),
+                    }
+                latest = (
+                    EmoBroadcastFeedbackSettlement.select()
+                    .where(scope)
+                    .order_by(
+                        EmoBroadcastFeedbackSettlement.client_seq.desc()
+                    )
+                    .first()
+                )
+                if latest is not None and client_seq <= latest.client_seq:
+                    raise BroadcastFeedbackSequenceConflictError(
+                        latest.client_seq
+                    )
+
+                broadcast = EmoBroadcast.get_or_none(
+                    EmoBroadcast.broadcast_id == broadcast_id
+                )
+                if broadcast is None:
+                    raise BroadcastNotFoundError(broadcast_id)
+                if (
+                    broadcast.user_name != user_name
+                    or broadcast.playback_context_id
+                    != playback_context_id
+                ):
+                    raise BroadcastResourceConflictError(
+                        "Broadcast feedback context does not match"
+                    )
+                if (
+                    broadcast.authority_client_id == client_id
+                    and broadcast.authority_device_session_id
+                    == device_session_id
+                ):
+                    raise PermissionError(
+                        "Broadcast source cannot send participant feedback"
+                    )
+                participant = EmoBroadcastParticipant.get_or_none(
+                    _participant_expression(
+                        broadcast_id,
+                        client_id,
+                        device_session_id,
+                    )
+                )
+                if participant is None:
+                    raise PermissionError(
+                        "Broadcast feedback requires a frozen ordinary participant"
+                    )
+
+                execution_status = str(payload["executionStatus"])
+                revision = int(
+                    payload[
+                        "appliedBroadcastRevision"
+                        if execution_status == "applied"
+                        else "failedBroadcastRevision"
+                    ]
+                )
+                delivery = EmoBroadcastDelivery.get_or_none(
+                    (EmoBroadcastDelivery.broadcast_id == broadcast_id)
+                    & (
+                        EmoBroadcastDelivery.broadcast_revision
+                        == revision
+                    )
+                    & (EmoBroadcastDelivery.client_id == client_id)
+                    & (
+                        EmoBroadcastDelivery.device_session_id
+                        == device_session_id
+                    )
+                    & (
+                        EmoBroadcastDelivery.delivery_id
+                        == payload["deliveryId"]
+                    )
+                    & (EmoBroadcastDelivery.is_current == 1)
+                )
+                if delivery is None:
+                    raise BroadcastResourceConflictError(
+                        "Broadcast feedback delivery ledger does not match"
+                    )
+                target = _load_json(delivery.payload_json, {})
+                terminal = (
+                    broadcast.lifecycle_state == "stopped"
+                    and revision == broadcast.broadcast_revision
+                )
+
+                if execution_status == "applied":
+                    previous_applied = participant.applied_broadcast_revision or 0
+                    if revision < previous_applied:
+                        raise BroadcastRevisionConflictError(previous_applied)
+                    if payload["queueIndex"] != target.get("currentIndex"):
+                        raise BroadcastResourceConflictError(
+                            "Broadcast feedback queueIndex does not match target"
+                        )
+                    if payload["trackId"] != target.get("trackId"):
+                        raise BroadcastResourceConflictError(
+                            "Broadcast feedback trackId does not match target"
+                        )
+                    if payload["playbackRate"] != target.get("playbackRate"):
+                        raise BroadcastResourceConflictError(
+                            "Broadcast feedback playbackRate does not match target"
+                        )
+                    if terminal:
+                        if (
+                            payload["state"] != "stopped"
+                            or payload.get("restoreCompleted") is not True
+                        ):
+                            raise BroadcastResourceConflictError(
+                                "Terminal feedback must confirm stopped restore"
+                            )
+                    else:
+                        if "restoreCompleted" in payload:
+                            raise BroadcastResourceConflictError(
+                                "Nonterminal feedback cannot complete restore"
+                            )
+                        if payload["state"] != target.get("state"):
+                            raise BroadcastResourceConflictError(
+                                "Broadcast feedback state does not match target"
+                            )
+                    if (
+                        track_duration_ms is not None
+                        and payload["positionMs"] > track_duration_ms
+                    ):
+                        raise ValueError(
+                            "Broadcast feedback positionMs exceeds media duration"
+                        )
+
+                    participant.applied_broadcast_revision = revision
+                    participant.applied_queue_index = payload["queueIndex"]
+                    participant.applied_track_id = payload["trackId"]
+                    participant.applied_position_ms = payload["positionMs"]
+                    participant.applied_state = payload["state"]
+                    participant.applied_playback_rate = payload[
+                        "playbackRate"
+                    ]
+                    participant.applied_at_server_ms = server_time_ms
+                    participant.failed_broadcast_revision = None
+                    participant.failed_last_applied_broadcast_revision = None
+                    participant.failed_error_code = None
+                    participant.failed_error_message = None
+                    participant.timed_out_broadcast_revision = None
+                    if revision == participant.target_broadcast_revision:
+                        participant.sync_status = "applied"
+                    else:
+                        next_delivery = (
+                            EmoBroadcastDelivery.select()
+                            .where(
+                                (EmoBroadcastDelivery.broadcast_id == broadcast_id)
+                                & (EmoBroadcastDelivery.client_id == client_id)
+                                & (
+                                    EmoBroadcastDelivery.device_session_id
+                                    == device_session_id
+                                )
+                                & (
+                                    EmoBroadcastDelivery.broadcast_revision
+                                    > revision
+                                )
+                                & (EmoBroadcastDelivery.is_current == 1)
+                            )
+                            .order_by(
+                                EmoBroadcastDelivery.broadcast_revision.asc()
+                            )
+                            .first()
+                        )
+                        if next_delivery is None:
+                            raise BroadcastResourceConflictError(
+                                "Lagging feedback has no later target"
+                            )
+                        participant.sync_status = "lagging"
+                        participant.deadline_broadcast_revision = (
+                            next_delivery.broadcast_revision
+                        )
+                        participant.feedback_deadline_at_server_ms = (
+                            server_time_ms + 8000
+                        )
+                    if terminal:
+                        participant.restore_pending = 0
+                        participant.terminal_confirmed = 1
+                        participant.restore_completed = 1
+                        EmoBroadcastFence.delete().where(
+                            (EmoBroadcastFence.broadcast_id == broadcast_id)
+                            & (EmoBroadcastFence.role == "ordinary")
+                            & (EmoBroadcastFence.client_id == client_id)
+                            & (
+                                EmoBroadcastFence.device_session_id
+                                == device_session_id
+                            )
+                        ).execute()
+                else:
+                    if revision != participant.target_broadcast_revision:
+                        raise BroadcastRevisionConflictError(
+                            participant.target_broadcast_revision or 0
+                        )
+                    previous_applied = participant.applied_broadcast_revision or 0
+                    if payload["lastAppliedBroadcastRevision"] != previous_applied:
+                        raise BroadcastRevisionConflictError(previous_applied)
+                    participant.sync_status = "failed"
+                    participant.failed_broadcast_revision = revision
+                    participant.failed_last_applied_broadcast_revision = (
+                        previous_applied
+                    )
+                    participant.failed_error_code = payload["errorCode"]
+                    participant.failed_error_message = payload.get(
+                        "errorMessage"
+                    )
+                    participant.timed_out_broadcast_revision = None
+
+                participant.last_feedback_client_seq = client_seq
+                participant.last_feedback_at_ms = server_time_ms
+                participant.updated_at = now()
+                participant.save()
+                delivery.delivery_status = (
+                    "settled"
+                    if execution_status == "applied"
+                    else "failed"
+                )
+                delivery.updated_at = now()
+                delivery.save()
+
+                canonical = {
+                    "playbackContextId": playback_context_id,
+                    "broadcastId": broadcast_id,
+                    "sourceClientId": client_id,
+                    "deviceSessionId": device_session_id,
+                    "deliveryId": payload["deliveryId"],
+                    "executionStatus": execution_status,
+                    "clientSeq": client_seq,
+                    "serverUpdatedAtMs": server_time_ms,
+                }
+                if execution_status == "applied":
+                    for field_name in (
+                        "appliedBroadcastRevision",
+                        "queueIndex",
+                        "trackId",
+                        "state",
+                        "positionMs",
+                        "playbackRate",
+                        "restoreCompleted",
+                    ):
+                        if field_name in payload:
+                            canonical[field_name] = payload[field_name]
+                else:
+                    for field_name in (
+                        "failedBroadcastRevision",
+                        "lastAppliedBroadcastRevision",
+                        "errorCode",
+                        "errorMessage",
+                    ):
+                        if field_name in payload:
+                            canonical[field_name] = payload[field_name]
+                EmoBroadcastFeedbackSettlement.create(
+                    playback_context_id=playback_context_id,
+                    broadcast_id=broadcast_id,
+                    client_id=client_id,
+                    device_session_id=device_session_id,
+                    connection_nonce=connection_nonce,
+                    connection_epoch=connection_epoch,
+                    client_seq=client_seq,
+                    request_fingerprint=request_fingerprint,
+                    canonical_result_json=_canonical_json(canonical),
+                    created_at_ms=server_time_ms,
+                )
+                return {
+                    "created": True,
+                    "canonicalResult": canonical,
+                    "participantState": _serialize_participant_record(
+                        participant
+                    ),
+                }
+    finally:
+        close_connection()
+
+
+def sweepBroadcastFeedbackDeadlines(
+    now_ms: Optional[int] = None,
+) -> List[Dict[str, object]]:
+    sweep_time_ms = int(
+        now_ms if now_ms is not None else time.time() * 1000
+    )
+    open_connection(reuse=True)
+    try:
+        candidates = list(
+            EmoBroadcastParticipant.select(
+                EmoBroadcastParticipant.broadcast_id,
+                EmoBroadcastParticipant.client_id,
+                EmoBroadcastParticipant.device_session_id,
+            ).where(
+                EmoBroadcastParticipant.sync_status.in_(
+                    ("pending", "lagging")
+                )
+                & (
+                    EmoBroadcastParticipant.feedback_deadline_at_server_ms
+                    <= sweep_time_ms
+                )
+            )
+        )
+    finally:
+        close_connection()
+    timed_out = []
+    for candidate in candidates:
+        open_connection(reuse=True)
+        try:
+            with broadcastMutationLock(candidate.broadcast_id):
+                with broadcastTransaction():
+                    participant = EmoBroadcastParticipant.get_or_none(
+                        _participant_expression(
+                            candidate.broadcast_id,
+                            candidate.client_id,
+                            candidate.device_session_id,
+                        )
+                    )
+                    if (
+                        participant is None
+                        or participant.sync_status
+                        not in ("pending", "lagging")
+                        or participant.feedback_deadline_at_server_ms is None
+                        or participant.feedback_deadline_at_server_ms
+                        > sweep_time_ms
+                    ):
+                        continue
+                    participant.sync_status = "timedOut"
+                    participant.timed_out_broadcast_revision = (
+                        participant.deadline_broadcast_revision
+                    )
+                    participant.failed_broadcast_revision = None
+                    participant.failed_last_applied_broadcast_revision = None
+                    participant.failed_error_code = "feedback_timeout"
+                    participant.failed_error_message = None
+                    participant.updated_at = now()
+                    participant.save()
+                    timed_out.append(
+                        _serialize_participant_record(participant)
+                    )
+        finally:
+            close_connection()
+    return timed_out
 
 
 def confirmBroadcastRestore(

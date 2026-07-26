@@ -1,6 +1,6 @@
 # Goal: EmoSonic strict-v2 2.8.0 / r18 群播服务端落地
 
-> 状态：In progress（Goal 0—6 已完成；正在实施 Goal 7—11）
+> 状态：In progress（Goal 0—7 已完成；正在实施 Goal 8—11）
 >
 > 制定日期：2026-07-23
 >
@@ -749,7 +749,7 @@ revision；每次实际 target 的 position/serverUpdatedAtMs 都锚定同一 ef
 返回持久化 Snapshot，不进行动态位置改写。Broadcast Socket 271 项、ws_store 45 项、strict contract
 30 项通过，`supportsBroadcast` 继续保持 false。
 
-### Goal 7：feedback、participantStates 和 deadline
+### Goal 7：feedback、participantStates 和 deadline（已完成）
 
 改动：
 
@@ -769,6 +769,17 @@ revision；每次实际 target 的 position/serverUpdatedAtMs 都锚定同一 ef
 - 后续 progress 不延期最早 deadline；
 - failed/timedOut 后合法 applied 可以收敛；
 - 幂等 feedback 不重建 deadline。
+
+完成记录（2026-07-26）：已新增 ordinary-only、event-confirmed `broadcast.feedback`，按当前物理连接
+nonce/epoch 使用独立 clientSeq 作用域，并对 applied/failed 闭合 shape、错误码、membership、冻结 pair、
+revision/current delivery、queue/index/track/state/rate 和 position 有效范围进行校验。canonical
+confirmation 只发给请求 Socket，不回 ACK；相同 clientSeq/content 从持久化结算或 requestId cache
+原样重放，确认发送失败不重复写状态。participantStates 已支持 pending/applied/lagging/failed/timedOut
+及其严格条件字段，最早未确认 deadline 不被后续 progress 延期，只有 pending/lagging 参与后台 sweep，
+failed/timedOut 后的更高 clientSeq 合法反馈可继续收敛。terminal applied feedback 在同一事务中确认
+restoreCompleted、清除 restorePending 并释放 pair fence。feedback、deadline sweep 和幂等重放均不修改
+BroadcastSnapshot、source Context、Broadcast/source cursors；三数据库 base schema 和 20260727 migration
+已同步。Goal 7 回归共 376 项通过、2 项按数据库环境跳过，`supportsBroadcast` 继续保持 false。
 
 ### Goal 8：rejection、resync 和 ordinary 重连
 

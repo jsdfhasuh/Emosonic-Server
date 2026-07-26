@@ -176,7 +176,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             self._assert_external_discovery_index(provider)
             self._assert_external_r11_transaction_schema()
             self._assert_external_r18_broadcast_schema()
-            self.assertEqual(db.Meta["schema_version"].value, "20260726")
+            self.assertEqual(db.Meta["schema_version"].value, "20260727")
             self._record_external_evidence(
                 provider,
                 "clean",
@@ -207,7 +207,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             self._assert_external_discovery_index(provider)
             self._assert_external_r11_transaction_schema()
             self._assert_external_r18_broadcast_schema()
-            self.assertEqual(db.Meta["schema_version"].value, "20260726")
+            self.assertEqual(db.Meta["schema_version"].value, "20260727")
             self._record_external_evidence(
                 provider,
                 "upgrade_from_20260708",
@@ -416,7 +416,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                     "emo_playback_local_intent",
                 },
             )
-            self.assertEqual(db.Meta["schema_version"].value, "20260726")
+            self.assertEqual(db.Meta["schema_version"].value, "20260727")
         finally:
             db.release_database()
             os.remove(path)
@@ -445,6 +445,9 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 ).read_text("utf-8")
                 broadcast_migration = (
                     root / "migration" / provider / "20260726.sql"
+                ).read_text("utf-8")
+                feedback_migration = (
+                    root / "migration" / provider / "20260727.sql"
                 ).read_text("utf-8")
                 for field_name in required_fields:
                     self.assertIn(field_name, base_schema)
@@ -489,7 +492,17 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 for model in self.BROADCAST_MODELS:
                     for field in model._meta.sorted_fields:
                         self.assertIn(field.column_name, base_schema)
-                        self.assertIn(field.column_name, broadcast_migration)
+                        migration = (
+                            feedback_migration
+                            if field.column_name
+                            in {
+                                "applied_at_server_ms",
+                                "failed_error_message",
+                                "timed_out_broadcast_revision",
+                            }
+                            else broadcast_migration
+                        )
+                        self.assertIn(field.column_name, migration)
 
     def test_sqlite_broadcast_model_schema_parity(self):
         handle, path = tempfile.mkstemp()

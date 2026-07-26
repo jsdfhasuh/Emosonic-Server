@@ -12,6 +12,7 @@ from supysonic.emo.broadcast_store import (
     MAX_USER_RECOVERY_SLOTS,
     MIN_RETAINED_BROADCAST_REVISIONS,
     BroadcastIntentConflictError,
+    BroadcastFeedbackSequenceConflictError,
     BroadcastLimitError,
     BroadcastResourceConflictError,
     commitBroadcastRevision,
@@ -24,6 +25,8 @@ from supysonic.emo.broadcast_store import (
     getBroadcastState,
     listTerminalRecoveries,
     saveBroadcastFeedbackSettlement,
+    settleBroadcastFeedback,
+    sweepBroadcastFeedbackDeadlines,
     terminalBroadcastState,
 )
 
@@ -76,7 +79,12 @@ class EmoBroadcastStoreTestCase(unittest.TestCase):
             "feedbackDeadlineAtServerMs": created_at_ms + 8300,
             "payload": {"broadcastId": "broadcast-1",
                         "broadcastRevision": revision,
-                        "deliveryId": delivery_id},
+                        "deliveryId": delivery_id,
+                        "currentIndex": 0,
+                        "trackId": "song-1",
+                        "state": "playing",
+                        "positionMs": 1500,
+                        "playbackRate": 1.0},
             "connectionNonce": "nonce-1", "createdAtMs": created_at_ms,
         }
 
@@ -85,6 +93,39 @@ class EmoBroadcastStoreTestCase(unittest.TestCase):
             self._snapshot(), [self._participant()], "fingerprint-1",
             {"broadcastId": "broadcast-1", "accepted": True},
             initial_deliveries=[self._delivery()],
+        )
+
+    def _applied_feedback(self, revision=1, delivery_id="delivery-1",
+                          client_seq=1, **extra):
+        payload = {
+            "playbackContextId": "context-source",
+            "broadcastId": "broadcast-1",
+            "deviceSessionId": "device:participant-1",
+            "deliveryId": delivery_id,
+            "executionStatus": "applied",
+            "appliedBroadcastRevision": revision,
+            "queueIndex": 0,
+            "trackId": "song-1",
+            "state": "playing",
+            "positionMs": 1510,
+            "playbackRate": 1.0,
+            "clientSeq": client_seq,
+        }
+        payload.update(extra)
+        return payload
+
+    def _settle(self, payload, fingerprint, server_time_ms):
+        return settleBroadcastFeedback(
+            "alice",
+            "context-source",
+            "broadcast-1",
+            "participant-1",
+            "device:participant-1",
+            "nonce-1",
+            1,
+            payload,
+            fingerprint,
+            server_time_ms,
         )
 
     def test_create_read_and_intent_replay(self):
@@ -209,6 +250,256 @@ class EmoBroadcastStoreTestCase(unittest.TestCase):
         with self.assertRaises(BroadcastResourceConflictError):
             saveBroadcastFeedbackSettlement(*args[:7], "different",
                                             {"status": "failed"})
+
+    def test_applied_feedback_is_atomic_and_client_seq_idempotent(self):
+        self._create()
+        payload = self._applied_feedback()
+
+        first = self._settle(payload, "feedback-1", 11000)
+        replay = self._settle(payload, "feedback-1", 12000)
+
+        self.assertTrue(first["created"])
+        self.assertFalse(replay["created"])
+        self.assertEqual(
+            first["canonicalResult"],
+            replay["canonicalResult"],
+        )
+        participant = getBroadcastState("broadcast-1")[
+            "participantStates"
+        ][0]
+        self.assertEqual(participant["syncStatus"], "applied")
+        self.assertEqual(participant["appliedBroadcastRevision"], 1)
+        self.assertEqual(participant["appliedPositionMs"], 1510)
+        self.assertEqual(participant["appliedAtServerMs"], 11000)
+        self.assertEqual(participant["lastFeedbackClientSeq"], 1)
+        self.assertEqual(participant["lastFeedbackAtMs"], 11000)
+        with self.assertRaises(BroadcastFeedbackSequenceConflictError):
+            self._settle(payload, "different", 13000)
+
+    def test_feedback_target_mismatch_has_no_side_effects(self):
+        self._create()
+        variants = (
+            {"deliveryId": "wrong-delivery"},
+            {"appliedBroadcastRevision": 2},
+            {"queueIndex": 1},
+            {"trackId": "song-2"},
+            {"state": "paused"},
+            {"playbackRate": 1.25},
+            {"positionMs": 2001},
+        )
+        for index, changes in enumerate(variants):
+            payload = self._applied_feedback(**changes)
+            with self.subTest(changes=changes):
+                with self.assertRaises((BroadcastResourceConflictError, ValueError)):
+                    settleBroadcastFeedback(
+                        "alice",
+                        "context-source",
+                        "broadcast-1",
+                        "participant-1",
+                        "device:participant-1",
+                        "nonce-1",
+                        1,
+                        payload,
+                        "mismatch-%d" % index,
+                        11000 + index,
+                        track_duration_ms=2000,
+                    )
+        participant = getBroadcastState("broadcast-1")[
+            "participantStates"
+        ][0]
+        self.assertEqual(participant["syncStatus"], "pending")
+        self.assertIsNone(participant["appliedBroadcastRevision"])
+        self.assertEqual(db.EmoBroadcastFeedbackSettlement.select().count(), 0)
+
+    def test_feedback_settlement_failure_rolls_back_participant(self):
+        self._create()
+        payload = self._applied_feedback()
+
+        with mock.patch.object(
+            db.EmoBroadcastFeedbackSettlement,
+            "create",
+            side_effect=RuntimeError("feedback settlement failure"),
+        ):
+            with self.assertRaises(RuntimeError):
+                self._settle(payload, "feedback-failure", 11000)
+
+        state = getBroadcastState("broadcast-1")
+        participant = state["participantStates"][0]
+        self.assertEqual(participant["syncStatus"], "pending")
+        self.assertIsNone(participant["appliedBroadcastRevision"])
+        self.assertEqual(state["deliveries"][0]["deliveryStatus"], "pending")
+        self.assertEqual(db.EmoBroadcastFeedbackSettlement.select().count(), 0)
+
+    def test_failed_feedback_can_converge_to_applied(self):
+        self._create()
+        self._settle(self._applied_feedback(), "applied-1", 11000)
+        commitBroadcastRevision(
+            "broadcast-1",
+            1,
+            self._snapshot(revision=2, updated_at_ms=12000),
+            "progress",
+            [self._delivery("delivery-2", 2, "progress", 12000)],
+        )
+        failed = {
+            "playbackContextId": "context-source",
+            "broadcastId": "broadcast-1",
+            "deviceSessionId": "device:participant-1",
+            "deliveryId": "delivery-2",
+            "executionStatus": "failed",
+            "failedBroadcastRevision": 2,
+            "lastAppliedBroadcastRevision": 1,
+            "errorCode": "track_load_failed",
+            "errorMessage": "Unable to load target",
+            "clientSeq": 2,
+        }
+        self._settle(failed, "failed-2", 13000)
+        failed_state = getBroadcastState("broadcast-1")[
+            "participantStates"
+        ][0]
+        self.assertEqual(failed_state["syncStatus"], "failed")
+        self.assertEqual(failed_state["failedBroadcastRevision"], 2)
+        self.assertEqual(
+            failed_state["failedErrorMessage"],
+            "Unable to load target",
+        )
+
+        applied = self._applied_feedback(
+            revision=2,
+            delivery_id="delivery-2",
+            client_seq=3,
+            positionMs=1600,
+        )
+        self._settle(applied, "applied-2", 14000)
+        applied_state = getBroadcastState("broadcast-1")[
+            "participantStates"
+        ][0]
+        self.assertEqual(applied_state["syncStatus"], "applied")
+        self.assertEqual(applied_state["appliedBroadcastRevision"], 2)
+        self.assertIsNone(applied_state["failedBroadcastRevision"])
+        self.assertIsNone(applied_state["failedErrorCode"])
+
+    def test_lagging_feedback_rebuilds_earliest_deadline(self):
+        self._create()
+        initial = getBroadcastState("broadcast-1")["participantStates"][0]
+        commitBroadcastRevision(
+            "broadcast-1",
+            1,
+            self._snapshot(revision=2, updated_at_ms=12000),
+            "progress",
+            [self._delivery("delivery-2", 2, "progress", 12000)],
+        )
+        commitBroadcastRevision(
+            "broadcast-1",
+            2,
+            self._snapshot(revision=3, updated_at_ms=13000),
+            "progress",
+            [self._delivery("delivery-3", 3, "progress", 13000)],
+        )
+        pending = getBroadcastState("broadcast-1")["participantStates"][0]
+        self.assertEqual(
+            pending["feedbackDeadlineAtServerMs"],
+            initial["feedbackDeadlineAtServerMs"],
+        )
+        self.assertEqual(pending["deadlineBroadcastRevision"], 1)
+        self.assertEqual(pending["targetBroadcastRevision"], 3)
+
+        self._settle(self._applied_feedback(), "applied-1", 15000)
+        lagging = getBroadcastState("broadcast-1")["participantStates"][0]
+        self.assertEqual(lagging["syncStatus"], "lagging")
+        self.assertEqual(lagging["deadlineBroadcastRevision"], 2)
+        self.assertEqual(lagging["feedbackDeadlineAtServerMs"], 23000)
+        self._settle(self._applied_feedback(), "applied-1", 19000)
+        replay = getBroadcastState("broadcast-1")["participantStates"][0]
+        self.assertEqual(replay["deadlineBroadcastRevision"], 2)
+        self.assertEqual(replay["feedbackDeadlineAtServerMs"], 23000)
+
+    def test_deadline_timeout_is_not_reopened_by_progress(self):
+        self._create()
+        deadline = getBroadcastState("broadcast-1")["participantStates"][0][
+            "feedbackDeadlineAtServerMs"
+        ]
+
+        timed_out = sweepBroadcastFeedbackDeadlines(deadline)
+
+        self.assertEqual(len(timed_out), 1)
+        self.assertEqual(timed_out[0]["syncStatus"], "timedOut")
+        self.assertEqual(timed_out[0]["timedOutBroadcastRevision"], 1)
+        commitBroadcastRevision(
+            "broadcast-1",
+            1,
+            self._snapshot(revision=2, updated_at_ms=20000),
+            "progress",
+            [self._delivery("delivery-2", 2, "progress", 20000)],
+        )
+        after_progress = getBroadcastState("broadcast-1")[
+            "participantStates"
+        ][0]
+        self.assertEqual(after_progress["syncStatus"], "timedOut")
+        self.assertEqual(after_progress["deadlineBroadcastRevision"], 1)
+        self.assertEqual(after_progress["feedbackDeadlineAtServerMs"], deadline)
+        self.assertEqual(after_progress["targetBroadcastRevision"], 2)
+
+        self._settle(self._applied_feedback(), "applied-after-timeout-1", 21000)
+        lagging = getBroadcastState("broadcast-1")["participantStates"][0]
+        self.assertEqual(lagging["syncStatus"], "lagging")
+        self.assertIsNone(lagging["timedOutBroadcastRevision"])
+        self.assertEqual(lagging["deadlineBroadcastRevision"], 2)
+        self.assertEqual(lagging["feedbackDeadlineAtServerMs"], 29000)
+
+        self._settle(
+            self._applied_feedback(
+                revision=2,
+                delivery_id="delivery-2",
+                client_seq=2,
+                positionMs=1600,
+            ),
+            "applied-after-timeout-2",
+            22000,
+        )
+        applied = getBroadcastState("broadcast-1")["participantStates"][0]
+        self.assertEqual(applied["syncStatus"], "applied")
+        self.assertEqual(applied["appliedBroadcastRevision"], 2)
+        self.assertIsNone(applied["timedOutBroadcastRevision"])
+
+    def test_terminal_applied_feedback_clears_restore_pending(self):
+        self._create()
+        terminal = self._snapshot(
+            revision=2,
+            lifecycle="stopped",
+            updated_at_ms=20000,
+        )
+        terminalBroadcastState(
+            "broadcast-1",
+            terminal,
+            {"stopped": True},
+            [self._delivery("terminal-delivery", 2, "stop", 20000)],
+            expected_broadcast_revision=1,
+            terminal_at_ms=20000,
+        )
+        feedback = self._applied_feedback(
+            revision=2,
+            delivery_id="terminal-delivery",
+            client_seq=1,
+            state="stopped",
+            restoreCompleted=True,
+        )
+
+        self._settle(feedback, "terminal-applied", 21000)
+
+        participant = getBroadcastState("broadcast-1")[
+            "participantStates"
+        ][0]
+        self.assertFalse(participant["restorePending"])
+        self.assertTrue(participant["terminalConfirmed"])
+        self.assertTrue(participant["restoreCompleted"])
+        self.assertEqual(
+            getBroadcastFenceForPair(
+                "alice",
+                "participant-1",
+                "device:participant-1",
+            ),
+            None,
+        )
 
     def test_20_and_256_limits(self):
         participants = [self._participant(
