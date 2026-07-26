@@ -4,7 +4,27 @@ from unittest import mock
 
 from supysonic import db
 from supysonic.emo import ws as emo_ws
-from supysonic.emo.ws_store import getDevicePlaybackState
+from supysonic.emo.broadcast_store import terminalBroadcastState
+from supysonic.emo.ws_store import (
+    PlaybackContextBroadcastBarrierError,
+    applyStrictPlaybackUpdate,
+    closeStrictPlaybackContextState,
+    commitStrictPlaybackHandoff,
+    completeStrictPlaybackHandoff,
+    createPlaybackControlTransaction,
+    createPlaybackPrepareTransaction,
+    createStrictPlaybackContextState,
+    createStrictPlaybackHandoff,
+    ensureStrictPlaybackContextState,
+    getDevicePlaybackState,
+    getPlaybackContextState,
+    mutateStrictPlaybackContextControl,
+    mutateStrictPlaybackContextQueue,
+    savePlaybackLocalIntent,
+    settlePlaybackControlTransaction,
+    settlePlaybackPrepareTransaction,
+    terminateStrictPlaybackHandoff,
+)
 from supysonic.emo.ws_state import get_state
 
 from tests.base.test_emo_ws import (
@@ -417,6 +437,299 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             db.EmoBroadcastDelivery,
         ):
             self.assertEqual(model.select().count(), 0, model.__name__)
+
+    def test_ordinary_context_mutation_store_paths_hit_one_barrier(self):
+        authority, _participant, controller = self.connect_broadcast_devices()
+        self.start_strict_broadcast(
+            controller,
+            participants=["participant-1"],
+        )
+        self.get_messages(authority)
+        context_id = "context-participant-original"
+        before = getPlaybackContextState(context_id)
+        mutation_functions = (
+            createPlaybackControlTransaction,
+            settlePlaybackControlTransaction,
+            applyStrictPlaybackUpdate,
+            createPlaybackPrepareTransaction,
+            settlePlaybackPrepareTransaction,
+            savePlaybackLocalIntent,
+            createStrictPlaybackContextState,
+            closeStrictPlaybackContextState,
+            mutateStrictPlaybackContextQueue,
+            mutateStrictPlaybackContextControl,
+            createStrictPlaybackHandoff,
+            terminateStrictPlaybackHandoff,
+            commitStrictPlaybackHandoff,
+        )
+        for mutation in mutation_functions:
+            with self.subTest(mutation=mutation.__name__):
+                with self.assertRaises(PlaybackContextBroadcastBarrierError):
+                    mutation(context_id)
+        with self.assertRaises(PlaybackContextBroadcastBarrierError):
+            ensureStrictPlaybackContextState(
+                "alice",
+                "participant-1",
+                "device:participant-1",
+                ["original-song-1"],
+                0,
+                500,
+                "paused",
+            )
+        self.assertEqual(getPlaybackContextState(context_id), before)
+
+    def test_ordinary_queue_sync_returns_canonical_conflict_without_push(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        self.start_strict_broadcast(
+            controller,
+            participants=["participant-1"],
+        )
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        before = getPlaybackContextState("context-participant-original")
+        participant.emit(
+            "message",
+            {
+                "type": "state",
+                "action": "queue.context.sync",
+                "requestId": "ordinary-queue-blocked-1",
+                "payload": {
+                    "playbackContextId": "context-participant-original",
+                    "deviceSessionId": "device:participant-1",
+                    "queueSongIds": ["replacement-song"],
+                    "currentIndex": 0,
+                    "positionMs": 0,
+                    "positionSampledAtServerMs": int(time.time() * 1000),
+                    "baseQueueRevision": before["queueRevision"],
+                    "baseControlVersion": before["controlVersion"],
+                },
+            },
+            namespace="/emo",
+        )
+        error = self.get_error(
+            self.get_messages(participant),
+            "ordinary-queue-blocked-1",
+        )
+        self.assertEqual(error["payload"]["code"], "conflict")
+        self.assertEqual(
+            error["payload"]["currentVersion"],
+            before["version"],
+        )
+        self.assertEqual(
+            error["payload"]["currentQueueRevision"],
+            before["queueRevision"],
+        )
+        self.assertEqual(
+            error["payload"]["currentControlVersion"],
+            before["controlVersion"],
+        )
+        self.assertEqual(
+            getPlaybackContextState("context-participant-original"),
+            before,
+        )
+        self.assertEqual(self.get_messages(authority), [])
+        self.assertEqual(self.get_messages(controller), [])
+
+    def test_source_noop_ensure_allowed_but_close_and_handoff_are_blocked(self):
+        authority, _participant, controller = self.connect_broadcast_devices()
+        self.start_strict_broadcast(
+            controller,
+            participants=["participant-1"],
+        )
+        before = getPlaybackContextState("context-broadcast-source")
+        ensured = ensureStrictPlaybackContextState(
+            "alice",
+            "authority-1",
+            "device:authority-1",
+            ["source-song-1", "source-song-2"],
+            0,
+            before["positionMs"],
+            before["state"],
+        )
+        self.assertFalse(ensured.mutated)
+        self.assertEqual(ensured.canonical_context, before)
+        with self.assertRaises(PlaybackContextBroadcastBarrierError):
+            closeStrictPlaybackContextState(
+                "context-broadcast-source",
+                "alice",
+            )
+        with self.assertRaises(PlaybackContextBroadcastBarrierError):
+            createStrictPlaybackHandoff(
+                "context-broadcast-source",
+                {
+                    "userName": "alice",
+                    "sourceClientId": "authority-1",
+                    "targetClientId": "participant-1",
+                },
+                "device:participant-1",
+            )
+        with self.assertRaises(PlaybackContextBroadcastBarrierError):
+            ensureStrictPlaybackContextState(
+                "alice",
+                "authority-1",
+                "device:authority-rebound",
+                ["source-song-1", "source-song-2"],
+                0,
+                before["positionMs"],
+                before["state"],
+            )
+        with self.assertRaises(PlaybackContextBroadcastBarrierError):
+            createStrictPlaybackContextState(
+                "context-second-source-binding",
+                "alice",
+                "authority-1",
+                "device:authority-1",
+                ["source-song-1"],
+                0,
+                0,
+                "playing",
+            )
+        self.report_source_state(authority, client_seq=2)
+        self.assertEqual(
+            getDevicePlaybackState(
+                "context-broadcast-source",
+                "authority-1",
+            )["clientSeq"],
+            2,
+        )
+        self.assertEqual(
+            getPlaybackContextState("context-broadcast-source")["lifecycle"],
+            "active",
+        )
+
+    def test_handoff_target_pair_cannot_cross_ordinary_barrier(self):
+        authority, _participant, controller = self.connect_broadcast_devices()
+        self.start_strict_broadcast(
+            controller,
+            participants=["participant-1"],
+        )
+        self.get_messages(authority)
+        source_result = createStrictPlaybackContextState(
+            "context-handoff-other-source",
+            "alice",
+            "other-source",
+            "device:other-source",
+            ["other-song"],
+            0,
+            0,
+            "playing",
+        )
+        handoff = {
+            "handoffId": "handoff-blocked-target",
+            "userName": "alice",
+            "sourceClientId": "other-source",
+            "targetClientId": "participant-1",
+            "baseControlVersion": source_result.canonical_context[
+                "controlVersion"
+            ],
+        }
+        with self.assertRaises(PlaybackContextBroadcastBarrierError):
+            createStrictPlaybackHandoff(
+                "context-handoff-other-source",
+                handoff,
+                "device:participant-1",
+            )
+        db.EmoPlaybackHandoff.create(
+            handoff_id="handoff-complete-blocked-target",
+            playback_context_id="context-handoff-other-source",
+            user_name="alice",
+            source_client_id="other-source",
+            target_client_id="participant-1",
+            status="committing",
+            base_control_version=source_result.canonical_context[
+                "controlVersion"
+            ],
+            snapshot_json="{}",
+        )
+        with self.assertRaises(PlaybackContextBroadcastBarrierError):
+            completeStrictPlaybackHandoff(
+                "context-handoff-other-source",
+                "handoff-complete-blocked-target",
+                "alice",
+                "participant-1",
+                "device:participant-1",
+            )
+        unchanged_source = getPlaybackContextState(
+            "context-handoff-other-source"
+        )
+        self.assertEqual(unchanged_source["authorityClientId"], "other-source")
+
+    def test_restore_pending_ensure_is_cached_without_side_effects(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        persisted = emo_ws.getPersistentBroadcastState(
+            start_ack["broadcastId"]
+        )
+        terminal_snapshot = dict(
+            persisted["snapshot"],
+            lifecycleState="stopped",
+            broadcastRevision=2,
+        )
+        terminalBroadcastState(
+            start_ack["broadcastId"],
+            terminal_snapshot,
+            {
+                "action": "broadcast.stop",
+                "broadcastId": start_ack["broadcastId"],
+            },
+        )
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        before = getPlaybackContextState("context-participant-original")
+        request_message = {
+            "type": "command",
+            "action": "playback.context.ensure",
+            "requestId": "restore-pending-ensure-1",
+            "payload": {
+                "deviceSessionId": "device:participant-1",
+                "queueSongIds": ["replacement-song"],
+                "currentIndex": 0,
+                "positionMs": 0,
+                "state": "paused",
+            },
+        }
+        participant.emit("message", request_message, namespace="/emo")
+        first = self.get_error(
+            self.get_messages(participant),
+            "restore-pending-ensure-1",
+        )
+        participant.emit("message", request_message, namespace="/emo")
+        replay = self.get_error(
+            self.get_messages(participant),
+            "restore-pending-ensure-1",
+        )
+        self.assertEqual(first["payload"], replay["payload"])
+        self.assertEqual(first["payload"]["code"], "restore_in_progress")
+        self.assertTrue(first["payload"]["retryable"])
+        self.assertEqual(
+            first["payload"]["playbackContextId"],
+            "context-participant-original",
+        )
+        self.assertEqual(
+            {
+                key: first["payload"][key]
+                for key in (
+                    "currentVersion",
+                    "currentQueueRevision",
+                    "currentControlVersion",
+                )
+            },
+            {
+                "currentVersion": before["version"],
+                "currentQueueRevision": before["queueRevision"],
+                "currentControlVersion": before["controlVersion"],
+            },
+        )
+        self.assertEqual(
+            getPlaybackContextState("context-participant-original"),
+            before,
+        )
 
 
 if __name__ == "__main__":

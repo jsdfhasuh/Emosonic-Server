@@ -64,6 +64,7 @@ from .ws_store import (
     PlaybackContextEnsureConflictError,
     PlaybackContextIntentConflictError,
     PlaybackContextQueueRequiredError,
+    PlaybackContextRestoreInProgressError,
     PlaybackPrepareAlreadyActiveError,
     PlaybackPrepareTransactionConflictError,
     PlaybackHandoffTargetConflictError,
@@ -605,7 +606,12 @@ def _build_message(msg_type, action, payload=None, **extra):
             if request_action:
                 message_payload["action"] = request_action
         if action == "system.error":
-            retryable_codes = {"authority_offline", "rate_limited", "internal_error"}
+            retryable_codes = {
+                "authority_offline",
+                "restore_in_progress",
+                "rate_limited",
+                "internal_error",
+            }
             message_payload.setdefault(
                 "retryable",
                 message_payload.get("code") in retryable_codes,
@@ -9909,6 +9915,20 @@ class EmoNamespace(Namespace):
                     "queueRevision"
                 )
             _send_error("stale_version", str(exc), request_id, **fields)
+        except PlaybackContextRestoreInProgressError as exc:
+            playback_context = exc.playback_context or {}
+            _send_error(
+                "restore_in_progress",
+                str(exc),
+                request_id,
+                playbackContextId=playback_context.get("playbackContextId")
+                or payload.get("playbackContextId"),
+                currentControlVersion=playback_context.get(
+                    "controlVersion"
+                ),
+                currentQueueRevision=playback_context.get("queueRevision"),
+                currentVersion=playback_context.get("version"),
+            )
         except PlaybackContextClosedError as exc:
             playback_context = exc.playback_context or {}
             _send_error(

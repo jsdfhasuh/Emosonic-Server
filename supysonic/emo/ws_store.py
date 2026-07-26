@@ -10,6 +10,7 @@ from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 from peewee import IntegrityError, SqliteDatabase
 
 from ..db import (
+    EmoBroadcastFence,
     EmoDevicePlaybackState,
     EmoLocalQueue,
     EmoPlaybackControlTransaction,
@@ -56,6 +57,21 @@ class PlaybackContextAuthorityAmbiguousError(Exception):
 class PlaybackContextEnsureConflictError(Exception):
     def __init__(self, playback_context=None):
         super().__init__("Stable client has a conflicting active playback context")
+        self.playback_context = playback_context
+
+
+class PlaybackContextBroadcastBarrierError(PlaybackContextEnsureConflictError):
+    def __init__(self, playback_context=None):
+        Exception.__init__(
+            self,
+            "Playback context is occupied by an active Broadcast",
+        )
+        self.playback_context = playback_context
+
+
+class PlaybackContextRestoreInProgressError(Exception):
+    def __init__(self, playback_context):
+        super().__init__("Original playback context restore is in progress")
         self.playback_context = playback_context
 
 
@@ -230,6 +246,84 @@ def strictPlaybackContextLockSet(
 
 
 @contextmanager
+def strictAuthorityPairLockSet(
+    authority_pairs: Iterable[AuthorityPair],
+) -> Iterator[None]:
+    with _strict_authority_pair_lock(authority_pairs):
+        yield
+
+
+_SOURCE_BROADCAST_ALLOWED_MUTATIONS = {
+    "applyStrictPlaybackUpdate",
+    "createPlaybackControlTransaction",
+    "mutateStrictPlaybackContextControl",
+    "mutateStrictPlaybackContextQueue",
+    "savePlaybackLocalIntent",
+    "settlePlaybackControlTransaction",
+}
+
+
+def _broadcast_fences_for_context(playback_context_id):
+    return list(
+        EmoBroadcastFence.select().where(
+            EmoBroadcastFence.playback_context_id == playback_context_id
+        )
+    )
+
+
+def _broadcast_fence_for_pair(
+    user_name,
+    client_id,
+    device_session_id,
+):
+    return EmoBroadcastFence.get_or_none(
+        (EmoBroadcastFence.user_name == user_name)
+        & (EmoBroadcastFence.client_id == client_id)
+        & (EmoBroadcastFence.device_session_id == device_session_id)
+    )
+
+
+def _canonical_context_for_barrier(playback_context_id):
+    record = EmoPlaybackContext.get_or_none(
+        EmoPlaybackContext.playback_context_id == playback_context_id
+    )
+    return None if record is None else _playback_context_payload(record)
+
+
+def _raise_broadcast_fence(
+    fence,
+    playback_context_id,
+    restore_in_progress=False,
+):
+    playback_context = _canonical_context_for_barrier(playback_context_id)
+    if restore_in_progress and fence.phase == "restorePending":
+        raise PlaybackContextRestoreInProgressError(playback_context or {})
+    raise PlaybackContextBroadcastBarrierError(playback_context)
+
+
+def _require_broadcast_context_mutation_allowed(
+    playback_context_id,
+    mutation_name,
+):
+    fences = _broadcast_fences_for_context(playback_context_id)
+    ordinary = next(
+        (fence for fence in fences if fence.role == "ordinary"),
+        None,
+    )
+    if ordinary is not None:
+        _raise_broadcast_fence(ordinary, playback_context_id)
+    source = next(
+        (fence for fence in fences if fence.role == "source"),
+        None,
+    )
+    if (
+        source is not None
+        and mutation_name not in _SOURCE_BROADCAST_ALLOWED_MUTATIONS
+    ):
+        _raise_broadcast_fence(source, playback_context_id)
+
+
+@contextmanager
 def _strict_stable_client_lock(user_name, client_id):
     key = (user_name, client_id)
     with _strict_stable_client_locks_guard:
@@ -245,6 +339,14 @@ def _serialize_strict_playback_context_mutation(function):
     @wraps(function)
     def serialized(playback_context_id, *args, **kwargs):
         with _strict_playback_context_lock(playback_context_id):
+            open_connection(reuse=True)
+            try:
+                _require_broadcast_context_mutation_allowed(
+                    playback_context_id,
+                    function.__name__,
+                )
+            finally:
+                close_connection()
             return function(playback_context_id, *args, **kwargs)
 
     return serialized
@@ -2145,7 +2247,19 @@ def ensureStrictPlaybackContextState(
                             )
                             if candidates and candidates[0].playback_context_id != selected_context_id:
                                 continue
+                            pair_fence = _broadcast_fence_for_pair(
+                                user_name,
+                                authority_client_id,
+                                authority_device_session_id,
+                            )
                             if not candidates:
+                                if pair_fence is not None:
+                                    _raise_broadcast_fence(
+                                        pair_fence,
+                                        pair_fence.playback_context_id
+                                        or selected_context_id,
+                                        restore_in_progress=True,
+                                    )
                                 existing = EmoPlaybackContext.get_or_none(
                                     EmoPlaybackContext.playback_context_id
                                     == generated_context_id
@@ -2204,6 +2318,54 @@ def ensureStrictPlaybackContextState(
                                 record.authority_device_session_id
                                 != authority_device_session_id
                             )
+                            would_initialize = bool(queue_song_ids) and not bool(
+                                json.loads(record.queue_json)
+                            )
+                            context_fences = _broadcast_fences_for_context(
+                                record.playback_context_id
+                            )
+                            ordinary_fence = next(
+                                (
+                                    fence
+                                    for fence in context_fences
+                                    if fence.role == "ordinary"
+                                ),
+                                None,
+                            )
+                            if ordinary_fence is not None:
+                                _raise_broadcast_fence(
+                                    ordinary_fence,
+                                    record.playback_context_id,
+                                    restore_in_progress=True,
+                                )
+                            source_fence = next(
+                                (
+                                    fence
+                                    for fence in context_fences
+                                    if fence.role == "source"
+                                ),
+                                None,
+                            )
+                            if source_fence is not None and (
+                                rebind or would_initialize
+                            ):
+                                _raise_broadcast_fence(
+                                    source_fence,
+                                    record.playback_context_id,
+                                )
+                            if pair_fence is not None and not (
+                                source_fence is not None
+                                and pair_fence.broadcast_id
+                                == source_fence.broadcast_id
+                                and not rebind
+                                and not would_initialize
+                            ):
+                                _raise_broadcast_fence(
+                                    pair_fence,
+                                    pair_fence.playback_context_id
+                                    or record.playback_context_id,
+                                    restore_in_progress=True,
+                                )
                             if rebind and not allow_rebind:
                                 raise PlaybackContextEnsureConflictError(
                                     _playback_context_payload(record)
@@ -2275,6 +2437,16 @@ def createStrictPlaybackContextState(
     open_connection(reuse=True)
     try:
         with _strict_authority_pair_transaction((authority_pair,)):
+            pair_fence = _broadcast_fence_for_pair(
+                user_name,
+                authority_client_id,
+                authority_device_session_id,
+            )
+            if pair_fence is not None:
+                _raise_broadcast_fence(
+                    pair_fence,
+                    pair_fence.playback_context_id or playback_context_id,
+                )
             record = EmoPlaybackContext.get_or_none(
                 EmoPlaybackContext.playback_context_id == playback_context_id
             )
@@ -2829,6 +3001,16 @@ def createStrictPlaybackHandoff(
         with _strict_authority_pair_transaction(
             (old_authority_pair, target_pair)
         ):
+            target_fence = _broadcast_fence_for_pair(
+                user_name,
+                target_client_id,
+                target_device_session_id,
+            )
+            if target_fence is not None:
+                _raise_broadcast_fence(
+                    target_fence,
+                    target_fence.playback_context_id or playback_context_id,
+                )
             source_record = _getStrictPlaybackContextRecord(
                 playback_context_id,
                 user_name,
@@ -2883,6 +3065,14 @@ def createStrictPlaybackHandoff(
                 snapshot.pop(field_name, None)
             if target_contexts:
                 standby = target_contexts[0]
+                standby_fences = _broadcast_fences_for_context(
+                    standby.playback_context_id
+                )
+                if standby_fences:
+                    _raise_broadcast_fence(
+                        standby_fences[0],
+                        standby.playback_context_id,
+                    )
                 _require_idle_handoff_standby(
                     standby,
                     target_device_session_id,
@@ -2950,6 +3140,33 @@ def completeStrictPlaybackHandoff(
     if isinstance(standby_context_id, str) and standby_context_id:
         context_ids.append(standby_context_id)
     with _strict_playback_context_lock_set(context_ids):
+        open_connection(reuse=True)
+        try:
+            _require_broadcast_context_mutation_allowed(
+                playback_context_id,
+                "completeStrictPlaybackHandoff",
+            )
+            target_fence = _broadcast_fence_for_pair(
+                user_name,
+                target_client_id,
+                target_device_session_id,
+            )
+            if target_fence is not None:
+                _raise_broadcast_fence(
+                    target_fence,
+                    target_fence.playback_context_id or playback_context_id,
+                )
+            if isinstance(standby_context_id, str) and standby_context_id:
+                standby_fences = _broadcast_fences_for_context(
+                    standby_context_id
+                )
+                if standby_fences:
+                    _raise_broadcast_fence(
+                        standby_fences[0],
+                        standby_context_id,
+                    )
+        finally:
+            close_connection()
         return _completeStrictPlaybackHandoffLocked(
             playback_context_id,
             handoff_id,

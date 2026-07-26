@@ -8,20 +8,20 @@
 | REQ-001—REQ-009 | Goal 1 | `test_emo_strict_v2_contract`, `test_emo_protocol_metadata`, Core Socket and JS client tests | Verified |
 | REQ-010—REQ-014 | Goal 1, Goal 3 | contract, timing persistence, effective-at and Core Socket tests | Verified |
 | REQ-015—REQ-022 | Goal 2, Goal 11 | persistence/limit tests verified in `test_emo_broadcast_store`; readiness remains | In progress |
-| REQ-023—REQ-038 | Goal 1, Goal 3, Goal 5, Goal 6 | Core Context, control and handoff tests | Planned |
+| REQ-023—REQ-038 | Goal 1, Goal 3, Goal 5, Goal 6 | Core barrier and Handoff guard verified; Broadcast-aware control remains | In progress |
 | REQ-039 | Goal 2, Goal 4, Goal 6 | persistent snapshot/revision and source-derived start verified; later projection remains | In progress |
 | REQ-040 | Goal 7 | feedback schema, settlement and Socket tests | Planned |
-| REQ-041 | Goal 5, Goal 10 | Context/binding barrier and terminal transaction tests | Planned |
+| REQ-041 | Goal 5, Goal 10 | Context/binding/source barriers verified; terminal transaction remains | In progress |
 | REQ-042 | Goal 4, Goal 10 | start role fanout verified; terminal and restore remain | In progress |
 | REQ-043 | Goal 9 | source reconnect and actual-state tests | Planned |
 | REQ-044 | Goal 2, Goal 10 | store terminal transaction/idempotency verified; Socket/restart remains | In progress |
 | REQ-045—REQ-046 | Goal 3, Goal 6 | rate/effective-at eligibility verified; progress revision remains | In progress |
-| REQ-047 | Goal 5, Goal 10 | restorePending ensure and mutation barrier tests | Planned |
+| REQ-047 | Goal 5, Goal 10 | restorePending ensure and no-side-effect replay verified; terminal drain remains | In progress |
 | REQ-048 | Goal 3, Goal 4 | fresh/settled/playing helper and atomic start integration verified | Verified |
 | REQ-049 | Goal 7 | participant outcome and deadline tests | Planned |
 | REQ-050 | Goal 3, Goal 6 | server clock gate verified; action late-policy remains | In progress |
 | REQ-051 | Goal 2, Goal 4, Goal 10 | 1024 limit, rate-limited new intent and persistent replay verified; Context-close cleanup remains | In progress |
-| REQ-052—REQ-053 | Goal 4, Goal 5 | crash-safe start, frozen pair and initial fence verified; all mutation barriers remain | In progress |
+| REQ-052—REQ-053 | Goal 4, Goal 5 | crash-safe start, frozen pair and all Context/binding mutation barriers verified | Verified |
 | REQ-054 | Goal 6 | natural source track transition tests | Planned |
 | REQ-055—REQ-056 | Goal 9, Goal 10 | restart, waiting, idle terminal and timeout tests | Planned |
 | REQ-057 | Goal 4 | source/ordinary/controller-only priority and fanout tests | Verified |

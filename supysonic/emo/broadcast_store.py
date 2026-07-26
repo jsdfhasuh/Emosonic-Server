@@ -26,7 +26,7 @@ from ..db import (
     now,
     open_connection,
 )
-from .ws_store import strictPlaybackContextLockSet
+from .ws_store import strictAuthorityPairLockSet, strictPlaybackContextLockSet
 
 
 MAX_BROADCAST_PARTICIPANTS = 20
@@ -646,12 +646,23 @@ def createBroadcastState(
         str(item["suspendedPlaybackContextId"])
         for item in participant_payloads
     )
+    authority_pairs = [
+        (user_name, authority_client_id, authority_device_session_id)
+    ]
+    authority_pairs.extend(
+        (
+            user_name,
+            str(item["clientId"]),
+            str(item["deviceSessionId"]),
+        )
+        for item in participant_payloads
+    )
 
     open_connection(reuse=True)
     try:
-        with strictPlaybackContextLockSet(context_ids), broadcastResourceLock(
-            resource_keys
-        ):
+        with strictPlaybackContextLockSet(context_ids), strictAuthorityPairLockSet(
+            authority_pairs
+        ), broadcastResourceLock(resource_keys):
             try:
                 with broadcastTransaction():
                     existing_intent = EmoBroadcastIntentOutcome.get_or_none(
@@ -1192,7 +1203,24 @@ def terminalBroadcastState(
     open_connection(reuse=True)
     try:
         resource_keys = _broadcast_resource_keys(broadcast_id)
-        with broadcastResourceLock(resource_keys):
+        fence_rows = list(
+            EmoBroadcastFence.select().where(
+                EmoBroadcastFence.broadcast_id == broadcast_id
+            )
+        )
+        context_ids = [
+            row.playback_context_id
+            for row in fence_rows
+            if row.playback_context_id
+        ]
+        authority_pairs = [
+            (row.user_name, row.client_id, row.device_session_id)
+            for row in fence_rows
+            if row.client_id and row.device_session_id
+        ]
+        with strictPlaybackContextLockSet(context_ids), strictAuthorityPairLockSet(
+            authority_pairs
+        ), broadcastResourceLock(resource_keys):
             with broadcastTransaction():
                 record = EmoBroadcast.get_or_none(
                     EmoBroadcast.broadcast_id == broadcast_id
@@ -1379,7 +1407,38 @@ def confirmBroadcastRestore(
     )
     open_connection(reuse=True)
     try:
-        with broadcastResourceLock((resource_key,)):
+        participant_hint = EmoBroadcastParticipant.get_or_none(
+            _participant_expression(
+                broadcast_id,
+                client_id,
+                device_session_id,
+            )
+        )
+        recovery_hint = EmoBroadcastTerminalRecovery.get_or_none(
+            (EmoBroadcastTerminalRecovery.broadcast_id == broadcast_id)
+            & (EmoBroadcastTerminalRecovery.user_name == user_name)
+            & (EmoBroadcastTerminalRecovery.client_id == client_id)
+            & (
+                EmoBroadcastTerminalRecovery.device_session_id
+                == device_session_id
+            )
+        )
+        suspended_context_id = (
+            participant_hint.suspended_playback_context_id
+            if participant_hint is not None
+            else (
+                recovery_hint.suspended_playback_context_id
+                if recovery_hint is not None
+                else None
+            )
+        )
+        context_ids = (
+            () if suspended_context_id is None else (suspended_context_id,)
+        )
+        authority_pair = ((user_name, client_id, device_session_id),)
+        with strictPlaybackContextLockSet(context_ids), strictAuthorityPairLockSet(
+            authority_pair
+        ), broadcastResourceLock((resource_key,)):
             with broadcastTransaction():
                 participant = EmoBroadcastParticipant.get_or_none(
                     _participant_expression(

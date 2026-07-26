@@ -1,6 +1,6 @@
 # Goal: EmoSonic strict-v2 2.8.0 / r18 群播服务端落地
 
-> 状态：In progress（Goal 0—4 已完成；正在实施 Goal 5—11）
+> 状态：In progress（Goal 0—5 已完成；正在实施 Goal 6—11）
 >
 > 制定日期：2026-07-23
 >
@@ -691,7 +691,7 @@ deliveryId/effective-at target；controller-only 只获得无 delivery 的观察
 rate_limited。start intent 可跨 Socket 重放首次 ACK 且不重发 push。store、contract、Socket 和继承
 WebSocket 回归共 172 项通过，`supportsBroadcast` 继续保持 false。
 
-### Goal 5：Context 屏障和 source ownership
+### Goal 5：Context 屏障和 source ownership（已完成）
 
 改动：
 
@@ -707,6 +707,16 @@ WebSocket 回归共 172 项通过，`supportsBroadcast` 继续保持 false。
 - 契约列出的所有 mutation 路径均有正向和拒绝测试；
 - 拒绝分支不改变 Context、cursor、binding、outbox 或 push；
 - ensure 不能穿透 active 或 restorePending fence。
+
+完成记录（2026-07-26）：Context、authority pair 与 Broadcast resource 已使用一致的排序锁进入持久化
+mutation；ordinary nonterminal fence 统一阻止 queue sync、prepare/prepared、control、playback.update、
+close、ensure、local intent、Handoff/ready/complete 与直接 Context/binding 创建，拒绝时返回 suspended
+Context 当前三个游标且不产生 push。source fence 继续允许普通 queue/player/playback.update 和相同 pair
+无副作用 ensure，但拒绝 close、prepare、Handoff、换 deviceSessionId 与第二 Context binding。terminal
+restorePending 下的 ensure 优先返回可重放 `restore_in_progress`，包含 suspendedPlaybackContextId 对应的
+currentVersion/currentQueueRevision/currentControlVersion，且不修改或重绑 Context。Handoff target pair、
+standby Context、start/terminal/restore fence 转换也进入同一 Context/pair 临界区。ws_store、contract、
+Socket 与继承 WebSocket 回归共 212 项通过，`supportsBroadcast` 继续保持 false。
 
 ### Goal 6：Broadcast control 与 source 派生更新
 

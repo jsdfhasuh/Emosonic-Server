@@ -1329,6 +1329,17 @@ def _validate_output_error(payload: object) -> str:
         }
         if not required.issubset(error):
             _output_error("queue_required requires Context and all canonical cursors")
+    if code == "restore_in_progress":
+        required = {
+            "playbackContextId",
+            "currentControlVersion",
+            "currentQueueRevision",
+            "currentVersion",
+        }
+        if not required.issubset(error):
+            _output_error(
+                "restore_in_progress requires Context and all canonical cursors"
+            )
     if code == "rate_limited" and "retryAfterMs" not in error:
         _output_error("rate_limited requires retryAfterMs")
     if code == "client_sequence_conflict" and "currentClientSeq" not in error:
