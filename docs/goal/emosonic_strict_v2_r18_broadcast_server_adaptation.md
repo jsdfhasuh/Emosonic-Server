@@ -1,6 +1,6 @@
 # Goal: EmoSonic strict-v2 2.8.0 / r18 群播服务端落地
 
-> 状态：In progress（Goal 0 已完成；正在实施 Goal 1—11）
+> 状态：In progress（Goal 0—2 已完成；正在实施 Goal 3—11）
 >
 > 制定日期：2026-07-23
 >
@@ -609,7 +609,7 @@ shape；`schemaHash` 缺失、空值、类型或格式变化不再阻断注册�
 输出路径已闭合。`supportsBroadcast` 继续由独立实现门禁强制为 false。Python Core/Socket/store/Web
 回归及 20 项 JS strict client 测试通过。
 
-### Goal 2：持久化模型和 store primitives
+### Goal 2：持久化模型和 store primitives（已完成）
 
 改动：
 
@@ -625,6 +625,15 @@ shape；`schemaHash` 缺失、空值、类型或格式变化不再阻断注册�
 - 并发 start 只有一个赢家；
 - 事务失败没有孤儿 fence、slot、delivery 或 outbox；
 - SQLite/MySQL/PostgreSQL model/schema parity 通过。
+
+完成记录（2026-07-26）：已新增 8 个 r18 Broadcast 持久化模型、三数据库 base schema 和
+`20260726` migration，并新增独立 `broadcast_store`。start intent、source/ordinary resource fence、
+participant、immutable revision、per-pair delivery、feedback settlement、terminal recovery、7 天压缩和
+20/256/512/1024 上限均由数据库记录驱动；并发 start、长期 intent 重放、start/terminal 故障注入回滚、
+terminal 幂等、restorePending 释放和 compact recovery 已有 store 测试。SQLite clean/upgrade 与
+model/schema parity 已运行通过；MySQL/PostgreSQL base/migration/model 字段 parity 静态测试通过，当前
+环境未配置两种外部数据库 URI，运行时 migration 用例按测试设计跳过。`supportsBroadcast` 仍保持
+false，Socket handler 尚未切换到新 store。
 
 ### Goal 3：clock、采样时间和 source eligibility
 

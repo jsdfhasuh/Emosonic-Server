@@ -17,6 +17,16 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
         "authority_client_id",
         "authority_device_session_id",
     )
+    BROADCAST_MODELS = (
+        db.EmoBroadcast,
+        db.EmoBroadcastIntentOutcome,
+        db.EmoBroadcastFence,
+        db.EmoBroadcastParticipant,
+        db.EmoBroadcastRevision,
+        db.EmoBroadcastDelivery,
+        db.EmoBroadcastFeedbackSettlement,
+        db.EmoBroadcastTerminalRecovery,
+    )
 
     @staticmethod
     def _record_external_evidence(
@@ -165,7 +175,8 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             self.assertTrue(required_fields.issubset(columns))
             self._assert_external_discovery_index(provider)
             self._assert_external_r11_transaction_schema()
-            self.assertEqual(db.Meta["schema_version"].value, "20260717")
+            self._assert_external_r18_broadcast_schema()
+            self.assertEqual(db.Meta["schema_version"].value, "20260726")
             self._record_external_evidence(
                 provider,
                 "clean",
@@ -195,7 +206,8 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             self.assertIsNotNone(row[9])
             self._assert_external_discovery_index(provider)
             self._assert_external_r11_transaction_schema()
-            self.assertEqual(db.Meta["schema_version"].value, "20260717")
+            self._assert_external_r18_broadcast_schema()
+            self.assertEqual(db.Meta["schema_version"].value, "20260726")
             self._record_external_evidence(
                 provider,
                 "upgrade_from_20260708",
@@ -263,6 +275,32 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 "emo_playback_local_intent",
             },
         )
+
+    def _assert_external_r18_broadcast_schema(self) -> None:
+        expected_tables = {
+            model._meta.table_name for model in self.BROADCAST_MODELS
+        }
+        placeholders = ", ".join(["%s"] * len(expected_tables))
+        rows = db.db.execute_sql(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_name IN (%s)" % placeholders,
+            tuple(sorted(expected_tables)),
+        ).fetchall()
+        self.assertEqual({row[0] for row in rows}, expected_tables)
+        for model in self.BROADCAST_MODELS:
+            columns = {
+                row[0]
+                for row in db.db.execute_sql(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = %s",
+                    (model._meta.table_name,),
+                ).fetchall()
+            }
+            self.assertEqual(
+                columns,
+                {field.column_name for field in model._meta.sorted_fields},
+                model._meta.table_name,
+            )
 
     def test_sqlite_20260708_upgrade_preserves_context_and_normalizes_cursors(self):
         handle, path = tempfile.mkstemp()
@@ -378,7 +416,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                     "emo_playback_local_intent",
                 },
             )
-            self.assertEqual(db.Meta["schema_version"].value, "20260717")
+            self.assertEqual(db.Meta["schema_version"].value, "20260726")
         finally:
             db.release_database()
             os.remove(path)
@@ -404,6 +442,9 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 ).read_text("utf-8")
                 transaction_migration = (
                     root / "migration" / provider / "20260717.sql"
+                ).read_text("utf-8")
+                broadcast_migration = (
+                    root / "migration" / provider / "20260726.sql"
                 ).read_text("utf-8")
                 for field_name in required_fields:
                     self.assertIn(field_name, base_schema)
@@ -433,6 +474,46 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 ):
                     self.assertIn(field_name, base_schema)
                     self.assertIn(field_name, transaction_migration)
+                for table_name in (
+                    "emo_broadcast",
+                    "emo_broadcast_intent_outcome",
+                    "emo_broadcast_fence",
+                    "emo_broadcast_participant",
+                    "emo_broadcast_revision",
+                    "emo_broadcast_delivery",
+                    "emo_broadcast_feedback_settlement",
+                    "emo_broadcast_terminal_recovery",
+                ):
+                    self.assertIn(table_name, base_schema)
+                    self.assertIn(table_name, broadcast_migration)
+                for model in self.BROADCAST_MODELS:
+                    for field in model._meta.sorted_fields:
+                        self.assertIn(field.column_name, base_schema)
+                        self.assertIn(field.column_name, broadcast_migration)
+
+    def test_sqlite_broadcast_model_schema_parity(self):
+        handle, path = tempfile.mkstemp()
+        os.close(handle)
+        try:
+            db.init_database("sqlite:///" + path)
+            for model in self.BROADCAST_MODELS:
+                with self.subTest(table=model._meta.table_name):
+                    columns = {
+                        row[1]
+                        for row in db.db.execute_sql(
+                            "PRAGMA table_info('%s')" % model._meta.table_name
+                        ).fetchall()
+                    }
+                    self.assertEqual(
+                        columns,
+                        {
+                            field.column_name
+                            for field in model._meta.sorted_fields
+                        },
+                    )
+        finally:
+            db.release_database()
+            os.remove(path)
 
     def test_postgres_runtime_clean_schema_and_20260708_upgrade(self):
         database_uri = os.environ.get("SUPYSONIC_TEST_POSTGRES_URI")

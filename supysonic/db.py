@@ -16,6 +16,14 @@ from .db_layer.annotations import (
 from .db_layer.client_releases import ClientRelease
 from .db_layer.core import Meta, PathMixin, PrimaryKeyField, db, now, random
 from .db_layer.emo import (
+    EmoBroadcast,
+    EmoBroadcastDelivery,
+    EmoBroadcastFeedbackSettlement,
+    EmoBroadcastFence,
+    EmoBroadcastIntentOutcome,
+    EmoBroadcastParticipant,
+    EmoBroadcastRevision,
+    EmoBroadcastTerminalRecovery,
     EmoDevicePlaybackState,
     EmoLocalQueue,
     EmoPlaybackControlTransaction,
