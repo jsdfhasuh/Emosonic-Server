@@ -1,3 +1,4 @@
+import json
 import time
 import unittest
 from unittest import mock
@@ -730,6 +731,325 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             getPlaybackContextState("context-participant-original"),
             before,
         )
+
+    def test_broadcast_pause_atomically_targets_source_and_ordinary(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        controller.emit(
+            "message",
+            {
+                "type": "command",
+                "action": "broadcast.pause",
+                "requestId": "broadcast-pause-r18-1",
+                "payload": {
+                    "playbackContextId": "context-broadcast-source",
+                    "broadcastId": start_ack["broadcastId"],
+                    "baseControlVersion": 1,
+                },
+            },
+            namespace="/emo",
+        )
+        controller_messages = self.get_messages(controller)
+        self.assertFalse(
+            [
+                message
+                for message in controller_messages
+                if message["action"] == "system.error"
+            ],
+            controller_messages,
+        )
+        self.get_ack(controller_messages, "broadcast-pause-r18-1")
+        observer = self._push(controller_messages, "broadcast.pause")
+        source_messages = self.get_messages(authority)
+        ordinary_messages = self.get_messages(participant)
+        source_command = self._push(source_messages, "player.pause")
+        ordinary = self._push(ordinary_messages, "broadcast.pause")
+        self.assertFalse(
+            any(
+                message["action"] == "broadcast.pause"
+                for message in source_messages
+            )
+        )
+        self.assertNotIn("deliveryId", observer["payload"])
+        self.assertIn("deliveryId", ordinary["payload"])
+        for field_name in ("effectiveAtServerMs", "serverTimeMs"):
+            self.assertEqual(
+                source_command["payload"][field_name],
+                ordinary["payload"][field_name],
+            )
+            self.assertEqual(
+                observer["payload"][field_name],
+                ordinary["payload"][field_name],
+            )
+        persisted = emo_ws.getPersistentBroadcastState(
+            start_ack["broadcastId"]
+        )
+        context = getPlaybackContextState("context-broadcast-source")
+        self.assertEqual(persisted["snapshot"]["broadcastRevision"], 2)
+        self.assertEqual(persisted["snapshot"]["state"], "paused")
+        self.assertEqual(
+            persisted["snapshot"]["sourceControlVersion"],
+            context["controlVersion"],
+        )
+        self.assertEqual(context["controlVersion"], 2)
+        self.assertEqual(
+            persisted["snapshot"]["serverUpdatedAtMs"],
+            ordinary["payload"]["effectiveAtServerMs"],
+        )
+        transaction = db.EmoPlaybackControlTransaction.get()
+        accepted_target = json.loads(transaction.accepted_target_json)
+        self.assertEqual(
+            accepted_target["effectiveAtServerMs"],
+            ordinary["payload"]["effectiveAtServerMs"],
+        )
+
+    def test_broadcast_play_item_advances_source_and_broadcast_cursors_once(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        controller.emit(
+            "message",
+            {
+                "type": "command",
+                "action": "broadcast.playItem",
+                "requestId": "broadcast-play-item-r18-1",
+                "payload": {
+                    "playbackContextId": "context-broadcast-source",
+                    "broadcastId": start_ack["broadcastId"],
+                    "queueIndex": 1,
+                    "baseQueueRevision": 1,
+                    "baseControlVersion": 1,
+                },
+            },
+            namespace="/emo",
+        )
+        controller_messages = self.get_messages(controller)
+        self.assertFalse(
+            [
+                message
+                for message in controller_messages
+                if message["action"] == "system.error"
+            ],
+            controller_messages,
+        )
+        self.get_ack(
+            controller_messages,
+            "broadcast-play-item-r18-1",
+        )
+        source = self._push(
+            self.get_messages(authority),
+            "queue.playItem",
+        )
+        ordinary = self._push(
+            self.get_messages(participant),
+            "broadcast.playItem",
+        )
+        context = getPlaybackContextState("context-broadcast-source")
+        persisted = emo_ws.getPersistentBroadcastState(
+            start_ack["broadcastId"]
+        )
+        self.assertEqual(context["currentIndex"], 1)
+        self.assertEqual(context["queueRevision"], 2)
+        self.assertEqual(context["controlVersion"], 2)
+        self.assertEqual(persisted["snapshot"]["broadcastRevision"], 2)
+        self.assertEqual(persisted["snapshot"]["sourceQueueRevision"], 2)
+        self.assertEqual(persisted["snapshot"]["sourceControlVersion"], 2)
+        self.assertEqual(persisted["snapshot"]["trackId"], "source-song-2")
+        self.assertEqual(
+            source["payload"]["effectiveAtServerMs"],
+            ordinary["payload"]["effectiveAtServerMs"],
+        )
+
+    def test_broadcast_projection_emit_failure_does_not_block_ack_or_observer(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        participant_sid = get_state().get_sid_for_client(
+            "participant-1",
+            user_name="alice",
+        )
+        real_emit = emo_ws.socketio.emit
+
+        def fail_participant_projection(event, message, *args, **kwargs):
+            if (
+                kwargs.get("to") == participant_sid
+                and message.get("action") == "broadcast.pause"
+            ):
+                raise RuntimeError("injected participant projection failure")
+            return real_emit(event, message, *args, **kwargs)
+
+        with mock.patch.object(
+            emo_ws.socketio,
+            "emit",
+            side_effect=fail_participant_projection,
+        ):
+            controller.emit(
+                "message",
+                {
+                    "type": "command",
+                    "action": "broadcast.pause",
+                    "requestId": "broadcast-pause-fanout-failure-1",
+                    "payload": {
+                        "playbackContextId": "context-broadcast-source",
+                        "broadcastId": start_ack["broadcastId"],
+                        "baseControlVersion": 1,
+                    },
+                },
+                namespace="/emo",
+            )
+
+        controller_messages = self.get_messages(controller)
+        self.get_ack(
+            controller_messages,
+            "broadcast-pause-fanout-failure-1",
+        )
+        self._push(controller_messages, "broadcast.pause")
+        self._push(self.get_messages(authority), "player.pause")
+        self.assertFalse(
+            any(
+                message["action"] == "broadcast.pause"
+                for message in self.get_messages(participant)
+            )
+        )
+        persisted = emo_ws.getPersistentBroadcastState(
+            start_ack["broadcastId"]
+        )
+        self.assertEqual(persisted["snapshot"]["broadcastRevision"], 2)
+
+    def test_broadcast_source_emit_failure_persists_failed_transaction(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        authority_sid = get_state().get_sid_for_client(
+            "authority-1",
+            user_name="alice",
+        )
+        real_emit = emo_ws.socketio.emit
+
+        def fail_source_command(event, message, *args, **kwargs):
+            if (
+                kwargs.get("to") == authority_sid
+                and message.get("action") == "player.pause"
+            ):
+                raise RuntimeError("injected source command failure")
+            return real_emit(event, message, *args, **kwargs)
+
+        with mock.patch.object(
+            emo_ws.socketio,
+            "emit",
+            side_effect=fail_source_command,
+        ):
+            controller.emit(
+                "message",
+                {
+                    "type": "command",
+                    "action": "broadcast.pause",
+                    "requestId": "broadcast-pause-source-failure-1",
+                    "payload": {
+                        "playbackContextId": "context-broadcast-source",
+                        "broadcastId": start_ack["broadcastId"],
+                        "baseControlVersion": 1,
+                    },
+                },
+                namespace="/emo",
+            )
+
+        error = self.get_error(
+            self.get_messages(controller),
+            "broadcast-pause-source-failure-1",
+        )
+        self.assertEqual(error["payload"]["code"], "internal_error")
+        transaction = db.EmoPlaybackControlTransaction.get()
+        self.assertEqual(transaction.status, "failed")
+        self.assertEqual(transaction.error_code, "execution_unknown")
+        persisted = emo_ws.getPersistentBroadcastState(
+            start_ack["broadcastId"]
+        )
+        self.assertEqual(persisted["snapshot"]["broadcastRevision"], 2)
+        self.assertEqual(persisted["snapshot"]["state"], "paused")
+        self.assertFalse(
+            any(
+                message["action"] == "broadcast.pause"
+                for message in self.get_messages(participant)
+            )
+        )
+
+    def test_stale_broadcast_control_changes_no_context_or_revision(self):
+        authority, _participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        for client in (authority, controller):
+            self.get_messages(client)
+        before_context = getPlaybackContextState("context-broadcast-source")
+        before_broadcast = emo_ws.getPersistentBroadcastState(
+            start_ack["broadcastId"]
+        )
+        controller.emit(
+            "message",
+            {
+                "type": "command",
+                "action": "broadcast.seek",
+                "requestId": "broadcast-seek-stale-r18-1",
+                "payload": {
+                    "playbackContextId": "context-broadcast-source",
+                    "broadcastId": start_ack["broadcastId"],
+                    "positionMs": 5000,
+                    "baseControlVersion": 2,
+                },
+            },
+            namespace="/emo",
+        )
+        error = self.get_error(
+            self.get_messages(controller),
+            "broadcast-seek-stale-r18-1",
+        )
+        self.assertEqual(error["payload"]["code"], "stale_version")
+        self.assertEqual(
+            getPlaybackContextState("context-broadcast-source"),
+            before_context,
+        )
+        after_broadcast = emo_ws.getPersistentBroadcastState(
+            start_ack["broadcastId"]
+        )
+        self.assertEqual(
+            after_broadcast["snapshot"],
+            before_broadcast["snapshot"],
+        )
+        self.assertEqual(self.get_messages(authority), [])
 
 
 if __name__ == "__main__":

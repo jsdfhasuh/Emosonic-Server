@@ -2686,6 +2686,8 @@ def mutateStrictPlaybackContextControl(
     routed_connection_epoch=1,
     accepted_at_ms=None,
     execution_timeout_ms=None,
+    accepted_target_extra=None,
+    post_mutation_hook=None,
 ):
     open_connection(reuse=True)
     try:
@@ -2792,6 +2794,8 @@ def mutateStrictPlaybackContextControl(
                 }:
                     accepted_target["queueIndex"] = record.current_index
                     accepted_target["queueRevision"] = record.queue_revision
+                if accepted_target_extra:
+                    accepted_target.update(dict(accepted_target_extra))
                 transaction_record = EmoPlaybackControlTransaction.create(
                     playback_context_id=playback_context_id,
                     user_name=user_name,
@@ -2813,6 +2817,12 @@ def mutateStrictPlaybackContextControl(
                 )
                 result["_controlTransaction"] = (
                     serializePlaybackControlTransaction(transaction_record)
+                )
+            if post_mutation_hook is not None:
+                result["_broadcastMutation"] = post_mutation_hook(
+                    record,
+                    result,
+                    current,
                 )
             return result
     finally:

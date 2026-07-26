@@ -3,7 +3,7 @@ import json
 import threading
 import time
 from contextlib import contextmanager
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from peewee import IntegrityError, SqliteDatabase
 
@@ -1116,6 +1116,93 @@ def _prune_revision_ledger(
     ).execute()
 
 
+@contextmanager
+def broadcastMutationLock(broadcast_id: str) -> Iterator[None]:
+    open_connection(reuse=True)
+    try:
+        resource_keys = _broadcast_resource_keys(broadcast_id)
+        fence_rows = list(
+            EmoBroadcastFence.select().where(
+                EmoBroadcastFence.broadcast_id == broadcast_id
+            )
+        )
+    finally:
+        close_connection()
+    context_ids = [
+        row.playback_context_id
+        for row in fence_rows
+        if row.playback_context_id
+    ]
+    authority_pairs = [
+        (row.user_name, row.client_id, row.device_session_id)
+        for row in fence_rows
+        if row.client_id and row.device_session_id
+    ]
+    with strictPlaybackContextLockSet(context_ids), strictAuthorityPairLockSet(
+        authority_pairs
+    ), broadcastResourceLock(resource_keys):
+        yield
+
+
+def commitBroadcastRevisionInTransaction(
+    broadcast_id: str,
+    expected_broadcast_revision: int,
+    snapshot: Dict[str, object],
+    canonical_action: str,
+    deliveries: Sequence[Dict[str, object]] = (),
+    created_at_ms: Optional[int] = None,
+) -> Dict[str, object]:
+    record = EmoBroadcast.get_or_none(
+        EmoBroadcast.broadcast_id == broadcast_id
+    )
+    if record is None:
+        raise BroadcastNotFoundError(broadcast_id)
+    if record.broadcast_revision != expected_broadcast_revision:
+        raise BroadcastRevisionConflictError(record.broadcast_revision)
+    if record.lifecycle_state == "stopped":
+        raise BroadcastResourceConflictError(
+            "Terminal Broadcast cannot advance"
+        )
+    next_revision = expected_broadcast_revision + 1
+    if (
+        snapshot.get("broadcastId") != broadcast_id
+        or snapshot.get("broadcastRevision") != next_revision
+    ):
+        raise ValueError("Snapshot must carry the next Broadcast revision")
+    lifecycle_state = snapshot.get("lifecycleState")
+    if lifecycle_state not in ("active", "waitingForSource"):
+        raise ValueError("Nonterminal revision has invalid lifecycleState")
+    ledger_time_ms = int(
+        created_at_ms
+        if created_at_ms is not None
+        else snapshot.get("serverUpdatedAtMs")
+        or time.time() * 1000
+    )
+    EmoBroadcastRevision.create(
+        broadcast_id=broadcast_id,
+        broadcast_revision=next_revision,
+        snapshot_json=_canonical_json(snapshot),
+        canonical_action=canonical_action,
+        created_at_ms=ledger_time_ms,
+    )
+    for delivery in deliveries:
+        _create_delivery(broadcast_id, next_revision, delivery)
+    record.lifecycle_state = lifecycle_state
+    record.broadcast_revision = next_revision
+    record.snapshot_json = _canonical_json(snapshot)
+    record.authority_disconnect_deadline_ms = snapshot.get(
+        "authorityDisconnectDeadlineMs"
+    )
+    record.updated_at = now()
+    record.save()
+    _prune_revision_ledger(
+        broadcast_id,
+        next_revision,
+        ledger_time_ms,
+    )
+    return _serialize_broadcast_record(record)
+
+
 def commitBroadcastRevision(
     broadcast_id: str,
     expected_broadcast_revision: int,
@@ -1129,65 +1216,14 @@ def commitBroadcastRevision(
         resource_keys = _broadcast_resource_keys(broadcast_id)
         with broadcastResourceLock(resource_keys):
             with broadcastTransaction():
-                record = EmoBroadcast.get_or_none(
-                    EmoBroadcast.broadcast_id == broadcast_id
-                )
-                if record is None:
-                    raise BroadcastNotFoundError(broadcast_id)
-                if record.broadcast_revision != expected_broadcast_revision:
-                    raise BroadcastRevisionConflictError(
-                        record.broadcast_revision
-                    )
-                if record.lifecycle_state == "stopped":
-                    raise BroadcastResourceConflictError(
-                        "Terminal Broadcast cannot advance"
-                    )
-                next_revision = expected_broadcast_revision + 1
-                if (
-                    snapshot.get("broadcastId") != broadcast_id
-                    or snapshot.get("broadcastRevision") != next_revision
-                ):
-                    raise ValueError(
-                        "Snapshot must carry the next Broadcast revision"
-                    )
-                lifecycle_state = snapshot.get("lifecycleState")
-                if lifecycle_state not in ("active", "waitingForSource"):
-                    raise ValueError(
-                        "Nonterminal revision has invalid lifecycleState"
-                    )
-                ledger_time_ms = int(
-                    created_at_ms
-                    if created_at_ms is not None
-                    else snapshot.get("serverUpdatedAtMs")
-                    or time.time() * 1000
-                )
-                EmoBroadcastRevision.create(
-                    broadcast_id=broadcast_id,
-                    broadcast_revision=next_revision,
-                    snapshot_json=_canonical_json(snapshot),
-                    canonical_action=canonical_action,
-                    created_at_ms=ledger_time_ms,
-                )
-                for delivery in deliveries:
-                    _create_delivery(
-                        broadcast_id,
-                        next_revision,
-                        delivery,
-                    )
-                record.lifecycle_state = lifecycle_state
-                record.broadcast_revision = next_revision
-                record.snapshot_json = _canonical_json(snapshot)
-                record.authority_disconnect_deadline_ms = snapshot.get(
-                    "authorityDisconnectDeadlineMs"
-                )
-                record.updated_at = now()
-                record.save()
-                _prune_revision_ledger(
+                return commitBroadcastRevisionInTransaction(
                     broadcast_id,
-                    next_revision,
-                    ledger_time_ms,
+                    expected_broadcast_revision,
+                    snapshot,
+                    canonical_action,
+                    deliveries=deliveries,
+                    created_at_ms=created_at_ms,
                 )
-                return _serialize_broadcast_record(record)
     finally:
         close_connection()
 

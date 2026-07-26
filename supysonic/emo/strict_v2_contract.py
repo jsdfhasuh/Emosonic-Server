@@ -1126,19 +1126,20 @@ def _validate_broadcast_snapshot(
     )
     if snapshot["authorityClientId"] in participants:
         _output_error("%s.participants must exclude authorityClientId" % label)
-    delivery_fields = {
-        "deliveryId",
+    timing_fields = {
         "effectiveAtServerMs",
         "serverTimeMs",
     }.intersection(snapshot)
-    if delivery_fields and delivery_fields != {
-        "deliveryId",
+    if timing_fields and timing_fields != {
         "effectiveAtServerMs",
         "serverTimeMs",
     }:
-        _output_error("%s delivery fields must appear together" % label)
-    if delivery_fields:
+        _output_error("%s timing fields must appear together" % label)
+    if "deliveryId" in snapshot and not timing_fields:
+        _output_error("%s deliveryId requires timing fields" % label)
+    if "deliveryId" in snapshot:
         _output_string(snapshot["deliveryId"], label + ".deliveryId")
+    if timing_fields:
         _output_int(snapshot["effectiveAtServerMs"], label + ".effectiveAtServerMs", 1)
         _output_int(snapshot["serverTimeMs"], label + ".serverTimeMs")
         if snapshot["effectiveAtServerMs"] - snapshot["serverTimeMs"] < 250:
@@ -1836,7 +1837,9 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
                 "sourceClientId",
                 "executionTimeoutMs",
             }
-            optional = {"positionMs"} if action in {"player.play", "player.pause"} else set()
+            optional = {"effectiveAtServerMs", "serverTimeMs"}
+            if action in {"player.play", "player.pause"}:
+                optional.add("positionMs")
             if action == "player.seek":
                 required.add("positionMs")
             control = _output_object(payload, required, optional, "%s payload" % action)
@@ -1851,6 +1854,20 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
             )
         if "positionMs" in control:
             _output_int(control["positionMs"], "%s positionMs" % action)
+        if "effectiveAtServerMs" in control or "serverTimeMs" in control:
+            if not {"effectiveAtServerMs", "serverTimeMs"}.issubset(control):
+                _output_error("%s timing fields must appear together" % action)
+            effective_at = _output_int(
+                control["effectiveAtServerMs"],
+                "%s effectiveAtServerMs" % action,
+                1,
+            )
+            server_time = _output_int(
+                control["serverTimeMs"],
+                "%s serverTimeMs" % action,
+            )
+            if effective_at - server_time < 250:
+                _output_error("%s effective-at lead must be at least 250ms" % action)
         return None
     if action == "queue.playItem":
         control = _output_object(
@@ -1864,7 +1881,7 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
                 "sourceClientId",
                 "executionTimeoutMs",
             },
-            set(),
+            {"effectiveAtServerMs", "serverTimeMs"},
             "queue.playItem payload",
         )
         _output_string(control["playbackContextId"], "queue.playItem playbackContextId")
@@ -1884,6 +1901,22 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
             1,
         )
         _output_string(control["sourceClientId"], "queue.playItem sourceClientId")
+        if "effectiveAtServerMs" in control or "serverTimeMs" in control:
+            if not {"effectiveAtServerMs", "serverTimeMs"}.issubset(control):
+                _output_error("queue.playItem timing fields must appear together")
+            effective_at = _output_int(
+                control["effectiveAtServerMs"],
+                "queue.playItem effectiveAtServerMs",
+                1,
+            )
+            server_time = _output_int(
+                control["serverTimeMs"],
+                "queue.playItem serverTimeMs",
+            )
+            if effective_at - server_time < 250:
+                _output_error(
+                    "queue.playItem effective-at lead must be at least 250ms"
+                )
         return None
     if action == "playback.prepare":
         prepare = _output_object(
