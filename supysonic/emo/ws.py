@@ -32,6 +32,7 @@ from .broadcast_store import (
     BroadcastNotFoundError,
     BroadcastResourceConflictError,
     BroadcastRevisionConflictError,
+    buildTerminalBroadcastSnapshot,
     broadcastMutationLock,
     commitBroadcastRevisionInTransaction,
     compactExpiredBroadcastStates,
@@ -998,6 +999,7 @@ def _prepare_strict_request_cache(
     retry_after_ms = strict_v2_safety.check_rate_limit(
         connection_nonce,
         action,
+        message.get("payload"),
     )
     if retry_after_ms is None:
         return True
@@ -4708,13 +4710,9 @@ def _commit_r18_broadcast_terminal(
     server_time_ms: int,
 ) -> Dict[str, object]:
     previous = persisted["snapshot"]
-    snapshot = dict(previous)
-    snapshot.update(
-        {
-            "lifecycleState": "stopped",
-            "broadcastRevision": previous["broadcastRevision"] + 1,
-            "serverUpdatedAtMs": server_time_ms,
-        }
+    snapshot = buildTerminalBroadcastSnapshot(
+        previous,
+        server_time_ms,
     )
     deliveries = _build_r18_terminal_deliveries(
         persisted,
@@ -5324,6 +5322,21 @@ def _handle_strict_broadcast_stop(
     payload,
     request_id,
 ):
+    with broadcastMutationLock(payload["broadcastId"]):
+        return _handle_strict_broadcast_stop_locked(
+            current_user_name,
+            current_client,
+            payload,
+            request_id,
+        )
+
+
+def _handle_strict_broadcast_stop_locked(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+):
     persisted = getPersistentBroadcastState(payload["broadcastId"])
     if persisted is None:
         outcome = getBroadcastStopOutcome(
@@ -5363,12 +5376,9 @@ def _handle_strict_broadcast_stop(
     server_time_ms = _server_time_ms()
     terminal_snapshot = dict(broadcast)
     if broadcast["lifecycleState"] != "stopped":
-        terminal_snapshot.update(
-            {
-                "lifecycleState": "stopped",
-                "broadcastRevision": broadcast["broadcastRevision"] + 1,
-                "serverUpdatedAtMs": server_time_ms,
-            }
+        terminal_snapshot = buildTerminalBroadcastSnapshot(
+            broadcast,
+            server_time_ms,
         )
     deliveries = _build_r18_terminal_deliveries(
         persisted,

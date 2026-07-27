@@ -861,15 +861,31 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             initial_delivery,
             request_id="broadcast-feedback-old-attempt-1",
         )
-        conflict = self.get_error(
-            self.get_messages(reconnected),
-            "broadcast-feedback-old-attempt-1",
+        stale_messages = self.get_messages(reconnected)
+        rejected = self._push(
+            stale_messages,
+            "broadcast.feedback.rejected",
         )
-        self.assertEqual(conflict["payload"]["code"], "conflict")
+        replacement = self._push(stale_messages, "broadcast.resync")
+        self.assertEqual(rejected["payload"]["errorCode"], "revision_unknown")
+        self.assertEqual(rejected["payload"]["rejectedBroadcastRevision"], 1)
+        self.assertNotEqual(
+            replacement["payload"]["deliveryId"],
+            resync["payload"]["deliveryId"],
+        )
         current = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
         self.assertEqual(
             current["participantStates"][0]["targetDeliveryId"],
-            resync["payload"]["deliveryId"],
+            replacement["payload"]["deliveryId"],
+        )
+        current_deliveries = [
+            delivery for delivery in current["deliveries"]
+            if delivery["isCurrent"]
+        ]
+        self.assertEqual(len(current_deliveries), 1)
+        self.assertEqual(
+            current_deliveries[0]["deliveryId"],
+            replacement["payload"]["deliveryId"],
         )
 
     def test_source_disconnect_waits_then_fresh_update_resumes(self):

@@ -11,6 +11,7 @@ const {
   StrictProtocolError,
   StrictV2Client,
   containsForbiddenSessionField,
+  restoreBroadcastParticipantContext,
   stableStringify,
   validateQueue,
 } = require('../../supysonic/static/js/emo_strict_v2_client.js');
@@ -191,6 +192,119 @@ test('business requests are gated until transport bootstrap is ready', async () 
     /forbidden before ready/,
   );
   assert.equal(socket.sent.length, 0);
+});
+
+test('registered replay feedback can settle while bootstrap is synchronizing', async () => {
+  const { client, socket } = readyClient();
+  client.state = 'synchronizing';
+  client.negotiatedCapabilities = { ...PLAYER_CAPABILITIES, supportsBroadcast: true };
+  const payload = {
+    playbackContextId: 'ctx-source',
+    broadcastId: 'broadcast-1',
+    deviceSessionId: 'web-player-device:1',
+    deliveryId: 'delivery-1',
+    executionStatus: 'failed',
+    failedBroadcastRevision: 2,
+    lastAppliedBroadcastRevision: 1,
+    errorCode: 'restore_failed',
+    clientSeq: 1,
+  };
+
+  const pending = client.request('broadcast.feedback', payload, {
+    allowBeforeReady: true,
+    requireRegistration: true,
+  });
+  assert.equal(socket.sent.length, 1);
+  client._onMessage({
+    type: 'event',
+    action: 'broadcast.feedback',
+    payload: {
+      ...payload,
+      sourceClientId: 'web-player-1',
+      serverUpdatedAtMs: 1000,
+    },
+    timestamp: 1,
+    connectionNonce: 'nonce-1',
+    connectionEpoch: 1,
+  });
+  assert.equal((await pending).action, 'broadcast.feedback');
+});
+
+test('early replay feedback still requires registration provenance', async () => {
+  const { client, socket } = readyClient();
+  client.state = 'registering';
+  client.connectionNonce = null;
+  client.connectionEpoch = null;
+  client.negotiatedCapabilities = null;
+  await assert.rejects(
+    client.request('broadcast.feedback', {}, {
+      allowBeforeReady: true,
+      requireRegistration: true,
+    }),
+    /requires completed registration/,
+  );
+  assert.equal(socket.sent.length, 0);
+});
+
+test('broadcast terminal restore uses the suspended Context and reports completion only after apply', async () => {
+  const calls = [];
+  const result = await restoreBroadcastParticipantContext({
+    snapshot: { suspendedPlaybackContextId: 'ctx-snapshot' },
+    recovery: { suspendedPlaybackContextId: 'ctx-recovery' },
+    currentContextId: 'ctx-current',
+    async refreshContext(contextId) {
+      calls.push(['refresh', contextId]);
+      return {
+        payload: {
+          playbackContext: { playbackContextId: contextId, queueSongIds: ['track-1'] },
+        },
+      };
+    },
+    selectContext(contextId) { calls.push(['select', contextId]); },
+    clearContext(contextId) { calls.push(['clear', contextId]); },
+    async applyContext(context) { calls.push(['apply', context.playbackContextId]); },
+  });
+
+  assert.deepEqual(result, { contextId: 'ctx-snapshot', contextClosed: false });
+  assert.deepEqual(calls, [
+    ['refresh', 'ctx-snapshot'],
+    ['select', 'ctx-snapshot'],
+    ['apply', 'ctx-snapshot'],
+  ]);
+});
+
+test('broadcast terminal restore resolves closed Context but preserves transient failures', async () => {
+  const cleared = [];
+  const closed = new Error('closed');
+  closed.code = 'context_closed';
+  const closedResult = await restoreBroadcastParticipantContext({
+    snapshot: {},
+    recovery: { suspendedPlaybackContextId: 'ctx-recovery' },
+    currentContextId: 'ctx-current',
+    async refreshContext() { throw closed; },
+    selectContext() { throw new Error('must not select a closed Context'); },
+    clearContext(contextId) { cleared.push(contextId); },
+    async applyContext() { throw new Error('must not apply a closed Context'); },
+  });
+  assert.deepEqual(closedResult, {
+    contextId: 'ctx-recovery',
+    contextClosed: true,
+  });
+  assert.deepEqual(cleared, ['ctx-recovery']);
+
+  const transient = new Error('temporary database failure');
+  await assert.rejects(
+    restoreBroadcastParticipantContext({
+      snapshot: {},
+      recovery: { suspendedPlaybackContextId: 'ctx-recovery' },
+      currentContextId: 'ctx-current',
+      async refreshContext() { throw transient; },
+      selectContext() {},
+      clearContext() {},
+      async applyContext() {},
+    }),
+    transient,
+  );
 });
 
 test('request retry reuses the byte-equivalent envelope and fingerprint', async () => {

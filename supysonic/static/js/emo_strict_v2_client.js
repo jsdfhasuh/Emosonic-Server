@@ -863,6 +863,18 @@
         return Promise.reject(new StrictProtocolError(`Unsupported strict-v2 action: ${action}`));
       }
       if (
+        requestOptions.requireRegistration
+        && (
+          !this.connectionNonce
+          || !Number.isInteger(this.connectionEpoch)
+          || !this.negotiatedCapabilities
+        )
+      ) {
+        return Promise.reject(new StrictProtocolError(
+          `Action ${action} requires completed registration`,
+        ));
+      }
+      if (
         this.state !== 'ready'
         && !requestOptions.allowBeforeReady
         && !READY_BYPASS_ACTIONS.has(action)
@@ -1242,6 +1254,39 @@
     return created;
   }
 
+  async function restoreBroadcastParticipantContext(options) {
+    const snapshot = options.snapshot || {};
+    const recovery = options.recovery || {};
+    const contextId = [
+      snapshot.suspendedPlaybackContextId,
+      recovery.suspendedPlaybackContextId,
+      options.currentContextId,
+    ].find((value) => typeof value === 'string' && value);
+    if (!contextId) {
+      const error = new Error('Broadcast recovery does not identify the original Context');
+      error.code = 'restore_failed';
+      throw error;
+    }
+
+    let response;
+    try {
+      response = await options.refreshContext(contextId);
+    } catch (error) {
+      if (!['context_closed', 'not_found'].includes(error && error.code)) throw error;
+      options.clearContext(contextId);
+      return { contextId, contextClosed: true };
+    }
+    const context = response && response.payload && response.payload.playbackContext;
+    if (!context || context.playbackContextId !== contextId) {
+      const error = new Error('Broadcast recovery returned the wrong original Context');
+      error.code = 'restore_failed';
+      throw error;
+    }
+    options.selectContext(contextId);
+    await options.applyContext(context);
+    return { contextId, contextClosed: false };
+  }
+
   return {
     ACTION_TYPES,
     CAPABILITY_NAMES,
@@ -1252,6 +1297,7 @@
     StrictRequestError,
     StrictV2Client,
     containsForbiddenSessionField,
+    restoreBroadcastParticipantContext,
     stableIdentity,
     stableStringify,
     validateQueue,

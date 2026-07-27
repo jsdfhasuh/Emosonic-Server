@@ -79,6 +79,10 @@ class ConfigTestCase(unittest.TestCase):
             defaults["emo_strict_requests_per_connection_per_minute"],
             120,
         )
+        self.assertEqual(
+            defaults["emo_strict_passive_feedbacks_per_connection_per_second"],
+            10,
+        )
         self.assertFalse(
             defaults["emo_strict_v2_allow_local_test_evidence"]
         )

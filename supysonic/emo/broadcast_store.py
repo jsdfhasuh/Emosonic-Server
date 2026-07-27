@@ -1304,6 +1304,30 @@ def commitBroadcastRevision(
         close_connection()
 
 
+def buildTerminalBroadcastSnapshot(
+    previous: Dict[str, object],
+    terminal_at_ms: int,
+) -> Dict[str, object]:
+    position_ms = int(previous["positionMs"])
+    if previous["state"] == "playing":
+        position_ms = projectBroadcastPositionMs(
+            position_ms,
+            int(previous["serverUpdatedAtMs"]),
+            terminal_at_ms,
+            float(previous["playbackRate"]),
+        )
+    snapshot = dict(previous)
+    snapshot.update(
+        {
+            "lifecycleState": "stopped",
+            "broadcastRevision": int(previous["broadcastRevision"]) + 1,
+            "positionMs": position_ms,
+            "serverUpdatedAtMs": terminal_at_ms,
+        }
+    )
+    return snapshot
+
+
 def terminalBroadcastStateInTransaction(
     broadcast_id: str,
     snapshot: Dict[str, object],
@@ -1980,7 +2004,10 @@ def settleBroadcastFeedback(
                     )
                     & (EmoBroadcastDelivery.is_current == 1)
                 )
-                if delivery is None:
+                if (
+                    delivery is None
+                    or delivery.delivery_id != payload["deliveryId"]
+                ):
                     current_revision = int(broadcast.broadcast_revision)
                     minimum_revision = _minimum_retained_broadcast_revision(
                         broadcast_id
@@ -2035,10 +2062,6 @@ def settleBroadcastFeedback(
                     result = _feedback_settlement_result(settlement)
                     result["created"] = True
                     return result
-                if delivery.delivery_id != payload["deliveryId"]:
-                    raise BroadcastResourceConflictError(
-                        "Broadcast feedback deliveryId is not current"
-                    )
                 target = _load_json(delivery.payload_json, {})
                 terminal = (
                     broadcast.lifecycle_state == "stopped"
@@ -2580,13 +2603,9 @@ def sweepBroadcastAuthorityDisconnectDeadlines(
                     ):
                         continue
                     previous = _load_json(record.snapshot_json, {})
-                    snapshot = dict(previous)
-                    snapshot.update(
-                        {
-                            "lifecycleState": "stopped",
-                            "broadcastRevision": int(record.broadcast_revision) + 1,
-                            "serverUpdatedAtMs": sweep_time_ms,
-                        }
+                    snapshot = buildTerminalBroadcastSnapshot(
+                        previous,
+                        sweep_time_ms,
                     )
                     deliveries = []
                     participants = EmoBroadcastParticipant.select().where(
@@ -2662,13 +2681,9 @@ def stopNonterminalBroadcastsForRestart(
                     if record is None or record.lifecycle_state == "stopped":
                         continue
                     previous = _load_json(record.snapshot_json, {})
-                    snapshot = dict(previous)
-                    snapshot.update(
-                        {
-                            "lifecycleState": "stopped",
-                            "broadcastRevision": int(record.broadcast_revision) + 1,
-                            "serverUpdatedAtMs": stopped_at_ms,
-                        }
+                    snapshot = buildTerminalBroadcastSnapshot(
+                        previous,
+                        stopped_at_ms,
                     )
                     deliveries = []
                     for participant in EmoBroadcastParticipant.select().where(

@@ -13,6 +13,7 @@ DEFAULT_LIMITS = {
     "authenticated_connections_per_user": 20,
     "requests_per_connection_per_minute": 120,
     "controls_per_connection_per_second": 20,
+    "passive_feedbacks_per_connection_per_second": 10,
     "creates_per_connection_per_minute": 10,
     "handoff_starts_per_connection_per_minute": 10,
     "broadcast_starts_per_connection_per_minute": 10,
@@ -23,6 +24,9 @@ _CONFIG_KEYS = {
     "authenticated_connections_per_user": "emo_authenticated_connections_per_user",
     "requests_per_connection_per_minute": "emo_strict_requests_per_connection_per_minute",
     "controls_per_connection_per_second": "emo_strict_controls_per_connection_per_second",
+    "passive_feedbacks_per_connection_per_second": (
+        "emo_strict_passive_feedbacks_per_connection_per_second"
+    ),
     "creates_per_connection_per_minute": "emo_strict_creates_per_connection_per_minute",
     "handoff_starts_per_connection_per_minute": "emo_strict_handoff_starts_per_connection_per_minute",
     "broadcast_starts_per_connection_per_minute": "emo_strict_broadcast_starts_per_connection_per_minute",
@@ -164,7 +168,12 @@ class StrictV2Safety:
                 self._condition.wait(remaining)
             return True
 
-    def check_rate_limit(self, connection_nonce: str, action: str) -> Optional[int]:
+    def check_rate_limit(
+        self,
+        connection_nonce: str,
+        action: str,
+        payload: Optional[Mapping[str, object]] = None,
+    ) -> Optional[int]:
         checks = [
             (
                 "requests",
@@ -172,11 +181,26 @@ class StrictV2Safety:
                 60.0,
             )
         ]
-        if action in _CONTROL_ACTIONS:
+        playback_origin = None if payload is None else payload.get("origin")
+        if action in _CONTROL_ACTIONS or (
+            action == "playback.update" and playback_origin == "localUser"
+        ):
             checks.append(
                 (
                     "controls",
                     self._limits["controls_per_connection_per_second"],
+                    1.0,
+                )
+            )
+        if action == "broadcast.feedback" or (
+            action == "playback.update" and playback_origin == "passive"
+        ):
+            checks.append(
+                (
+                    "passive_feedbacks",
+                    self._limits[
+                        "passive_feedbacks_per_connection_per_second"
+                    ],
                     1.0,
                 )
             )

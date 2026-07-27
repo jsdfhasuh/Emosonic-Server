@@ -16,6 +16,7 @@ from supysonic.emo.broadcast_store import (
     BroadcastFeedbackSequenceConflictError,
     BroadcastLimitError,
     BroadcastResourceConflictError,
+    buildTerminalBroadcastSnapshot,
     commitBroadcastRevision,
     compactExpiredBroadcastStates,
     createBroadcastRegistrationReplay,
@@ -335,7 +336,6 @@ class EmoBroadcastStoreTestCase(unittest.TestCase):
     def test_feedback_target_mismatch_has_no_side_effects(self):
         self._create()
         variants = (
-            {"deliveryId": "wrong-delivery"},
             {"queueIndex": 1},
             {"trackId": "song-2"},
             {"state": "paused"},
@@ -430,12 +430,35 @@ class EmoBroadcastStoreTestCase(unittest.TestCase):
             19250,
         )
 
-        with self.assertRaises(BroadcastResourceConflictError):
-            self._settle(
-                self._applied_feedback(client_seq=2),
-                "superseded-delivery",
-                13000,
-            )
+        stale = self._settle(
+            self._applied_feedback(client_seq=2),
+            "superseded-delivery",
+            13000,
+        )
+        stale_replay = self._settle(
+            self._applied_feedback(client_seq=2),
+            "superseded-delivery",
+            14000,
+        )
+        self.assertTrue(stale["created"])
+        self.assertEqual(stale["action"], "broadcast.feedback.rejected")
+        self.assertEqual(
+            stale["canonicalResult"]["errorCode"],
+            "revision_unknown",
+        )
+        self.assertFalse(stale_replay["created"])
+        self.assertEqual(
+            stale_replay["followUpDelivery"]["deliveryId"],
+            stale["followUpDelivery"]["deliveryId"],
+        )
+        state = getBroadcastState("broadcast-1")
+        current = [item for item in state["deliveries"] if item["isCurrent"]]
+        self.assertEqual(len(current), 1)
+        self.assertEqual(
+            current[0]["deliveryId"],
+            stale["followUpDelivery"]["deliveryId"],
+        )
+        self.assertEqual(state["snapshot"], snapshot_before)
 
     def test_feedback_unknown_revision_classification(self):
         self._create()
@@ -673,7 +696,20 @@ class EmoBroadcastStoreTestCase(unittest.TestCase):
         self.assertEqual(persisted["lifecycleState"], "stopped")
         self.assertEqual(persisted["broadcastRevision"], 3)
         self.assertTrue(persisted["participantStates"][0]["restorePending"])
+        self.assertEqual(persisted["snapshot"]["positionMs"], 3200)
         self.assertEqual(stopNonterminalBroadcastsForRestart(14000), [])
+
+    def test_terminal_snapshot_projects_only_a_playing_anchor(self):
+        playing = buildTerminalBroadcastSnapshot(self._snapshot(), 13000)
+        self.assertEqual(playing["positionMs"], 4200)
+        self.assertEqual(playing["serverUpdatedAtMs"], 13000)
+
+        for state_name in ("paused", "stopped"):
+            with self.subTest(state=state_name):
+                previous = dict(self._snapshot(), state=state_name)
+                terminal = buildTerminalBroadcastSnapshot(previous, 13000)
+                self.assertEqual(terminal["positionMs"], 1200)
+                self.assertEqual(terminal["serverUpdatedAtMs"], 13000)
 
     def test_compaction_failure_preserves_full_terminal_record(self):
         self._create()

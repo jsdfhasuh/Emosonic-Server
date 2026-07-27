@@ -543,7 +543,12 @@
     }
   }
 
-  async function applyContext(context, follow = false, deviceStates = []) {
+  async function applyContext(
+    context,
+    follow = false,
+    deviceStates = [],
+    requirePlaybackRestore = false,
+  ) {
     if (!context || typeof context.playbackContextId !== 'string') return;
     const incomingCurrent = state.client.isCurrentContextSnapshot(context);
     const canonicalContext = state.client.cursor(context.playbackContextId);
@@ -632,8 +637,12 @@
     } else {
       loadRequiredCurrent(context.positionMs || 0);
     }
-    if (playback.state === 'playing') await safePlay('远程播放需要用户手势');
-    else if (playback.state === 'paused') audio.pause();
+    if (playback.state === 'playing') {
+      const started = await safePlay('远程播放需要用户手势');
+      if (!started && requirePlaybackRestore) {
+        throw new Error('Original Context playback did not resume');
+      }
+    } else if (playback.state === 'paused') audio.pause();
     else { audio.pause(); state.playbackState = 'stopped'; }
     renderQueue();
     await reportFeedback();
@@ -960,7 +969,7 @@
   }
 
   async function sendBroadcastFeedback(snapshot, terminal, failure = null) {
-    if (!snapshot.deliveryId || !state.client || state.client.state !== 'ready') return;
+    if (!snapshot.deliveryId || !state.client) return false;
     const revision = snapshot.broadcastRevision ?? snapshot.terminalBroadcastRevision;
     const payload = {
       playbackContextId: snapshot.playbackContextId,
@@ -987,7 +996,10 @@
       if (terminal) payload.restoreCompleted = true;
     }
     try {
-      const response = await state.client.request('broadcast.feedback', payload);
+      const response = await state.client.request('broadcast.feedback', payload, {
+        allowBeforeReady: true,
+        requireRegistration: true,
+      });
       if (response.action !== 'broadcast.feedback') return false;
       if (!failure) {
         state.broadcastAppliedRevision = revision;
@@ -1057,12 +1069,29 @@
       if (terminal) {
         audio.pause();
         state.playbackState = 'stopped';
-        if (state.contextId) {
-          const contextId = state.contextId;
-          const response = await state.client.refreshContext(contextId).catch(() => null);
-          if (response && state.contextId === contextId) {
-            await applyContext(response.payload.playbackContext);
-          }
+        try {
+          await api.restoreBroadcastParticipantContext({
+            snapshot,
+            recovery: state.broadcastExecution,
+            currentContextId: state.contextId,
+            refreshContext: (contextId) => state.client.refreshContext(contextId),
+            selectContext: (contextId) => setContextId(contextId),
+            clearContext: (contextId) => {
+              state.client.forgetSubscription(contextId);
+              if (state.contextId === contextId) setContextId(null);
+            },
+            applyContext: (context) => applyContext(context, false, [], true),
+          });
+        } catch (error) {
+          state.processedCommands.delete(api.stableStringify({
+            action: message.action,
+            payload: message.payload,
+          }));
+          await sendBroadcastFeedback(snapshot, true, {
+            code: 'restore_failed',
+            message: error.message || 'Original Context restore failed',
+          });
+          return;
         }
         const terminalConfirmed = await sendBroadcastFeedback(snapshot, true);
         if (!terminalConfirmed) return;
@@ -1079,13 +1108,16 @@
       state.broadcastExecution = {
         broadcastId: snapshot.broadcastId,
         deliveryId: snapshot.deliveryId,
+        suspendedPlaybackContextId:
+          snapshot.suspendedPlaybackContextId || state.contextId,
       };
       localStorage.setItem(
         'emosonic.webPlayer.broadcastRecovery.v2',
         JSON.stringify({
           broadcastId: snapshot.broadcastId,
           playbackContextId: snapshot.playbackContextId,
-          suspendedPlaybackContextId: state.contextId,
+          suspendedPlaybackContextId:
+            snapshot.suspendedPlaybackContextId || state.contextId,
           lastAppliedBroadcastRevision: state.broadcastAppliedRevision,
         }),
       );
@@ -1421,6 +1453,14 @@
     setInterval(() => {
       if (state.client.state === 'ready') refreshBindings().catch(() => {});
     }, 10000);
+    setInterval(() => {
+      if (
+        state.client.state === 'ready'
+        && activeFeedbackContextId()
+        && !audio.paused
+        && state.playbackState === 'playing'
+      ) reportFeedback();
+    }, 1000);
   }
 
   start().catch((error) => showError(error.message));

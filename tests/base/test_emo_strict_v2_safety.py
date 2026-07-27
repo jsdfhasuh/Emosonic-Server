@@ -146,6 +146,46 @@ class StrictV2SafetyTestCase(unittest.TestCase):
             1000,
         )
 
+    def test_passive_updates_and_broadcast_feedback_share_rate_limit(self):
+        nonce = "nonce-passive-feedback"
+        for _ in range(5):
+            self.assertIsNone(
+                self.safety.check_rate_limit(
+                    nonce,
+                    "playback.update",
+                    {"origin": "passive"},
+                )
+            )
+            self.assertIsNone(
+                self.safety.check_rate_limit(nonce, "broadcast.feedback", {})
+            )
+        self.assertEqual(
+            self.safety.check_rate_limit(
+                nonce,
+                "playback.update",
+                {"origin": "passive"},
+            ),
+            1000,
+        )
+
+    def test_local_user_updates_share_the_control_rate_limit(self):
+        nonce = "nonce-local-controls"
+        for _ in range(10):
+            self.assertIsNone(
+                self.safety.check_rate_limit(nonce, "player.seek", {})
+            )
+            self.assertIsNone(
+                self.safety.check_rate_limit(
+                    nonce,
+                    "playback.update",
+                    {"origin": "localUser"},
+                )
+            )
+        self.assertEqual(
+            self.safety.check_rate_limit(nonce, "player.pause", {}),
+            1000,
+        )
+
     def test_default_start_rate_limit_boundaries_are_independent(self):
         for nonce, action in (
             ("nonce-ensure", "playback.context.ensure"),

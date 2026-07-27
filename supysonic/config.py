@@ -53,6 +53,7 @@ class DefaultConfig:
         "emo_authenticated_connections_per_user": 20,
         "emo_strict_requests_per_connection_per_minute": 120,
         "emo_strict_controls_per_connection_per_second": 20,
+        "emo_strict_passive_feedbacks_per_connection_per_second": 10,
         "emo_strict_creates_per_connection_per_minute": 10,
         "emo_strict_handoff_starts_per_connection_per_minute": 10,
         "emo_strict_broadcast_starts_per_connection_per_minute": 10,
