@@ -372,6 +372,52 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         self.assertEqual(db.EmoBroadcastDelivery.select().count(), 1)
         self.assertEqual(db.EmoPlaybackContext.select().count(), 2)
 
+    def test_start_accepts_source_immediately_after_queue_sync(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        sampled_at_ms = int(time.time() * 1000)
+        self.sync_source_queue(
+            authority,
+            ["source-song-1", "source-song-2"],
+            current_index=0,
+            position_ms=1100,
+            sampled_at_ms=sampled_at_ms,
+            request_id="source-queue-before-start",
+        )
+        queue_messages = self.get_messages(authority)
+        self.get_ack(queue_messages, "source-queue-before-start")
+        self.get_messages(participant)
+        self.get_messages(controller)
+
+        context = getPlaybackContextState("context-broadcast-source")
+        source_state = getDevicePlaybackState(
+            "context-broadcast-source",
+            "authority-1",
+        )
+        self.assertEqual(
+            source_state["appliedControlVersion"],
+            context["controlVersion"],
+        )
+        self.assertEqual(source_state["trackId"], context["trackId"])
+        self.assertEqual(source_state["positionMs"], 1100)
+        self.assertEqual(
+            source_state["positionSampledAtServerMs"],
+            sampled_at_ms,
+        )
+
+        messages = self.start_strict_broadcast(
+            controller,
+            participants=["participant-1"],
+        )
+        ack = self.get_ack(messages, "broadcast-start-1")
+        persisted = emo_ws.getPersistentBroadcastState(
+            ack["payload"]["broadcastId"]
+        )
+        self.assertEqual(
+            persisted["snapshot"]["sourceControlVersion"],
+            context["controlVersion"],
+        )
+        self.assertEqual(persisted["snapshot"]["trackId"], context["trackId"])
+
     def test_strict_client_cannot_enter_legacy_broadcast_mutation_paths(self):
         authority, _participant, _controller = self.connect_broadcast_devices()
         self.get_messages(authority)

@@ -131,6 +131,7 @@ class StrictV2EffectiveAtTestCase(unittest.TestCase):
     def test_source_rejects_future_sample_unsettled_track_and_rate(self):
         cases = (
             ("positionSampledAtServerMs", 10051, "clock_unsynchronized"),
+            ("clientSeq", 0, "source_state_unsettled"),
             ("appliedControlVersion", 6, "source_state_unsettled"),
             ("trackId", "song-2", "source_track_mismatch"),
             ("state", "paused", "source_not_playing"),

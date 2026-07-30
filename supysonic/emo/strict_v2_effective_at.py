@@ -154,6 +154,12 @@ def validateBroadcastSourceState(
             "authority_changed",
             "DevicePlaybackState is not authoritative",
         )
+    client_seq = device_state.get("clientSeq")
+    if type(client_seq) is not int or client_seq < 1:
+        raise EffectiveAtEligibilityError(
+            "source_state_unsettled",
+            "Source has not reported a complete DevicePlaybackState",
+        )
     if (
         device_state.get("appliedControlVersion")
         != playback_context.get("controlVersion")

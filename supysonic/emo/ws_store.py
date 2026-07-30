@@ -2,10 +2,11 @@ import hashlib
 import json
 import threading
 import time
-from uuid import uuid4
 from contextlib import contextmanager
+from datetime import datetime
 from functools import wraps
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from uuid import uuid4
 
 from peewee import IntegrityError, SqliteDatabase
 
@@ -2590,6 +2591,83 @@ def _getStrictPlaybackContextRecord(playback_context_id, user_name):
     return record
 
 
+def _advance_queue_sync_authority_device_state(
+    record: EmoPlaybackContext,
+    authority_client_id: str,
+    authority_device_session_id: str,
+    position_sampled_at_server_ms: int,
+    updated_at: datetime,
+) -> EmoDevicePlaybackState:
+    existing = EmoDevicePlaybackState.get_or_none(
+        (
+            EmoDevicePlaybackState.playback_context_id
+            == record.playback_context_id
+        )
+        & (
+            EmoDevicePlaybackState.owner_client_id
+            == authority_client_id
+        )
+    )
+    same_scope = bool(
+        existing is not None
+        and existing.context_epoch == record.epoch
+        and existing.device_session_id == authority_device_session_id
+    )
+    playback_json = {}
+    if same_scope and existing.playback_json:
+        loaded = json.loads(existing.playback_json)
+        if isinstance(loaded, dict):
+            playback_json = loaded
+
+    if same_scope and record.state != "idle":
+        state_name = existing.state
+        if state_name not in {"playing", "paused", "stopped"}:
+            state_name = record.state
+    else:
+        state_name = record.state
+
+    server_updated_at_ms = int(updated_at.timestamp() * 1000)
+    playback_json.update(
+        {
+            "state": state_name,
+            "positionMs": record.position_ms,
+            "positionSampledAtServerMs": position_sampled_at_server_ms,
+            "appliedControlVersion": record.control_version,
+            "serverUpdatedAtMs": server_updated_at_ms,
+        }
+    )
+    if record.track_id is None:
+        playback_json.pop("trackId", None)
+    else:
+        playback_json["trackId"] = record.track_id
+
+    values = {
+        "device_session_id": authority_device_session_id,
+        "owner_client_id": authority_client_id,
+        "user_name": record.user_name,
+        "state": state_name,
+        "track_id": record.track_id,
+        "position_ms": record.position_ms,
+        "volume": existing.volume if same_scope else None,
+        "is_authority": 1,
+        "mode": existing.mode if same_scope else "normal",
+        "context_epoch": record.epoch,
+        "applied_control_version": record.control_version,
+        "client_seq": existing.client_seq if same_scope else 0,
+        "playback_json": json.dumps(playback_json, ensure_ascii=True),
+        "updated_at": updated_at,
+    }
+    if existing is None:
+        return EmoDevicePlaybackState.create(
+            playback_context_id=record.playback_context_id,
+            **values,
+        )
+    for field_name, value in values.items():
+        setattr(existing, field_name, value)
+    existing.save()
+    return existing
+
+
 @_serialize_strict_playback_context_mutation
 def mutateStrictPlaybackContextQueue(
     playback_context_id,
@@ -2649,13 +2727,40 @@ def mutateStrictPlaybackContextQueue(
                 and base_control_version != record.control_version
             ):
                 raise PlaybackContextStaleVersionError(current, "controlVersion")
+            if control_changed:
+                has_pending_control = (
+                    EmoPlaybackControlTransaction.select()
+                    .where(
+                        (
+                            EmoPlaybackControlTransaction.playback_context_id
+                            == playback_context_id
+                        )
+                        & (
+                            EmoPlaybackControlTransaction.epoch
+                            == record.epoch
+                        )
+                        & (
+                            EmoPlaybackControlTransaction.status
+                            == "pending"
+                        )
+                    )
+                    .exists()
+                )
+                if has_pending_control:
+                    raise PlaybackControlTransactionConflictError(
+                        "Queue sync cannot advance appliedControlVersion "
+                        "across a pending control"
+                    )
 
             record.queue_json = json.dumps(queue_song_ids, ensure_ascii=True)
             record.current_index = next_index or 0
             record.track_id = next_track
             record.position_ms = position_ms
+            updated_at = now()
             if position_sampled_at_server_ms is None:
-                position_sampled_at_server_ms = int(now().timestamp() * 1000)
+                position_sampled_at_server_ms = int(
+                    updated_at.timestamp() * 1000
+                )
             playback_json = (
                 json.loads(record.playback_json)
                 if record.playback_json
@@ -2677,8 +2782,16 @@ def mutateStrictPlaybackContextQueue(
             record.queue_revision += 1
             if control_changed:
                 record.control_version += 1
-            record.updated_at = now()
+            record.updated_at = updated_at
             record.save()
+            if control_changed:
+                _advance_queue_sync_authority_device_state(
+                    record,
+                    authority_client_id,
+                    authority_device_session_id,
+                    position_sampled_at_server_ms,
+                    updated_at,
+                )
             result = _playback_context_payload(record)
             if post_mutation_hook is not None:
                 result["_broadcastMutation"] = post_mutation_hook(

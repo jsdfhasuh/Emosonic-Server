@@ -3472,6 +3472,108 @@ class StrictV2CoreTestCase(unittest.TestCase):
             before_stale,
         )
 
+    def test_queue_sync_advances_authority_applied_and_accepts_passive(self):
+        client = self.ready_strict_client()
+        self.create_context(client)
+        self.emit_strict(
+            client,
+            "event",
+            "playback.update",
+            "queue-applied-baseline",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-2",
+                "positionMs": 1200,
+                "positionSampledAtServerMs": 100,
+                "playbackRate": 1.25,
+                "clientSeq": 1,
+            },
+        )
+
+        messages = self.emit_strict(
+            client,
+            "state",
+            "queue.context.sync",
+            "queue-applied-sync",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "queueSongIds": ["song-2", "song-1"],
+                "currentIndex": 1,
+                "positionMs": 500,
+                "positionSampledAtServerMs": 200,
+                "baseQueueRevision": 1,
+                "baseControlVersion": 1,
+            },
+        )
+        queue_push = next(
+            message
+            for message in messages
+            if message["action"] == "queue.context.sync"
+        )
+        self.assertEqual(queue_push["payload"]["controlVersion"], 2)
+        device = emo_ws.getDevicePlaybackState("context-1", "phone-1")
+        self.assertEqual(device["appliedControlVersion"], 2)
+        self.assertEqual(device["trackId"], "song-1")
+        self.assertEqual(device["positionMs"], 500)
+        self.assertEqual(device["positionSampledAtServerMs"], 200)
+        self.assertEqual(device["playbackRate"], 1.25)
+        self.assertEqual(device["clientSeq"], 1)
+
+        status = self.emit_strict(
+            client,
+            "state",
+            "playback.context.status",
+            "queue-applied-status",
+            {"playbackContextId": "context-1"},
+        )
+        status_message = next(
+            message
+            for message in status
+            if message["action"] == "playback.context.status"
+            and "requestId" in message
+        )
+        status_device = status_message["payload"]["deviceStates"][0]
+        self.assertEqual(status_device["appliedControlVersion"], 2)
+        self.assertEqual(status_device["trackId"], "song-1")
+        self.assertEqual(status_device["positionMs"], 500)
+
+        passive = self.emit_strict(
+            client,
+            "event",
+            "playback.update",
+            "queue-applied-passive",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "origin": "passive",
+                "appliedControlVersion": 2,
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 600,
+                "positionSampledAtServerMs": 300,
+                "playbackRate": 1.25,
+                "clientSeq": 2,
+            },
+        )
+        self.assertEqual(
+            [message["action"] for message in passive],
+            ["playback.update"],
+        )
+        persisted = getPlaybackContextState("context-1")
+        self.assertEqual(
+            (
+                persisted["version"],
+                persisted["queueRevision"],
+                persisted["controlVersion"],
+            ),
+            (2, 2, 2),
+        )
+
     def test_controller_control_routes_only_to_bound_authority_then_acks(self):
         player = self.ready_strict_client()
         self.create_context(player)
