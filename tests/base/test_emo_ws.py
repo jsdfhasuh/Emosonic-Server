@@ -3861,6 +3861,9 @@ class EmoWebSocketTestCase(unittest.TestCase):
 
     phone_messages = self.get_messages(phone)
     self.get_ack(phone_messages, "compat-context-queue-1")
+    self.assertFalse(
+      any(message["action"] == "queue.context.sync" for message in phone_messages)
+    )
     control_messages = self.get_messages(control)
     binding_changed = next(
       message
@@ -3907,6 +3910,9 @@ class EmoWebSocketTestCase(unittest.TestCase):
 
     phone_messages = self.get_messages(phone)
     self.get_ack(phone_messages, "compat-context-queue-2")
+    self.assertFalse(
+      any(message["action"] == "queue.context.sync" for message in phone_messages)
+    )
     control_messages = self.get_messages(control)
     strict_queue = next(
       message
@@ -3923,6 +3929,276 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertEqual(persisted["authorityClientId"], "phone-1")
     self.assertEqual(persisted["authorityDeviceSessionId"], "root:phone")
     self.assertEqual(persisted["currentIndex"], 1)
+
+  def test_legacy_context_queue_sync_clears_strict_snapshot(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+    )
+    control = self.connect_device(
+      "alice",
+      "Alic3",
+      "control-1",
+      "root:control",
+      ["controller"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(phone)
+    self.get_messages(control)
+    self.sync_playback_context(
+      phone,
+      "compat-clear-initial-1",
+      playback_context_id="playback:alice:compat-clear",
+      queue_song_ids=["song-1"],
+    )
+    self.get_messages(control)
+
+    control.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "playback.context.subscribe",
+        "requestId": "compat-clear-subscribe-1",
+        "payload": {
+          "playbackContextId": "playback:alice:compat-clear",
+        },
+      },
+      namespace="/emo",
+    )
+    self.get_ack(
+      self.get_messages(control),
+      "compat-clear-subscribe-1",
+    )
+
+    phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.session.sync",
+        "requestId": "compat-clear-1",
+        "payload": {
+          "playbackContextId": "playback:alice:compat-clear",
+          "deviceSessionId": "root:phone",
+          "queueSongIds": [],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+
+    phone_messages = self.get_messages(phone)
+    ack = self.get_ack(phone_messages, "compat-clear-1")
+    self.assertEqual(ack["payload"]["queue"]["state"], "idle")
+    self.assertFalse(
+      any(
+        message["action"] == "system.error"
+        and message.get("requestId") == "compat-clear-1"
+        for message in phone_messages
+      )
+    )
+    self.assertFalse(
+      any(message["action"] == "queue.context.sync" for message in phone_messages)
+    )
+
+    control_messages = self.get_messages(control)
+    strict_queue = next(
+      message
+      for message in control_messages
+      if message["action"] == "queue.context.sync"
+    )
+    self.assertEqual(strict_queue["payload"]["queueSongIds"], [])
+    self.assertEqual(strict_queue["payload"]["state"], "idle")
+    self.assertEqual(strict_queue["payload"]["positionMs"], 0)
+    self.assertNotIn("currentIndex", strict_queue["payload"])
+    self.assertNotIn("trackId", strict_queue["payload"])
+
+    persisted = getPlaybackContextState("playback:alice:compat-clear")
+    self.assertEqual(persisted["queueSongIds"], [])
+    self.assertEqual(persisted["state"], "idle")
+    self.assertEqual(persisted["queueRevision"], 2)
+    self.assertEqual(persisted["controlVersion"], 2)
+    self.assertEqual(persisted["version"], 2)
+    self.assertEqual(persisted["epoch"], 1)
+
+  def test_legacy_context_queue_sync_rejects_device_session_mismatch(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+    )
+    self.get_messages(phone)
+
+    phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.session.sync",
+        "requestId": "compat-device-mismatch-1",
+        "payload": {
+          "playbackContextId": "playback:alice:device-mismatch",
+          "deviceSessionId": "root:not-this-socket",
+          "queueSongIds": ["song-1"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+
+    error = self.get_error(
+      self.get_messages(phone),
+      "compat-device-mismatch-1",
+    )
+    self.assertEqual(error["payload"]["code"], "bad_request")
+    self.assertIsNone(
+      getPlaybackContextState("playback:alice:device-mismatch")
+    )
+
+  def test_legacy_context_queue_sync_rejects_authority_client_mismatch(self):
+    phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone",
+      ["player"],
+    )
+    pc = self.connect_device(
+      "alice",
+      "Alic3",
+      "pc-1",
+      "root:pc",
+      ["player"],
+    )
+    self.get_messages(phone)
+    self.get_messages(pc)
+    self.sync_playback_context(
+      phone,
+      "compat-authority-initial-1",
+      playback_context_id="playback:alice:authority-mismatch",
+      queue_song_ids=["song-1"],
+    )
+    self.get_messages(pc)
+
+    pc.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.session.sync",
+        "requestId": "compat-authority-mismatch-1",
+        "payload": {
+          "playbackContextId": "playback:alice:authority-mismatch",
+          "deviceSessionId": "root:pc",
+          "queueSongIds": ["song-2"],
+          "currentIndex": 0,
+          "positionMs": 500,
+        },
+      },
+      namespace="/emo",
+    )
+
+    error = self.get_error(
+      self.get_messages(pc),
+      "compat-authority-mismatch-1",
+    )
+    self.assertEqual(error["payload"]["code"], "forbidden")
+    persisted = getPlaybackContextState(
+      "playback:alice:authority-mismatch"
+    )
+    self.assertEqual(persisted["authorityClientId"], "phone-1")
+    self.assertEqual(
+      persisted["authorityDeviceSessionId"],
+      "root:phone",
+    )
+    self.assertEqual(persisted["queueSongIds"], ["song-1"])
+    self.assertEqual(persisted["queueRevision"], 1)
+
+  def test_legacy_context_queue_rebind_notifies_old_and_new_pairs(self):
+    old_phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone-old",
+      ["player"],
+    )
+    self.get_messages(old_phone)
+    self.sync_playback_context(
+      old_phone,
+      "compat-rebind-old-1",
+      playback_context_id="playback:alice:compat-rebind",
+      device_session_id="root:phone-old",
+      queue_song_ids=["song-1"],
+    )
+    old_phone.disconnect(namespace="/emo")
+    self.clients.remove(old_phone)
+
+    control = self.connect_device(
+      "alice",
+      "Alic3",
+      "control-1",
+      "root:control",
+      ["controller"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    new_phone = self.connect_device(
+      "alice",
+      "Alic3",
+      "phone-1",
+      "root:phone-new",
+      ["player"],
+    )
+    self.get_messages(control)
+    self.get_messages(new_phone)
+
+    new_phone.emit(
+      "message",
+      {
+        "type": "state",
+        "action": "queue.session.sync",
+        "requestId": "compat-rebind-new-1",
+        "payload": {
+          "playbackContextId": "playback:alice:compat-rebind",
+          "deviceSessionId": "root:phone-new",
+          "queueSongIds": ["song-1"],
+          "currentIndex": 0,
+          "positionMs": 0,
+        },
+      },
+      namespace="/emo",
+    )
+
+    phone_messages = self.get_messages(new_phone)
+    self.get_ack(phone_messages, "compat-rebind-new-1")
+    self.assertFalse(
+      any(message["action"] == "queue.context.sync" for message in phone_messages)
+    )
+    binding_pairs = {
+      (
+        message["payload"]["authorityClientId"],
+        message["payload"]["authorityDeviceSessionId"],
+      )
+      for message in self.get_messages(control)
+      if message["action"] == "playback.context.bindings.changed"
+    }
+    self.assertEqual(
+      binding_pairs,
+      {
+        ("phone-1", "root:phone-old"),
+        ("phone-1", "root:phone-new"),
+      },
+    )
+
+    persisted = getPlaybackContextState("playback:alice:compat-rebind")
+    self.assertEqual(
+      persisted["authorityDeviceSessionId"],
+      "root:phone-new",
+    )
+    self.assertEqual(persisted["epoch"], 2)
 
   def test_non_authority_playback_update_is_device_feedback_only(self):
     phone = self.connect_device("alice", "Alic3", "phone-1", "root:phone", ["player"])

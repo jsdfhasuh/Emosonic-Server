@@ -1258,6 +1258,12 @@ def _broadcast_context_queue_v2(user_name, playback_context_id):
         )
     )
     for target_sid in target_sids:
+        target_client = state.get_client_for_sid(target_sid)
+        if (
+            target_client is None
+            or not _is_strict_playback_context_v2(target_client)
+        ):
+            continue
         _emit_message(message, target_sid)
 
 
@@ -10681,6 +10687,7 @@ class EmoNamespace(Namespace):
                 current_client_id = payload.get("clientId") or current_client.get("clientId")
                 if not isinstance(current_client_id, str) or not current_client_id:
                     raise ValueError("queue.session.sync clientId must be a non-empty string")
+                owner_client = current_client
                 if payload.get("clientId"):
                     owner_client = state.get_client(
                         current_client_id,
@@ -10690,8 +10697,8 @@ class EmoNamespace(Namespace):
                         raise LookupError("Queue owner client is offline")
                     if owner_client.get("userName") != current_user_name:
                         raise PermissionError("Cross-user queue sync is not allowed")
-                    if _device_session_id(owner_client) != device_session_id:
-                        raise ValueError("queue.session.sync clientId must belong to deviceSessionId")
+                if _device_session_id(owner_client) != device_session_id:
+                    raise ValueError("queue.session.sync clientId must belong to deviceSessionId")
                 _ensure_not_follow_source_queue_update(
                     current_client,
                     device_session_id,
@@ -10727,6 +10734,17 @@ class EmoNamespace(Namespace):
                         existing_playback_context,
                         current_user_name,
                     )
+                    existing_authority_client_id = (
+                        existing_playback_context.get("authorityClientId")
+                    )
+                    if (
+                        is_context_payload
+                        and existing_authority_client_id
+                        and existing_authority_client_id != current_client_id
+                    ):
+                        raise PermissionError(
+                            "Playback context authority mismatch"
+                        )
                     previous_authority_device_session_id = (
                         existing_playback_context.get(
                             "authorityDeviceSessionId"
@@ -10811,10 +10829,13 @@ class EmoNamespace(Namespace):
                 ack_queue = playback_context if is_context_payload else queue_state
                 _send_ack(request_id, {"updated": True, "queue": ack_queue})
                 if is_context_payload:
-                    _broadcast_playback_context_queue(current_user_name, playback_context_id)
-                    _broadcast_context_queue_v2(
-                        current_user_name,
-                        playback_context_id,
+                    _run_post_commit_push(
+                        "queue.session.sync",
+                        request_id,
+                        lambda: _broadcast_playback_context_queue(
+                            current_user_name,
+                            playback_context_id,
+                        ),
                     )
                     authority_client_id = playback_context.get(
                         "authorityClientId"
@@ -10830,16 +10851,43 @@ class EmoNamespace(Namespace):
                         and previous_authority_device_session_id
                         != authority_device_session_id
                     ):
-                        _broadcast_playback_context_bindings_changed(
-                            current_user_name,
-                            {
+                        affected_authority_pairs = {
+                            (
+                                current_user_name,
+                                authority_client_id,
+                                authority_device_session_id,
+                            )
+                        }
+                        if (
+                            isinstance(
+                                previous_authority_device_session_id,
+                                str,
+                            )
+                            and previous_authority_device_session_id
+                        ):
+                            affected_authority_pairs.add(
                                 (
                                     current_user_name,
                                     authority_client_id,
-                                    authority_device_session_id,
+                                    previous_authority_device_session_id,
                                 )
-                            },
+                            )
+                        _run_post_commit_push(
+                            "queue.session.sync",
+                            request_id,
+                            lambda: _broadcast_playback_context_bindings_changed(
+                                current_user_name,
+                                affected_authority_pairs,
+                            ),
                         )
+                    _run_post_commit_push(
+                        "queue.session.sync",
+                        request_id,
+                        lambda: _broadcast_context_queue_v2(
+                            current_user_name,
+                            playback_context_id,
+                        ),
+                    )
                 else:
                     _broadcast_queue(current_user_name, playback_context_id)
             elif action == "queue.ready.complete":

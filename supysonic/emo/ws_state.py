@@ -1099,35 +1099,67 @@ class WebSocketState:
                 raise QueueRevisionMismatchError(current_revision)
 
             previous_queue_song_ids = list(context.get("queueSongIds") or [])
-            previous_index = context.get("currentIndex", 0)
-            previous_track_id = context.get("trackId")
-            next_track_id = _queue_track_id(queue_song_ids, current_index)
-            queue_identity_changed = (
-                is_new_context
-                or previous_queue_song_ids != queue_song_ids
-                or previous_index != current_index
+            previous_index = (
+                context.get("currentIndex", 0)
+                if previous_queue_song_ids
+                else None
             )
+            previous_track_id = context.get("trackId")
+            previous_position_ms = context.get("positionMs", 0)
+            previous_state = context.get("state") or "stopped"
+            previous_authority_device_session_id = context.get(
+                "authorityDeviceSessionId"
+            )
+            next_index = current_index if queue_song_ids else None
+            next_track_id = _queue_track_id(queue_song_ids, current_index)
             if not context.get("authorityClientId") and source_client_id:
                 context["authorityClientId"] = source_client_id
-            if (
+            binding_changed = bool(
                 device_session_id
                 and context.get("authorityClientId") == source_client_id
-            ):
+                and previous_authority_device_session_id != device_session_id
+            )
+            if binding_changed:
                 context["authorityDeviceSessionId"] = device_session_id
+            if not queue_song_ids:
+                next_state = "idle"
+            elif (
+                is_new_context
+                or not previous_queue_song_ids
+                or previous_state == "idle"
+            ):
+                next_state = "paused"
+            elif previous_state in {"playing", "paused", "stopped"}:
+                next_state = previous_state
+            else:
+                next_state = "stopped"
+            control_changed = (
+                is_new_context
+                or binding_changed
+                or previous_index != next_index
+                or previous_track_id != next_track_id
+                or previous_position_ms != position_ms
+                or previous_state != next_state
+            )
             context["originClientId"] = source_client_id or context.get("originClientId")
             context["userName"] = user_name or context.get("userName")
             context["queueSongIds"] = queue_song_ids
             context["currentIndex"] = current_index
             context["trackId"] = next_track_id
+            context["state"] = next_state
             context["positionMs"] = position_ms
-            context["queueRevision"] = (
-                current_revision + 1 if queue_identity_changed else current_revision
+            context["positionSampledAtServerMs"] = server_updated_at_ms
+            context["queueRevision"] = current_revision + 1
+            current_control_version = context.get("controlVersion", 0)
+            context["controlVersion"] = (
+                current_control_version + 1
+                if control_changed or current_control_version == 0
+                else current_control_version
             )
-            context["controlVersion"] = context.get("controlVersion", 0) + 1
             context["version"] = context.get("version", 0) + 1
             if context.get("epoch", 0) == 0:
                 context["epoch"] = 1
-            elif queue_identity_changed or previous_track_id != next_track_id:
+            elif binding_changed and not is_new_context:
                 context["epoch"] = context.get("epoch", 0) + 1
             context["deviceSessionId"] = device_session_id
             context["sessionId"] = playback_context_id
@@ -1164,32 +1196,60 @@ class WebSocketState:
                 raise QueueRevisionMismatchError(current_revision)
 
             previous_queue_song_ids = list(context.get("queueSongIds") or [])
-            previous_index = context.get("currentIndex", 0)
-            previous_track_id = context.get("trackId")
-            next_track_id = _queue_track_id(queue_song_ids, current_index)
-            queue_identity_changed = (
-                previous_queue_song_ids != queue_song_ids
-                or previous_index != current_index
+            previous_index = (
+                context.get("currentIndex", 0)
+                if previous_queue_song_ids
+                else None
             )
-            if (
+            previous_track_id = context.get("trackId")
+            previous_position_ms = context.get("positionMs", 0)
+            previous_state = context.get("state") or "stopped"
+            previous_authority_device_session_id = context.get(
+                "authorityDeviceSessionId"
+            )
+            next_index = current_index if queue_song_ids else None
+            next_track_id = _queue_track_id(queue_song_ids, current_index)
+            binding_changed = bool(
                 device_session_id
                 and context.get("authorityClientId") == source_client_id
-            ):
+                and previous_authority_device_session_id != device_session_id
+            )
+            if binding_changed:
                 context["authorityDeviceSessionId"] = device_session_id
+            if not queue_song_ids:
+                next_state = "idle"
+            elif not previous_queue_song_ids or previous_state == "idle":
+                next_state = "paused"
+            elif previous_state in {"playing", "paused", "stopped"}:
+                next_state = previous_state
+            else:
+                next_state = "stopped"
+            control_changed = (
+                binding_changed
+                or previous_index != next_index
+                or previous_track_id != next_track_id
+                or previous_position_ms != position_ms
+                or previous_state != next_state
+            )
             context["originClientId"] = source_client_id or context.get("originClientId")
             context["userName"] = user_name or context.get("userName")
             context["queueSongIds"] = queue_song_ids
             context["currentIndex"] = current_index
             context["trackId"] = next_track_id
+            context["state"] = next_state
             context["positionMs"] = position_ms
-            context["queueRevision"] = (
-                current_revision + 1 if queue_identity_changed else current_revision
+            context["positionSampledAtServerMs"] = server_updated_at_ms
+            context["queueRevision"] = current_revision + 1
+            current_control_version = context.get("controlVersion", 0)
+            context["controlVersion"] = (
+                current_control_version + 1
+                if control_changed or current_control_version == 0
+                else current_control_version
             )
-            context["controlVersion"] = context.get("controlVersion", 0) + 1
             context["version"] = context.get("version", 0) + 1
             if context.get("epoch", 0) == 0:
                 context["epoch"] = 1
-            elif queue_identity_changed or previous_track_id != next_track_id:
+            elif binding_changed:
                 context["epoch"] = context.get("epoch", 0) + 1
             context["deviceSessionId"] = device_session_id
             context["sessionId"] = playback_context_id

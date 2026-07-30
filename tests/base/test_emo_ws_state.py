@@ -507,6 +507,82 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
         self.assertEqual(unchanged_context["positionMs"], 100)
         self.assertEqual(pc_feedback["positionMs"], 999)
 
+    def test_playback_context_queue_uses_strict_snapshot_cursors(self):
+        initial = self.state.update_playback_context_queue(
+            "playback:alice:main",
+            "root:phone",
+            ["song-1"],
+            source_client_id="phone-1",
+            user_name="alice",
+            now=10,
+        )
+        self.assertEqual(initial["state"], "paused")
+        self.assertEqual(initial["queueRevision"], 1)
+        self.assertEqual(initial["controlVersion"], 1)
+        self.assertEqual(initial["version"], 1)
+        self.assertEqual(initial["epoch"], 1)
+
+        queue_only = self.state.update_playback_context_queue(
+            "playback:alice:main",
+            "root:phone",
+            ["song-1", "song-2"],
+            source_client_id="phone-1",
+            user_name="alice",
+            now=11,
+        )
+        self.assertEqual(queue_only["queueRevision"], 2)
+        self.assertEqual(queue_only["controlVersion"], 1)
+        self.assertEqual(queue_only["version"], 2)
+        self.assertEqual(queue_only["epoch"], 1)
+
+        position = self.state.update_playback_context_queue(
+            "playback:alice:main",
+            "root:phone",
+            ["song-1", "song-2"],
+            position_ms=500,
+            source_client_id="phone-1",
+            user_name="alice",
+            now=12,
+        )
+        self.assertEqual(position["queueRevision"], 3)
+        self.assertEqual(position["controlVersion"], 2)
+        self.assertEqual(position["version"], 3)
+        self.assertEqual(position["epoch"], 1)
+        self.assertEqual(position["positionSampledAtServerMs"], 12000)
+
+        cleared = self.state.update_playback_context_queue(
+            "playback:alice:main",
+            "root:phone",
+            [],
+            source_client_id="phone-1",
+            user_name="alice",
+            now=13,
+        )
+        self.assertEqual(cleared["state"], "idle")
+        self.assertEqual(cleared["positionMs"], 0)
+        self.assertIsNone(cleared["trackId"])
+        self.assertEqual(cleared["queueRevision"], 4)
+        self.assertEqual(cleared["controlVersion"], 3)
+        self.assertEqual(cleared["version"], 4)
+        self.assertEqual(cleared["epoch"], 1)
+
+        rebound = self.state.update_playback_context_queue(
+            "playback:alice:main",
+            "root:phone-reconnected",
+            [],
+            source_client_id="phone-1",
+            user_name="alice",
+            now=14,
+        )
+        self.assertEqual(
+            rebound["authorityDeviceSessionId"],
+            "root:phone-reconnected",
+        )
+        self.assertEqual(rebound["queueRevision"], 5)
+        self.assertEqual(rebound["controlVersion"], 4)
+        self.assertEqual(rebound["version"], 5)
+        self.assertEqual(rebound["epoch"], 2)
+
     def test_authority_device_volume_does_not_update_playback_context_volume(self):
         self.state.update_playback_context_queue(
             "playback:alice:main",
