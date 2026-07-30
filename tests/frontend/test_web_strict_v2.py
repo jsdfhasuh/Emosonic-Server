@@ -144,6 +144,7 @@ class WebStrictV2FrontendTestCase(FrontendTestBase):
             "missing.slice(offset, offset + META_BATCH_SIZE)",
             "state.client.isCurrentContextSnapshot(receivedContext)",
             "playback.context.status",
+            "playback.context.bindings.changed",
             "baseControlVersion",
             "baseQueueRevision",
             "authority_offline",

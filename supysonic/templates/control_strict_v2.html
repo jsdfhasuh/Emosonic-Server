@@ -1094,6 +1094,8 @@
     if (action === 'device.list') {
       state.devices = message.payload.devices;
       refreshBindings().catch((error) => showError(error.message));
+    } else if (action === 'playback.context.bindings.changed') {
+      refreshBindings().catch((error) => showError(error.message));
     } else if (action === 'device.volume.update') {
       const device = state.devices.find((item) => (
         item.clientId === message.payload.sourceClientId

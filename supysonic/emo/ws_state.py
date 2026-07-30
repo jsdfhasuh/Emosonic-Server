@@ -1109,6 +1109,11 @@ class WebSocketState:
             )
             if not context.get("authorityClientId") and source_client_id:
                 context["authorityClientId"] = source_client_id
+            if (
+                device_session_id
+                and context.get("authorityClientId") == source_client_id
+            ):
+                context["authorityDeviceSessionId"] = device_session_id
             context["originClientId"] = source_client_id or context.get("originClientId")
             context["userName"] = user_name or context.get("userName")
             context["queueSongIds"] = queue_song_ids
@@ -1166,6 +1171,11 @@ class WebSocketState:
                 previous_queue_song_ids != queue_song_ids
                 or previous_index != current_index
             )
+            if (
+                device_session_id
+                and context.get("authorityClientId") == source_client_id
+            ):
+                context["authorityDeviceSessionId"] = device_session_id
             context["originClientId"] = source_client_id or context.get("originClientId")
             context["userName"] = user_name or context.get("userName")
             context["queueSongIds"] = queue_song_ids

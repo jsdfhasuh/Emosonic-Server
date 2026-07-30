@@ -471,6 +471,7 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
             now=10,
         )
         self.assertEqual(context["authorityClientId"], "phone-1")
+        self.assertEqual(context["authorityDeviceSessionId"], "root:phone")
 
         updated_context, authoritative = self.state.apply_authority_playback_update(
             "playback:alice:main",

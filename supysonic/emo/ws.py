@@ -1227,10 +1227,12 @@ def _broadcast_playback_context_queue(user_name, playback_context_id):
     if context is None:
         return
     message = _build_message("state", "queue.session.sync", context)
-    target_sids = {
-        sid for sid, _ in state.list_sids(user_name=user_name)
-    }
-    for target_sid in target_sids:
+    for target_sid, target_client in state.list_sids(user_name=user_name):
+        if (
+            target_client is not None
+            and _is_strict_playback_context_v2(target_client)
+        ):
+            continue
         _emit_message(message, target_sid)
 
 
@@ -10719,10 +10721,16 @@ class EmoNamespace(Namespace):
                 existing_playback_context = _get_or_restore_playback_context(
                     playback_context_id
                 )
+                previous_authority_device_session_id = None
                 if existing_playback_context is not None:
                     _ensure_playback_context_for_user(
                         existing_playback_context,
                         current_user_name,
+                    )
+                    previous_authority_device_session_id = (
+                        existing_playback_context.get(
+                            "authorityDeviceSessionId"
+                        )
                     )
                 try:
                     if is_context_payload:
@@ -10804,6 +10812,34 @@ class EmoNamespace(Namespace):
                 _send_ack(request_id, {"updated": True, "queue": ack_queue})
                 if is_context_payload:
                     _broadcast_playback_context_queue(current_user_name, playback_context_id)
+                    _broadcast_context_queue_v2(
+                        current_user_name,
+                        playback_context_id,
+                    )
+                    authority_client_id = playback_context.get(
+                        "authorityClientId"
+                    )
+                    authority_device_session_id = playback_context.get(
+                        "authorityDeviceSessionId"
+                    )
+                    if (
+                        isinstance(authority_client_id, str)
+                        and authority_client_id
+                        and isinstance(authority_device_session_id, str)
+                        and authority_device_session_id
+                        and previous_authority_device_session_id
+                        != authority_device_session_id
+                    ):
+                        _broadcast_playback_context_bindings_changed(
+                            current_user_name,
+                            {
+                                (
+                                    current_user_name,
+                                    authority_client_id,
+                                    authority_device_session_id,
+                                )
+                            },
+                        )
                 else:
                     _broadcast_queue(current_user_name, playback_context_id)
             elif action == "queue.ready.complete":
