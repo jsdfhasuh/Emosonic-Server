@@ -418,6 +418,76 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         )
         self.assertEqual(persisted["snapshot"]["trackId"], context["trackId"])
 
+    def test_reconnected_source_requires_fresh_feedback_after_queue_sync(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        authority.disconnect(namespace="/emo")
+        replacement = self.connect_device(
+            "alice",
+            "Alic3",
+            "authority-1",
+            "device:authority-1",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+            },
+        )
+        for client in (replacement, participant, controller):
+            self.get_messages(client)
+
+        sampled_at_ms = int(time.time() * 1000)
+        self.sync_source_queue(
+            replacement,
+            ["source-song-1", "source-song-2"],
+            current_index=0,
+            position_ms=1100,
+            sampled_at_ms=sampled_at_ms,
+            request_id="reconnected-source-queue",
+        )
+        self.get_ack(
+            self.get_messages(replacement),
+            "reconnected-source-queue",
+        )
+        source_state = getDevicePlaybackState(
+            "context-broadcast-source",
+            "authority-1",
+        )
+        context = getPlaybackContextState("context-broadcast-source")
+        self.assertEqual(source_state["appliedControlVersion"], 2)
+        self.assertEqual(source_state["clientSeq"], 0)
+        self.assertEqual(context["controlVersion"], 2)
+
+        blocked = self.get_error(
+            self.start_strict_broadcast(
+                controller,
+                request_id="broadcast-start-before-fresh-feedback",
+                participants=["participant-1"],
+            ),
+            "broadcast-start-before-fresh-feedback",
+        )
+        self.assertEqual(blocked["payload"]["code"], "conflict")
+
+        self.update_source_playback(
+            replacement,
+            1,
+            int(time.time() * 1000),
+            positionMs=1100,
+        )
+        self.assertEqual(
+            [message["action"] for message in self.get_messages(replacement)],
+            ["playback.update"],
+        )
+        messages = self.start_strict_broadcast(
+            controller,
+            request_id="broadcast-start-after-fresh-feedback",
+            participants=["participant-1"],
+        )
+        ack = self.get_ack(
+            messages,
+            "broadcast-start-after-fresh-feedback",
+        )
+        self.assertTrue(ack["payload"]["started"])
+
     def test_strict_client_cannot_enter_legacy_broadcast_mutation_paths(self):
         authority, _participant, _controller = self.connect_broadcast_devices()
         self.get_messages(authority)

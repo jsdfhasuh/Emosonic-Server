@@ -7875,6 +7875,10 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
         or playback_context.get("authorityDeviceSessionId") != device_session_id
     ):
         raise PermissionError("Playback context authority device mismatch")
+    session_info = state.get_session(request.sid) or {}
+    connection_nonce = session_info.get("connectionNonce")
+    if not isinstance(connection_nonce, str) or not connection_nonce:
+        raise PermissionError("Registered connection provenance is missing")
 
     queue_song_ids, current_index, position_ms = _validate_playback_context_queue_payload(
         payload
@@ -7953,6 +7957,7 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
                 position_sampled_at_server_ms=payload[
                     "positionSampledAtServerMs"
                 ],
+                connection_nonce=connection_nonce,
             )
         else:
             with broadcastMutationLock(persisted_broadcast["broadcastId"]):
@@ -7969,6 +7974,7 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
                     position_sampled_at_server_ms=payload[
                         "positionSampledAtServerMs"
                     ],
+                    connection_nonce=connection_nonce,
                     post_mutation_hook=projection_hook,
                 )
                 broadcast_mutation = updated_context.pop(

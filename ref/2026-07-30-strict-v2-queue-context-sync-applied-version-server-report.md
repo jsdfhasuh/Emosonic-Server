@@ -334,9 +334,12 @@ readiness 检查后再恢复为 `true`。
 - `mutateStrictPlaybackContextQueue` 在同一数据库事务中推进 Context control cursor 和 authority
   DevicePlaybackState applied cursor；
 - 已有当前 epoch DevicePlaybackState 时，同步更新 track、position、采样/接收时间，保留 clientSeq、
-  playbackRate 和普通非空队列的既有实际 state；
+  playbackRate 和普通非空队列的既有实际 state；这些完整实际状态只允许在当前物理连接的
+  connectionNonce 与持久化 feedback scope 一致时复用；
 - 尚无完整 DevicePlaybackState 时写入 `clientSeq=0` 的内部 applied baseline；status 不暴露该条目，
   Broadcast source 校验也拒绝将其作为完整实际状态；
+- queue sync 后收到低于新 applied baseline 的迟到 feedback 时，canonical correction 使用并持久化
+  本次传入的 clientSeq；隐藏 baseline 仍保持不可见，相同序号/内容只重放首次 correction；
 - 会被新 applied cursor 跨越的 pending control 在任何 cursor mutation 前返回 conflict；已经完成实际
   状态对账的 failed 历史不形成永久阻塞；
 - queue sync 不创建远程 pending control transaction，后续等值 passive update 可以正常结算。
@@ -346,7 +349,7 @@ readiness 检查后再恢复为 `true`。
 ```text
 专项回归：7 tests OK
 Core/Store/Effective-at：133 tests OK
-完整测试：Ran 1647 tests ... OK (skipped=3)
+完整测试：Ran 1648 tests ... OK (skipped=3)
 git diff --check：通过
 py_compile：通过
 ```

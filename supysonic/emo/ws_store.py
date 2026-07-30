@@ -837,6 +837,7 @@ def _save_strict_device_state_record(
     playback_json.update(
         {
             "_connectionNonce": connection_nonce,
+            "_settledClientSeq": canonical_update["clientSeq"],
             "_requestFingerprint": request_fingerprint,
             "_canonicalUpdate": canonical_update,
         }
@@ -870,7 +871,11 @@ def _save_strict_device_state_record(
     return existing
 
 
-def _passive_correction_from_device(record, device_state):
+def _passive_correction_from_device(
+    record,
+    device_state,
+    client_seq=None,
+):
     persisted = _device_playback_state_payload(device_state)
     correction = {
         "playbackContextId": record.playback_context_id,
@@ -885,13 +890,52 @@ def _passive_correction_from_device(record, device_state):
             "positionSampledAtServerMs"
         ],
         "playbackRate": persisted["playbackRate"],
-        "clientSeq": device_state.client_seq,
+        "clientSeq": (
+            device_state.client_seq
+            if client_seq is None
+            else client_seq
+        ),
         "serverUpdatedAtMs": persisted["serverUpdatedAtMs"],
     }
     for field_name in ("trackId", "volume", "muted"):
         if persisted.get(field_name) is not None:
             correction[field_name] = persisted[field_name]
     return correction
+
+
+def _settle_stale_playback_correction(
+    record,
+    existing,
+    existing_json,
+    connection_nonce,
+    request_fingerprint,
+    client_seq,
+):
+    canonical = _passive_correction_from_device(
+        record,
+        existing,
+        client_seq=client_seq,
+    )
+    playback_json = dict(existing_json)
+    playback_json.update(canonical)
+    playback_json.update(
+        {
+            "_connectionNonce": connection_nonce,
+            "_settledClientSeq": client_seq,
+            "_requestFingerprint": request_fingerprint,
+            "_canonicalUpdate": canonical,
+        }
+    )
+    if existing.client_seq >= 1:
+        existing.client_seq = client_seq
+    existing.playback_json = json.dumps(playback_json, ensure_ascii=True)
+    existing.save(
+        only=(
+            EmoDevicePlaybackState.client_seq,
+            EmoDevicePlaybackState.playback_json,
+        )
+    )
+    return canonical
 
 
 @_serialize_strict_playback_context_mutation
@@ -944,7 +988,23 @@ def applyStrictPlaybackUpdate(
                 and existing.device_session_id == device_session_id
                 and existing_json.get("_connectionNonce") == connection_nonce
             )
-            current_client_seq = existing.client_seq if same_scope else 0
+            settled_client_seq = existing_json.get(
+                "_settledClientSeq",
+                existing.client_seq if existing is not None else 0,
+            )
+            if (
+                type(settled_client_seq) is not int
+                or settled_client_seq < 0
+            ):
+                settled_client_seq = (
+                    existing.client_seq if existing is not None else 0
+                )
+            elif existing is not None:
+                settled_client_seq = max(
+                    existing.client_seq,
+                    settled_client_seq,
+                )
+            current_client_seq = settled_client_seq if same_scope else 0
             incoming_client_seq = payload["clientSeq"]
             if payload["positionSampledAtServerMs"] > server_updated_at_ms + 1000:
                 raise ValueError(
@@ -986,7 +1046,14 @@ def applyStrictPlaybackUpdate(
                         "appliedControlVersion exceeds canonical controlVersion"
                     )
                 if last_applied is not None and applied < last_applied:
-                    canonical = _passive_correction_from_device(record, existing)
+                    canonical = _settle_stale_playback_correction(
+                        record,
+                        existing,
+                        existing_json,
+                        connection_nonce,
+                        request_fingerprint,
+                        incoming_client_seq,
+                    )
                     return {
                         "playbackContext": current,
                         "deviceState": _device_playback_state_payload(existing),
@@ -1049,9 +1116,13 @@ def applyStrictPlaybackUpdate(
                     return {
                         "playbackContext": current,
                         "deviceState": _device_playback_state_payload(existing),
-                        "canonicalUpdate": _passive_correction_from_device(
+                        "canonicalUpdate": _settle_stale_playback_correction(
                             record,
                             existing,
+                            existing_json,
+                            connection_nonce,
+                            request_fingerprint,
+                            incoming_client_seq,
                         ),
                         "created": False,
                         "sourceOnly": True,
@@ -2595,6 +2666,7 @@ def _advance_queue_sync_authority_device_state(
     record: EmoPlaybackContext,
     authority_client_id: str,
     authority_device_session_id: str,
+    connection_nonce: Optional[str],
     position_sampled_at_server_ms: int,
     updated_at: datetime,
 ) -> EmoDevicePlaybackState:
@@ -2608,18 +2680,27 @@ def _advance_queue_sync_authority_device_state(
             == authority_client_id
         )
     )
-    same_scope = bool(
+    same_authority_scope = bool(
         existing is not None
         and existing.context_epoch == record.epoch
         and existing.device_session_id == authority_device_session_id
     )
     playback_json = {}
-    if same_scope and existing.playback_json:
+    if same_authority_scope and existing.playback_json:
         loaded = json.loads(existing.playback_json)
         if isinstance(loaded, dict):
             playback_json = loaded
 
-    if same_scope and record.state != "idle":
+    same_feedback_scope = bool(
+        same_authority_scope
+        and isinstance(connection_nonce, str)
+        and connection_nonce
+        and playback_json.get("_connectionNonce") == connection_nonce
+    )
+    if not same_feedback_scope:
+        playback_json = {}
+
+    if same_feedback_scope and record.state != "idle":
         state_name = existing.state
         if state_name not in {"playing", "paused", "stopped"}:
             state_name = record.state
@@ -2648,12 +2729,12 @@ def _advance_queue_sync_authority_device_state(
         "state": state_name,
         "track_id": record.track_id,
         "position_ms": record.position_ms,
-        "volume": existing.volume if same_scope else None,
+        "volume": existing.volume if same_feedback_scope else None,
         "is_authority": 1,
-        "mode": existing.mode if same_scope else "normal",
+        "mode": existing.mode if same_feedback_scope else "normal",
         "context_epoch": record.epoch,
         "applied_control_version": record.control_version,
-        "client_seq": existing.client_seq if same_scope else 0,
+        "client_seq": existing.client_seq if same_feedback_scope else 0,
         "playback_json": json.dumps(playback_json, ensure_ascii=True),
         "updated_at": updated_at,
     }
@@ -2680,6 +2761,7 @@ def mutateStrictPlaybackContextQueue(
     base_queue_revision,
     base_control_version=None,
     position_sampled_at_server_ms=None,
+    connection_nonce=None,
     post_mutation_hook=None,
 ):
     queue_song_ids = list(queue_song_ids)
@@ -2789,6 +2871,7 @@ def mutateStrictPlaybackContextQueue(
                     record,
                     authority_client_id,
                     authority_device_session_id,
+                    connection_nonce,
                     position_sampled_at_server_ms,
                     updated_at,
                 )

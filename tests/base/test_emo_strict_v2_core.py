@@ -3542,6 +3542,40 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(status_device["trackId"], "song-1")
         self.assertEqual(status_device["positionMs"], 500)
 
+        stale = self.emit_strict(
+            client,
+            "event",
+            "playback.update",
+            "queue-applied-stale",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-2",
+                "positionMs": 1200,
+                "positionSampledAtServerMs": 250,
+                "playbackRate": 1.25,
+                "clientSeq": 2,
+            },
+        )
+        self.assertEqual(
+            [message["action"] for message in stale],
+            ["playback.update"],
+        )
+        correction = stale[0]["payload"]
+        self.assertEqual(correction["clientSeq"], 2)
+        self.assertEqual(correction["appliedControlVersion"], 2)
+        self.assertEqual(correction["trackId"], "song-1")
+        corrected_device = emo_ws.getDevicePlaybackState(
+            "context-1",
+            "phone-1",
+        )
+        self.assertEqual(corrected_device["clientSeq"], 2)
+        self.assertEqual(corrected_device["appliedControlVersion"], 2)
+        self.assertEqual(corrected_device["positionMs"], 500)
+
         passive = self.emit_strict(
             client,
             "event",
@@ -3557,7 +3591,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
                 "positionMs": 600,
                 "positionSampledAtServerMs": 300,
                 "playbackRate": 1.25,
-                "clientSeq": 2,
+                "clientSeq": 3,
             },
         )
         self.assertEqual(

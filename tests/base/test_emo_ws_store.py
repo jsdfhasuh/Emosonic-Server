@@ -2294,6 +2294,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             1,
             1,
             position_sampled_at_server_ms=1100,
+            connection_nonce="nonce-1",
         )
 
         device = getDevicePlaybackState("context-1", "player-1")
@@ -2356,31 +2357,65 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertEqual(baseline["clientSeq"], 0)
         self.assertEqual(getDevicePlaybackStates("context-1"), [])
 
+        stale_payload = {
+            "playbackContextId": "context-1",
+            "deviceSessionId": "device:player-1",
+            "origin": "passive",
+            "appliedControlVersion": 1,
+            "state": "playing",
+            "trackId": "song-1",
+            "positionMs": 0,
+            "positionSampledAtServerMs": 1200,
+            "playbackRate": 1.0,
+            "clientSeq": 1,
+        }
         stale = applyStrictPlaybackUpdate(
             "context-1",
             "alice",
             "player-1",
             "device:player-1",
             "nonce-1",
-            {
-                "playbackContextId": "context-1",
-                "deviceSessionId": "device:player-1",
-                "origin": "passive",
-                "appliedControlVersion": 1,
-                "state": "playing",
-                "trackId": "song-1",
-                "positionMs": 0,
-                "positionSampledAtServerMs": 1200,
-                "playbackRate": 1.0,
-                "clientSeq": 1,
-            },
+            stale_payload,
             1300,
         )
         self.assertFalse(stale["created"])
+        self.assertEqual(stale["canonicalUpdate"]["clientSeq"], 1)
+        self.assertEqual(
+            stale["canonicalUpdate"]["appliedControlVersion"],
+            2,
+        )
         self.assertEqual(
             getDevicePlaybackState("context-1", "player-1")["clientSeq"],
             0,
         )
+        self.assertEqual(getDevicePlaybackStates("context-1"), [])
+
+        replay = applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            stale_payload,
+            1300,
+        )
+        self.assertFalse(replay["created"])
+        self.assertEqual(
+            replay["canonicalUpdate"],
+            stale["canonicalUpdate"],
+        )
+        conflicting_stale = dict(stale_payload)
+        conflicting_stale["positionMs"] = 1
+        with self.assertRaises(PlaybackClientSequenceConflictError):
+            applyStrictPlaybackUpdate(
+                "context-1",
+                "alice",
+                "player-1",
+                "device:player-1",
+                "nonce-1",
+                conflicting_stale,
+                1350,
+            )
 
         accepted = applyStrictPlaybackUpdate(
             "context-1",
@@ -2398,13 +2433,17 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 "positionMs": 50,
                 "positionSampledAtServerMs": 1400,
                 "playbackRate": 1.0,
-                "clientSeq": 1,
+                "clientSeq": 2,
             },
             1500,
         )
         self.assertTrue(accepted["created"])
         self.assertEqual(
             getDevicePlaybackStates("context-1")[0]["appliedControlVersion"],
+            2,
+        )
+        self.assertEqual(
+            getDevicePlaybackStates("context-1")[0]["clientSeq"],
             2,
         )
 
@@ -2464,6 +2503,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 before["queueRevision"],
                 before["controlVersion"],
                 position_sampled_at_server_ms=1200,
+                connection_nonce="nonce-1",
             )
 
         after = getPlaybackContextState("context-1")
@@ -2516,6 +2556,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             reconciled["queueRevision"],
             reconciled["controlVersion"],
             position_sampled_at_server_ms=1400,
+            connection_nonce="nonce-1",
         )
         self.assertEqual(advanced["controlVersion"], 3)
         self.assertEqual(
@@ -2574,6 +2615,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 1,
                 1,
                 position_sampled_at_server_ms=1100,
+                connection_nonce="nonce-1",
                 post_mutation_hook=fail_after_device_update,
             )
 
