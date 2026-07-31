@@ -128,6 +128,22 @@ class StrictV2EffectiveAtTestCase(unittest.TestCase):
                 self._context(), stale_receive, now_ms=10000)
         self.assertEqual(conflict.exception.reason, "source_state_stale")
 
+    def test_source_playing_ignores_context_control_state(self):
+        for context_state in ("paused", "stopped"):
+            with self.subTest(context_state=context_state):
+                context = self._context()
+                context["state"] = context_state
+
+                anchor = validateBroadcastSourceState(
+                    context,
+                    self._device_state(),
+                    now_ms=10000,
+                )
+
+                self.assertEqual(anchor["state"], "playing")
+                self.assertEqual(anchor["sourceControlVersion"], 7)
+                self.assertEqual(anchor["trackId"], "song-1")
+
     def test_source_rejects_future_sample_unsettled_track_and_rate(self):
         cases = (
             ("positionSampledAtServerMs", 10051, "clock_unsynchronized"),
@@ -135,6 +151,7 @@ class StrictV2EffectiveAtTestCase(unittest.TestCase):
             ("appliedControlVersion", 6, "source_state_unsettled"),
             ("trackId", "song-2", "source_track_mismatch"),
             ("state", "paused", "source_not_playing"),
+            ("state", "stopped", "source_not_playing"),
             ("playbackRate", 2.01, "rate_unsupported"),
         )
         for field, value, reason in cases:
@@ -145,6 +162,27 @@ class StrictV2EffectiveAtTestCase(unittest.TestCase):
                     validateBroadcastSourceState(
                         self._context(), device_state, now_ms=10000)
                 self.assertEqual(conflict.exception.reason, reason)
+
+    def test_source_rejects_missing_state_and_unsettled_controls(self):
+        with self.assertRaises(EffectiveAtEligibilityError) as missing:
+            validateBroadcastSourceState(
+                self._context(),
+                None,
+                now_ms=10000,
+            )
+        self.assertEqual(missing.exception.reason, "source_state_missing")
+
+        with self.assertRaises(EffectiveAtEligibilityError) as unsettled:
+            validateBroadcastSourceState(
+                self._context(),
+                self._device_state(),
+                now_ms=10000,
+                has_unsettled_controls=True,
+            )
+        self.assertEqual(
+            unsettled.exception.reason,
+            "source_state_unsettled",
+        )
 
     def test_position_projection_clamps_to_known_duration(self):
         self.assertEqual(

@@ -2251,6 +2251,43 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertEqual(queue_backed["queueRevision"], 3)
         self.assertEqual(queue_backed["controlVersion"], 3)
 
+    def test_queue_sync_preserves_each_non_empty_context_state(self):
+        for index, state_name in enumerate(
+            ("playing", "paused", "stopped"),
+            start=1,
+        ):
+            with self.subTest(state_name=state_name):
+                context_id = "context-state-%d" % index
+                client_id = "player-state-%d" % index
+                device_session_id = "device:player-state-%d" % index
+                createStrictPlaybackContextState(
+                    context_id,
+                    "alice",
+                    client_id,
+                    device_session_id,
+                    ["song-1", "song-2"],
+                    0,
+                    100,
+                    state_name,
+                )
+
+                updated = mutateStrictPlaybackContextQueue(
+                    context_id,
+                    "alice",
+                    client_id,
+                    device_session_id,
+                    ["song-1", "song-2"],
+                    1,
+                    25,
+                    1,
+                    1,
+                    position_sampled_at_server_ms=1100,
+                )
+
+                self.assertEqual(updated["state"], state_name)
+                self.assertEqual(updated["trackId"], "song-2")
+                self.assertEqual(updated["controlVersion"], 2)
+
     def test_queue_sync_advances_existing_authority_device_state_atomically(self):
         createStrictPlaybackContextState(
             "context-1",
@@ -2278,6 +2315,8 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 "positionMs": 500,
                 "positionSampledAtServerMs": 900,
                 "playbackRate": 1.25,
+                "volume": 35,
+                "muted": True,
                 "clientSeq": 7,
             },
             1000,
@@ -2305,6 +2344,8 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertEqual(device["positionMs"], 25)
         self.assertEqual(device["positionSampledAtServerMs"], 1100)
         self.assertEqual(device["playbackRate"], 1.25)
+        self.assertEqual(device["volume"], 35)
+        self.assertIs(device["muted"], True)
         self.assertEqual(device["clientSeq"], 7)
 
         content_only = mutateStrictPlaybackContextQueue(
@@ -2325,6 +2366,244 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             unchanged_device["positionSampledAtServerMs"],
             1100,
         )
+
+    def test_queue_sync_preserves_paused_and_stopped_device_facts(self):
+        for index, state_name in enumerate(("paused", "stopped"), start=1):
+            with self.subTest(state_name=state_name):
+                context_id = "context-device-%d" % index
+                client_id = "player-device-%d" % index
+                device_session_id = "device:player-device-%d" % index
+                nonce = "nonce-device-%d" % index
+                createStrictPlaybackContextState(
+                    context_id,
+                    "alice",
+                    client_id,
+                    device_session_id,
+                    ["song-1", "song-2"],
+                    0,
+                    500,
+                    "playing",
+                )
+                applyStrictPlaybackUpdate(
+                    context_id,
+                    "alice",
+                    client_id,
+                    device_session_id,
+                    nonce,
+                    {
+                        "playbackContextId": context_id,
+                        "deviceSessionId": device_session_id,
+                        "origin": "passive",
+                        "appliedControlVersion": 1,
+                        "state": state_name,
+                        "trackId": "song-1",
+                        "positionMs": 500,
+                        "positionSampledAtServerMs": 900,
+                        "playbackRate": 1.25 + index / 10,
+                        "volume": 20 + index * 10,
+                        "muted": index == 1,
+                        "clientSeq": 4,
+                    },
+                    1000,
+                )
+
+                updated = mutateStrictPlaybackContextQueue(
+                    context_id,
+                    "alice",
+                    client_id,
+                    device_session_id,
+                    ["song-1", "song-2"],
+                    1,
+                    25,
+                    1,
+                    1,
+                    position_sampled_at_server_ms=1100,
+                    connection_nonce=nonce,
+                )
+                device = getDevicePlaybackState(context_id, client_id)
+
+                self.assertEqual(updated["state"], "playing")
+                self.assertEqual(updated["controlVersion"], 2)
+                self.assertEqual(device["appliedControlVersion"], 2)
+                self.assertEqual(device["state"], state_name)
+                self.assertEqual(device["trackId"], "song-2")
+                self.assertEqual(device["positionMs"], 25)
+                self.assertEqual(
+                    device["positionSampledAtServerMs"],
+                    1100,
+                )
+                self.assertEqual(
+                    device["playbackRate"],
+                    1.25 + index / 10,
+                )
+                self.assertEqual(device["volume"], 20 + index * 10)
+                self.assertEqual(device["muted"], index == 1)
+                self.assertEqual(device["clientSeq"], 4)
+
+    def test_equal_applied_passive_update_keeps_context_and_device_independent(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            100,
+            "paused",
+        )
+        applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "paused",
+                "trackId": "song-1",
+                "positionMs": 100,
+                "positionSampledAtServerMs": 900,
+                "playbackRate": 1.0,
+                "clientSeq": 1,
+            },
+            1000,
+        )
+        before = getPlaybackContextState("context-1")
+
+        result = applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 250,
+                "positionSampledAtServerMs": 1100,
+                "playbackRate": 1.5,
+                "clientSeq": 2,
+            },
+            1200,
+        )
+        after = getPlaybackContextState("context-1")
+        device = getDevicePlaybackState("context-1", "player-1")
+
+        self.assertTrue(result["created"])
+        self.assertEqual(
+            tuple(
+                before[field]
+                for field in (
+                    "state",
+                    "version",
+                    "queueRevision",
+                    "controlVersion",
+                )
+            ),
+            tuple(
+                after[field]
+                for field in (
+                    "state",
+                    "version",
+                    "queueRevision",
+                    "controlVersion",
+                )
+            ),
+        )
+        self.assertEqual(after["state"], "paused")
+        self.assertEqual(device["state"], "playing")
+        self.assertEqual(device["positionMs"], 250)
+        self.assertEqual(device["playbackRate"], 1.5)
+        self.assertEqual(device["appliedControlVersion"], 1)
+
+    def test_passive_update_cannot_advance_existing_applied_cursor(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            100,
+            "playing",
+        )
+        applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 100,
+                "positionSampledAtServerMs": 900,
+                "playbackRate": 1.0,
+                "clientSeq": 1,
+            },
+            1000,
+        )
+        mutateStrictPlaybackContextControl(
+            "context-1",
+            "alice",
+            "controller-1",
+            "player.pause",
+            1,
+            requesting_client_id="controller-1",
+            authority_client_id="player-1",
+            authority_device_session_id="device:player-1",
+            routed_connection_nonce="nonce-1",
+            accepted_at_ms=1100,
+            execution_timeout_ms=15000,
+        )
+        before_context = getPlaybackContextState("context-1")
+        before_device = getDevicePlaybackState("context-1", "player-1")
+
+        with self.assertRaises(PlaybackControlTransactionConflictError):
+            applyStrictPlaybackUpdate(
+                "context-1",
+                "alice",
+                "player-1",
+                "device:player-1",
+                "nonce-1",
+                {
+                    "playbackContextId": "context-1",
+                    "deviceSessionId": "device:player-1",
+                    "origin": "passive",
+                    "appliedControlVersion": 2,
+                    "state": "paused",
+                    "trackId": "song-1",
+                    "positionMs": 100,
+                    "positionSampledAtServerMs": 1200,
+                    "playbackRate": 1.0,
+                    "clientSeq": 2,
+                },
+                1300,
+            )
+
+        self.assertEqual(
+            getPlaybackContextState("context-1"),
+            before_context,
+        )
+        self.assertEqual(
+            getDevicePlaybackState("context-1", "player-1"),
+            before_device,
+        )
+        transaction = getPlaybackControlTransaction("context-1", 1, 2)
+        self.assertEqual(transaction["status"], "pending")
+        self.assertEqual(before_context["controlVersion"], 2)
+        self.assertEqual(before_device["appliedControlVersion"], 1)
 
     def test_queue_sync_without_feedback_creates_hidden_applied_baseline(self):
         createStrictPlaybackContextState(

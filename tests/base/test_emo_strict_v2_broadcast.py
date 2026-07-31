@@ -140,6 +140,42 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             namespace="/emo",
         )
 
+    def set_source_context_state(self, state_name):
+        record = db.EmoPlaybackContext.get(
+            db.EmoPlaybackContext.playback_context_id
+            == "context-broadcast-source"
+        )
+        record.state = state_name
+        record.save(only=(db.EmoPlaybackContext.state,))
+        context = getPlaybackContextState("context-broadcast-source")
+        get_state().restore_playback_context(
+            "context-broadcast-source",
+            context,
+        )
+        return context
+
+    @staticmethod
+    def set_persisted_source_device_state(**changes):
+        record = db.EmoDevicePlaybackState.get(
+            (db.EmoDevicePlaybackState.playback_context_id
+             == "context-broadcast-source")
+            & (db.EmoDevicePlaybackState.owner_client_id == "authority-1")
+        )
+        playback = json.loads(record.playback_json)
+        column_fields = {
+            "appliedControlVersion": "applied_control_version",
+            "state": "state",
+            "trackId": "track_id",
+            "positionMs": "position_ms",
+        }
+        for field_name, value in changes.items():
+            playback[field_name] = value
+            column_name = column_fields.get(field_name)
+            if column_name is not None:
+                setattr(record, column_name, value)
+        record.playback_json = json.dumps(playback, ensure_ascii=True)
+        record.save()
+
     def sync_source_queue(
         self,
         authority,
@@ -417,6 +453,194 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             context["controlVersion"],
         )
         self.assertEqual(persisted["snapshot"]["trackId"], context["trackId"])
+
+    def _assert_start_accepts_nonplaying_context_state(self, state_name):
+        authority, participant, controller = self.connect_broadcast_devices()
+        context = self.set_source_context_state(state_name)
+        source_state = getDevicePlaybackState(
+            "context-broadcast-source",
+            "authority-1",
+        )
+        self.assertEqual(context["state"], state_name)
+        self.assertEqual(source_state["state"], "playing")
+        self.assertEqual(
+            source_state["appliedControlVersion"],
+            context["controlVersion"],
+        )
+
+        messages = self.start_strict_broadcast(
+            controller,
+            participants=["participant-1"],
+        )
+        ack = self.get_ack(messages, "broadcast-start-1")
+        persisted = emo_ws.getPersistentBroadcastState(
+            ack["payload"]["broadcastId"]
+        )
+        snapshot = persisted["snapshot"]
+
+        self.assertEqual(snapshot["state"], source_state["state"])
+        self.assertEqual(snapshot["queueSongIds"], context["queueSongIds"])
+        self.assertEqual(snapshot["currentIndex"], context["currentIndex"])
+        self.assertEqual(snapshot["trackId"], context["trackId"])
+        self.assertEqual(snapshot["sourceVersion"], context["version"])
+        self.assertEqual(
+            snapshot["sourceQueueRevision"],
+            context["queueRevision"],
+        )
+        self.assertEqual(
+            snapshot["sourceControlVersion"],
+            context["controlVersion"],
+        )
+        self.assertEqual(snapshot["sourceEpoch"], context["epoch"])
+        self.assertEqual(db.EmoBroadcast.select().count(), 1)
+        self.get_messages(authority)
+        self.get_messages(participant)
+
+    def test_start_accepts_playing_device_when_context_is_paused(self):
+        self._assert_start_accepts_nonplaying_context_state("paused")
+
+    def test_start_accepts_playing_device_when_context_is_stopped(self):
+        self._assert_start_accepts_nonplaying_context_state("stopped")
+
+    def test_start_rejects_paused_or_stopped_device_when_context_is_playing(self):
+        authority, _participant, controller = self.connect_broadcast_devices()
+        context = getPlaybackContextState("context-broadcast-source")
+        self.assertEqual(context["state"], "playing")
+
+        for client_seq, state_name in enumerate(
+            ("paused", "stopped"),
+            start=2,
+        ):
+            with self.subTest(state_name=state_name):
+                self.update_source_playback(
+                    authority,
+                    client_seq,
+                    int(time.time() * 1000),
+                    state=state_name,
+                )
+                self.get_messages(authority)
+                device_state = getDevicePlaybackState(
+                    "context-broadcast-source",
+                    "authority-1",
+                )
+                self.assertEqual(device_state["state"], state_name)
+                self.assertEqual(
+                    device_state["appliedControlVersion"],
+                    context["controlVersion"],
+                )
+
+                request_id = "broadcast-start-device-%s" % state_name
+                messages = self.start_strict_broadcast(
+                    controller,
+                    request_id=request_id,
+                    intent_id="intent-device-%s" % state_name,
+                    participants=["participant-1"],
+                )
+                error = self.get_error(messages, request_id)
+                self.assertEqual(error["payload"]["code"], "conflict")
+                self.assertEqual(db.EmoBroadcast.select().count(), 0)
+
+    def test_start_rejects_each_stale_source_clock(self):
+        authority, _participant, controller = self.connect_broadcast_devices()
+
+        for index, stale_field in enumerate(
+            ("serverUpdatedAtMs", "positionSampledAtServerMs"),
+            start=1,
+        ):
+            with self.subTest(stale_field=stale_field):
+                server_time_ms = int(time.time() * 1000)
+                self.set_persisted_source_device_state(
+                    **{
+                        "serverUpdatedAtMs": server_time_ms,
+                        "positionSampledAtServerMs": server_time_ms,
+                        stale_field: server_time_ms - 2100,
+                    }
+                )
+                request_id = "broadcast-start-stale-%d" % index
+                messages = self.start_strict_broadcast(
+                    controller,
+                    request_id=request_id,
+                    intent_id="intent-stale-%d" % index,
+                    participants=["participant-1"],
+                )
+                error = self.get_error(messages, request_id)
+                self.assertEqual(error["payload"]["code"], "conflict")
+                self.assertEqual(db.EmoBroadcast.select().count(), 0)
+
+                self.report_source_state(
+                    authority,
+                    sampled_at_ms=int(time.time() * 1000),
+                    client_seq=index + 1,
+                )
+                self.get_messages(authority)
+
+    def test_start_rejects_unsettled_or_mismatched_source_state(self):
+        authority, _participant, controller = self.connect_broadcast_devices()
+        cases = ("applied", "track", "future-sample")
+
+        for index, case_name in enumerate(cases, start=1):
+            with self.subTest(case_name=case_name):
+                if case_name == "applied":
+                    changes = {"appliedControlVersion": 0}
+                elif case_name == "track":
+                    changes = {"trackId": "source-song-2"}
+                else:
+                    server_time_ms = int(time.time() * 1000)
+                    changes = {
+                        "serverUpdatedAtMs": server_time_ms,
+                        "positionSampledAtServerMs": server_time_ms + 1000,
+                    }
+                self.set_persisted_source_device_state(**changes)
+                request_id = "broadcast-start-%s" % case_name
+                messages = self.start_strict_broadcast(
+                    controller,
+                    request_id=request_id,
+                    intent_id="intent-%s" % case_name,
+                    participants=["participant-1"],
+                )
+                error = self.get_error(messages, request_id)
+                self.assertEqual(error["payload"]["code"], "conflict")
+                self.assertEqual(db.EmoBroadcast.select().count(), 0)
+
+                self.report_source_state(
+                    authority,
+                    sampled_at_ms=int(time.time() * 1000),
+                    client_seq=index + 1,
+                )
+                self.get_messages(authority)
+
+    def test_start_rejects_pending_source_control(self):
+        authority, _participant, controller = self.connect_broadcast_devices()
+        context = getPlaybackContextState("context-broadcast-source")
+        createPlaybackControlTransaction(
+            "context-broadcast-source",
+            "alice",
+            context["epoch"],
+            context["controlVersion"],
+            "controller-1",
+            "authority-1",
+            "device:authority-1",
+            "test-source-connection",
+            1,
+            "player.pause",
+            {"state": "paused"},
+            int(time.time() * 1000),
+            15000,
+        )
+
+        messages = self.start_strict_broadcast(
+            controller,
+            request_id="broadcast-start-pending-control",
+            intent_id="intent-pending-control",
+            participants=["participant-1"],
+        )
+        error = self.get_error(
+            messages,
+            "broadcast-start-pending-control",
+        )
+        self.assertEqual(error["payload"]["code"], "conflict")
+        self.assertEqual(db.EmoBroadcast.select().count(), 0)
+        self.get_messages(authority)
 
     def test_reconnected_source_requires_fresh_feedback_after_queue_sync(self):
         authority, participant, controller = self.connect_broadcast_devices()

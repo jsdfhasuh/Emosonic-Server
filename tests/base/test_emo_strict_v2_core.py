@@ -3490,6 +3490,8 @@ class StrictV2CoreTestCase(unittest.TestCase):
                 "positionMs": 1200,
                 "positionSampledAtServerMs": 100,
                 "playbackRate": 1.25,
+                "volume": 40,
+                "muted": True,
                 "clientSeq": 1,
             },
         )
@@ -3522,6 +3524,8 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(device["positionMs"], 500)
         self.assertEqual(device["positionSampledAtServerMs"], 200)
         self.assertEqual(device["playbackRate"], 1.25)
+        self.assertEqual(device["volume"], 40)
+        self.assertIs(device["muted"], True)
         self.assertEqual(device["clientSeq"], 1)
 
         status = self.emit_strict(
@@ -3541,6 +3545,9 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(status_device["appliedControlVersion"], 2)
         self.assertEqual(status_device["trackId"], "song-1")
         self.assertEqual(status_device["positionMs"], 500)
+        self.assertEqual(status_device["playbackRate"], 1.25)
+        self.assertEqual(status_device["volume"], 40)
+        self.assertIs(status_device["muted"], True)
 
         stale = self.emit_strict(
             client,
@@ -3607,6 +3614,60 @@ class StrictV2CoreTestCase(unittest.TestCase):
             ),
             (2, 2, 2),
         )
+
+    def test_status_allows_equal_applied_with_different_actual_state(self):
+        client = self.ready_strict_client()
+        self.create_context(client, state="paused")
+        self.messages(client)
+
+        update = self.emit_strict(
+            client,
+            "event",
+            "playback.update",
+            "passive-actual-playing",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-2",
+                "positionMs": 1500,
+                "positionSampledAtServerMs": 100,
+                "playbackRate": 1.5,
+                "clientSeq": 1,
+            },
+        )
+        self.assertEqual(
+            [message["action"] for message in update],
+            ["playback.update"],
+        )
+
+        status = self.emit_strict(
+            client,
+            "state",
+            "playback.context.status",
+            "status-context-paused-device-playing",
+            {"playbackContextId": "context-1"},
+        )
+        status_message = next(
+            message
+            for message in status
+            if message["action"] == "playback.context.status"
+            and "requestId" in message
+        )
+        payload = status_message["payload"]
+        device = payload["deviceStates"][0]
+
+        self.assertEqual(payload["playbackContext"]["state"], "paused")
+        self.assertEqual(
+            payload["playbackContext"]["controlVersion"],
+            1,
+        )
+        self.assertEqual(device["state"], "playing")
+        self.assertEqual(device["appliedControlVersion"], 1)
+        self.assertEqual(device["positionMs"], 1500)
+        self.assertEqual(device["playbackRate"], 1.5)
 
     def test_controller_control_routes_only_to_bound_authority_then_acks(self):
         player = self.ready_strict_client()
