@@ -2669,7 +2669,8 @@ def _advance_queue_sync_authority_device_state(
     connection_nonce: Optional[str],
     position_sampled_at_server_ms: int,
     updated_at: datetime,
-) -> EmoDevicePlaybackState:
+    advance_applied_control_version: bool = True,
+) -> Optional[EmoDevicePlaybackState]:
     existing = EmoDevicePlaybackState.get_or_none(
         (
             EmoDevicePlaybackState.playback_context_id
@@ -2697,6 +2698,8 @@ def _advance_queue_sync_authority_device_state(
         and connection_nonce
         and playback_json.get("_connectionNonce") == connection_nonce
     )
+    if not advance_applied_control_version and not same_authority_scope:
+        return existing
     if not same_feedback_scope:
         playback_json = {}
 
@@ -2708,12 +2711,17 @@ def _advance_queue_sync_authority_device_state(
         state_name = record.state
 
     server_updated_at_ms = int(updated_at.timestamp() * 1000)
+    applied_control_version = (
+        record.control_version
+        if advance_applied_control_version
+        else existing.applied_control_version
+    )
     playback_json.update(
         {
             "state": state_name,
             "positionMs": record.position_ms,
             "positionSampledAtServerMs": position_sampled_at_server_ms,
-            "appliedControlVersion": record.control_version,
+            "appliedControlVersion": applied_control_version,
             "serverUpdatedAtMs": server_updated_at_ms,
         }
     )
@@ -2733,7 +2741,7 @@ def _advance_queue_sync_authority_device_state(
         "is_authority": 1,
         "mode": existing.mode if same_feedback_scope else "normal",
         "context_epoch": record.epoch,
-        "applied_control_version": record.control_version,
+        "applied_control_version": applied_control_version,
         "client_seq": existing.client_seq if same_feedback_scope else 0,
         "playback_json": json.dumps(playback_json, ensure_ascii=True),
         "updated_at": updated_at,
@@ -2791,10 +2799,10 @@ def mutateStrictPlaybackContextQueue(
             )
             index_changed = previous_index != next_index
             boundary_changed = bool(previous_queue) != bool(queue_song_ids)
+            position_changed = record.position_ms != position_ms
             control_changed = (
                 index_changed
                 or previous_track != next_track
-                or record.position_ms != position_ms
                 or boundary_changed
             )
             if control_changed:
@@ -2866,7 +2874,7 @@ def mutateStrictPlaybackContextQueue(
                 record.control_version += 1
             record.updated_at = updated_at
             record.save()
-            if control_changed:
+            if control_changed or position_changed:
                 _advance_queue_sync_authority_device_state(
                     record,
                     authority_client_id,
@@ -2874,6 +2882,7 @@ def mutateStrictPlaybackContextQueue(
                     connection_nonce,
                     position_sampled_at_server_ms,
                     updated_at,
+                    advance_applied_control_version=control_changed,
                 )
             result = _playback_context_payload(record)
             if post_mutation_hook is not None:

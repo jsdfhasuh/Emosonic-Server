@@ -244,7 +244,7 @@ List/Ensure 不允许用简略 ACK 代替 direct response。
 | ensure 将同 clientId 的离线旧 deviceSession 重新绑定到当前 session | +1 | +1 | 仅同时将 idle 初始化为非空时 +1 | +1 |
 | `device.setVolume` / `device.volume.update` | 不变 | 不变 | 不变 | 不变；不访问 Context |
 | `playback.context.prepare` / `playback.context.prepared` | 不变 | 不变 | 不变 | 不变；prepare 使用独立 intentId 状态机 |
-| `queue.context.sync` | 不变 | +1 | +1 | 当 currentIndex、该 index 的 trackId、position 或 idle/non-empty 边界改变时 +1；这是 authority 已提交的实际 state mutation，control 前进时该 authority 的 applied cursor 同步前进；idle→non-empty 将 state 设为 paused，non-empty→idle 将 state 设为 idle |
+| `queue.context.sync` | 不变 | +1 | +1 | 当 currentIndex、该 index 的 trackId 或 idle/non-empty 边界改变时 +1；position 自然前进不是控制变化；这是 authority 已提交的实际 state mutation，control 前进时该 authority 的 applied cursor 同步前进；idle→non-empty 将 state 设为 paused，non-empty→idle 将 state 设为 idle |
 | `queue.playItem` | 不变 | +1 | +1 | +1 |
 | `player.play` / `pause` / `seek` | 不变 | +1 | 不变 | +1 |
 | `player.next` / `prev` | 不变 | +1 | +1（`currentIndex` 改变） | +1 |

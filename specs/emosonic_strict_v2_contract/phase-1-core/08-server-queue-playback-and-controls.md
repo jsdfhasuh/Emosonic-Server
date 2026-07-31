@@ -38,8 +38,10 @@ serverUpdatedAtMs/timelineId 可选。
 
 `queue.context.sync` 从 idle 进入非空时，服务端把 canonical state 设为 paused；从非空清为空时设为
 idle。两种边界变化都递增 version、queueRevision 和 controlVersion。普通非空队列内容变化始终递增
-version/queueRevision；只有当前 index、track 或 position 的 canonical 值同时变化时才递增
-controlVersion。请求不得携带 state 或 trackId，二者由服务端根据队列推导。
+version/queueRevision；只有当前 index、该 index 对应的 track 或 idle/non-empty 边界变化时才递增
+controlVersion。position 自然前进不是控制变化；服务端保存 positionMs 和采样时间作为事实锚点，
+明确 seek 必须使用 player.seek 或 playback.update(origin:"localUser")。请求不得携带 state 或 trackId，
+二者由服务端根据队列推导。
 `positionSampledAtServerMs` 必须与 positionMs 同时采样，canonical push 原样保留该合法采样时间；
 `serverUpdatedAtMs` 仍是服务端接受/提交时间，不得代替位置采样时间。
 

@@ -3327,6 +3327,8 @@ class StrictV2CoreTestCase(unittest.TestCase):
         persisted = getPlaybackContextState("context-1")
         self.assertEqual(persisted["queueSongIds"], ["song-2", "song-3"])
         self.assertEqual(persisted["version"], 2)
+        self.assertEqual(persisted["queueRevision"], 2)
+        self.assertEqual(persisted["controlVersion"], 1)
         self.assertEqual(mutate_queue.call_count, 1)
 
         client.emit("message", request, namespace="/emo")
@@ -3340,6 +3342,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
             {"action": "queue.context.sync"},
         )
         self.assertEqual(mutate_queue.call_count, 1)
+        self.assertEqual(getPlaybackContextState("context-1"), persisted)
 
     def test_context_ensure_retry_after_runtime_reset_uses_persisted_context(self):
         client = self.ready_strict_client()
@@ -3441,10 +3444,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(persisted["queueRevision"], 2)
         self.assertEqual(persisted["controlVersion"], 2)
 
-        before_stale = tuple(
-            persisted[field]
-            for field in ("version", "queueRevision", "controlVersion")
-        )
+        before_stale = dict(persisted)
         stale = {
             "type": "state",
             "action": "queue.context.sync",
@@ -3464,13 +3464,79 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(error["payload"]["code"], "stale_version")
         self.assertEqual(error["payload"]["currentQueueRevision"], 2)
         after_stale = getPlaybackContextState("context-1")
-        self.assertEqual(
-            tuple(
-                after_stale[field]
-                for field in ("version", "queueRevision", "controlVersion")
-            ),
-            before_stale,
+        self.assertEqual(after_stale, before_stale)
+
+    def test_queue_sync_natural_progress_keeps_control_and_applied(self):
+        client = self.ready_strict_client()
+        self.create_context(client)
+        self.emit_strict(
+            client,
+            "event",
+            "playback.update",
+            "natural-progress-baseline",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-2",
+                "positionMs": 1200,
+                "positionSampledAtServerMs": 100,
+                "playbackRate": 1.0,
+                "clientSeq": 1,
+            },
         )
+
+        scenarios = (
+            ("append", ["song-2", "song-1", "song-50"], 1800, 200, 2),
+            ("position", ["song-2", "song-1", "song-50"], 2400, 300, 3),
+        )
+        for name, queue_song_ids, position_ms, sampled_at_ms, expected_version in scenarios:
+            with self.subTest(name=name):
+                before = getPlaybackContextState("context-1")
+                messages = self.emit_strict(
+                    client,
+                    "state",
+                    "queue.context.sync",
+                    "natural-progress-%s" % name,
+                    {
+                        "playbackContextId": "context-1",
+                        "deviceSessionId": "device:phone-1",
+                        "queueSongIds": queue_song_ids,
+                        "currentIndex": 0,
+                        "positionMs": position_ms,
+                        "positionSampledAtServerMs": sampled_at_ms,
+                        "baseQueueRevision": before["queueRevision"],
+                    },
+                )
+
+                self.assertEqual(
+                    [message["action"] for message in messages],
+                    ["system.ack", "queue.context.sync"],
+                )
+                persisted = getPlaybackContextState("context-1")
+                self.assertEqual(persisted["version"], expected_version)
+                self.assertEqual(
+                    persisted["queueRevision"],
+                    expected_version,
+                )
+                self.assertEqual(persisted["controlVersion"], 1)
+                self.assertEqual(persisted["positionMs"], position_ms)
+                self.assertEqual(
+                    persisted["positionSampledAtServerMs"],
+                    sampled_at_ms,
+                )
+                device = emo_ws.getDevicePlaybackState(
+                    "context-1",
+                    "phone-1",
+                )
+                self.assertEqual(device["appliedControlVersion"], 1)
+                self.assertEqual(device["positionMs"], position_ms)
+                self.assertEqual(
+                    device["positionSampledAtServerMs"],
+                    sampled_at_ms,
+                )
 
     def test_queue_sync_advances_authority_applied_and_accepts_passive(self):
         client = self.ready_strict_client()
@@ -3871,9 +3937,10 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.create_context(client)
         scenarios = (
             ("content", ["song-2", "song-3"], 0, 1200, None, (2, 2, 1)),
-            ("position", ["song-2", "song-3"], 0, 29639, 1, (3, 3, 2)),
-            ("index", ["song-2", "song-3"], 1, 0, 2, (4, 4, 3)),
-            ("no-op", ["song-2", "song-3"], 1, 0, None, (5, 5, 3)),
+            ("position", ["song-2", "song-3"], 0, 29639, None, (3, 3, 1)),
+            ("track", ["song-4", "song-3"], 0, 29639, 1, (4, 4, 2)),
+            ("index", ["song-4", "song-3"], 1, 0, 2, (5, 5, 3)),
+            ("no-op", ["song-4", "song-3"], 1, 0, None, (6, 6, 3)),
         )
         for name, queue, index, position, base_control, expected in scenarios:
             with self.subTest(name=name):
@@ -3939,8 +4006,18 @@ class StrictV2CoreTestCase(unittest.TestCase):
                     ),
                     expected,
                 )
+                if name in {"track", "index"}:
+                    device = emo_ws.getDevicePlaybackState(
+                        "context-1",
+                        "phone-1",
+                    )
+                    self.assertEqual(
+                        device["appliedControlVersion"],
+                        expected[2],
+                    )
 
         before = getPlaybackContextState("context-1")
+        before_device = emo_ws.getDevicePlaybackState("context-1", "phone-1")
         error = self.emit_strict(
             client,
             "state",
@@ -3949,17 +4026,44 @@ class StrictV2CoreTestCase(unittest.TestCase):
             {
                 "playbackContextId": "context-1",
                 "deviceSessionId": "device:phone-1",
-                "queueSongIds": ["song-2", "song-3"],
-                "currentIndex": 1,
+                "queueSongIds": ["song-4", "song-3"],
+                "currentIndex": 0,
                 "positionMs": 1,
                 "baseQueueRevision": before["queueRevision"],
             },
         )[0]
         self.assertEqual(error["payload"]["code"], "bad_request")
         after = getPlaybackContextState("context-1")
+        self.assertEqual(after, before)
         self.assertEqual(
-            tuple(after[field] for field in ("version", "queueRevision", "controlVersion")),
-            tuple(before[field] for field in ("version", "queueRevision", "controlVersion")),
+            emo_ws.getDevicePlaybackState("context-1", "phone-1"),
+            before_device,
+        )
+
+        stale_control = self.emit_strict(
+            client,
+            "state",
+            "queue.context.sync",
+            "queue-stale-control",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "queueSongIds": ["song-4", "song-3"],
+                "currentIndex": 0,
+                "positionMs": 1,
+                "baseQueueRevision": before["queueRevision"],
+                "baseControlVersion": before["controlVersion"] - 1,
+            },
+        )[0]
+        self.assertEqual(stale_control["payload"]["code"], "stale_version")
+        self.assertEqual(
+            stale_control["payload"]["currentControlVersion"],
+            before["controlVersion"],
+        )
+        self.assertEqual(getPlaybackContextState("context-1"), before)
+        self.assertEqual(
+            emo_ws.getDevicePlaybackState("context-1", "phone-1"),
+            before_device,
         )
 
     def test_all_core_controls_follow_cursor_matrix_and_wire_schema(self):

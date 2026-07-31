@@ -677,9 +677,9 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             "authority-1",
         )
         context = getPlaybackContextState("context-broadcast-source")
-        self.assertEqual(source_state["appliedControlVersion"], 2)
+        self.assertEqual(source_state["appliedControlVersion"], 1)
         self.assertEqual(source_state["clientSeq"], 0)
-        self.assertEqual(context["controlVersion"], 2)
+        self.assertEqual(context["controlVersion"], 1)
 
         blocked = self.get_error(
             self.start_strict_broadcast(
