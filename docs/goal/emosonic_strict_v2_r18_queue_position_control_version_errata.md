@@ -1,6 +1,6 @@
 # Goal: strict-v2 r18 Queue 位置与控制版本勘误落地
 
-> 状态：Completed
+> 状态：Completed（2026-07-31 审查修正）
 >
 > 制定日期：2026-07-31
 >
@@ -150,3 +150,42 @@ python -m unittest
    范围。
 3. Windows 来源与 Android 接收设备的同时间段完整日志和真机行为尚未验证，状态
    保持 `pending user validation`。
+
+## 十、2026-07-31 审查修正
+
+提交 `b1ba67d` 的后续审查发现：authority 以相同 client/device pair 重连后，
+如果第一次 `queue.context.sync` 只修改非当前队列内容或完全 no-op，并保持 Context
+中的 `positionMs` 不变，服务端不会进入 DevicePlaybackState 的连接作用域重置路径。
+旧连接的 `clientSeq>=1` 因此可能被 `broadcast.start` 误当成新连接反馈。
+
+修正结果：
+
+1. 每次携带合法 `connectionNonce` 的已接受 queue sync 都核对持久化
+   DevicePlaybackState 的反馈作用域；旧连接反馈存在且 nonce 不同时，保留原
+   applied cursor 并建立 `clientSeq=0` 隐藏基线。
+2. 同一当前连接的 content-only/no-op sync 直接保留已有设备行，不刷新
+   `serverUpdatedAtMs` 或 `positionSampledAtServerMs`，过期反馈不会重新取得群播来源
+   资格。
+3. 重连后的同位置 content-only 和 no-op sync 都必须等待新连接的 fresh
+   `playback.update(clientSeq=1)`，之后 `broadcast.start` 才可接受。
+4. 权威契约已删除“position 变化要求 `baseControlVersion`”的残留旧文字。
+5. 未修改协议版本、`contractRevision`、Socket action、消息字段、错误码、数据库
+   结构或 Flutter 代码。
+
+新增/强化的回归测试：
+
+- `test_same_connection_noop_queue_sync_does_not_refresh_source_feedback`
+- `test_reconnected_source_requires_fresh_feedback_after_queue_sync`
+- `test_reconnected_source_requires_fresh_feedback_after_noop_queue_sync`
+
+验证结果：
+
+- 关键 4 项：`Ran 4 tests in 1.671s`，`OK`。
+- Broadcast 模块：`Ran 310 tests in 43.474s`，`OK`。
+- Store/Core 模块：`Ran 134 tests in 14.303s`，`OK`。
+- 完整 `python -m unittest`：`Ran 1665 tests in 430.475s`，
+  `OK (skipped=3)`。
+- `git diff --check` 通过。
+
+Flutter 本地是否仍会阻止 `broadcast.start` 发送，以及 Windows 来源、Android 接收
+真机行为，均保持 `pending user validation`。

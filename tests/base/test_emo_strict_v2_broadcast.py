@@ -188,15 +188,30 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         if sampled_at_ms is None:
             sampled_at_ms = int(time.time() * 1000)
         context = getPlaybackContextState("context-broadcast-source")
+        queue_song_ids = list(queue_song_ids)
+        previous_queue = context["queueSongIds"]
+        previous_index = context.get("currentIndex") if previous_queue else None
+        next_index = current_index if queue_song_ids else None
+        next_track = (
+            queue_song_ids[next_index]
+            if queue_song_ids and next_index is not None
+            else None
+        )
+        control_changed = (
+            previous_index != next_index
+            or context.get("trackId") != next_track
+            or bool(previous_queue) != bool(queue_song_ids)
+        )
         payload = {
             "playbackContextId": "context-broadcast-source",
             "deviceSessionId": "device:authority-1",
-            "queueSongIds": list(queue_song_ids),
+            "queueSongIds": queue_song_ids,
             "positionMs": position_ms,
             "positionSampledAtServerMs": sampled_at_ms,
             "baseQueueRevision": context["queueRevision"],
-            "baseControlVersion": context["controlVersion"],
         }
+        if control_changed:
+            payload["baseControlVersion"] = context["controlVersion"]
         if current_index is not None:
             payload["currentIndex"] = current_index
         authority.emit(
@@ -209,6 +224,7 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             },
             namespace="/emo",
         )
+        return payload
 
     def update_source_playback(
         self,
@@ -454,6 +470,53 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         )
         self.assertEqual(persisted["snapshot"]["trackId"], context["trackId"])
 
+    def test_same_connection_noop_queue_sync_does_not_refresh_source_feedback(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        stale_at_ms = int(time.time() * 1000) - 2100
+        self.set_persisted_source_device_state(
+            serverUpdatedAtMs=stale_at_ms,
+            positionSampledAtServerMs=stale_at_ms,
+        )
+        source_state_before = getDevicePlaybackState(
+            "context-broadcast-source",
+            "authority-1",
+        )
+        context = getPlaybackContextState("context-broadcast-source")
+
+        sync_payload = self.sync_source_queue(
+            authority,
+            context["queueSongIds"],
+            current_index=context["currentIndex"],
+            position_ms=context["positionMs"],
+            sampled_at_ms=int(time.time() * 1000),
+            request_id="same-connection-noop-queue",
+        )
+        self.assertNotIn("baseControlVersion", sync_payload)
+        self.get_ack(
+            self.get_messages(authority),
+            "same-connection-noop-queue",
+        )
+        self.get_messages(participant)
+        self.get_messages(controller)
+
+        self.assertEqual(
+            getDevicePlaybackState(
+                "context-broadcast-source",
+                "authority-1",
+            ),
+            source_state_before,
+        )
+        error = self.get_error(
+            self.start_strict_broadcast(
+                controller,
+                request_id="broadcast-start-after-noop-queue",
+                intent_id="intent-after-noop-queue",
+                participants=["participant-1"],
+            ),
+            "broadcast-start-after-noop-queue",
+        )
+        self.assertEqual(error["payload"]["code"], "conflict")
+
     def _assert_start_accepts_nonplaying_context_state(self, state_name):
         authority, participant, controller = self.connect_broadcast_devices()
         context = self.set_source_context_state(state_name)
@@ -642,8 +705,13 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         self.assertEqual(db.EmoBroadcast.select().count(), 0)
         self.get_messages(authority)
 
-    def test_reconnected_source_requires_fresh_feedback_after_queue_sync(self):
+    def _assert_reconnected_source_requires_fresh_feedback_after_queue_sync(
+        self,
+        queue_song_ids,
+        request_suffix,
+    ):
         authority, participant, controller = self.connect_broadcast_devices()
+        context_before = getPlaybackContextState("context-broadcast-source")
         authority.disconnect(namespace="/emo")
         replacement = self.connect_device(
             "alice",
@@ -660,34 +728,49 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             self.get_messages(client)
 
         sampled_at_ms = int(time.time() * 1000)
-        self.sync_source_queue(
+        sync_payload = self.sync_source_queue(
             replacement,
-            ["source-song-1", "source-song-2"],
+            queue_song_ids,
             current_index=0,
-            position_ms=1100,
+            position_ms=context_before["positionMs"],
             sampled_at_ms=sampled_at_ms,
-            request_id="reconnected-source-queue",
+            request_id="reconnected-source-queue-%s" % request_suffix,
         )
+        self.assertNotIn("baseControlVersion", sync_payload)
         self.get_ack(
             self.get_messages(replacement),
-            "reconnected-source-queue",
+            "reconnected-source-queue-%s" % request_suffix,
         )
         source_state = getDevicePlaybackState(
             "context-broadcast-source",
             "authority-1",
         )
         context = getPlaybackContextState("context-broadcast-source")
-        self.assertEqual(source_state["appliedControlVersion"], 1)
+        self.assertEqual(
+            context["queueRevision"],
+            context_before["queueRevision"] + 1,
+        )
+        self.assertEqual(
+            context["controlVersion"],
+            context_before["controlVersion"],
+        )
+        self.assertEqual(
+            source_state["appliedControlVersion"],
+            context_before["controlVersion"],
+        )
         self.assertEqual(source_state["clientSeq"], 0)
-        self.assertEqual(context["controlVersion"], 1)
+        self.assertEqual(source_state["positionMs"], context_before["positionMs"])
 
         blocked = self.get_error(
             self.start_strict_broadcast(
                 controller,
-                request_id="broadcast-start-before-fresh-feedback",
+                request_id=(
+                    "broadcast-start-before-fresh-feedback-%s" % request_suffix
+                ),
+                intent_id="intent-before-fresh-feedback-%s" % request_suffix,
                 participants=["participant-1"],
             ),
-            "broadcast-start-before-fresh-feedback",
+            "broadcast-start-before-fresh-feedback-%s" % request_suffix,
         )
         self.assertEqual(blocked["payload"]["code"], "conflict")
 
@@ -695,7 +778,7 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             replacement,
             1,
             int(time.time() * 1000),
-            positionMs=1100,
+            positionMs=context_before["positionMs"],
         )
         self.assertEqual(
             [message["action"] for message in self.get_messages(replacement)],
@@ -703,14 +786,27 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         )
         messages = self.start_strict_broadcast(
             controller,
-            request_id="broadcast-start-after-fresh-feedback",
+            request_id="broadcast-start-after-fresh-feedback-%s" % request_suffix,
+            intent_id="intent-after-fresh-feedback-%s" % request_suffix,
             participants=["participant-1"],
         )
         ack = self.get_ack(
             messages,
-            "broadcast-start-after-fresh-feedback",
+            "broadcast-start-after-fresh-feedback-%s" % request_suffix,
         )
         self.assertTrue(ack["payload"]["started"])
+
+    def test_reconnected_source_requires_fresh_feedback_after_queue_sync(self):
+        self._assert_reconnected_source_requires_fresh_feedback_after_queue_sync(
+            ["source-song-1", "source-song-2", "source-song-3"],
+            "content-only",
+        )
+
+    def test_reconnected_source_requires_fresh_feedback_after_noop_queue_sync(self):
+        self._assert_reconnected_source_requires_fresh_feedback_after_queue_sync(
+            ["source-song-1", "source-song-2"],
+            "noop",
+        )
 
     def test_strict_client_cannot_enter_legacy_broadcast_mutation_paths(self):
         authority, _participant, _controller = self.connect_broadcast_devices()

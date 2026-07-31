@@ -2670,6 +2670,7 @@ def _advance_queue_sync_authority_device_state(
     position_sampled_at_server_ms: int,
     updated_at: datetime,
     advance_applied_control_version: bool = True,
+    refresh_same_feedback_scope: bool = True,
 ) -> Optional[EmoDevicePlaybackState]:
     existing = EmoDevicePlaybackState.get_or_none(
         (
@@ -2699,6 +2700,12 @@ def _advance_queue_sync_authority_device_state(
         and playback_json.get("_connectionNonce") == connection_nonce
     )
     if not advance_applied_control_version and not same_authority_scope:
+        return existing
+    if (
+        not advance_applied_control_version
+        and not refresh_same_feedback_scope
+        and same_feedback_scope
+    ):
         return existing
     if not same_feedback_scope:
         playback_json = {}
@@ -2874,7 +2881,11 @@ def mutateStrictPlaybackContextQueue(
                 record.control_version += 1
             record.updated_at = updated_at
             record.save()
-            if control_changed or position_changed:
+            if (
+                control_changed
+                or position_changed
+                or (isinstance(connection_nonce, str) and connection_nonce)
+            ):
                 _advance_queue_sync_authority_device_state(
                     record,
                     authority_client_id,
@@ -2883,6 +2894,9 @@ def mutateStrictPlaybackContextQueue(
                     position_sampled_at_server_ms,
                     updated_at,
                     advance_applied_control_version=control_changed,
+                    refresh_same_feedback_scope=(
+                        control_changed or position_changed
+                    ),
                 )
             result = _playback_context_payload(record)
             if post_mutation_hook is not None:

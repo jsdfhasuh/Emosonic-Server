@@ -262,7 +262,8 @@ List/Ensure 不允许用简略 ACK 代替 direct response。
 请求中的 base cursor 必须精确等于服务器当前值；不相等返回 `stale_version`，不执行副作用。
 条件可选的 base cursor 只有在对应 canonical 域完全不改变时才可省略；实际变化却缺少对应 base
 cursor 时返回 `bad_request`。例如 queue sync 中队列内容变化要求 `baseQueueRevision`，而 index、
-该 index 的 trackId 或 position 变化还要求 `baseControlVersion`。
+该 index 的 trackId 或 idle/non-empty 边界变化还要求 `baseControlVersion`；position 自然前进不要求
+`baseControlVersion`。
 服务端 push 的比较顺序为 Context `(epoch, version)`、Queue `(epoch, queueRevision)` 和 Control
 `(epoch, controlVersion)`。旧值必须拒绝；完全相等且内容相同视为重复并忽略；完全相等但内容
 不同是 `conflict`，必须记录协议错误。`clientSeq` 重复且内容相同可忽略，重复但内容不同或倒退
