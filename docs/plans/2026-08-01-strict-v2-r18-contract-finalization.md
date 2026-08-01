@@ -4,13 +4,13 @@
 > 目标分支：`agent/strict-v2-r5-server-adaptation`  
 > 当前权威基线：strict-v2 `2.8.0` / r18  
 > 最终目标身份：`2026-08-01-r18` / `2.8.0`  
-> 本文性质：实施计划与决策记录，不替代 `specs/emosonic_strict_v2_socketio_server_contract.md` 及其 19 个权威分卷。
+> 本文性质：最终实施计划与决策记录，不替代 `specs/emosonic_strict_v2_socketio_server_contract.md` 及其 19 个权威分卷。
 
 ## 1. 版本身份、冻结状态与工作边界
 
-本轮不是创建 r19，也不升级 `protocolVersion`。当前 strict-v2 `2.8.0/r18` 尚未正式发布，本轮属于 r18 在首次冻结前的最终闭合、定稿和一致性修正。
+本轮不是创建 r19，也不升级 `protocolVersion`。当前 strict-v2 `2.8.0/r18` 尚未正式发布，本轮属于 r18 首次冻结前的最终闭合、定稿和一致性修正。
 
-本轮完成并通过最终一致性审计后，权威契约必须明确区分“契约已经冻结”和“实现尚待完成”：
+全部权威分卷完成修改并通过机械一致性审计后，入口必须明确区分：
 
 ```text
 文档状态：Approved r18 authoritative contract
@@ -20,56 +20,44 @@
 协议版本：2.8.0
 ```
 
-不得使用容易被误解为实现已经完成的 `Frozen implementation baseline`。
+不得使用 `Frozen implementation baseline`。
 
-本次保留 `2.8.0` 是首次冻结前的单次闭合例外。权威入口的维护规则必须同步写明：
+本次保留 `2.8.0` 是首次冻结前的单次闭合例外。权威入口必须写明：
 
-- 冻结前编译的旧 `2.8.0` 调试服务端与 Flutter 客户端，不保证兼容最终冻结后的 `2.8.0`；
+- 冻结前构建的旧 `2.8.0` 调试服务端与 Flutter，不保证兼容最终冻结后的 `2.8.0`；
 - 服务端与 Flutter 必须按最终 r18 成组升级，不支持新旧 pre-freeze `2.8.0` 混跑；
 - r18 冻结后，服务端或 Flutter 与 r18 不一致时，默认修改实现适配 r18；
-- 纯错字、链接、示例或不改变行为的文字澄清可作为 r18 errata；
-- 冻结后新增 action、字段、状态、错误码、持久化义务或改变客户端行为，必须进入下一修订 r19，并重新评估和更新 `protocolVersion`；
+- 纯错字、链接、示例或不改变行为的文字澄清使用 r18 errata；
+- 冻结后新增 action、字段、状态、错误码、持久化义务或改变客户端行为，必须进入 r19，并重新评估 `protocolVersion`；
 - 冻结后不得继续静默改变 `2.8.0` wire shape。
 
-本轮先修改全部权威契约，再修改服务端、Flutter、schema validator、fixtures 与测试。
-
-以下内容明确不进入本轮：
+本轮明确不做：
 
 - 不设计或修改协议版本协商；
 - 不修改调试环境中 profile implementation readiness 默认 `true` 的便利行为；
 - 不以 conformance manifest 的发布状态阻止本地 debug 路径运行；
 - 不新增 legacy/session 兼容 shape；
-- 不增加 Broadcast 动态 participant membership、`broadcast.leave`、add/remove participant；
-- 不支持 shuffle、repeat-one、repeat-all 或 `queueSongIds` 内重复 songId；
+- 不增加 Broadcast 动态 membership、`broadcast.leave`、add/remove participant；
+- 不支持 shuffle、repeat-one、repeat-all 或重复 `queueSongIds`；
 - 不增加 `follow.feedback` 或新的 Follow mirror action；
 - 不增加 control transaction 查询 action；
-- 不在 r18 中加入严格持续 drift SLA、paused/stopped source Handoff、live-stream 完整模型或新的 buffering/loading/error 枚举。
+- 不加入严格持续 drift SLA、paused/stopped source Handoff、live-stream 完整模型或新的 buffering/loading/error 枚举。
 
-本轮目标是让以下五层使用同一套最终 r18 定义：
-
-```text
-权威 specs
-  -> 服务端 strict_v2_contract.py / strict_v2_readiness.py
-  -> 服务端 ws.py / ws_store.py / broadcast_store.py
-  -> Flutter action policy / models / controllers
-  -> 双端 fixtures、自动测试与真机验收
-```
+契约阶段只改 Markdown 权威契约、验证映射和计划引用；禁止修改 Python、Dart、JSON fixtures 和测试。
 
 ## 2. 已锁定的 D1—D17
 
 ### D1 — Core prepare
 
-选择 A。`playback.context.prepare` 是 Core 行为，不依赖 Handoff profile，也不依赖 negotiated `playbackPrepare:true`。
-
-`playbackPrepare` 只表示设备能够处理 Handoff target 的 server-routed `playback.prepare` 预加载。
+选择 A。`playback.context.prepare` 是 Core 行为，不依赖 Handoff profile，也不依赖 negotiated `playbackPrepare:true`。`playbackPrepare` 只表示设备能够处理 Handoff target 的 server-routed `playback.prepare`。
 
 ### D2 — Follow
 
-Follow 是 Context 驱动的一对一软同步音频跟随，不是只读观察。
+Follow 是 Context 驱动的一对一软同步音频跟随，不是只读观察：
 
 - 每个 follower 同时只跟随一个 `sourcePlaybackContextId`；
 - 一个 source Context 可以有多个 follower；
-- follower 在本地捕获原任务，应用 source queue/state/position/rate，并做 drift 修正；
+- follower 保存本机原任务，应用 source queue/state/position/rate，并在本地修正 drift；
 - follower 不取得 source Context 控制权；
 - Follow 退出后恢复本机原任务；
 - Follow 不建立 Broadcast revision、deliveryId、feedback deadline 或服务端 participant ledger。
@@ -78,7 +66,7 @@ Follow 是 Context 驱动的一对一软同步音频跟随，不是只读观察�
 
 选择 A。正式纳入：
 
-- server-routed control 的 `executionTimeoutMs`；
+- routed control 的 `executionTimeoutMs`；
 - server-only `playback.control.settled`；
 - `dependency_failed`；
 - `execution_unknown`。
@@ -87,7 +75,7 @@ Follow 是 Context 驱动的一对一软同步音频跟随，不是只读观察�
 
 ### D4 — Handoff source eligibility
 
-选择 A。第一版只允许 fresh、settled、playing 的 source：
+选择 A。第一版只允许 fresh、settled、playing source：
 
 ```text
 active Context
@@ -107,15 +95,15 @@ idle 返回 `queue_required`；paused/stopped/stale/unsettled 返回无副作用
 
 ### D6 — Handoff complete proof
 
-选择 A。`playback.handoff.complete` 必须携带 target 的完整实际播放事实，并成为 authority switch point。
+选择 A。`playback.handoff.complete` 携带 target 完整实际播放事实，并成为唯一 authority switch point。
 
 ### D7 — Broadcast restorePending
 
-选择 A。`restorePending:true` 期间服务端冻结 suspended Context 的写操作，统一返回 `restore_in_progress`；Flutter 不再排队普通 Context command。清理型 negative confirmation 与 cancel 按本计划的 action-aware 例外继续允许。
+选择 A。`restorePending:true` 期间服务端冻结 suspended Context 写操作，统一返回 `restore_in_progress`；Flutter 不再排队普通 Context command。清理型 negative confirmation 与 cancel 依 action-aware 例外继续允许。
 
 ### D8 — Broadcast synchronization promise
 
-选择 A。Broadcast 为软同步。`syncStatus:"applied"` 只表示 participant 已应用该 revision 的目标，不证明持续 drift 小于固定毫秒阈值。
+选择 A。Broadcast 为软同步。`syncStatus:"applied"` 只表示 participant 已应用 revision target，不证明持续 drift 小于固定毫秒阈值。
 
 ### D9 — Close during Handoff
 
@@ -131,162 +119,172 @@ idle 返回 `queue_required`；paused/stopped/stale/unsettled 返回无副作用
 
 ### D11 — Recovery abandon
 
-选择 A。增加管理端/调试 CLI 的 recovery abandon；不加入 Flutter 公共 strict realtime action。abandon 必须与被冻结 pair 的 device decommission 原子绑定，不能让同一旧 `deviceSessionId` 以后重新注册而永远失去 terminal recovery。
+选择 A。增加管理端/调试 CLI recovery abandon，不加入 Flutter 公共 strict realtime action。abandon 必须与 exact pair decommission 原子绑定。
 
 ### D12 — Follow disconnect/reconnect
 
-选择 A。
+选择 A：
 
-- 只有最新 source state 为 `playing` 时，才使用 3 秒新鲜度门槛；
-- 最新 source state 为 `paused|stopped` 时，该状态是稳定事实，不能只因没有 heartbeat 而判定 stale；
-- idle Context 不允许新建 Follow；active Follow 的 source 后续转为 idle 时，follower 停止并清空 mirror audio、保持 relationship，静默等待 source 再次 queue-backed；
-- source authority 明确离线、playing fact 过期或重新 `follow.start`/status 失败时，进入最多 30 秒 source 恢复窗口；
-- 同一应用进程内 Socket 重连后可以重新 `follow.start`、subscribe/status 并继续；
-- 30 秒仍无法恢复或 source Context closed 时退出 Follow，并恢复本机任务；closed 立即结束，不等待 30 秒；
-- 应用进程重启后不自动恢复音频 Follow，只执行旧 relationship/fence 的安全清理。
+- 只有 source state 为 playing 时使用 3 秒 stale 门槛；
+- paused/stopped 是稳定事实，不因没有进度 heartbeat 自动 stale；
+- idle Context 不允许新建 Follow；
+- active Follow 的 source 后续转 idle 时，follower 清空 mirror audio、保持 relationship，静默等待 source 再次 queue-backed；
+- source authority 离线、playing fact 过期或 status 恢复失败时，进入最多 30 秒 source 恢复窗口；
+- 同一应用进程内 Socket 重连后可以重新 `follow.start` 并继续；
+- 30 秒仍无法恢复或 source Context closed 时退出并恢复本机任务；closed 立即结束；
+- 应用进程重启后不自动恢复音频 Follow，只执行安全 cleanup。
 
 ### D13 — User controls while following
 
-选择 A。Follow 模式禁用 play/pause/seek/next/prev 与 queue mutation；保留本机音量和“停止跟播”。服务端还必须用 Follow occupancy fence 阻止其他 controller 远程修改 follower 的 suspended Context。
+选择 A。Follow 模式禁用 play/pause/seek/next/prev 与 queue mutation；保留本机音量和“停止跟播”。服务端 Follow fence 同时阻止其他 controller 修改 follower suspended Context。
 
 ### D14 — Follow feedback
 
-选择 A。strict Follow overlay 不发送普通 `playback.update`，也不新增 `follow.feedback`。Follow 镜像不得写 source Context 或 follower 原 Context。退出 Follow、恢复原任务并释放 Follow fence 后，follower 才可为自己的正常 Context 发送普通 `playback.update`。
+选择 A。strict Follow overlay 不发送普通 `playback.update`，也不新增 `follow.feedback`。Follow mirror 不得写 source Context 或 follower 原 Context。
 
 ### D15 — Mode coexistence
 
-允许同一个正常 source Context 同时被 Follow 与 Broadcast 使用。
-
-同一设备本地执行覆盖层互斥：
+允许同一个正常 source Context 同时被 Follow 和 Broadcast 使用。同一设备本地执行覆盖层互斥：
 
 ```text
 Follow follower
 Broadcast ordinary participant
-Handoff target preparing/committing
+Handoff target preparing/ready/committing
 ```
-
-处于 Follow overlay 的 pair 自己的 suspended Context 不得被当作新的 Follow source、Broadcast source、Broadcast participant 或 Handoff source/target。正常 source Context 的 Handoff 仍受 active Broadcast source fence 阻止；Follow 绑定 Context ID，source Handoff 完成后继续跟随新 authority。
 
 ### D16 — Broadcast membership
 
-选择 A。r18 继续使用固定 membership；不增加 `broadcast.leave/add/removeParticipant`。
+选择 A。r18 使用固定 membership；不增加 leave/add/remove participant。
 
 ### D17 — Control settlement recipients
 
-选择 A。`playback.control.settled` 发给当前原请求 Socket、全部当前 Context subscribers，并额外发给仍在线的原 authority 物理连接；按 sid 去重。非请求 controller 只更新全局 cursor/UI，不弹出本地操作错误。
+选择 A。`playback.control.settled` 发给仍是同一物理连接的原请求 Socket、全部当前 Context subscribers，以及仍是最初 routed 物理连接的原 authority；按 sid 去重。
 
-## 3. 冻结前必须补齐的机械闭环规则
+## 3. 公共 wire、身份、Cursor 与错误规则
 
-本节不改变 D1—D17 的产品方向，只消除能力依赖、时间线、清理、序号、并发、恢复和安全上的协议空洞。
+### 3.1 Active Context snapshot 必须表达 exact authority pair
 
-### 3.1 Follow 与 Handoff 的复合能力、source 状态和时钟门禁
-
-固定 10 字段 capability shape，不新增 playback-rate capability。`supportsFollow`、`playbackPrepare`、`effectiveAtPlayback` 和 Handoff eligibility 本身承担复合执行承诺。
-
-`effectiveAtPlayback:true` 的协商条件必须覆盖 Follow、Handoff 或 Broadcast 任一已开启 profile，不能只由 Handoff/Broadcast readiness 触发。
-
-`supportsFollow:true` 只可授予满足以下全部条件的 follower connection：
+所有 active Context snapshot 必需包含：
 
 ```text
-role includes player
-playbackContextV2:true
-effectiveAtPlayback:true
-canPlay:true
-canPause:true
-canSeek:true
-能够设置并保持 0.5..2.0 playbackRate
+authorityClientId
+authorityDeviceSessionId
 ```
 
-`follow.start` 必须验证 follower 当前 nonce 的 clock gate 已通过。
+至少覆盖：
 
-Follow source 不要求 `supportsFollow:true`，但必须满足：
+- `playback.context.ensure` direct response；
+- `playback.context.status.playbackContext`；
+- canonical `queue.context.sync`；
+- 其他复用 Context snapshot schema 的服务端状态消息；
+- 服务端 serializer/validator；
+- Flutter Context model 与 fixtures。
+
+Context snapshot 不新增 `playbackRate`；rate 继续属于 DevicePlaybackState、`playback.update` 和 Broadcast/Handoff target。
+
+### 3.2 Context-scoped error 必须带完整四 Cursor
+
+`system.error` 闭合 allowlist 增加：
 
 ```text
-当前 Context authority player
-playbackContextV2:true
-effectiveAtPlayback:true
-当前 nonce clock gate 有效
-playbackRate 合法且在 0.5..2.0
-sourcePlaybackContextId != suspendedPlaybackContextId
-source authority pair != follower exact pair
+currentEpoch
 ```
 
-source 状态门禁分开定义：
+以下 Context-scoped 错误必须携带：
 
 ```text
-playing：
-  queue-backed
-  DevicePlaybackState settled
-  track/index/rate 匹配
-  serverUpdatedAtMs 与 positionSampledAtServerMs 年龄均 <= 2000ms
-
-paused/stopped：
-  queue-backed
-  DevicePlaybackState settled
-  track/index/rate 匹配
-  不套用 playing 的 2000ms progress freshness 门槛
-
-idle：
-  follow.start 返回 queue_required，零副作用
+playbackContextId
+currentEpoch
+currentVersion
+currentQueueRevision
+currentControlVersion
 ```
 
-active Follow 的 source 后续转为 idle 时，follower 必须停止并清空 mirror audio，保持 relationship 和 Follow fence，不恢复自己的原任务；source 再次 queue-backed 后继续 Follow。
+适用于：
 
-Handoff target 必须满足：
+- `stale_version`；
+- `queue_required`；
+- `restore_in_progress`；
+- Context/Handoff/Broadcast/Follow fence 的 state-machine `conflict`；
+- close tombstone 的 `context_closed`。
+
+纯 requestId fingerprint conflict 可省略 Context cursor。涉及 source/target 两个 Context 时，error 中的 `playbackContextId/current*` 必须描述真正阻止操作的 Context；source Context 仍由原请求 payload 确定。
+
+### 3.3 用户域解析和错误顺序
+
+服务端不得为了选择错误码做全局存在性查询。统一顺序：
 
 ```text
-role includes player
-playbackContextV2:true
-playbackPrepare:true
-effectiveAtPlayback:true
-canPlay:true
-canPause:true
-canSeek:true
-能够设置并保持 0.5..2.0 playbackRate
-当前 nonce clock gate 有效
+envelope/schema
+authentication
+registration/capability
+caller role
+authenticated-user-scoped lookup
+lifecycle/overlay/recovery fence
+base cursor
+mutation
 ```
 
-Handoff source 必须是当前在线 authority player，至少具备 `canPause:true`，并具有 fresh、settled、playing fact 和有效 clock gate。能力或 clock gate 不满足时，在任何事务创建前返回 `capability_required` 或带完整 cursors 的 `conflict`。
+规则：
 
-调试环境默认 capability 为 true 的便利行为保持不变；本节只定义 true 所代表的完整承诺。
+- 其他用户资源与真正不存在资源使用相同 `not_found`；
+- `forbidden` 只用于当前用户域内可见资源的角色/权限不足；
+- Handoff target、volume target 只在当前用户域解析；
+- Broadcast explicit participant 中跨用户、不存在、离线或不可用目标使用同类 `skippedClientIds`；
+- 日志不得泄露全局查询获得的其他用户资源细节。
 
-### 3.2 Queue 边界与最后一首自然结束
+### 3.4 `device.list.volumeState`
 
-#### 第一首 `player.prev`
+只向请求连接满足：
 
-目标固定为第一首从头播放：
+```text
+negotiatedCapabilities.remoteVolumeControl == true
+```
+
+时输出 `volumeState`。不得使用“capability shape 包含该字段”作为条件。
+
+## 4. Core prepare、Queue、Control transaction 与 safe close
+
+### 4.1 Core prepare
+
+`playback.context.prepare`：
+
+- 属于 Core；
+- 不检查 Handoff profile；
+- 不检查 `playbackPrepare:true`；
+- 只检查同用户 controller、唯一 active Context、authority exact pair 在线、authority player/canPlay、binding/epoch/cursor 和 prepare intent 状态。
+
+`playbackPrepare` 仅控制 Handoff target 的 server-routed `playback.prepare`。
+
+### 4.2 Queue 边界 Cursor
+
+第一首 `player.prev`：
 
 ```text
 currentIndex 不变
 trackId 不变
-state = playing
-positionMs = 0
+state=playing
+positionMs=0
 epoch 不变
 version += 1
 queueRevision 不变
 controlVersion += 1
 ```
 
-#### 最后一首 `player.next`
-
-目标固定为停止在最后一首：
+最后一首 `player.next`：
 
 ```text
 currentIndex 不变
 trackId 不变
-state = stopped
-positionMs = 0
+state=stopped
+positionMs=0
 epoch 不变
 version += 1
 queueRevision 不变
 controlVersion += 1
 ```
 
-#### 最后一首自然结束
-
-最后一首自然结束不能只更新 DevicePlaybackState，否则主 Context 会永久停留在 `playing`。
-
-r18 固定使用以下最小例外，不新增 `origin:"automatic"`：
+最后一首自然结束使用唯一 passive automatic terminal 例外：
 
 ```text
 playback.update(
@@ -294,46 +292,25 @@ playback.update(
   state:"stopped",
   positionMs:0,
   trackId:当前最后一首,
-  appliedControlVersion:controlVersion
+  appliedControlVersion:canonical controlVersion
 )
 ```
 
-只有同时满足以下条件时，服务端把它识别为 automatic queue terminal：
+仅当 queue 非空、当前为最后 index、此前 canonical playing、track 匹配、无 pending control、authority exact pair/Socket/epoch 匹配时接受。原子效果：
 
 ```text
-canonical queue 非空
-currentIndex == queueSongIds.length - 1
-此前 canonical state == playing
-reported trackId 等于当前最后一首
-reported state == stopped
-reported positionMs == 0
-appliedControlVersion == canonical controlVersion
-当前不存在 pending control transaction
-当前 authority client/device/Socket 与 Context binding 精确匹配
-```
-
-原子效果固定为：
-
-```text
-DevicePlaybackState.state = stopped
-DevicePlaybackState.positionMs = 0
-Context.state = stopped
-Context.positionMs = 0
+Context.state=stopped
+Context.positionMs=0
 Context.version += 1
-Context.epoch 不变
-Context.queueRevision 不变
-Context.controlVersion 不变
-appliedControlVersion 不变
-不 supersede 任何事务
+epoch/queueRevision/controlVersion 不变
+DevicePlaybackState 保存 stopped/0
 ```
 
-服务端提交后发送 canonical `playback.update` 与新的 Context status；不需要发送 queue sync。若 source Context 正在作为 Broadcast source，只从这一次 Context mutation 派生一个 stopped `broadcast.state.sync`；Follow follower 也只从该 canonical source fact 收敛一次。
+只派生一次 Follow fact 和一次 Broadcast stopped revision。
 
-本地人工 stop 仍必须走 `origin:"localUser"`；remote command 结果仍走 remote transaction。其他 passive update 不获得修改主 Context 的权限。
+### 4.3 Routed control closed shape
 
-### 3.3 普通控制事务、dependency、timeout 与 settlement exact pair
-
-普通 server-routed action：
+普通 routed action：
 
 ```text
 queue.playItem
@@ -344,17 +321,68 @@ player.next
 player.prev
 ```
 
-必须携带正整数 `executionTimeoutMs`。包括 active Broadcast source control 派生的普通 source command；Handoff commit 和 `device.setVolume` 不使用该字段。
+必须携带：
+
+```text
+playbackContextId
+controlVersion
+sourceClientId
+executionTimeoutMs:int>=1
+dependsOnControlVersion:O int>=1
+action-specific fields
+```
+
+active Broadcast source 派生的普通 command 同样携带 `executionTimeoutMs` 和可选 dependency，并按既有规则额外携带成组 effective-at 字段。Handoff commit 使用独立闭合 shape，不使用 `executionTimeoutMs`。
 
 部署默认：
 
 ```text
 executionTimeoutMs = 15000
-Windows execution lease deadline = 收到命令后 executionTimeoutMs
-server watchdogDeadlineAtMs = acceptedAtMs + executionTimeoutMs + 2000
 ```
 
-控制事务必须持久化：
+### 4.4 Deterministic dependency assignment
+
+track-changing action 固定为：
+
+```text
+queue.playItem
+player.next
+player.prev
+```
+
+接受每个普通控制时，服务端查找当前 Context/epoch 内最高的、仍 pending 的较低 track-changing version：
+
+```text
+存在：
+  新事务.dependsOnControlVersion = 该版本
+不存在：
+  省略
+```
+
+新 track-changing transaction 本身也可以依赖此前 pending track-changing transaction，因此依赖链可传递。
+
+Windows 收到带 dependency 的 command 后：
+
+1. 登记事务，但不得执行；
+2. 等待 dependency 的 canonical committed confirmation；
+3. dependency committed 后才进入 execution-eligible；
+4. dependency failed/unknown/dependency_failed 时丢弃本地待执行事务；
+5. dependency superseded 时按 supersede 丢弃；
+6. 不得在错误歌曲/队列基线上执行 seek/pause/play 等后续操作。
+
+服务端 cascade：
+
+```text
+dependency failed / execution_unknown / dependency_failed
+→ 直接依赖它的 pending transaction 按 controlVersion 升序变为 dependency_failed
+→ 再递归结算其后继
+```
+
+每条 `dependency_failed` 的 `dependsOnControlVersion` 指向其直接依赖，不一律指向根失败版本。
+
+### 4.5 Execution eligibility、lease 与 watchdog
+
+控制事务内部必须保存：
 
 ```text
 requestingClientId
@@ -366,51 +394,43 @@ authorityDeviceSessionId
 routedConnectionNonce
 routedConnectionEpoch
 action
-accepted target
+acceptedTarget
 executionTimeoutMs
 dependsOnControlVersion:O
+executionEligibleAtMs:O
+watchdogDeadlineAtMs:O
 ```
 
-track-changing action 固定为：
+时间规则：
 
 ```text
-queue.playItem
-player.next
-player.prev
+无依赖、无 effective-at：
+  command 可靠加入 authority 发送路径时 executionEligibleAtMs
+
+有依赖：
+  dependency canonical committed 时 executionEligibleAtMs 才可建立
+
+有 effective-at：
+  executionEligibleAtMs = max(dependency committed time, effectiveAtServerMs)
 ```
 
-服务端接受每个普通控制时，在当前 Context/epoch 内查找最高的、仍 pending 的 track-changing controlVersion：
+Windows AudioExecutionLease 从 execution eligibility 开始计时；服务端：
 
 ```text
-存在：
-  新事务.dependsOnControlVersion = 该版本
-
-不存在：
-  省略 dependsOnControlVersion
+watchdogDeadlineAtMs =
+  executionEligibleAtMs + executionTimeoutMs + 2000
 ```
 
-因此，在未确定切歌成功前接受的 play/pause/seek/next/prev/playItem 都保守依赖当前最高 pending track-changing version。
+等待 dependency 的时间不计入 execution timeout。dependency 在 eligibility 前失败时，直接 dependency_failed，不建立 watchdog。
 
-依赖结算规则：
+若 dependency 直到 effective-at 后才成功：
 
-```text
-依赖版本 committed：后续事务正常执行
-依赖版本 failed / execution_unknown：后续仍 pending 事务按版本升序 dependency_failed
-localUser supersede：仍按 superseded 处理，不转换为 dependency_failed
-```
+- 迟到不超过 1000ms：按 effective-at late policy 追赶；
+- 超过 1000ms：不得执行成功，按 `effective_at_missed` 结算。
 
-watchdog、authority disconnect、authority Socket replacement 或服务端重启只能生成：
+### 4.6 `playback.control.settled`
 
-```text
-playback.control.settled(
-  status:"failed",
-  errorCode:"execution_unknown"
-)
-```
-
-不得伪造 authority `playback.update`。
-
-`playback.control.settled` 的闭合 payload：
+闭合 payload：
 
 ```text
 playbackContextId
@@ -427,88 +447,82 @@ dependsOnControlVersion:C
 errorMessage:O
 ```
 
-幂等键：
+规则：
+
+- `dependsOnControlVersion` 在 `dependency_failed` 时必需，`execution_unknown` 时禁止；
+- 幂等键 `(playbackContextId, epoch, commandControlVersion)`；
+- authority disconnect、Socket replacement、服务端 restart、watchdog 到期只能生成 `execution_unknown`，不得伪造 authority playback.update；
+- 原请求 replacement Socket 不自动补历史 settlement；
+- authority 收到 settlement 必须失效相应 execution lease；
+- settlement recipients 按 D17，按 sid 去重。
+
+### 4.7 Terminal control gap reconciliation
+
+不仅 `execution_unknown`，以下 terminal gap 都必须最终收敛：
 
 ```text
-(playbackContextId, epoch, commandControlVersion)
+remoteCommand failed
+execution_unknown
+dependency_failed 链结束后留下的 terminal gap
 ```
-
-收件人是：
-
-```text
-当前原请求 Socket（requesting client/device/nonce/epoch 仍全部匹配时）
-全部当前 Context subscribers
-原 authority Socket（仍为最初 routed physical connection 时）
-```
-
-按 sid 去重。原请求 controller 已断线时，不向 replacement Socket 自动补历史 settlement；controller 断线后本地 pending UI 立即转为 unknown，重连通过 `list -> subscribe -> status` 收敛。
-
-### 3.4 `execution_unknown` 后的 server reconciliation version
-
-`execution_unknown` 终态本身不猜测设备实际结果，也不立即改写 Context。相同 authority pair 重新在线或重新提供 fresh passive actual fact 后，服务端允许一次有界 reconciliation。
 
 前置条件：
 
 ```text
-当前 authority pair 与 Context 精确匹配
-fact 的 track/state/position/rate 合法且 fresh
+authority exact pair/epoch/current physical Socket 匹配
+fresh actual fact 合法
 fact.appliedControlVersion <= canonical controlVersion
-fact.appliedControlVersion 之后直到 canonical controlVersion 的事务均已 terminal
-至少存在一个 execution_unknown gap
+fact.appliedControlVersion 后至 canonical controlVersion 的事务全部 terminal
 不存在新的 pending transaction
-实际 trackId 在 distinct canonical queue 中唯一可解析
-同一 unknown gap 尚未 reconciliation
+actual track 在 distinct canonical queue 中唯一解析
+该 gap 尚未 reconciliation
 ```
 
-服务端不得把旧 unknown command 的版本伪装成已成功 applied。无论 actual 是否已经等于当前 canonical target，都必须分配新的 server reconciliation control version：
+服务端不得把旧 failed/unknown command 伪装成 applied。设：
 
 ```text
 N = reconciliation 前 canonical controlVersion
 R = N + 1
 ```
 
-原子规则：
+原子执行：
 
 ```text
-创建内部 reconciliation transaction：
-  controlVersion = R
-  kind = serverReconciliation（内部字段，不新增客户端 action）
-  status = committed
-
-Context 按 fresh actual fact 收敛：
-  state/currentIndex/trackId/position/playbackRate = actual
-  epoch 不变
-  controlVersion = R
-  version += 1
-  queueRevision 仅 currentIndex 改变时 += 1
-
-DevicePlaybackState：
-  保存 actual fact
-  appliedControlVersion = R
-
-原 execution_unknown transaction：
-  保持原终态，不改成 committed
+创建内部 serverReconciliation record R（无客户端 request/action，无 AudioExecutionLease）
+Context 按 actual 收敛 state/currentIndex/trackId/position
+Context.controlVersion = R
+Context.version += 1
+currentIndex 改变时 queueRevision += 1
+Context.epoch 不变
+DevicePlaybackState 保存 actual playbackRate 和其他事实
+DevicePlaybackState.appliedControlVersion = R
+旧 failed/unknown/dependency transaction 保持原 terminal
 ```
 
-服务端向 authority 与合法 recipients 发送 canonical `playback.update` / Context status，使客户端看到 control/applied 已在 R 收敛。内部持久化：
+Context snapshot不增加 playbackRate。
+
+唯一 wire confirmation：
+
+- 由 passive fact 触发：同一 clientSeq 返回一份 canonical `playback.update(origin:"passive", controlVersion:R, appliedControlVersion:R, actual...)`，再推 Context status；
+- remoteCommand failed 且无后续 pending、可在同一事务立即 reconciliation：只发送一份 canonical failed confirmation：
 
 ```text
-reconciledFromAppliedControlVersion
-reconciledThroughControlVersion
-reconciliationControlVersion = R
+origin:"remoteCommand"
+executionStatus:"failed"
+commandControlVersion:N
+controlVersion:R
+appliedControlVersion:R
+errorCode:原执行错误
+actual state/track/position/rate
 ```
 
-这些是内部审计字段，不增加 r18 wire 字段。
+此时 `appliedControlVersion:R` 表示 actual 被内部 reconciliation R 吸收，不表示命令 N 成功。若仍有 pending，则先发送普通 failed，等 gap 全 terminal 后由 fresh passive fact分配 R。
 
-若 actual track 不在 canonical queue、事实不 fresh 或仍有 pending gap，拒绝 reconciliation，并要求通过正常 `queue.context.sync` / `localUser` 路径收敛。
+迟到 remote committed/failed 不得改写旧 terminal；相同结果重放既有 canonical outcome，不同结果 `conflict`。active Broadcast 只从 R 派生一个 correction revision；Follow 只消费一次 R canonical fact。
 
-active Broadcast 只从该 canonical correction 派生一个 correction revision；Follow 只从新的 canonical fact 收敛一次。
+### 4.8 Safe close
 
-unknown settlement 之后到达的迟到 remoteCommand committed/failed 不得改变事务终态或 Context；相同内容只重放 unknown settlement，不同 terminal 结果返回 `conflict`。authority 收到 settlement 时必须失效对应 execution lease。
-
-### 3.5 `playback.context.close` 的并发前置条件、错误 shape 和 tombstone
-
-普通 strict close 请求改为：
+请求闭合为：
 
 ```text
 playbackContextId:R
@@ -516,17 +530,9 @@ expectedEpoch:R int>=1
 baseVersion:R int>=1
 ```
 
-首次 close 必须在同一 Context/authority-pair 临界区精确验证 `expectedEpoch` 与 `baseVersion`。不匹配返回 `stale_version`；非终态 Handoff、active Broadcast source/ordinary fence、Follow fence 或 restorePending 按各自 `conflict` / `restore_in_progress` 规则优先拒绝。
+首次 close 在 Context/authority-pair 临界区验证。stale 返回完整四 Cursor。非终态 Handoff、Broadcast/Follow fence、restorePending 按对应优先错误拒绝。
 
-合法 close：
-
-```text
-lifecycle -> closed
-version += 1
-其他 cursor 按现有 close 规则保持
-```
-
-closed tombstone 必须保存：
+closed tombstone 保存：
 
 ```text
 closedFromEpoch
@@ -538,113 +544,121 @@ finalControlVersion
 close ACK outcome
 ```
 
-使用新的 requestId 重复 close 时：
+新 requestId 重复 close：
 
-- `expectedEpoch/baseVersion` 与 tombstone 的 `closedFrom*` 完全相同：幂等重放等价 ACK；
-- 内容不同：返回 `context_closed`；
+- expected/base 与 `closedFrom*` 相同：幂等重放等价 ACK；
+- 不同：`context_closed` + final 四 Cursor；
 - 不再次递增任何 cursor。
-
-`playback.context.close` 命中 tombstone时，`context_closed` error 必须携带：
-
-```text
-playbackContextId
-currentVersion = finalVersion
-currentQueueRevision = finalQueueRevision
-currentControlVersion = finalControlVersion
-```
-
-其他 action 的 `context_closed` 是否携带 cursors，按其 action-aware error 表定义；不得与 close tombstone 的必需 shape 冲突。
 
 管理端强制关闭不加入普通 strict Socket action。
 
-### 3.6 Follow settled entry、occupancy fence 与 source/self gate
+## 5. Follow 完整闭环
 
-`follow.start` 必须按 follower 当前注册的 exact client/device pair 解析其唯一 active authority Context，并记录：
+### 5.1 Capability 与 source eligibility
+
+固定十字段 capability shape不新增 rate capability。
+
+`effectiveAtPlayback:true` 的协商条件必须覆盖 Follow、Handoff 或 Broadcast 任一已开启 profile。
+
+`supportsFollow:true` 代表 follower 同时满足：
 
 ```text
+role includes player
+playbackContextV2:true
+effectiveAtPlayback:true
+canPlay:true
+canPause:true
+canSeek:true
+支持并保持 0.5..2.0 playbackRate
+```
+
+Follow source 不要求 supportsFollow，但必须：
+
+```text
+当前 Context authority player
+playbackContextV2:true
+effectiveAtPlayback:true
+当前 source Socket clock gate 有效
+playbackRate 0.5..2.0
+source Context != follower suspended Context
+source authority pair != follower exact pair
+```
+
+source fact 无论 playing/paused/stopped 都必须属于当前物理连接：
+
+```text
+sourceClientId == authorityClientId
+deviceSessionId == authorityDeviceSessionId
+内部 fact.connectionNonce == 当前 source Socket nonce
+Context epoch 匹配
+appliedControlVersion == controlVersion
+```
+
+状态门禁：
+
+```text
+playing：
+  queue-backed、settled、track/index/rate 匹配
+  serverUpdatedAtMs 与 positionSampledAtServerMs 年龄均 <= 2000ms
+
+paused/stopped：
+  queue-backed、settled、track/index/rate 匹配
+  不套用 playing 的 2000ms进度 freshness
+
+idle：
+  follow.start -> queue_required，零副作用
+```
+
+### 5.2 Preflight、RecoveryRecord 与 Follow start ACK
+
+Flutter 在发送 `follow.start` 前：
+
+1. 解析自身 exact pair 的唯一 active suspended Context；
+2. 确认 applied==control、无 pending control、无 active Core prepare/Handoff/Broadcast/Follow/restore fence；
+3. 确认本地 command lane 和 AudioExecutionLease 空闲；
+4. 捕获原 queue/index/position/state/rate 与 suspended Context exact authority/cursors；
+5. **先持久化** `FollowRecoveryRecord phase=acquiring`，再发送 `follow.start`。
+
+RecoveryRecord 至少保存：
+
+```text
+sourcePlaybackContextId
 suspendedPlaybackContextId
+suspendedAuthorityClientId
+suspendedAuthorityDeviceSessionId
 suspendedEpoch
 suspendedVersion
 suspendedQueueRevision
 suspendedControlVersion
 suspendedAppliedControlVersion
-followerClientId
-followerDeviceSessionId
-sourcePlaybackContextId
+原 queue/index/position/state/playbackRate
+phase: acquiring|active|stopPending|restoring
+relationshipAcquired
 ```
 
-服务端在零副作用阶段验证：
+服务端在一个事务中冻结当前 baseline，建立 relationship、subscription、`FollowSafetyLease` 和 fence，然后 ACK：
 
 ```text
-follower exact pair 只有一个 active Context
-suspendedAppliedControlVersion == suspendedControlVersion
-不存在 pending control transaction
-不存在非终态 Core prepare
-不存在非终态 Handoff
-不存在 Broadcast/Follow/restore fence
-follower/source capability 与 clock gate 满足第 3.1 节
-source Context 可见且 active
-source queue-backed 且 actual fact settled
-sourcePlaybackContextId != suspendedPlaybackContextId
-source authority pair != follower exact pair
-```
-
-Flutter 在发送 `follow.start` 前还必须保证本机 strict command lane 与 AudioExecutionLease 没有未完成的 suspended-Context command。客户端前置条件失败时不得发送 start；服务端只能验证持久化 pending 状态，不能假装知道本地尚未回调的音频操作。
-
-任一条件不满足时返回带相关 Context 完整 cursors 的 `conflict` / `capability_required` / `queue_required`，不得建立 relationship、subscription、safety lease 或 fence。
-
-Follow relationship active、terminating、reconnect-grace 或 cleanup-required 期间，服务端对 follower suspended Context 建立 pair-level 写屏障。
-
-阻止：
-
-```text
-player.*
-queue.playItem
-queue.context.sync
-playback.context.prepare
-playback.context.prepared（清理型 negative confirmation 除外）
-playback.update
-playback.context.close
-playback.context.ensure 的创建、初始化、重绑或快照修改
-playback.handoff.start/complete
-成为 Handoff source/target
-成为 Broadcast source/ordinary participant
-成为另一个 Follow source
-```
-
-允许：
-
-```text
-playback.context.list/status
-playback.context.subscribe/unsubscribe
-follow.stop
-device.setVolume / device.volume.update
-device.list
-system.ping
-其他纯读取和 clock action
-```
-
-被阻止的 suspended Context mutation 返回 `conflict`，携带 suspended Context 的完整 canonical cursors，不产生 mutation、command 或 binding invalidation。
-
-同一个正常 source Context 可以同时存在 Follow followers 和 active Broadcast；但 source authority pair 自己不得正处于任何本地 overlay。
-
-### 3.7 FollowRecoveryRecord、持久化 FollowSafetyLease 与安全 cleanup
-
-Follow 不持久化 mirror audio/profile 状态，但必须持久化最小安全门禁。
-
-Flutter 必须保存专用 `FollowRecoveryRecord`，它不写普通 PlaybackContext durable snapshot，至少包含：
-
-```text
+action:"follow.start"
+status:"active"
 sourcePlaybackContextId
 suspendedPlaybackContextId
-followerClientId
-followerDeviceSessionId
-进入 Follow 前的 queue/index/position/state/playbackRate
-relationshipAcquired
-stopPending
+suspendedAuthorityClientId
+suspendedAuthorityDeviceSessionId
+suspendedEpoch
+suspendedVersion
+suspendedQueueRevision
+suspendedControlVersion
+suspendedAppliedControlVersion
 ```
 
-服务端必须保存最小 `FollowSafetyLease`：
+Flutter 必须逐字段比较 ACK baseline 与本地 acquiring record。完全匹配才改为 phase=active 并触碰音频；不匹配则不进入 overlay，立即幂等 `follow.stop`，然后按服务端当前 status 收敛。
+
+如果 acquiring record 写失败，不发送 start。若 ACK 已收到但 active record 更新失败，不触碰音频，立即 stop；stop 结算未知时保存 stopPending 并断开 Socket。
+
+### 5.3 Persistent FollowSafetyLease、fence 与上限
+
+服务端持久化：
 
 ```text
 userName
@@ -652,149 +666,202 @@ followerClientId
 followerDeviceSessionId
 sourcePlaybackContextId
 suspendedPlaybackContextId
-phase: active | reconnectGrace | cleanupRequired
+suspendedAuthorityClientId
+suspendedAuthorityDeviceSessionId
+suspendedEpoch
+suspendedVersion
+suspendedQueueRevision
+suspendedControlVersion
+suspendedAppliedControlVersion
+phase: active|reconnectGrace|cleanupRequired
 followReconnectGraceExpiresAtMs
 createdAtMs
 updatedAtMs
 ```
 
-`FollowSafetyLease` 只用于恢复 fence 和清理义务，不代表服务端在重启后自动恢复 Follow 音频。
+它只恢复安全 fence，不代表服务端重启后自动恢复音频 Follow。
 
-安全建立顺序：
-
-1. 服务端原子建立 relationship、subscription、FollowSafetyLease 和 fence，再 ACK `follow.start`；
-2. Flutter 收到 ACK 后、触碰本地音频前持久化 `FollowRecoveryRecord`；
-3. 记录持久化成功后才允许进入 Follow overlay。
-
-若 `FollowRecoveryRecord` 持久化失败：
+资源上限：
 
 ```text
-不得触碰本地音频
-立即发送幂等 follow.stop
-follow.stop 无法确定结算时断开当前 Socket
-不得进入 Follow overlay
+一个 exact follower pair 最多一条非终态 lease
+一个 suspended Context 最多被一个 Follow overlay 占用
+每 user 最多 256 条 active/reconnectGrace/cleanupRequired safety records
 ```
 
-因为本地音频尚未切换，服务端 lease 可以在 reconnect grace/cleanup 规则下安全释放；不得假装 Follow 已经正常开始。
+达到上限：
 
-客户端本地维护：
+- 新 `follow.start` -> `rate_limited`；
+- 已有关系重试仍可重放；
+- `follow.stop`/cleanup 永远允许；
+- 不得删除旧未完成 lease 接受新 lease。
 
-```text
-followResumeIntent：仅内存、仅当前应用进程可用
-followStopPending：持久化、表示只能继续退出，禁止重新 Follow
-```
+cleanupRequired tombstone保留到 exact pair `follow.stop` 或管理端 decommission，不能按普通 TTL 静默删除。
 
-规则：
+### 5.4 Follow occupancy fence
 
-1. 正常 Follow 中同进程 Socket 断线：保留 `followResumeIntent`；重连后优先重发相同 `follow.start`；
-2. 一旦开始停止 Follow：清除 resume intent，设置 `followStopPending=true`；
-3. `follow.stop` ACK 丢失后重连：只能幂等重试 `follow.stop`，不得重新 `follow.start`；
-4. 应用进程重启：不恢复音频 Follow；读取 FollowRecoveryRecord，把状态视为 cleanup pending，先恢复 suspended Context，再发送幂等 `follow.stop`；
-5. cleanup marker 只用于安全退出，不代表 app restart 自动 Follow；
-6. Follow cleanup 必须在普通 startup ensure、Context outbox 和音频 command 恢复之前完成；
-7. 本地恢复失败：保持本机非播放、保留 recovery record 和服务端 fence，不发送 follow.stop；有界重试，无法恢复时断开当前 Socket，不得提前放行远程命令。
-
-停止 Follow 的固定顺序：
-
-```text
-进入 restoringFollowContext
-忽略后续 source mirror
-取消 drift timer/seek/rate correction
-恢复进入 Follow 前的原任务；必要时读取一次 suspended Context status
-恢复成功后发送 follow.stop
-服务端 ACK 并原子释放 relationship/subscription/FollowSafetyLease/fence
-清除 FollowRecoveryRecord
-fence 释放后才允许为正常 Context 发送 playback.update
-```
-
-source Context closed 时，服务端推 closed 并将 lease 标记为 `cleanupRequired`；follower 在线时保持 fence，直到安全恢复并发送幂等 `follow.stop`。
-
-两个 30 秒计时器必须使用不同名称和状态机：
-
-```text
-followSourceRecoveryDeadlineAtMs
-  source playing fact/authority 恢复窗口
-
-followReconnectGraceExpiresAtMs
-  follower 自身 Socket 重连并重新 acquire relationship 的窗口
-```
-
-最新 source state 为 playing 时，`serverUpdatedAtMs` 或 `positionSampledAtServerMs` 任一超过 3000ms，进入 source recovery；paused/stopped 不因没有 heartbeat 自动 stale。
-
-follower Socket 断线时，服务端把 lease 置为 `reconnectGrace` 并保持 fence：
-
-- 相同 pair 在 grace 内重发相同 `follow.start`：幂等恢复 active；
-- stopPending 重连：只接受 follow.stop cleanup；
-- grace 到期且 pair 离线：可释放当前 active fence，但保留轻量 `cleanupRequired` tombstone，阻止同一旧 pair 下次注册后直接写 suspended Context；
-- 同一旧 pair 未来注册时，必须先完成幂等 `follow.stop` cleanup 或管理端 decommission；
-- grace 到期后旧 relationship 不得被新连接自动继承。
-
-服务端重启时：
-
-```text
-不自动恢复 Follow mirror audio
-重新加载 FollowSafetyLease
-所有非终态 lease 进入 cleanupRequired/reconnectGrace
-恢复 suspended Context fence
-相同 pair 完成 follow.start 或 follow.stop 前，不开放普通 Context 写操作
-```
-
-这取代旧的“服务端重启时直接清除全部 Follow 并放开写操作”规则。
-
-### 3.8 Handoff 全生命周期 source/target fence 与 target 本地 UI gate
-
-Handoff start 成功创建事务时，服务端同时建立：
-
-```text
-source Context fence
-target exact pair/standby Context fence
-```
-
-持续到 Handoff completed/failed/cancelled/timedOut。
-
-#### preparing / ready
-
-允许：
-
-```text
-source passive playing progress
-positionMs/positionSampledAtServerMs/serverUpdatedAtMs 正常更新
-只读 status/subscribe
-playback.ready
-handoff cancel
-```
-
-普通 controller 对 source 的以下操作返回 `conflict`：
+active、terminating、reconnectGrace、cleanupRequired 阶段阻止 suspended Context：
 
 ```text
 player.*
 queue.playItem
 queue.context.sync
+playback.context.prepare
+playback.context.prepared（cleanup negative 除外）
+playback.update
 playback.context.close
-第二个 Handoff
-Broadcast start
-会改变 authority/binding 的 ensure
+会创建/初始化/重绑/改 snapshot 的 ensure
+Handoff source/target
+Broadcast source/ordinary
+另一个 Follow source
 ```
 
-source 本地真实操作已经发生时不能简单拒绝。`localUser`、automatic queue terminal、自然切歌 queue sync，或 passive actual fact 显示 state/track/rate 发生实质变化时，服务端必须在同一 Context 临界区：
+允许：
 
 ```text
-先把 Handoff 终止为 failed/source_changed
-向 target 推 cancel/status，失效 scheduled execution
-再按正常 Core 规则接受并提交 source 的真实 mutation/fact
+list/status/subscribe/unsubscribe
+follow.stop
+device volume/list
+system.ping
+其他纯读取/clock
 ```
 
-#### committing
+阻止结果 `conflict` + suspended Context 四 Cursor，零副作用。
 
-authority 仍是 source，但所有新的普通远程控制和 binding mutation都被 source fence 阻止。
+### 5.5 Follow source state 与本地失败
 
-source 本地用户操作、自然结束或真实 state/track/rate 改变时，本地实际事实优先：先 source_changed 终止 Handoff，target 取消 timer/lease且已起播则暂停，再提交 source actual mutation。
+active source 转 idle：
 
-#### target standby 和本地 UI
+```text
+停止并清空 mirror audio
+保持 relationship/SafetyLease/fence
+不恢复原任务
+等待 source 再次 queue-backed
+```
 
-从 start/prepare 到 terminal，target standby Context 的 queue/player/update/close/prepare/Handoff/Broadcast/Follow mutation全部被阻止。仅允许 list/status/subscribe 和不创建、不初始化、不重绑、不改 snapshot 的纯 no-op ensure。任何 target deviceSession/standby binding 变化使 Handoff failed/source_changed 或 target_disconnected。
+Follow 本地 queue load、seek、rate、play/pause 或媒体应用失败时，不发送 normal playback.update：
 
-Flutter target 在 `preparing|ready|committing` 期间必须禁用本机：
+```text
+触碰音频前失败：
+  不进入 overlay
+  恢复/保持原任务
+  follow.stop
+
+已进入 overlay 后失败：
+  停止 mirror
+  恢复原任务
+  恢复成功后 follow.stop
+
+恢复失败：
+  保持非播放
+  保留 RecoveryRecord/SafetyLease/fence
+  不发送 follow.stop
+  有界重试或断开 Socket
+```
+
+### 5.6 Stop、断线、重连与服务端重启
+
+本地 intent：
+
+```text
+followResumeIntent：仅当前进程内存
+followStopPending：持久化，只允许继续退出
+```
+
+停止顺序：
+
+```text
+phase=restoring
+忽略 source mirror
+取消 drift timer/seek/rate correction
+读取服务端当前 suspended Context status
+比较 SafetyLease 冻结 baseline
+```
+
+恢复规则：
+
+- 服务端 binding/cursors仍等于冻结 baseline：可恢复本地原快照；
+- 服务端 cursor 更高、binding 改变或 Context closed：丢弃旧本地快照，采用服务端当前 status，绝不能把旧 queue/cursor 写回。
+
+恢复成功后发送 `follow.stop`；服务端 ACK 后原子删除 relationship/subscription/SafetyLease/fence；最后清 RecoveryRecord。fence 释放后才允许 normal playback.update。
+
+两个不同 timer：
+
+```text
+followSourceRecoveryDeadlineAtMs
+followReconnectGraceExpiresAtMs
+```
+
+服务端重启：
+
+```text
+不自动恢复 mirror audio
+重新加载 SafetyLease
+非终态 lease -> cleanupRequired/reconnectGrace
+恢复 suspended Context fence
+相同 pair follow.start 或 follow.stop 完成前不开放普通写
+```
+
+Socket disconnect 时 lease进入 reconnectGrace。同进程 resume 重发 start；stopPending 只重试 stop。grace 到期且 pair 离线可释放 active in-memory fence，但保留 cleanupRequired tombstone，阻止旧 pair 下次注册直接写 suspended Context。
+
+## 6. Handoff 完整闭环
+
+### 6.1 Capability 与 exact pair
+
+source 必须：
+
+```text
+当前 authority player
+canPause:true
+effectiveAtPlayback:true
+有效 clock gate
+fresh/settled/playing fact
+```
+
+target 必须：
+
+```text
+player
+playbackContextV2:true
+playbackPrepare:true
+effectiveAtPlayback:true
+canPlay/canPause/canSeek:true
+支持 0.5..2.0 rate
+有效 clock gate
+```
+
+`playback.handoff.start` 必需：
+
+```text
+playbackContextId
+targetClientId
+targetDeviceSessionId
+baseControlVersion
+```
+
+target 冻结为 exact pair；start 前 queue/fact/cursor/pending/overlay 全部零副作用验证。
+
+### 6.2 Full lifecycle fences 与 target local UI
+
+start 成功同时建立：
+
+```text
+source Context fence
+target exact pair fence
+target standby Context fence
+```
+
+覆盖 preparing/ready/committing 到 terminal。
+
+source 正常 position/sample 前进允许；remote player/queue/close/第二个 Handoff/Broadcast/binding mutation 被阻止。source localUser、自然结束、自然切歌或实际 track/state/rate 变化时：
+
+```text
+同一临界区先 failed/source_changed
+通知 target 取消 timer/lease
+再提交 source actual mutation
+```
+
+target 本机在 preparing/ready/committing 禁用：
 
 ```text
 play/pause/seek/next/prev
@@ -802,94 +869,60 @@ queue mutation
 新的 Follow/Broadcast/Handoff
 ```
 
-只保留设备音量以及 Handoff cancel/failure cleanup。服务端 fence 不能替代客户端对本机 UI 和 AudioPlayerService 的执行门禁。
+只保留设备音量和 Handoff cancel/failure cleanup。
 
-### 3.9 Handoff source revalidation、provisional N+1 与固定 cursor
+### 6.3 Prepare/commit/provisional version
 
-target ready 后、commit 前重新读取 source actual state。
-
-以下是正常 playing 时间线推进，不触发 `source_changed`：
+prepare：
 
 ```text
-positionMs 正常前进
-positionSampledAtServerMs 更新
-serverUpdatedAtMs 更新
-```
-
-服务端使用最新 fresh sample 重新投影 commit position。
-
-以下变化终止为 `failed/errorCode:"source_changed"`：
-
-```text
-trackId 改变
-state 不再 playing
-playbackRate 改变
-authority client/device binding 改变
-sourceEpoch 改变
-sourceVersion 改变
-sourceQueueRevision 改变
-prepare.controlVersion 对应的 source controlVersion 改变
-appliedControlVersion 不再等于 source controlVersion
-出现新的 pending control transaction
-```
-
-重新读取时 `serverUpdatedAtMs` 与 `positionSampledAtServerMs` 任一年龄不得超过 2000ms，source 当前物理连接必须继续满足 clock gate。
-
-不增加与现有字段重复的 `sourceControlVersion`。
-
-```text
-prepare.controlVersion = N
-commit.controlVersion = N + 1
-complete.appliedControlVersion = N + 1
-```
-
-prepare 增加：
-
-```text
+controlVersion=N
 playbackRate
 positionSampledAtServerMs
 sourceEpoch
 sourceVersion
 sourceQueueRevision
+其他既有 snapshot 字段
 ```
 
-commit 增加：
+ready 后、commit 前重新读 source。position/sample 正常推进不 source_changed；track/state/rate/binding/cursor/pending变化则 source_changed。
+
+commit 是独立 Handoff `player.play` closed shape，至少：
 
 ```text
+playbackContextId
+handoffId
+controlVersion=N+1
+sourceClientId
 serverTimeMs
+effectiveAtServerMs
+positionMs
 playbackRate
 ```
 
-并满足：
+`N+1` 是 `(playbackContextId, epoch, handoffId)` provisional version，不是 canonical cursor。
+
+包含 `handoffId` 的 commit：
+
+- 不进入普通 ControlTransactionCoordinator；
+- 不推进普通 Context reducer；
+- 不发送 remoteCommand playback.update；
+- 只进入 Handoff execution lane；
+- 只由 complete/cancel/timeout结算。
+
+只有 completed status / Context status 后 Flutter 才把 N+1视为 canonical。Handoff failed/cancelled/timedOut 且 target lease失效后，Context仍为N，下一普通 mutation可重新分配N+1；旧消息必须匹配 handoffId、exact pair、physical Socket和非终态状态。
+
+### 6.4 Position projection、near-end 与 complete proof
+
+服务端使用最新 sample 生成 commit position。若已知 duration 且：
 
 ```text
-effectiveAtServerMs - serverTimeMs >= 250
+projectedPositionMs >= durationMs
 ```
 
-Handoff commit 的 `N+1` 是 `(playbackContextId, epoch, handoffId)` 作用域的 provisional version，不是 canonical controlVersion，只有 complete 原子提交时才进入 Context。
+commit 前终止为 `failed/source_changed`，authority保持 source，不发送必然失败的 commit。
 
-complete 成功后的 Context cursor 固定为：
-
-```text
-epoch = old epoch + 1
-version = old version + 1
-queueRevision = old queueRevision
-controlVersion = commit.controlVersion
-```
-
-Handoff failed/cancelled/timedOut 且 target execution lease 已失效后，Context 仍停留在 canonical N；下一次普通 Context mutation可以再次从 N 分配 N+1。所有旧 target ready/complete/cancel 必须同时匹配 handoffId、exact pair、physical Socket 和非终态 Handoff，不能借数字复用穿透。
-
-### 3.10 Handoff wire shape、expected-position proof、clientSeq 和 exact pair terminal
-
-`playback.handoff.start` 请求增加必需：
-
-```text
-targetDeviceSessionId
-```
-
-目标冻结为 exact `(targetClientId, targetDeviceSessionId)`。
-
-`playback.handoff.complete` 改为：
+complete request：
 
 ```text
 playbackContextId
@@ -905,409 +938,345 @@ appliedControlVersion
 clientSeq
 ```
 
-complete 必须来自 frozen target 的当前 exact Socket，并验证：
+必须验证：
 
 ```text
-deviceSessionId 精确匹配 frozen target
-state == playing
-queueIndex/trackId 精确匹配 prepare/commit target
-playbackRate 精确等于 commit target
-appliedControlVersion == commit.controlVersion
-positionMs >= 0，且已知媒体时长时不超过 duration
-positionSampledAtServerMs <= serverNowMs + 1000
-serverNowMs - positionSampledAtServerMs <= 2000
-positionSampledAtServerMs >= effectiveAtServerMs
-positionSampledAtServerMs - effectiveAtServerMs <= 1000
-target 当前 nonce clock gate 仍有效
+exact target Socket/pair
+queueIndex/track/rate匹配
+appliedControlVersion == provisional N+1
+state=playing
+known duration bounds
+target clock gate仍有效
+sample future <= 50ms
+sample age <= 2000ms
+sample >= effectiveAtServerMs
+sample-effectiveAt <= 1000ms
 ```
 
-服务端计算：
+统一整数投影：
 
 ```text
+deltaMs = max(0, positionSampledAtServerMs - effectiveAtServerMs)
 expectedPositionMs =
-  commit.positionMs
-  + (positionSampledAtServerMs - effectiveAtServerMs) * playbackRate
+  commit.positionMs + floor(deltaMs * playbackRate)
+known duration 时 min(expectedPositionMs, durationMs)
 ```
 
-已知 duration 时对 expectedPositionMs 做 clamp。r18 固定：
+r18 固定：
 
 ```text
 HANDOFF_COMPLETE_POSITION_TOLERANCE_MS = 1000
 abs(reportedPositionMs - expectedPositionMs) <= 1000
 ```
 
-超出位置容差、超过 1000ms late policy、clock 失效、track/rate 不匹配或执行失败时，不得发送/接受成功 complete，必须走 commit failure report，authority 保持 source。
+未来时间容差 50ms、执行迟到容差 1000ms、位置容差 1000ms 是三种不同门槛。
 
-目标必须从实际确认 playing 的第一份音频快照立即构造 complete。
+complete.clientSeq 复用 target 后续普通 playback.update 的 `(playbackContextId,targetClientId,connectionNonce,connectionEpoch)` 作用域并消耗序号。
 
-`playback.handoff.complete.clientSeq` 复用 target 后续普通 `playback.update` 的序号作用域：
-
-```text
-(playbackContextId, targetClientId, connectionNonce, connectionEpoch)
-```
-
-complete 消耗该序号并写入完整 target DevicePlaybackState；后续 target passive update 必须使用更高序号。
+complete 原子：
 
 ```text
-相同 clientSeq + 相同 complete 内容 -> 幂等重放 completed status + current Context status
-相同 clientSeq + 不同内容 -> client_sequence_conflict
-clientSeq 倒退 -> client_sequence_conflict
+退休 standby
+写完整 target DevicePlaybackState
+authority exact pair切换
+epoch += 1
+version += 1
+queueRevision不变
+controlVersion=N+1
+Handoff completed
 ```
 
-completed status 和 release 必须完整表达 exact 新 authority pair：
+completed status/release 必须包含：
 
 ```text
 newAuthorityClientId
 newAuthorityDeviceSessionId
 ```
 
-旧 source 收到 release、completed status、Context status 或 bindings.changed 任一权威事实，都必须停止旧 authority audio lease。
+### 6.5 Failure、disconnect 与幂等
 
-扩展 `playback.handoff.cancel` 的 target failure 条件 shape：
+target committing 执行失败通过 target-only：
 
 ```text
-playbackContextId
-handoffId
+playback.handoff.cancel
 reason:"commit_failed"
 errorCode:"commit_failed"
 errorMessage:O
 ```
 
-只有 frozen target 当前 Socket 在 committing 中可发送。服务端结算为 `failed/commit_failed`。普通 controller/source cancel 仍为 cancelled；target failure 与 hard timeout竞争时只允许一个终态。
-
-### 3.11 restorePending 的 action-aware 清理矩阵
-
-`restorePending:true` 不是无条件拒绝所有 Handoff/Follow/Core event。
-
-必须阻止：
+服务端结算 failed/commit_failed。target Socket disconnect 或服务端 restart 时，Flutter立即：
 
 ```text
-playback.context.ensure
+取消 scheduled timer
+失效 Handoff lease
+已起播则暂停
+不得发送迟到 complete
+```
+
+旧 source 收到 release、completed status、Context status 或 bindings.changed 任一权威事实都必须停止旧 authority lease。
+
+duplicate start重放首次 preparing ACK；duplicate/late ready只重放 canonical status；duplicate complete重放 completed status+Context status，不重复 switch/release。prepare/commit不能可靠 enqueue时立即 failed。
+
+## 7. Broadcast restore、soft sync 与管理清理
+
+### 7.1 restorePending action-aware gate
+
+阻止：
+
+```text
+会创建/初始化/重绑/改 snapshot 的 ensure
 playback.context.prepare
 playback.context.close
 queue.context.sync
 queue.playItem
 player.*
 playback.update
-playback.handoff.start
-playback.handoff.complete
+playback.handoff.start/complete
 playback.ready(ready:true)
 playback.context.prepared(ready:true)
 follow.start
 broadcast.start
-任何 authority/device binding mutation
+authority/device binding mutation
 ```
 
-必须允许只用于清理、无新执行副作用的请求：
+允许清理/读取：
 
 ```text
-playback.ready(
-  ready:false,
-  errorCode:"restore_in_progress"
-)
-playback.context.prepared(
-  ready:false,
-  errorCode:"restore_in_progress"
-)
+playback.ready(ready:false,errorCode:"restore_in_progress")
+playback.context.prepared(ready:false,errorCode:"restore_in_progress")
 playback.handoff.cancel
 follow.stop
 terminal broadcast.feedback
 broadcast.status
-playback.context.list/status/subscribe/unsubscribe
-device.setVolume / device.volume.update
-device.list
+list/status/subscribe/unsubscribe
+device.setVolume/device.volume.update/device.list
 system.ping
-terminal stop/restore replay
+terminal replay
 ```
 
-negative `playback.ready` 只结算匹配的 raced Handoff prepare；negative `playback.context.prepared` 只结算匹配的 raced Core prepare。两者均不得初始化队列、推进 Context cursor、进入 commit 或清除 restorePending；重复结果幂等重放 canonical failed confirmation。
+negative confirmation只结算匹配 raced prepare，不初始化队列、不推进 cursor、不 commit、不清 restore fence。
 
-Core prepared errorCode 集合增加 `restore_in_progress`，仅允许上述 cleanup shape。
-
-`playback.handoff.cancel` 只允许终止匹配非终态 Handoff。`follow.stop` 只释放已存在 relationship/fence。
-
-当请求 source Context 与实际 restore fence 的 suspended Context 不同，`system.error.playbackContextId` 和三个 `current*` cursor 必须描述真正被 fence 占用的 suspended Context。
-
-所有被阻止的写请求返回：
+被阻止错误：
 
 ```text
 restore_in_progress
 retryable:true
 playbackContextId
+currentEpoch
 currentVersion
 currentQueueRevision
 currentControlVersion
 ```
 
-不得推进 cursor、发送新执行 command、产生 canonical mutation 或 binding invalidation。
+描述真正被 fence 占用的 suspended Context，零副作用。
 
-### 3.12 用户域资源解析、确定性验证顺序与 volumeState
+### 7.2 Soft sync 与固定 membership
 
-服务端不得为了选择错误码做全局资源存在性查询。
+`applied` 只证明 revision target已应用，不证明持续 drift SLA。feedback position只做类型、非负和已知 duration范围校验。
 
-统一验证顺序：
+membership从start到terminal固定；不支持leave/add/remove。
 
-```text
-envelope/schema
-authentication
-registration/capability
-caller role
-authenticated-user-scoped resource lookup
-lifecycle/overlay/recovery fence
-base cursor
-mutation
-```
+### 7.3 Terminal delivery gate
 
-规则：
+terminal stop/restore未成功加入当前 pair发送路径时：
 
-- direct ID action 中，其他用户资源与真正不存在资源使用相同 `not_found`；
-- `forbidden` 只表示调用者对当前用户域内可见资源缺少角色或操作权限；
-- `playback.context.list` 只返回 user-scoped 结果；
-- Handoff target、device.setVolume target 只在当前 user scope 解析，跨用户/不存在均为 `not_found`；
-- Broadcast explicit participant 中，跨用户、不存在、离线或不可用目标均使用同一种 `skippedClientIds` 结果，不得区分存在性；
-- 最终无 participant 时按既有 `bad_request`/recovery-slot `rate_limited` 规则结算；
-- 日志不得输出通过全局查询获得的其他用户资源细节。
+- 该 Socket不得先收到 suspended Context普通写 command；
+- enqueue失败立即断开；
+- 下次注册先terminal replay，再开放普通业务。
 
-`device.list.volumeState` 只向请求连接的：
+### 7.4 Recovery abandon、decommission 与资源
+
+管理事务原子：
 
 ```text
-negotiatedCapabilities.remoteVolumeControl == true
-```
-
-时输出。不能再使用“capability shape 包含 remoteVolumeControl 字段”作为条件，因为 strict 固定 10 字段 shape 对所有连接都包含该字段。
-
-### 3.13 Recovery abandon 与 exact pair decommission
-
-管理端 recovery abandon 必须原子执行：
-
-```text
-确认 Broadcast 已 terminal
-确认 exact pair 仍 restorePending
+确认 Broadcast terminal
+确认 exact pair restorePending
 删除 full/compact recovery obligation
 删除 ordinary fence
 释放 recovery slot
-写 abandoned audit tombstone
-写 device-pair decommission tombstone
-禁止相同 clientId + deviceSessionId 再次注册继承旧身份
+写 abandoned tombstone
+写 exact pair decommission tombstone
+撤销当前注册并断开在线 exact pair Socket
+从 device.list 移除
+停止路由 command
 ```
 
-同一 stable clientId 以后可以使用新的 `deviceSessionId` 正常注册和 ensure，但不得复用被 decommission 的旧 pair。
-
-只有满足 exact pair decommission，才允许永久停止向旧 pair terminal replay。
-
-## 4. REQ 与验证映射规则
-
-- 保持现有 REQ-001—REQ-067 编号稳定，不做全量重编号；
-- 已有规则发生语义修正时，直接修改原 REQ；
-- 无法合理归入旧 REQ 的新职责从 REQ-068 开始追加；
-- 新增或改变但尚未实现的要求标记为 `Contract defined / implementation pending`，不得提前标记 `Verified`；
-- 任何被 D1—D17 或第 3 节机械闭环改变语义的旧 REQ，都必须重新评估；旧测试未覆盖新语义时，从 `Verified` 降为 `Contract defined / implementation pending`；
-- 不新建 r19 requirement mapping；
-- 继续更新 `docs/verification/emosonic_strict_v2_r18_requirement_mapping.md`；
-- mapping 必须分别记录：服务端 schema、服务端状态机、Flutter parser/controller、自动测试和 Android + Windows 真机证据；
-- 契约 Frozen 不等于 profile ready；真机证据只决定 implementation readiness。
-
-## 5. 契约优先修改批次
-
-下列路径均相对于仓库根目录。列出的是最低必改集合；每个 Batch 完成后仍必须全仓搜索交叉引用。
-
-## Batch A — Core、控制结算、close 与 queue terminal
-
-### 最低必改文件
-
-- `specs/emosonic_strict_v2_contract/phase-0-foundation/01-overview.md`
-- `specs/emosonic_strict_v2_contract/phase-0-foundation/02-transport-registration-and-clock.md`
-- `specs/emosonic_strict_v2_contract/phase-0-foundation/03-ack-errors-idempotency-and-cursors.md`
-- `specs/emosonic_strict_v2_contract/phase-1-core/04-client-core-actions.md`
-- `specs/emosonic_strict_v2_contract/phase-1-core/07-server-device-context-and-status.md`
-- `specs/emosonic_strict_v2_contract/phase-1-core/08-server-queue-playback-and-controls.md`
-- `specs/emosonic_strict_v2_contract/phase-2-optional-profiles/06b-broadcast-source-context.md`
-- `specs/emosonic_strict_v2_contract/phase-3-conformance/11a-common-and-core-requirements.md`
-- `specs/emosonic_strict_v2_contract/phase-3-conformance/11b-broadcast-requirements.md`
-- `specs/emosonic_strict_v2_contract/phase-3-conformance/11c-security-persistence-and-readiness.md`
-- `specs/emosonic_strict_v2_contract/phase-3-conformance/13-integration-acceptance.md`
-
-### 必须落实
-
-- Core prepare 与 Handoff capability 解耦；
-- 普通 routed control 的 `executionTimeoutMs`、lease、watchdog；
-- transaction exact requester pair 与 deterministic dependency assignment；
-- `playback.control.settled` action、payload、幂等、dependency cascade、收件人和跨连接行为；
-- `execution_unknown` 后分配新 server reconciliation version，不伪造旧 applied；
-- `playback.context.close(expectedEpoch,baseVersion)`、action-aware `context_closed` cursors 与 tombstone 幂等；
-- first-prev、last-next 和 automatic final queue terminal 的精确 cursor；
-- user-scoped lookup、volumeState 条件与确定性错误优先级。
-
-### 契约验收条件
-
-- ACK、actual committed/failed、unknown 和 dependency failure 有唯一来源；
-- unknown 后能够最终消除 canonical/applied 永久分叉，同时保留旧 unknown 审计终态；
-- 没有订阅 Context 的原请求 controller 仍可在同一物理连接收到 settlement；
-- settlement 可精确归属 requesting client/device pair；
-- close 不能穿透 authority/Context 变化，重复 close 仍幂等；
-- 最后一首结束只产生一次 canonical mutation，Follow/Broadcast 各派生一次。
-
-## Batch B — Follow 音频、能力、持久安全租约与 crash-safe cleanup
-
-### 最低必改文件
-
-- `specs/emosonic_strict_v2_contract/phase-0-foundation/01-overview.md`
-- `specs/emosonic_strict_v2_contract/phase-0-foundation/02-transport-registration-and-clock.md`
-- `specs/emosonic_strict_v2_contract/phase-0-foundation/03-ack-errors-idempotency-and-cursors.md`
-- `specs/emosonic_strict_v2_contract/phase-1-core/04-client-core-actions.md`
-- `specs/emosonic_strict_v2_contract/phase-1-core/07-server-device-context-and-status.md`
-- `specs/emosonic_strict_v2_contract/phase-1-core/08-server-queue-playback-and-controls.md`
-- `specs/emosonic_strict_v2_contract/phase-2-optional-profiles/05-client-follow-and-handoff.md`
-- `specs/emosonic_strict_v2_contract/phase-2-optional-profiles/06a-client-broadcast-actions.md`
-- `specs/emosonic_strict_v2_contract/phase-2-optional-profiles/06c-broadcast-feedback-and-recovery.md`
-- `specs/emosonic_strict_v2_contract/phase-2-optional-profiles/06d-flutter-broadcast-roles-and-terminal.md`
-- `specs/emosonic_strict_v2_contract/phase-2-optional-profiles/09-server-handoff.md`
-- `specs/emosonic_strict_v2_contract/phase-3-conformance/11a-common-and-core-requirements.md`
-- `specs/emosonic_strict_v2_contract/phase-3-conformance/11b-broadcast-requirements.md`
-- `specs/emosonic_strict_v2_contract/phase-3-conformance/11c-security-persistence-and-readiness.md`
-- `specs/emosonic_strict_v2_contract/phase-3-conformance/13-integration-acceptance.md`
-
-### Wire shape
-
-保持请求：
+decommission key：
 
 ```text
-follow.start: sourcePlaybackContextId + deviceSessionId
-follow.stop: sourcePlaybackContextId
+(user, clientId, deviceSessionId)
 ```
 
-不新增 Follow mirror push 或 feedback action。
+永久拒绝复用；可压缩为最小 tombstone，仅账号/用户数据整体删除时清除。达到部署上限时限制新 deviceSession 创建，不能删除旧 decommission tombstone。
 
-### 必须落实
+同一 clientId 可使用新的 deviceSessionId 建立新生命周期。
 
-- `supportsFollow:true` 的复合能力，`effectiveAtPlayback` 协商必须覆盖 Follow profile；
-- follower/source clock gate 与 source state-specific eligibility；
-- idle start 拒绝、自 Follow 拒绝，active sourceIdle 保持 relationship；
-- settled entry：applied==control、无 pending/prepare/Handoff/overlay，Flutter local lane idle；
-- exact pair + suspended Context relationship；
-- Follow occupancy fence 和 mode eligibility；
-- playing-only stale；paused/stopped 稳定事实；
-- Flutter `FollowRecoveryRecord`、resume/stop intent；
-- server `FollowSafetyLease`、restart fence recovery 与 cleanupRequired；
-- recovery record 写失败时立即 stop/disconnect，不进入 overlay；
-- restore-before-stop，ACK 后释放 fence；
-- source recovery deadline 与 follower reconnect grace 两个独立 timer；
-- app restart 只 cleanup、不自动恢复 Follow；
-- source Handoff 后 relationship 继续绑定 Context ID。
+## 8. 持久化、重启和资源上限
 
-### 契约验收条件
+### 8.1 Pending controls on restart
 
-- Follow 是实际音频执行且不会污染任何正常 Context；
-- 已送达旧命令不能在 Follow start 后晚执行；
-- 其他 controller 不能穿透 suspended Context fence；
-- 服务端重启不会短暂丢失 Follow 安全门禁；
-- stop ACK 丢失、Socket 重连和 app restart 都不会错误重新 Follow；
-- recovery record 写失败或本地恢复失败不会提前释放 fence；
-- idle/self-follow 行为唯一且可测试。
+服务端 restart 时所有 pending ordinary control 必须结算为 `execution_unknown`，不再保留“有界重投或 failed/superseded 任意选择”的旧规则。随后依 terminal-gap reconciliation 收敛。
 
-## Batch C — Handoff 能力、全生命周期 fence 与完整执行证明
+### 8.2 Follow resources
 
-### 最低必改文件
+见 5.3：
 
-- `specs/emosonic_strict_v2_contract/phase-0-foundation/01-overview.md`
-- `specs/emosonic_strict_v2_contract/phase-0-foundation/02-transport-registration-and-clock.md`
-- `specs/emosonic_strict_v2_contract/phase-0-foundation/03-ack-errors-idempotency-and-cursors.md`
-- `specs/emosonic_strict_v2_contract/phase-1-core/04-client-core-actions.md`
-- `specs/emosonic_strict_v2_contract/phase-1-core/07-server-device-context-and-status.md`
-- `specs/emosonic_strict_v2_contract/phase-1-core/08-server-queue-playback-and-controls.md`
-- `specs/emosonic_strict_v2_contract/phase-2-optional-profiles/05-client-follow-and-handoff.md`
-- `specs/emosonic_strict_v2_contract/phase-2-optional-profiles/09-server-handoff.md`
-- `specs/emosonic_strict_v2_contract/phase-3-conformance/11a-common-and-core-requirements.md`
-- `specs/emosonic_strict_v2_contract/phase-3-conformance/11c-security-persistence-and-readiness.md`
-- `specs/emosonic_strict_v2_contract/phase-3-conformance/13-integration-acceptance.md`
+- exact pair最多一条非终态 lease；
+- suspended Context最多一个 Follow overlay；
+- 每user最多256条 active/reconnectGrace/cleanupRequired record；
+- cleanup不受 rate limit；
+- 未完成旧 lease不得为接收新 lease而删除。
 
-### 必须落实
+### 8.3 Existing limits
 
-- source/target composite capability 与双方 clock gate；
-- start exact target pair 和 playing/settled/fresh gate；
-- source 与 target standby fence 覆盖 preparing/ready/committing 全生命周期；
-- target 本机 UI/AudioPlayerService gate；
-- source local actual mutation 先 source_changed 终止 Handoff，再提交实际事实；
-- prepare/commit/complete N/N+1 关系、provisional reuse 和固定 cursor；
-- normal position/sample 前进不触发 source_changed；
-- complete 的完整 fact、sample/late/clock/media/expected-position 校验；
-- 1000ms complete position tolerance；
-- shared playback `clientSeq` scope；
-- completed status/release 的 exact new authority pair；
-- commit_failed 主动报告入口；
-- duplicate start/ready/complete 和可靠 enqueue failure；
-- active Handoff 时 close conflict。
+保留现有 control/local intent/Broadcast ledger、participant、recovery slot、payload和connection上限。新增内部 reconciliation record计入 control transaction持久化上限；不得在其仍被 gap审计引用时提前清理。
 
-### 契约验收条件
+## 9. REQ、mapping 与状态
 
-- commit 到 complete 之间没有普通控制穿透窗口；
-- target standby 和本机 UI 不会被其他操作修改；
-- late/mismatched/wrong-position target 不能伪造成功 complete；
-- provisional N+1 失败后可安全复用且旧消息不能穿透；
-- release 丢失时旧 source 仍由 status/binding 停止。
+- 保持 REQ-001—REQ-067 稳定；
+- 已有语义变化直接修改原 REQ；
+- 新职责从 REQ-068 继续追加；
+- 新增或改变但尚未实现的要求标记 `Contract defined / implementation pending`；
+- 旧测试不覆盖新语义时，旧 `Verified` 必须降级；
+- 不新建 r19 mapping；
+- 更新 `docs/verification/emosonic_strict_v2_r18_requirement_mapping.md`；
+- mapping分别记录服务端 schema、服务端状态机、Flutter parser/controller、自动测试、Android+Windows真机证据；
+- Contract Frozen不等于 profile implementation ready。
 
-## Batch D — Broadcast restore action-aware gate、软同步与 decommission
+## 10. 契约修改批次
 
-### 最低必改文件
+每个 Batch 完成后必须全仓搜索交叉引用。
 
-- `specs/emosonic_strict_v2_contract/phase-0-foundation/01-overview.md`
-- `specs/emosonic_strict_v2_contract/phase-0-foundation/03-ack-errors-idempotency-and-cursors.md`
-- `specs/emosonic_strict_v2_contract/phase-1-core/04-client-core-actions.md`
-- `specs/emosonic_strict_v2_contract/phase-1-core/07-server-device-context-and-status.md`
-- `specs/emosonic_strict_v2_contract/phase-1-core/08-server-queue-playback-and-controls.md`
-- `specs/emosonic_strict_v2_contract/phase-2-optional-profiles/05-client-follow-and-handoff.md`
-- `specs/emosonic_strict_v2_contract/phase-2-optional-profiles/06a-client-broadcast-actions.md`
-- `specs/emosonic_strict_v2_contract/phase-2-optional-profiles/06c-broadcast-feedback-and-recovery.md`
-- `specs/emosonic_strict_v2_contract/phase-2-optional-profiles/06d-flutter-broadcast-roles-and-terminal.md`
-- `specs/emosonic_strict_v2_contract/phase-2-optional-profiles/09-server-handoff.md`
-- `specs/emosonic_strict_v2_contract/phase-2-optional-profiles/10-server-broadcast.md`
-- `specs/emosonic_strict_v2_contract/phase-3-conformance/11a-common-and-core-requirements.md`
-- `specs/emosonic_strict_v2_contract/phase-3-conformance/11b-broadcast-requirements.md`
-- `specs/emosonic_strict_v2_contract/phase-3-conformance/11c-security-persistence-and-readiness.md`
-- `specs/emosonic_strict_v2_contract/phase-3-conformance/13-integration-acceptance.md`
+### Batch A — 公共 schema、Core、settlement 与 safe close
 
-### 必须落实
+最低必改：
 
-- 删除“服务端放行、Flutter 排队”的旧 restore 规则；
-- `restore_in_progress` action-aware 阻止矩阵；
-- Handoff negative ready 和 Core negative prepared 清理例外；
-- follow.start 禁止、follow.stop 允许；
-- device volume/list/ping 不受 Context restore fence 影响；
-- error cursor 指向真正 suspended Context；
-- Broadcast `applied` 仅表示 revision target 已应用；
-- membership 固定到 terminal；
+```text
+01-overview.md
+02-transport-registration-and-clock.md
+03-ack-errors-idempotency-and-cursors.md
+04-client-core-actions.md
+07-server-device-context-and-status.md
+08-server-queue-playback-and-controls.md
+06b-broadcast-source-context.md
+11a-common-and-core-requirements.md
+11b-broadcast-requirements.md
+11c-security-persistence-and-readiness.md
+13-integration-acceptance.md
+```
+
+落实：
+
+- Context snapshot exact authority pair；
+- currentEpoch error；
+- Core prepare解耦；
+- routed dependency/timeout/eligibility；
+- settlement exact requester pair；
+- transitive dependency cascade；
+- terminal-gap reconciliation与唯一 wire confirmation；
+- queue边界/natural terminal；
+- safe close；
+- user-scoped lookup与volumeState。
+
+### Batch B — Follow capability、baseline ACK、安全租约与恢复
+
+最低必改：
+
+```text
+01,02,03,04,07,08
+05-client-follow-and-handoff.md
+06a,06c,06d
+09-server-handoff.md
+11a,11b,11c
+13-integration-acceptance.md
+```
+
+落实：
+
+- Follow复合能力/effectiveAt；
+- source current physical fact；
+- state-specific source门禁、idle/self gate；
+- RecoveryRecord prewrite；
+- start ACK冻结 baseline；
+- persistent SafetyLease、fence、resource limit；
+- local failure；
+- sourceIdle；
+- reconnect/restart/cleanup cursor comparison。
+
+### Batch C — Handoff provisional lane、position proof 与全生命周期 fence
+
+最低必改：
+
+```text
+01,02,03,04,07,08
+05-client-follow-and-handoff.md
+09-server-handoff.md
+11a,11c
+13-integration-acceptance.md
+```
+
+落实：
+
+- source/target capability和exact pair；
+- full lifecycle fences；
+- target UI gate；
+- independent Handoff execution lane；
+- provisional N+1；
+- prepare/commit/complete shape；
+- 50ms future、1000ms late、1000ms position tolerance；
+- near-end fail-fast；
+- clientSeq；
+- disconnect immediate cancel；
+- terminal exact pair、duplicate和enqueue failure。
+
+### Batch D — Broadcast restore、terminal gate 与 decommission
+
+最低必改：
+
+```text
+01,03,04,07,08
+05
+06a,06c,06d
+09
+10-server-broadcast.md
+11a,11b,11c
+13-integration-acceptance.md
+```
+
+落实：
+
+- action-aware restore gate；
+- Handoff/Core negative cleanup；
+- soft sync；
+- fixed membership；
 - terminal delivery gate；
-- recovery abandon + exact pair decommission。
+- online abandon disconnect；
+- permanent decommission tombstone。
 
-### 契约验收条件
+### Batch E — 权威入口、mapping 与冻结
 
-- raced Handoff 和 Core prepare 都可立即 negative cleanup，不等待 timeout；
-- restore gate 不阻止设备级音量、时钟和读取；
-- abandon 后旧 pair 注册失败，新 deviceSession 可建立新生命周期。
+最低必改：
 
-## Batch E — r18 权威入口、mapping 与冻结收口
+```text
+specs/emosonic_strict_v2_socketio_server_contract.md
+全部19个权威分卷页首
+docs/verification/emosonic_strict_v2_r18_requirement_mapping.md
+13-integration-acceptance.md
+14-authority-and-deployment-evidence.md
+```
 
-### 最低必改文件
+落实：
 
-- `specs/emosonic_strict_v2_socketio_server_contract.md`
-- 全部 19 个权威分卷页首
-- `docs/verification/emosonic_strict_v2_r18_requirement_mapping.md`
-- `specs/emosonic_strict_v2_contract/phase-3-conformance/13-integration-acceptance.md`
-- `specs/emosonic_strict_v2_contract/phase-3-conformance/14-authority-and-deployment-evidence.md`
+- `2026-08-01-r18` / `2.8.0`；
+- Approved + Contract Frozen + implementation pending；
+- pre-freeze例外和成组升级；
+- mapping降级；
+- r19/errata纪律；
+- 真机只决定 implementation readiness。
 
-### 必须落实
+## 11. 契约完成后的实现顺序
 
-- 权威身份保持 r18 / `2.8.0`，修订更新为 `2026-08-01-r18`；
-- 使用三项状态：Approved、契约 Frozen、实现 pending；
-- 入口摘要覆盖 Follow safety lease/recovery、control settlement/reconciliation、safe close、queue terminal、Handoff full proof、restore gate、volumeState 与 user-scoped security；
-- 全部 19 个分卷页首同步；
-- mapping 对语义变化的旧 Verified 重新评估并降级；
-- 写入 pre-freeze 例外、成组升级、冻结后 r19/errata 纪律；
-- 契约冻结不以真机证据为前置；Android + Windows 真机只决定 implementation ready。
-
-## 6. 契约完成后的代码实施顺序
-
-### Phase 1 — capability、schema validator 与双方 fixtures
+### Phase 1 — Capability、schema validator 与 fixtures
 
 服务端：
 
@@ -1319,188 +1288,168 @@ supysonic/emo/strict_v2_readiness.py
 Flutter：
 
 ```text
-lib/services/emo_action_contract_policy.dart
-lib/services/emo_strict_v2_models.dart
-StrictV2CapabilityPolicy 所在文件
-test/fixtures/emo_protocol/strict_v2/...
+emo_action_contract_policy.dart
+emo_strict_v2_models.dart
+StrictV2CapabilityPolicy所在文件
+双方 strict-v2 fixtures
 ```
 
 先同步：
 
-- `supportsFollow` / `effectiveAtPlayback` 复合协商；
-- close request 与 context_closed cursors；
-- settlement `requestingDeviceSessionId`；
-- Handoff start/prepare/commit/complete/cancel/status/release；
-- expected-position proof 与 clientSeq；
-- Core negative prepared；
+- Context snapshot `authorityDeviceSessionId`；
+- `currentEpoch` error；
+- routed `dependsOnControlVersion` / `executionTimeoutMs`；
+- settlement requesting exact pair；
+- close；
+- Follow start ACK baseline；
+- Handoff所有新shape；
 - restore errors；
-- `device.list.volumeState` 条件。
+- volumeState条件。
 
-### Phase 2 — Core settlement、dependency、reconciliation、safe close 与 queue terminal
+### Phase 2 — Core
 
-服务端：`ws.py`、`ws_store.py`。
+服务端：`ws.py`、`ws_store.py`、数据库模型/迁移。  
+Flutter：control coordinator、execution lease、command lane、audio end callback、close sender。
 
-Flutter：control transaction coordinator、execution lease、command lane、audio end callback、close sender。
+实现 dependency admission/hold/cascade、eligibility watchdog、terminal-gap reconciliation、安全 close、queue terminal。
 
 ### Phase 3 — Follow
 
-服务端：persistent `FollowSafetyLease`/fence/reconnect cleanup store、mode eligibility、restart recovery。
-
-Flutter：`FollowRecoveryRecord`、resume/stop intent、restore-before-stop、playing stale、sourceIdle、app restart cleanup。
+服务端：persistent SafetyLease store、fence、restart cleanup、limit。  
+Flutter：RecoveryRecord、prewrite/ACK compare、resume/stop intent、local failure、sourceIdle、cleanup。
 
 ### Phase 4 — Handoff
 
-服务端：full lifecycle fences、exact pair、source revalidation、provisional version、complete transaction、position proof、commit failure。
+服务端：fences、exact pair、provisional lane、source revalidation、complete transaction、position proof。  
+Flutter：independent Handoff lane、target UI gate、complete proof/clientSeq、disconnect cancel、source fallback stop。
 
-Flutter：new schema、target local UI gate、complete proof/clientSeq、source fallback stop、target terminal lease invalidation。
+### Phase 5 — Broadcast / management
 
-### Phase 5 — Broadcast restore 与管理清理
+服务端：restore matrix、negative cleanup、terminal gate、abandon/decommission。  
+Flutter：删除恢复期普通命令队列，处理 restore error和raced prepare cleanup。
 
-服务端：restore action matrix、negative cleanup、terminal delivery gate、recovery abandon/decommission。
-
-Flutter：删除恢复期间普通命令队列，处理 restore errors 和 raced prepare cleanup。
-
-## 7. 测试计划
+## 12. 必须新增的验收
 
 ### Core
 
-- Handoff profile off / `playbackPrepare:false` 时 Core prepare 仍成功；
-- executionTimeout 默认/配置、Windows lease 和 server +2000ms watchdog；
-- deterministic `dependsOnControlVersion` 分配；
-- committed、failed、dependency_failed、execution_unknown；
-- settlement 包含 requesting exact pair；
-- 原请求者未 subscribe 仍收到同连接 settlement；
-- disconnect 后不向 replacement 自动补历史 settlement；
-- unknown actual matches/differs canonical 时均分配新的 reconciliation version；
-- 原 unknown transaction 不被改成 committed；
-- late remote result 不能改写 unknown terminal；
-- close stale epoch/version、active fence、重复 close tombstone与 context_closed cursors；
-- first-prev、last-next 的精确 cursor；
-- natural last-end 只产生一次 version+1，queue/control/epoch 不变；
-- volumeState 只向 negotiated remoteVolumeControl=true 输出。
+- Core prepare不依赖 playbackPrepare；
+- routed dependency字段和transitive chain；
+- dependent command等待 committed后才开始lease；
+- dependency等待不消耗execution timeout；
+- effective-at+dependency迟到策略；
+- requester exact pair settlement；
+- restart/watchdog/disconnect unknown；
+- failed/unknown/dependency gap均分配新 reconciliation version；
+- remote failed inline reconciliation唯一confirmation；
+- Context无playbackRate但DeviceState保留rate；
+- close currentEpoch/version和tombstone；
+- first-prev、last-next、natural terminal；
+- Context snapshot exact authority pair；
+- currentEpoch error；
+- volumeState capability。
 
 ### Follow
 
-- Follow profile 开启时 `effectiveAtPlayback` 可以正确协商；
-- capability 缺任一 can/effective-at/rate 承诺时不协商或 start fail-closed；
-- follower/source clock gate 不满足时 start 无副作用失败；
-- playing source 使用 2 秒 fresh gate，paused/stopped source 可稳定开始；
-- idle source start 返回 queue_required；
-- self-follow 返回 conflict；
-- active source 转 idle 时清空 mirror、保持 relationship，恢复 queue 后继续；
-- pending control、active prepare 或 local execution lane 未空闲时不能 start；
-- 实际应用 source queue/play/pause/seek/natural transition；
-- playing 3 秒 stale；paused/stopped 长时间稳定不退出；
-- Follow fence 阻止其他 controller；
-- FollowSafetyLease 在服务端重启后恢复 fence；
-- recovery record 写失败时不触碰音频并立即 cleanup；
-- stop 先恢复后释放 fence；
-- stop ACK 丢失重连只重试 stop，不重新 start；
-- app restart 使用 cleanup marker，不自动 Follow；
-- restore 失败保持非播放和 fence；
-- source Handoff 后继续 Follow；
-- source 同时有 Follow 和 Broadcast 时互不污染。
+- Follow profile正确协商effectiveAt；
+- source fact必须来自当前nonce；
+- playing/paused/stopped/idle/self-follow；
+- RecoveryRecord在start前写入；
+- start ACK baseline匹配/不匹配；
+- crash在ACK前后均可cleanup；
+- SafetyLease重启恢复fence；
+- 每user/pair/context资源上限；
+- local mirror执行失败；
+- sourceIdle保持relationship；
+- stop恢复时cursor未变/已变/closed三种分支；
+- stop ACK丢失、app restart不自动Follow；
+- Follow+Broadcast source共存。
 
 ### Handoff
 
-- source/target capability 和双方 clock gate；
-- idle/paused/stopped/stale/unsettled source fail-fast；
-- exact target deviceSession replacement；
-- source/target standby fences覆盖全部阶段；
-- target 本机 transport/queue/mode UI gate；
-- prepare 期间仅 position/sample 更新继续；track/state/rate/cursor/binding变化 source_changed；
-- committing 期间普通 remote control 被拒绝；
-- source localUser/natural-end 优先终止 Handoff 后提交 actual fact；
-- prepare N、provisional commit N+1、complete N+1；
-- failed provisional N+1 可被下一普通 mutation安全复用；
-- 1.5x rate 和最新 sample projection；
-- complete sample/late/clock/media bounds；
-- reported position 在 expectedPosition ±1000ms 内才可 complete；
-- complete clientSeq 与后续 passive 连续；
-- completed status/release 包含 exact new authority pair；
-- duplicate start/ready/complete；
-- prepare/commit enqueue failure；
-- commit_failed 主动报告；
-- release 丢失但 status/binding 仍停止 source；
-- active Handoff close conflict。
+- provisional commit不进入普通Control coordinator；
+- source/target effectiveAt与clock gate；
+- full fences和target UI gate；
+- prepare正常position推进；
+- near-end commit前source_changed；
+- sample future>50ms拒绝；
+- late>1000ms拒绝；
+- wrong position>1000ms拒绝；
+- floor投影一致；
+- target disconnect立即取消timer；
+- provisional N+1失败后安全复用；
+- complete clientSeq连续；
+- exact pair terminal；
+- duplicate和enqueue failure。
 
-### Broadcast restore
+### Broadcast / management / security
 
-- 每个受阻写 action 返回 `restore_in_progress`；
-- Handoff ready:false、Core prepared:false、handoff.cancel、follow.stop 和 terminal feedback 可清理；
-- device volume/list/ping/read 不受阻；
-- error cursor 指向真正 suspended Context；
-- terminal feedback 清 fence 后新 requestId 可执行；
-- applied 只证明 revision target；
-- terminal enqueue failure 断开并重连 replay；
-- abandon 原子清 fence/record/slot并 decommission exact pair；
-- old pair 注册失败，新 deviceSession 正常。
+- restore action矩阵；
+- negative ready/prepared cleanup；
+- currentEpoch+真正fenced Context cursor；
+- terminal enqueue失败断开/replay；
+- soft sync applied语义；
+- fixed membership；
+- abandon在线pair立即断开并从device.list移除；
+- decommission tombstone永久拒绝旧pair；
+- user-scoped lookup无侧信道。
 
-### Security
+## 13. 最终机械审计
 
-- 跨用户与不存在 Context/target 得到不可区分结果；
-- 不执行全局存在性查询来选择错误码；
-- Broadcast explicit 跨用户与不存在目标均进入同类 skipped 结果；
-- 验证顺序和错误优先级确定。
+必须搜索并验证：
 
-## 8. 全量一致性审计
+1. 当前 normative 身份没有误写 r19/2.9.0；
+2. 全部页首为 `2026-08-01-r18`；
+3. 不残留 `Frozen implementation baseline`；
+4. Context snapshot全部含 `authorityDeviceSessionId`；
+5. Context-scoped error全部含 `currentEpoch`；
+6. Follow capability/source nonce/idle/self/baseline ACK/SafetyLease完整；
+7. Follow RecoveryRecord必须在start前写入；
+8. Follow cleanup有cursor comparison和local failure；
+9. routed control有executionTimeout和dependency；
+10. dependency支持传递且eligibility后才计时；
+11. failed/unknown/dependency terminal gap统一reconciliation；
+12. reconciliation不把playbackRate写入Context；
+13. settlement含requestingDeviceSessionId；
+14. close有expectedEpoch/baseVersion/currentEpoch tombstone；
+15. Handoff commit不进入普通control reducer；
+16. Handoff future=50ms、late=1000ms、position=1000ms；
+17. near-end和disconnect规则存在；
+18. restore无服务端放行/Flutter排队旧规则；
+19. volumeState检查negotiated true；
+20. FollowSafetyLease和decommission资源有界；
+21. abandon在线pair断开；
+22. mapping失效Verified已降级；
+23. Markdown链接、REQ引用无断链；
+24. `git diff --check`通过。
 
-契约修改后必须机械搜索：
+契约阶段不得为了让旧代码测试通过而修改代码、validator、fixtures或测试。
 
-1. `r19` / `2.9.0`：当前 normative 身份不得误写；只允许未来变更纪律；
-2. `2026-07-23-r18`：当前页首统一更新为 `2026-08-01-r18`；
-3. `Frozen implementation baseline`：不得残留；
-4. `supportsFollow` / `effectiveAtPlayback`：Follow 复合协商必须完整，不得只写 player+canPlay；
-5. Follow source：playing、paused/stopped、idle 和 self-follow 必须有唯一门禁；
-6. Follow lifecycle：必须有 settled entry、fence、FollowRecoveryRecord、persistent FollowSafetyLease、restart cleanup、resume/stop intent、两个独立 timer；
-7. Handoff fence：必须覆盖 preparing/ready/committing、target standby 和 target 本机 UI；
-8. Handoff shape：不得残留仅 targetClientId start、仅 positionMs complete、重复 sourceControlVersion 或仅 clientId terminal identity；
-9. Handoff complete：必须有 sample/late/clock/media/expected-position proof、1000ms tolerance 和 shared clientSeq；
-10. Handoff provisional N+1：失败后的复用和旧消息拒绝规则必须存在；
-11. restorePending：不得残留服务端放行/Flutter 排队；不得误删 Handoff/Core negative cleanup；
-12. control settlement：必须有 requester exact pair、dependency assignment、timeout、new-version reconciliation 和 late result规则；
-13. appliedControlVersion：不得把原 execution_unknown command 伪装为成功 applied；
-14. close：必须有 expectedEpoch/baseVersion、tombstone幂等和 context_closed final cursors；
-15. queue boundary：first-prev/last-next/natural-end cursor 一致；
-16. security：跨用户与不存在不可区分，不得全局探测；
-17. `volumeState`：必须检查 negotiated remoteVolumeControl==true；
-18. recovery abandon：必须与 exact pair decommission绑定；
-19. mapping：所有旧证据失效的 Verified 已降级；
-20. Markdown 链接、章节引用、REQ 引用无断链；
-21. 运行 `git diff --check`。
-
-契约阶段不得为了让旧代码测试通过而修改 Python、Dart、fixtures 或测试。
-
-## 9. 纯文档提交顺序
+## 14. 纯文档提交顺序
 
 ```text
-1. spec: close r18 core settlement and lifecycle gaps
-2. spec: define r18 follow capability safety lease and recovery
-3. spec: harden r18 handoff lifecycle and execution proof
-4. spec: finalize r18 broadcast restore and security gates
+1. spec: close r18 core dependency settlement and lifecycle gaps
+2. spec: define r18 follow baseline safety lease and recovery
+3. spec: harden r18 handoff provisional execution and proof
+4. spec: finalize r18 broadcast restore and decommission gates
 5. spec: freeze r18 contract authority and mapping
 ```
 
-## 10. r18 契约完成标准
+## 15. r18 契约完成标准
 
-只有以下条件全部满足，才能宣布 r18 契约定稿并冻结：
+只有以下全部满足，才能宣布 r18 契约 Frozen：
 
 - D1—D17 全部进入权威分卷和 REQ/acceptance；
-- 第 3 节全部机械闭环进入权威分卷，不只停留在本计划；
-- 每个 action 的请求、结算、错误、幂等、断线、重启和超时有唯一解释；
-- Follow 的能力、source state、self gate、settled entry、fence、恢复记录、安全租约、restart cleanup、resume/stop intent 和 timer 无歧义；
-- Handoff source/target fence覆盖完整生命周期，target 本机 UI 受控，complete具有可验证的位置和实际事实；
-- `execution_unknown` 后通过新的 reconciliation controlVersion 收敛，且不伪造旧 command applied；
-- dependency assignment 和 cascade 完全确定；
-- settlement 可以精确归属 requesting client/device pair；
-- close 具备并发前置条件、action-aware error cursors 且跨 requestId 幂等；
-- 最后一首自然结束有唯一 canonical mutation；
-- restorePending 无相反规则，Handoff/Core negative cleanup 不被阻止；
-- user-scoped security、volumeState 条件和错误优先级无存在性侧信道；
-- recovery abandon 与 exact pair decommission 原子绑定；
-- r18 mapping 对全部新/改要求有实施状态，失效旧证据已降级；
-- 全部 19 个分卷页首、入口、修订和版本一致；
-- 权威入口写明 pre-freeze 例外、成组升级和冻结后 r19/errata 纪律；
-- 最终机械审计与 `git diff --check` 通过。
+- 本计划第3—8节全部进入权威分卷，不只停留在计划；
+- 每个 action 的请求、ACK/direct response、push、错误、幂等、断线、重启和超时有唯一解释；
+- Context snapshot与error都能表达exact pair/epoch；
+- dependency admission、execution eligibility、cascade和timeout无歧义；
+- failed/unknown/dependency gap通过新 reconciliation version收敛，不伪造旧command成功；
+- Follow prewrite baseline、ACK、SafetyLease、fence、local failure、restart cleanup无崩溃窗口；
+- Handoff provisional lane与普通control reducer隔离，complete有时间、位置、clock和actual proof；
+- restorePending无相反规则；
+- user-scoped security、volumeState、资源上限和decommission闭合；
+- mapping全部更新，未实现项不伪造Verified；
+- 全部19个分卷、入口、修订和版本一致；
+- 最终机械审计与`git diff --check`通过。
 
-冻结后进入“实现 r18”阶段，不再重新讨论 D1—D17。未来真正改变冻结行为的新功能进入 r19。
+冻结后进入“实现 r18”阶段，不再重新讨论D1—D17；未来真正改变冻结行为的新功能进入r19。
