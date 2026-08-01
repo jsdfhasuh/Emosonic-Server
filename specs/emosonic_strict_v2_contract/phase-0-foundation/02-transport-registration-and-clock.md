@@ -166,7 +166,9 @@ action”规则的 bootstrap 例外。
 - strict 注册 payload 中不得有 `sessionId`；
 - `playbackContextV2:true` 是要求服务端返回 strict metadata 的条件。
 - `effectiveAtPlayback:true` 表示连接具备服务端时钟映射和计划执行能力，可以独立于
-  `playbackPrepare` 协商；Handoff target 才同时要求两者为 true。
+  `playbackPrepare` 协商；Handoff target 才同时要求两者为 true。Core
+  `playback.context.prepare` 不依赖 `playbackPrepare`，该字段只表示设备能够处理 Handoff target 的
+  server-routed `playback.prepare`。
 
 请求中的 capabilities 描述客户端自身能力；服务端必须将它们与部署 readiness 求交集，并在 ACK
 中返回完整 `negotiatedCapabilities`。Core profile 未 ready 时不得静默降级：服务端返回
@@ -310,8 +312,9 @@ fallback。wire contract 变化时必须同步更新 protocolVersion 和 schema 
 ```
 
 strict 设备对象必须且只允许 `clientId`、`deviceSessionId`、`deviceName`、`roles`、完整协商后
-`capabilities`，以及可选非空 `alias`、可选闭合 `volumeState`。`volumeState` 只向请求 capability
-形状包含 `remoteVolumeControl` 的 recipient 输出，且只允许 `volume:int 0..100`、
+`capabilities`，以及可选非空 `alias`、可选闭合 `volumeState`。`volumeState` 只向当前请求连接的
+`negotiatedCapabilities.remoteVolumeControl == true` 时输出；仅因固定 capability shape 包含该字段
+不得输出。`volumeState` 只允许 `volume:int 0..100`、
 `clientSeq:int>=1`、`serverUpdatedAtMs:int>=0`。不得返回 legacy `sessionId`、`userName`、连接时间或其他
 内部字段。设备数组按 `clientId` 稳定排序；roles 输出采用 `player`、`controller` 的固定枚举顺序。
 

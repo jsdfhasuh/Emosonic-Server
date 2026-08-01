@@ -21,17 +21,33 @@ target 字段也禁止，例外只有第 5.2 节 `device.setVolume` 与第 5.4 �
 | `playback.context.unsubscribe` / `state` | `playbackContextId:R` | 移除 context recipient；返回 ACK。 |
 | `playback.context.status` / `state` | `playbackContextId:R` | 返回第 6.3 的完整 status（同 requestId 直接 action response）。 |
 | `playback.context.prepare` / `command` | `playbackContextId:R`、`intentId:R string`、`baseControlVersion:R int>=0`、`initialQueueSongIds:O non-empty distinct string[]`、`currentIndex:C int>=0`、`positionMs:C int>=0` | 仅 controller 可调用。只允许对 idle Context 准备队列；可选初始队列存在时 currentIndex 与 positionMs 必需且 index 必须合法，不存在时两者必须省略。服务端按第 6.2.1—6.2.3 节 ACK、路由并结算。 |
-| `playback.context.close` / `command` | `playbackContextId:R` | 当前 authority 或同用户 controller 可关闭。写入不可复用 tombstone，返回 ACK，并向所有订阅者推送 `playback.context.closed`。authority 若仍在线且没有进入应用退出流程，收到 closed 后必须立即重新 ensure 一个 idle Context。 |
+| `playback.context.close` / `command` | `playbackContextId:R`、`expectedEpoch:R int>=1`、`baseVersion:R int>=1` | 当前 authority 或同用户 controller 可关闭。服务端在 Context/authority-pair 临界区校验 exact epoch/version、全部 lifecycle/overlay/recovery fence 与非终态 Handoff，写入不可复用 tombstone，返回 ACK，并向所有订阅者推送 `playback.context.closed`。authority 若仍在线且没有进入应用退出流程，收到 closed 后必须立即重新 ensure 一个 idle Context。 |
+
+`playback.context.prepare` 属于 Core。服务端不得检查 Handoff profile 或
+`negotiatedCapabilities.playbackPrepare`；它只检查同用户 controller、唯一 active Context、authority
+exact pair 在线、authority 为 player 且 `canPlay:true`、binding/epoch/base cursor 和 prepare intent
+状态。`playbackPrepare` 只控制 Handoff target 能否接收 server-routed `playback.prepare`。
 
 Context 授权采用“用户域读取、角色控制”：同一 authenticated user 的已注册设备可 subscribe/status；
-controller 可发起控制；当前 authority 必须是在线 player。对携带 `playbackContextId` 的跨用户
-访问统一返回 `forbidden`，不得用 `not_found` 泄露资源是否存在；list 不接收 Context ID，按下述
+controller 可发起控制；当前 authority 必须是在线 player。所有资源解析先限定 authenticated user；
+跨用户资源与真正不存在的资源统一返回 `not_found`，不得用错误码泄露资源是否存在；`forbidden`
+只表示当前用户域内可见资源上的角色或权限不足。list 不接收 Context ID，按下述
 规则先限定用户域并对不可见 binding 返回成功空数组。Context authority 持久绑定 `authorityClientId` 与
 `authorityDeviceSessionId`；只有两者均匹配的重连才恢复 authority 路由。
 
 本节表格中的一般授权不覆盖第 5.5 节 Broadcast source-ownership/suspended-Context 写屏障。任何
 ensure、close、prepare、queue/player/update 或 binding mutation 在获得角色授权后仍必须检查该屏障；
 命中时按第 5.5 节返回 `conflict`。
+
+close 还必须遵守以下安全闭合：
+
+- `expectedEpoch/baseVersion` 不等于 active Context 时返回 `stale_version` 与完整四 cursor；
+- 非终态 Handoff 存在时返回 `conflict`，调用方必须先 cancel；Follow/Broadcast/restorePending fence
+  按各自优先错误拒绝，全部分支零副作用；
+- 首次成功时保存 `closedFromEpoch/closedFromVersion`、递增后的 final version、其余 final cursors 与
+  close ACK outcome；
+- tombstone 上使用新 requestId 重复 close 时，只有 expected/base 与 closedFrom 值相同才重放等价
+  ACK；否则返回 `context_closed` 与 final 四 cursor，不再次递增任何 cursor。
 
 `playback.context.list` 是 remote-control scope discovery，不是模糊搜索：
 
@@ -74,6 +90,9 @@ ensure、close、prepare、queue/player/update 或 binding mutation 在获得角
 也应主动发送 `device.volume.update`；player 若同时有活动 Context，还应在正常 `playback.update`
 中包含相同实际 volume，以维持该 Context 的 DevicePlaybackState。
 
+`device.setVolume` 的 target lookup 必须先限定当前 authenticated user。跨用户 target、真正不存在、
+离线或已被 replacement 的 pair 都使用同一 `not_found` 结果；不得先做全局存在性查询再选择错误码。
+
 `baseControlVersion` / `baseQueueRevision` 是客户端请求的乐观并发前置条件。服务端在 `2.8.x`
 中必须继续接受并按下表校验这些字段；若 cursor 已过期，返回第 4.2 节的 correlated
 `system.error`。服务端接受请求后向客户端推送 canonical `controlVersion` / `queueRevision`，
@@ -104,10 +123,20 @@ Context 为 idle 时，`queue.playItem` 和全部 `player.*` 请求返回 `queue
 `queue.playItem` / `player.*` 控制前，必须在与该控制 mutation 相同的原子临界区内验证：当前
 Context 是其 `authorityClientId` / `authorityDeviceSessionId` pair 唯一的 active Context。若同一
 pair 存在其他 active Context，返回 `conflict`，并在 error payload 中带请求的
-`playbackContextId`、`currentControlVersion`、`currentQueueRevision`、`currentVersion`；不得向
+`playbackContextId`、`currentEpoch`、`currentControlVersion`、`currentQueueRevision`、`currentVersion`；不得向
 authority 发送命令，也不得修改任何 cursor。ensure、close、handoff authority switch 与普通
 player control 必须按 authority/device pair 串行化，不能在“检查唯一性”和“提交控制”之间插入
 binding mutation。
+
+队列固定为 distinct 顺序列表；r18 不支持 shuffle、repeat-one 或 repeat-all。边界控制的 canonical
+结果固定如下：
+
+```text
+第一首 player.prev：index/track 不变，state=playing，positionMs=0，
+                    version +1，controlVersion +1，queueRevision 不变
+最后一首 player.next：index/track 不变，state=stopped，positionMs=0，
+                     version +1，controlVersion +1，queueRevision 不变
+```
 
 ### 5.2.1 `playback.update` 请求的闭合 shape
 
@@ -158,7 +187,7 @@ controller-only 或旧 authority 返回 `forbidden`，旧 device session 返回 
 | --- | --- | --- | --- |
 | `passive` | `appliedControlVersion:int>=1` | 禁止 executionStatus、commandControlVersion、intentId、epoch、observedControlVersion、queueIndex、error 字段 | 更新进度、状态、音量等事实；applied 必须等于 lastApplied，不推进任何 Context cursor |
 | `remoteCommand` / `committed` | `executionStatus:"committed"`、`commandControlVersion:int>=1`、`appliedControlVersion:int>=1` | applied 必须等于 command；禁止 intentId、epoch、observedControlVersion、queueIndex、error 字段 | 只允许按序结算匹配的 pending command；推进 lastApplied，不再次推进 controlVersion |
-| `remoteCommand` / `failed` | `executionStatus:"failed"`、`commandControlVersion:int>=1`、`appliedControlVersion:int>=1`、`errorCode` | applied 必须小于 command；`errorMessage:O string`；禁止 intentId、epoch、observedControlVersion、queueIndex | 将 pending command 结算为 failed；必要时使用新 Context version/Queue revision恢复实际 snapshot，但 controlVersion 不变 |
+| `remoteCommand` / `failed` | `executionStatus:"failed"`、`commandControlVersion:int>=1`、`appliedControlVersion:int>=1`、`errorCode` | applied 必须小于 command；`errorMessage:O string`；禁止 intentId、epoch、observedControlVersion、queueIndex | 将 pending command 结算为 failed；旧 command 不得伪装为 applied，actual snapshot 由第 5.2.2 节 internal reconciliation 收敛 |
 | `localUser` / `committed` | `executionStatus:"committed"`、`intentId:string`、`epoch:int>=1`、`observedControlVersion:int>=1`、`queueIndex:int>=0`、`trackId:string` | state 只能 playing/paused/stopped；queueIndex 必须在 canonical queue 内且 trackId 匹配；禁止 appliedControlVersion、commandControlVersion、error 字段 | 接受本地人工最终结果，从当前 canonical controlVersion +1，并 supersede 旧 pending remote |
 
 remoteCommand failed 的稳定 `errorCode` 固定为：
@@ -183,6 +212,22 @@ currentIndex 和实际 positionMs 发送 `queue.context.sync`，在 canonical qu
 对应 passive `playback.update`。完整 queue 内容改变同样必须先走显式
 `queue.context.sync`。
 
+最后一首自然结束是唯一 passive automatic queue-terminal 例外。authority 发送：
+
+```text
+origin:"passive"
+state:"stopped"
+positionMs:0
+trackId:当前最后一首
+appliedControlVersion:canonical controlVersion
+```
+
+仅当 queue 非空、当前为最后 index、此前 canonical state 为 playing、track 匹配、无 pending control，
+且 authority exact pair/当前 Socket/epoch 匹配时接受。服务端在一个事务中保存 stopped/0 的
+DevicePlaybackState，并令 Context `state=stopped`、`positionMs=0`、`version += 1`；
+epoch/queueRevision/controlVersion 不变。重复事实不得再次递增，只派生一次 Follow fact 和一次 active
+Broadcast stopped revision。
+
 服务端接受 localUser update 时必须与普通 control、ensure、close、handoff 和 remote result 结算在
 同一 Context 串行区内执行：
 
@@ -205,6 +250,30 @@ currentIndex 和实际 positionMs 发送 `queue.context.sync`，在 canonical qu
 `(playbackContextId, epoch, controlVersion)` 唯一事务并设置 `status:"pending"`。ACK 只表示请求已
 验证、版本已分配且命令已可靠加入当前 authority Socket 的发送路径，不表示音频已经执行。
 
+事务至少持久化：
+
+```text
+requestingClientId
+requestingDeviceSessionId
+requestingConnectionNonce
+requestingConnectionEpoch
+authorityClientId
+authorityDeviceSessionId
+routedConnectionNonce
+routedConnectionEpoch
+action
+acceptedTarget
+executionTimeoutMs
+dependsOnControlVersion:O
+executionEligibleAtMs:O
+watchdogDeadlineAtMs:O
+```
+
+`executionTimeoutMs` 的部署默认值为 15000，wire 值必须为 `int>=1`。track-changing action 固定为
+`queue.playItem|player.next|player.prev`。接受每个普通控制时，服务端在当前 Context/epoch 内查找最高
+的、仍 pending 的较低 track-changing version；存在时把它确定性写为新事务的
+`dependsOnControlVersion`，否则省略。新 track-changing transaction 自身也可以形成传递依赖链。
+
 事务状态机固定为：
 
 ```text
@@ -217,9 +286,49 @@ terminal 状态不可互换。Windows 收到 server-routed command 后必须按 
 AudioPlayerService/PlaybackActor 返回实际 song/index/state/position 的 committed snapshot 时才发送
 remoteCommand committed。加载中的旧 track、临时 pause、buffering 和播放器回调不能作为结算。
 
+带 dependency 的 command 到达 Windows 时只登记，不得执行。dependency canonical committed 后才
+进入 execution-eligible；dependency failed、`execution_unknown`、`dependency_failed` 或 superseded
+时丢弃本地后继。服务端从直接依赖开始按 controlVersion 升序递归结算全部 pending 后继为
+`dependency_failed`，每条 outcome 的 `dependsOnControlVersion` 都指向直接依赖。
+
+execution eligibility 与计时规则固定为：
+
+```text
+无依赖、无 effective-at：command 可靠加入 authority 发送路径时 eligible
+有依赖：dependency canonical committed 时才 eligible
+有 effective-at：eligibleAt = max(command enqueue/dependency committed time, effectiveAtServerMs)
+watchdogDeadlineAtMs = executionEligibleAtMs + executionTimeoutMs + 2000
+```
+
+Windows AudioExecutionLease 也只从 eligibility 开始计时；等待 dependency 不消耗 timeout。dependency
+在 eligibility 前失败时直接结算后继，不建立 watchdog。dependency 直到 effective-at 后才成功时，
+迟到不超过 1000ms 按 late policy 追赶，超过 1000ms 必须以 `effective_at_missed` 失败。
+
 服务端接受 remoteCommand committed/failed 前还必须验证：commandControlVersion 不低于当前
 lastApplied，且它之前不存在仍为 pending 的更低控制事务；已经 failed/superseded 的低版本可以跨过。
 如果更低版本仍 pending，返回 conflict 并记录 Windows 执行乱序，不能提前把 applied 跳到更高版本。
+
+authority disconnect、Socket replacement、服务端 restart 或 watchdog 到期且没有 authority actual proof
+时，只能把受影响事务结算为 `execution_unknown`，不得伪造 playback.update。服务端为每个版本发送第
+6.7.2 节 `playback.control.settled`；随后按 dependency 链传播 `dependency_failed`。原 requester 的
+replacement Socket 不自动补发历史 settlement。
+
+所有 `remoteCommand failed|execution_unknown|dependency_failed` 形成的 terminal gap 都必须最终由
+fresh actual fact 收敛。前置条件是 authority exact pair/epoch/当前 Socket 匹配、actual fact 合法，
+`fact.appliedControlVersion <= canonical controlVersion`，其后全部事务已 terminal、没有新 pending、
+actual track 在 distinct canonical queue 中唯一解析且该 gap 尚未 reconciliation。令接受前
+`N=canonical controlVersion`、`R=N+1`，服务端原子创建无客户端 request/action/AudioExecutionLease 的
+`serverReconciliation` record R，按 actual 更新 Context state/index/track/position，令
+`controlVersion=R`、`version += 1`、index 变化时 `queueRevision += 1`，epoch 不变；保存 actual
+playbackRate 到 DevicePlaybackState 并令 `appliedControlVersion=R`。Context snapshot 不增加
+playbackRate，旧 terminal transaction 保持原结果。
+
+reconciliation 的 wire confirmation 只能有一份：passive fact 触发时，同一 clientSeq 返回 canonical
+`playback.update(origin:"passive",controlVersion:R,appliedControlVersion:R,actual...)`；remoteCommand
+failed 且已无后续 pending、可在同一事务立即收敛时，只发送 canonical failed confirmation，其中
+`commandControlVersion=N`、`controlVersion=R`、`appliedControlVersion=R` 和原执行 errorCode。若仍有
+pending，先发送普通 failed，再由后续 fresh passive fact 分配 R。迟到 terminal feedback相同结果只
+重放旧 outcome，不同结果返回 `conflict`；Follow 与 active Broadcast 都只消费/派生一次 R fact。
 
 Windows 本地人工操作开始后必须暂缓尚未 committed 的远程事务；收到匹配 intentId 的 localUser
 canonical confirmation 后，丢弃所有 `controlVersion <= supersededThroughControlVersion` 且仍未完成

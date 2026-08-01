@@ -11,7 +11,8 @@ Broadcast。Broadcast control 必须在 source Context 事务中创建普通 con
 BroadcastSnapshot 的 source cursors 在 active/waitingForSource 期间必须精确等于 source Context，
 只能另行递增 broadcastRevision；terminal 时它们冻结为历史值，不跟随后续 source mutation。
 Broadcast 不得保存或接受第二套 queue/index/position/autoPlay/cursor。每个 Broadcast control 的 source 普通
-command 与 ordinary mirror push 必须共享事务内一次生成的同一 effectiveAtServerMs/serverTimeMs，
+command 必须使用普通 control 的 executionTimeoutMs/deterministic dependency/eligibility 规则，并与
+ordinary mirror push 共享事务内一次生成的同一 effectiveAtServerMs/serverTimeMs，
 不得按 recipient 分别取时或让 source 无计划地提前执行。每个带 effective-at 的新 revision 必须把
 position 投影到 effectiveAtServerMs，并令 Snapshot.serverUpdatedAtMs 等于 effectiveAtServerMs。
 
@@ -125,6 +126,8 @@ broadcastRevision；服务端必须只向该 pair 发送 `broadcast.resync`，�
 提交 currentIndex/position，由服务端推导 track 并更新唯一 source Context，再发 passive 实际状态。活动 Broadcast
 必须从该 Context mutation 只派生一个 `broadcast.queue.sync` target，不得让 passive track
 变化单独创建第二套 currentIndex。
+当 source 已在最后一首自然结束时，必须先用唯一 passive automatic terminal 例外把 source Context
+收敛为 stopped/0/version+1，再只派生一个 broadcast.pause revision；不得 repeat 或生成第二个 fact。
 
 **REQ-055 — Non-terminal Broadcast restart**
 当服务端重启时，任何 `active` 或 `waitingForSource` Broadcast 都必须以同一原子 terminal

@@ -191,7 +191,8 @@ player 完成 negotiated 注册后，必须先读取当时可用的本地播放�
 服务端 active/terminal replay；只有 terminal 恢复完成或 tombstone 过期回退流程要求时才可发送 ensure。
 若 matching ordinary pair 在 `restorePending:true` 期间仍发送 ensure，服务端必须以同 requestId 的
 `system.error(code:"restore_in_progress",retryable:true)` 终态结算该请求并缓存该拒绝；错误携带
-suspendedPlaybackContextId 与三个当前 cursor。该结算不得创建、初始化、重绑、修改或关闭 Context，
+suspendedPlaybackContextId 与 `currentEpoch/currentVersion/currentQueueRevision/currentControlVersion`。
+该结算不得创建、初始化、重绑、修改或关闭 Context，
 不得递增 cursor、发送 bindings.changed 或清除 restorePending。恢复完成后必须使用新 requestId 重试，
 旧 requestId 永远重放原错误。
 本地已有队列时：
@@ -244,6 +245,7 @@ Context：
   "payload": {
     "playbackContextId": "playback:user:windows-1",
     "authorityClientId": "windows-1",
+    "authorityDeviceSessionId": "device:windows-1",
     "queueSongIds": ["song-1", "song-2"],
     "currentIndex": 1,
     "trackId": "song-2",
@@ -265,6 +267,7 @@ Context：
 {
   "playbackContextId": "playback:user:windows-1",
   "authorityClientId": "windows-1",
+  "authorityDeviceSessionId": "device:windows-1",
   "queueSongIds": [],
   "state": "idle",
   "positionMs": 0,
@@ -305,7 +308,8 @@ queueRevision/controlVersion 发送显式 `queue.context.sync`，不得在 ensur
 
 所有 Context snapshot 使用一套条件闭合 schema：
 
-- 公共必需字段：`playbackContextId`、`authorityClientId`、`queueSongIds`、`state`、`positionMs`、
+- 公共必需字段：`playbackContextId`、`authorityClientId`、`authorityDeviceSessionId`、
+  `queueSongIds`、`state`、`positionMs`、
   `queueRevision`、`controlVersion`、`version`、`epoch`；`timelineId`、`serverUpdatedAtMs` 可选；
 - idle：`queueSongIds` 必须为空，`state` 必须为 `idle`，`positionMs` 必须为 0，`currentIndex` 与
   `trackId` 必须省略；
@@ -313,6 +317,8 @@ queueRevision/controlVersion 发送显式 `queue.context.sync`，不得在 ensur
   和 `trackId` 必需，且 `currentIndex < queueSongIds.length`、
   `trackId == queueSongIds[currentIndex]`；
 - 不得使用 JSON null、负数 index、假歌曲或 sentinel track 表示 idle。
+- Context snapshot 不含 `playbackRate`；实际速度只属于 DevicePlaybackState、`playback.update` 与
+  Broadcast/Handoff execution target。
 
 ### 6.2.1 `playback.context.prepare`：让 idle Context 准备队列
 
@@ -338,8 +344,10 @@ controller 在 idle Context 上收到一次用户播放意图后发送：
 本地队列；提供时数组必须非空、去重且不超过 1000 首，currentIndex/positionMs 必需且合法。该队列
 只是待验证输入，只有 authority 成功执行 `queue.context.sync` 后才成为 canonical queue。
 
-服务端验证同用户 controller、唯一 Context、当前 authority 在线、Context epoch/binding 未变化、
-baseControlVersion 精确匹配且 Context 仍为 idle，然后建立最多 10 秒的 prepare 事务，并 ACK：
+服务端验证同用户 controller、唯一 Context、当前 authority exact pair 在线、authority 是 player 且
+`canPlay:true`、Context epoch/binding 未变化、baseControlVersion 精确匹配且 Context 仍为 idle，然后
+建立最多 10 秒的 prepare 事务，并 ACK。该 Core action 不检查 Handoff profile 或
+`playbackPrepare:true`；后者只适用于 Handoff target：
 
 ```json
 {
@@ -452,6 +460,7 @@ controlVersion，再发送最初的 `player.play` 一次。prepare ACK 或 prepa
     "playbackContext": {
       "playbackContextId": "playback:user:main",
       "authorityClientId": "phone-1",
+      "authorityDeviceSessionId": "device:phone-1",
       "queueSongIds": ["song-1", "song-2"],
       "currentIndex": 0,
       "trackId": "song-1",
@@ -492,6 +501,7 @@ idle status 使用相同 action，但主 snapshot 为：
   "playbackContext": {
     "playbackContextId": "playback:user:windows-1",
     "authorityClientId": "windows-1",
+    "authorityDeviceSessionId": "device:windows-1",
     "queueSongIds": [],
     "state": "idle",
     "positionMs": 0,
@@ -539,3 +549,20 @@ payload 只能有 `playbackContextId`；不得有 `sessionId` 或 `targetClientI
 close 表示终止旧 Context ID，不表示让在线 player 永久失去控制范围。仍在线、具备 canPlay 的旧
 authority 必须在处理 closed 后立即发送新的 `playback.context.ensure`；服务端不得复用 tombstone ID。
 应用退出或设备已经离线时不要求创建替代 Context。
+
+close 首次提交必须在 Context/authority-pair 临界区验证请求的 `expectedEpoch/baseVersion`，拒绝任何
+非终态 Handoff、Follow/Broadcast occupancy 或 restorePending fence，然后令 Context version 只递增
+一次。持久化 tombstone 必须保存：
+
+```text
+closedFromEpoch
+closedFromVersion
+finalEpoch
+finalVersion
+finalQueueRevision
+finalControlVersion
+close ACK outcome
+```
+
+新 requestId 的重复 close 只有在 expected/base 与 closedFrom 值相同才重放等价 ACK；其他值返回
+`context_closed` 与 final 四 cursor，不再次发送 closed、bindings.changed 或递增 cursor。

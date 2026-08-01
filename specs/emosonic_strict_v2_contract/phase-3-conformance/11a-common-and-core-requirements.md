@@ -2,7 +2,7 @@
 
 > [返回 r18 权威入口](../../emosonic_strict_v2_socketio_server_contract.md)
 > 文档修订：`2026-07-23-r18`；协议版本：`2.8.0`
-> 覆盖范围：原契约第 7 节 REQ-001—REQ-038。本文件是完整契约的一个规范分卷，不能脱离入口列出的公共规则单独解释。
+> 覆盖范围：原契约第 7 节 REQ-001—REQ-038、REQ-068—REQ-075。本文件是完整契约的一个规范分卷，不能脱离入口列出的公共规则单独解释。
 ## 7. 服务端与 Flutter 实现要求（EARS）
 
 **REQ-001 — ACK correlation**
@@ -33,6 +33,8 @@ shape 再次变化时必须同步更新 protocolVersion 和本文。
 当请求 payload、capability、context membership 或 cursor 无效时，服务端必须返回 correlated `system.error`，且不得退回 legacy/session action。
 缺失合法 requestId/action 的请求按第 2.2 节直接断开，是唯一无法 correlated error 的例外。
 strict register ACK 前的 correlated error 按第 4.2 节省略 provenance；register ACK 后不得省略。
+Context-scoped stale/queue/fence/closed error 必须带 playbackContextId 与 epoch/version/queue/control 四
+cursor；资源解析必须先限定 authenticated user，跨用户与不存在统一 not_found。
 
 **REQ-008 — 可选模式**
 当连接未在 `negotiatedCapabilities` 获得 Follow、Broadcast 或 Handoff 所需能力时，服务端不得
@@ -125,6 +127,8 @@ Context 时必须返回带 canonical cursors 的 `conflict`，不得发送命令
 错误 pair、离线目标或能力不足必须 fail-closed。设备的 `device.volume.update` 必须按连接级
 clientSeq event-confirmed、只保存在在线瞬态状态中，并且上述请求、执行与反馈均不得创建或修改
 PlaybackContext 及其任何 cursor。
+`device.list.volumeState` 只有请求连接自身协商的 remoteVolumeControl 精确为 true 时才能输出；固定
+capability shape 中存在该字段不构成授权。
 
 **REQ-027 — Player startup ensure**
 当具有 player 角色且 canPlay:true 的设备完成 negotiated 注册时，它必须立即发送
@@ -138,12 +142,16 @@ Context，也不得产生第二个 active Context。
 当 Context 队列为空时，服务端必须输出 `queueSongIds:[]`、`state:"idle"`、`positionMs:0`，并省略
 currentIndex/trackId；当队列非空时必须输出合法 currentIndex 与匹配 trackId，且 state 不得为 idle。
 任何 request、response、push、持久化恢复和重启后状态恢复都必须保持该条件 schema。
+每个 active Context snapshot 还必须同时携带 authorityClientId/authorityDeviceSessionId exact pair，
+且不得增加 playbackRate。
 
 **REQ-029 — Prepare before play**
 当 controller 对 idle Context 发起 `playback.context.prepare` 时，服务端必须验证 intentId、最新
 controlVersion、唯一 authority 和可选初始队列，最多建立一个 10 秒 prepare，并只向当前 authority
 路由一次。authority 必须把队列写入同一 Context；controller 只有在 canonical queue 非空后才能使用
 最新 controlVersion 发送原始 player.play。
+该 prepare 是 Core action，不依赖 Handoff profile 或 playbackPrepare capability；playbackPrepare 只表示
+Handoff target 能处理 server-routed playback.prepare。
 
 **REQ-030 — Idle control fail-closed**
 当 Context 为 idle 时，服务端收到 queue.playItem 或任一 player.* 请求必须返回 queue_required，
@@ -160,6 +168,8 @@ controlVersion、唯一 authority 和可选初始队列，最多建立一个 10 
 ACK 只表示 accepted/routed。只有当前 authority 的 remoteCommand committed playback.update 可以把
 匹配 pending 事务结算为 committed；failed update 结算为 failed；不得以 Socket emit 成功、ACK 或
 canonical target snapshot 代替实际执行结果。
+每个 routed command 必须携带 executionTimeoutMs，并按 deterministic dependency admission 可选携带
+dependsOnControlVersion；dependency committed 前不得执行或开始 execution lease。
 
 **REQ-033 — Canonical versus applied cursor**
 当 authority 尚未执行最新控制时，服务端必须允许 `appliedControlVersion < controlVersion`，并在
@@ -184,11 +194,62 @@ canonical controlVersion 的 feedback 必须返回 bad_request。
 或 Context lifecycle 改变时，旧 intent 不得应用到新 binding。
 
 **REQ-037 — Failed command state correction**
-当 remote command failed 且 accepted target 已改变主 Context state/currentIndex 时，服务端必须在同一
-结算中使用新的 Context version、必要时新的 Queue revision 恢复实际 snapshot，但 controlVersion
-保持已分配值。服务端不得在同一完整 cursor 下静默改写 Context，也不得把失败命令标记为 applied。
+当 remote command failed 且 actual 与 canonical target 出现 terminal gap 时，服务端不得在旧
+commandControlVersion 下改写 Context 或把失败命令标记为 applied；必须按 REQ-073 分配新的 internal
+reconciliation controlVersion 后收敛实际 snapshot。
 
 **REQ-038 — Supersede execution barrier**
 当 localUser update 被接受时，服务端必须持久化 supersededThroughControlVersion 并只将对应 pending
 事务改为 superseded。Windows 必须暂缓本地 intent 期间的未完成远程命令，收到 canonical localUser
 confirmation 后丢弃不高于该上界的未完成事务；更新版本的后续远程命令仍必须可执行。
+
+**REQ-068 — Exact authority Context snapshot**
+当服务端输出任一 active Context snapshot 时，必须同时输出 authorityClientId 与
+authorityDeviceSessionId；ensure、status.playbackContext、queue.context.sync 及所有复用 snapshot schema
+的消息必须一致。Context snapshot 不得包含 playbackRate，实际速度只保存在 DevicePlaybackState 或
+对应 execution target。
+
+**REQ-069 — Four-cursor error and scoped lookup**
+当服务端结算 Context-scoped stale_version、queue_required、restore_in_progress、state-machine
+conflict 或 context_closed 时，必须输出 playbackContextId 与
+currentEpoch/currentVersion/currentQueueRevision/currentControlVersion，并描述真正阻止操作的 Context。
+服务端必须按 schema/auth/registration/role/user-scoped lookup/fence/base/mutation 顺序处理，其他用户
+资源与不存在资源统一 not_found，不得用全局查询或日志泄露资源存在性。
+
+**REQ-070 — Deterministic control dependency**
+当服务端接受普通 routed control 时，必须查找当前 Context/epoch 中最高的 pending lower
+track-changing transaction，并在存在时把它写为 dependsOnControlVersion；track-changing action 只包括
+queue.playItem/player.next/player.prev，依赖链允许传递。Windows 必须等直接依赖 canonical committed 后
+才执行，依赖 terminal failure 或 supersede 时丢弃后继。
+
+**REQ-071 — Execution eligibility and watchdog**
+当 routed control 等待 dependency 或 effective-at 时，服务端与 Windows 都必须从 execution eligibility
+而不是 accepted/routed 时刻开始 timeout。watchdog 必须等于 eligibleAt + executionTimeoutMs + 2000；
+依赖等待不消耗 timeout，effective-at 后超过 1000ms 才 eligible 的命令必须以 effective_at_missed
+失败。
+
+**REQ-072 — Server-only control settlement cascade**
+当 authority disconnect、Socket replacement、restart 或 watchdog 使 pending control 结果不可证明时，
+服务端必须结算 execution_unknown；当 dependency failed/unknown/dependency_failed 时，必须按版本顺序
+递归把直接后继结算为 dependency_failed，并在每条 playback.control.settled 中携带 requesting exact
+pair，dependency_failed 指向直接依赖。settlement 按原物理 requester、当前 subscribers 和仍匹配的原
+authority 去重发送，不得伪造 playback.update 或补给 replacement requester Socket。
+
+**REQ-073 — Terminal-gap reconciliation**
+当 failed/unknown/dependency terminal gap 已无 pending 且当前 authority 提供合法 fresh actual fact
+时，服务端必须从 canonical controlVersion 分配新的 internal serverReconciliation version R，原子更新
+Context version、必要时 queueRevision 和 DevicePlaybackState.appliedControlVersion。旧 terminal 结果
+保持不变，Context 不增加 playbackRate，wire 只发送一次 passive 或 inline failed canonical
+confirmation；Follow/Broadcast 只消费一次 R fact。
+
+**REQ-074 — Safe Context close**
+当客户端关闭 Context 时，请求必须携带 expectedEpoch/baseVersion；服务端在 Context/authority-pair
+临界区验证所有 Handoff/Follow/Broadcast/restore fence，并保存 closedFrom、final 四 cursor 与 ACK
+outcome。只有与 closedFrom 相同的新 requestId 重试重放 ACK，其他 tombstone close 返回
+context_closed/final cursors，不再次推进版本。
+
+**REQ-075 — Distinct queue terminal boundaries**
+当服务端处理 queue 或边界控制时，queueSongIds 必须 distinct，且不得实现 shuffle/repeat。第一首 prev
+重播第一首；最后一首 next 停在最后 index/stopped/0；最后一首自然结束只能使用严格的 passive
+automatic terminal 例外推进一次 Context version，不推进 queue/control cursor，并只派生一次
+Follow/Broadcast fact。

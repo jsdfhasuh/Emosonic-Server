@@ -23,12 +23,27 @@
   `queueSongIds:[]`、`state:"idle"`、`positionMs:0` 并省略 `currentIndex`；
 - controller 在 idle Context 上不能直接发送普通 player control；一次播放点击先发送
   `playback.context.prepare`，Context 变为非空后再使用最新 controlVersion 发送一次 `player.play`；
+- `playback.context.prepare` 是 Core 行为，只要求 controller、当前 Context 与 authority player 的
+  Core 条件；它不依赖 Handoff profile，也不检查 target-only capability `playbackPrepare`；
+- 所有 active Context snapshot 必须同时携带 `authorityClientId` 与
+  `authorityDeviceSessionId`。Context-scoped stale/queue/fence/closed error 必须携带
+  `playbackContextId` 和 `currentEpoch/currentVersion/currentQueueRevision/currentControlVersion`；
 - `playback.update` 使用 `origin` 区分 passive、remoteCommand 和 localUser。被动事实与远程执行结果
   不推进 controlVersion；Windows 本地人工操作完成后发送 localUser update，由服务端从当前
   canonical 值分配新版本，并只覆盖尚未 committed 的旧远程控制；
 - 服务端必须同时保存最新接受的 `controlVersion` 与 authority 实际执行到的
   `appliedControlVersion`。远程 ACK 只证明 accepted/routed，只有 remoteCommand committed
   `playback.update` 才证明电脑已经执行成功；
+- 每个普通 routed control 都携带 `executionTimeoutMs`，并在需要时携带确定性分配的
+  `dependsOnControlVersion`。依赖成功后才开始执行租约与 watchdog；依赖失败必须传递结算为
+  `dependency_failed`，断线、Socket replacement、重启或 watchdog 无法证明结果时只能结算为
+  `execution_unknown`；
+- failed/unknown/dependency terminal gap 不得伪造旧命令成功；服务端必须从当前
+  `controlVersion` 分配新的内部 reconciliation version，把 canonical Context 与 fresh actual fact
+  收敛，并只发送一次对应 wire confirmation；
+- `queueSongIds` 必须 distinct，且 r18 不支持 shuffle、repeat-one 或 repeat-all。第一首 `prev`
+  重播第一首；最后一首 `next` 和最后一首自然结束都停在最后 index、position 0，后者只允许通过
+  passive automatic terminal 例外推进一次 Context version；
 - Broadcast 对普通 participant 是临时音频覆盖层：进入时冻结其原本地任务，terminal stop 后恢复
   原队列、索引、位置、速度和 playing/paused/stopped/idle 状态；source authority 的 Broadcast Context 就是
   自己正在执行并向其他设备复制的播放任务，结束时只解除复制关系，不 pause、不 seek、不切换或

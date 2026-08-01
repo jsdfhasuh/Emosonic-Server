@@ -25,13 +25,17 @@
    每 authenticated user 最多 256 个 Broadcast recovery slot；每个 ordinary pair 从 start 到 terminal
    restore confirmation 占用一个，不随断线或 full-to-compact 压缩重复计数。超出 slot 的目标进入
    skippedClientIds；最终无可用 participant 时 start 返回 `rate_limited`。
+   internal serverReconciliation record 计入 control transaction 持久化上限；当 terminal-gap 审计仍
+   引用它时不得提前清理。普通 routed control 的 executionTimeoutMs 部署默认值为 15000。
 5. 必须设置 Engine.IO payload 上限不高于 256 KiB；transport 超限使用 message-too-big 行为断开，
    已进入 handler 的业务限制超限返回 correlated `bad_request`。malformed JSON、非 object
    envelope 不得进入 handler；格式合法但不在 allowlist 的 action 返回 `not_supported`；缺失或
    非法 action/requestId 时按第 2.2 节断开。
 6. 每个 action 在执行前重新校验 authenticated user、Context membership、角色、capability 和
-   当前 sid 绑定；不能只在 subscribe 时授权一次。`playback.context.list` 还必须先按当前用户
-   限定查询，再精确匹配 authority client/device pair；错误消息不得泄露其他用户资源是否存在。
+   当前 sid 绑定；不能只在 subscribe 时授权一次。解析顺序固定为 envelope/schema、authentication、
+   registration/capability、caller role、authenticated-user-scoped lookup、lifecycle/overlay/recovery
+   fence、base cursor、mutation。`playback.context.list`、Handoff target 与 volume target 都必须先按
+   当前用户限定查询；跨用户与不存在使用相同结果，错误与日志不得泄露其他用户资源是否存在。
 7. 必须配置 ping/pong dead-connection cleanup、发送缓冲上限和背压策略。控制命令不可作为
    volatile broadcast；无法可靠单播给 authority 时返回 `authority_offline`。
 8. Broadcast terminal tombstone、per-pair delivery outbox 和 start intent 记录不适用第 4 条 10 分钟
@@ -62,9 +66,9 @@
   tombstone、ACK outcome tombstone、target revision ledger、restorePending、recovery slot 与 per-pair delivery
   状态；已压缩 TerminalRecoveryRecord 同样必须持久化。等待相同 pair 重连后
   按第 5.5.2 节补发；基础 Context 继续保留。
-- 重启时 pending remote control 不得假装 committed。服务端可以在 authority 重新 ensure/status 后按
-  原 controlVersion 有界重投一次，或明确结算为 failed/superseded；任何分支都必须避免永久 pending
-  和重复音频执行。
+- 重启时所有 pending ordinary control 必须结算为 `execution_unknown`，并按依赖链递归结算
+  `dependency_failed`；不得保留旧 controlVersion 重投、假装 committed 或任意选择 failed/superseded。
+  随后只能按 terminal-gap reconciliation 与 fresh actual fact 收敛。
 - `connectionEpoch` 每个新物理连接固定为 1；不得持久化或复用旧 nonce。
 
 ### 7.3 Capability profile readiness
@@ -74,6 +78,8 @@ discovery/binding invalidation、Queue、Player Control 和 playback.update 控�
 `playback.context.ensure`、`playback.context.prepare`、`playback.context.prepared`、
 `playback.context.list`、`playback.context.bindings.changed` 及其他 Core action 的
 request/response/event、cursor、routing、control/applied 分离、terminal transaction、
+exact authority snapshot/four-cursor error、deterministic dependency、execution eligibility/watchdog、
+server-only settlement/cascade、terminal-gap reconciliation、safe close、distinct queue boundary、
 dedupe 和 error conformance 全部通过后，才可用 major `2`、minor `>=8` 的 `protocolVersion` 接受
 `playbackContextV2:true`，否则注册返回 `not_supported`。Handoff、Follow、Broadcast 是三个
 独立 profile，部署默认关闭；每个 profile 只有在本文对应状态机和双客户端 conformance 测试完成

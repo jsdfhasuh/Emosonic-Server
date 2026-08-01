@@ -49,6 +49,7 @@ register ACK 仍必须在 `payload.strictV2` 给出将绑定到该 Socket 的 no
     "message": "safe diagnostic string",
     "retryable": false,
     "playbackContextId": "可选",
+    "currentEpoch": 1,
     "currentControlVersion": 12,
     "currentQueueRevision": 8,
     "currentVersion": 33,
@@ -69,12 +70,12 @@ register ACK 仍必须在 `payload.strictV2` 给出将绑定到该 Socket 的 no
 | `forbidden` | 已登录但无 context/action 权限 | `false` | `playbackContextId` 可选 |
 | `not_supported` | action 不属于服务器声明的 `2.8.x` surface | `false` | 无 |
 | `not_found` | context、handoff、broadcast 或目标设备不存在 | `false` | `playbackContextId` 可选 |
-| `context_closed` | context 已终止 | `false` | `playbackContextId` 必需 |
+| `context_closed` | context 已终止 | `false` | `playbackContextId` 与 final 四 cursor 必需 |
 | `authority_offline` | 当前 authority 没有有效 Socket | `true` | `playbackContextId` 必需 |
-| `queue_required` | 请求需要非空 canonical queue，但 Context 仍是 idle；prepare 失败时也表示两端没有可采用队列 | `false` | `playbackContextId` 必需；三个 canonical cursor 必需 |
-| `restore_in_progress` | ordinary pair 的 terminal 原任务恢复尚未完成，当前请求不能穿透 restorePending gate | `true` | `playbackContextId` 及三个 `current*Version/Revision` 必需 |
-| `conflict` | 同一逻辑 ID 被用于不同意图，或状态机不允许该动作 | `false` | Context/handoff/broadcast 冲突时必须有 `playbackContextId` 及三个 `current*Version/Revision`；仅 requestId 内容冲突时省略 |
-| `stale_version` | base cursor 落后或超前于 canonical cursor | `false` | 对应 `current*` cursor 必需 |
+| `queue_required` | 请求需要非空 canonical queue，但 Context 仍是 idle；prepare 失败时也表示两端没有可采用队列 | `false` | `playbackContextId` 与四个 canonical cursor 必需 |
+| `restore_in_progress` | ordinary pair 的 terminal 原任务恢复尚未完成，当前请求不能穿透 restorePending gate | `true` | `playbackContextId` 与四个 canonical cursor 必需 |
+| `conflict` | 同一逻辑 ID 被用于不同意图，或状态机不允许该动作 | `false` | Context/Handoff/Broadcast/Follow state-machine 冲突时必须有 `playbackContextId` 与四个 canonical cursor；仅 requestId fingerprint 冲突时省略 |
+| `stale_version` | base cursor 落后或超前于 canonical cursor | `false` | Context-scoped 时 `playbackContextId` 与四个 canonical cursor 必需 |
 | `client_sequence_conflict` | `clientSeq` 重复但内容不同或倒退 | `false` | `currentClientSeq` 必需 |
 | `capability_required` | 连接未协商到动作所需 capability/角色依赖 | `false` | 无 |
 | `rate_limited` | 超出连接、用户或 action 限额 | `true` | `retryAfterMs` 必需且为正整数 |
@@ -87,8 +88,29 @@ status/control 时发生。调用方没有 controller 角色时返回 `forbidden
 `playbackContextV2:true` 时返回 `capability_required`。
 
 除表中条件字段外，错误 payload 只允许 `action`、`code`、`message`、`retryable`、
-`playbackContextId`、`currentControlVersion`、`currentQueueRevision`、`currentVersion`、
+`playbackContextId`、`currentEpoch`、`currentControlVersion`、`currentQueueRevision`、`currentVersion`、
 `currentClientSeq`、`retryAfterMs`。不适用的可选字段必须省略，不得写 JSON `null`。
+
+`stale_version`、`queue_required`、`restore_in_progress`、Context/Handoff/Broadcast/Follow fence 的
+state-machine `conflict` 和 close tombstone 的 `context_closed` 都是 Context-scoped error，必须成组
+输出：
+
+```text
+playbackContextId
+currentEpoch
+currentVersion
+currentQueueRevision
+currentControlVersion
+```
+
+涉及 source/target 两个 Context 时，这五个字段描述真正阻止操作的 Context；source Context ID 仍由
+原请求 payload 确定。纯 requestId fingerprint conflict 可以省略 Context cursor。
+
+服务端选择错误前必须固定执行 `envelope/schema -> authentication -> registration/capability -> caller
+role -> authenticated-user-scoped lookup -> lifecycle/overlay/recovery fence -> base cursor -> mutation`。
+不得为了区分错误码做全局资源存在性查询。其他用户的资源与真正不存在的资源统一返回
+`not_found`；`forbidden` 只用于当前用户域内可见资源的角色或权限不足。Handoff target、volume target
+也只在当前用户域解析；日志不得记录由跨用户全局查询获得的资源细节。
 
 `device.register` strict ACK 尚未成功、Socket 还没有绑定 provenance 时，任何具有合法
 requestId/action 的失败请求都是 bootstrap error：仍须使用同 `requestId` 的 `system.error` 和正确
@@ -150,8 +172,11 @@ List/Ensure 不允许用简略 ACK 代替 direct response。
    `broadcast.feedback` 重放已接受的 participant confirmation 或已结算的
    `broadcast.feedback.rejected`。不得重发 prepare/commit/release、切换
    authority、覆盖 participantStates 或递增任一 cursor。
-8. Context close 后必须保留持久化 terminal tombstone，`playbackContextId` 不可复用。重复 close
-   返回等价 ACK；其他 status/mutation 返回 `context_closed`。正常 Context snapshot 不输出
+8. Context close 后必须保留持久化 terminal tombstone，`playbackContextId` 不可复用。tombstone 保存
+   `closedFromEpoch/closedFromVersion/finalEpoch/finalVersion/finalQueueRevision/finalControlVersion` 与首次
+   close ACK outcome。新 requestId 的 close 只有在 `expectedEpoch/baseVersion` 与 closedFrom 值相同
+   时重放等价 ACK；其他值返回 `context_closed` 与 final 四 cursor，且不再递增。其他
+   status/mutation 返回 `context_closed`。正常 Context snapshot 不输出
    `state:"closed"`。服务端先向当前 subscribers/followers 推送 closed，再清除该 Context 的全部
    临时订阅和 Follow relationship。关闭的 Context 必须立即从新的 `playback.context.list` 查询
    中消失，并按第 6.1.2 节向该 authority/device pair 发送 binding 失效通知。
@@ -178,7 +203,9 @@ List/Ensure 不允许用简略 ACK 代替 direct response。
     重复递增 cursor或再次 supersede；同一 intentId 内容不同返回 `conflict`。Context close、epoch
     变化、authority client 或 deviceSession 变化后，旧 intentId 不得应用到新 binding。
 14. 服务端必须持久化每个 `(playbackContextId, epoch, controlVersion)` 的远程控制事务状态
-    `pending|committed|failed|superseded`。同一事务 terminal 后不能变成另一 terminal；相同
+    `pending|committed|failed|superseded`，以及请求/authority exact pair、连接 provenance、action、
+    accepted target、timeout、dependency、execution eligibility 与 watchdog。failed 的稳定结算原因还
+    包括 `dependency_failed|execution_unknown`。同一事务 terminal 后不能变成另一 terminal；相同
     remoteCommand 结果重试只重放 canonical confirmation，不得重复推进 applied cursor 或 Context
     对账。
 15. `broadcast.start.intentId` 是跨连接长期幂等键。服务端必须按第 5.5 节重放首次 ACK/broadcastId，
@@ -247,10 +274,12 @@ List/Ensure 不允许用简略 ACK 代替 direct response。
 | `queue.context.sync` | 不变 | +1 | +1 | 当 currentIndex、该 index 的 trackId 或 idle/non-empty 边界改变时 +1；position 自然前进不是控制变化；这是 authority 已提交的实际 state mutation，control 前进时该 authority 的 applied cursor 同步前进；idle→non-empty 将 state 设为 paused，non-empty→idle 将 state 设为 idle |
 | `queue.playItem` | 不变 | +1 | +1 | +1 |
 | `player.play` / `pause` / `seek` | 不变 | +1 | 不变 | +1 |
-| `player.next` / `prev` | 不变 | +1 | +1（`currentIndex` 改变） | +1 |
+| `player.next` / `prev` | 不变 | +1 | `currentIndex` 改变时 +1；第一首 prev、最后一首 next 不变 | +1 |
 | `playback.update(origin:"passive")` | 不变 | 不变 | 不变 | 不变；只更新对应 device state / `clientSeq` |
+| 最后一首 passive automatic terminal | 不变 | +1 | 不变 | 不变；仅在第 5.2.1 节严格前置条件下把 canonical state 收敛为 stopped/0 |
 | `playback.update(origin:"remoteCommand", executionStatus:"committed")` | 不变 | 不变 | 不变 | 不变；将 pending command 结算为 committed，并推进该 device 的 applied cursor |
-| `playback.update(origin:"remoteCommand", executionStatus:"failed")` | 不变 | 仅需要把预期 Context 恢复为实际状态时 +1 | 仅需要恢复 currentIndex 时 +1 | 不变；command 版本已占用但 applied cursor 不推进 |
+| `playback.update(origin:"remoteCommand", executionStatus:"failed")` | 不变 | 单独结算不变 | 不变 | 不变；command 版本已占用但 applied cursor 不推进，实际收敛由下一行完成 |
+| internal terminal-gap reconciliation `R=N+1` | 不变 | +1 | actual currentIndex 改变时 +1 | +1；旧 failed/unknown/dependency transaction 保持 terminal，DevicePlaybackState.applied 推进到 R |
 | `playback.update(origin:"localUser", executionStatus:"committed")` | 不变 | +1 | queueIndex 改变时 +1 | +1；服务端从当前 canonical 值递增，并 supersede 旧 pending remote |
 | `broadcast.feedback` | 不变 | 不变 | 不变 | 不变；只更新匹配 Broadcast 的 participantStates / `clientSeq` |
 | `broadcast.start` / `status` / `stop` | 不变 | 不变 | 不变 | 不变；只初始化、读取或终止派生 Broadcast lifecycle |

@@ -87,8 +87,9 @@
    使用最新 48 的新远程命令 49 仍正常执行；
 38. 首次连接前 Windows 已播放时，ensure 按实际 snapshot 创建版本 1，后续 passive update 仍为 applied
    1，不额外生成 localUser 版本 2；
-39. 重连 status 恢复 canonical N 和 per-device applied M，不把 canonical N 误报为已执行；pending
-   control 被有界重投或显式终止，不永久 pending；
+39. 重连 status 恢复 canonical N 和 per-device applied M，不把 canonical N 误报为已执行；服务端
+   restart 时 pending ordinary control 全部结算 execution_unknown，依赖后继结算 dependency_failed，
+   再由 fresh actual fact 分配 reconciliation version，不重投旧 controlVersion；
 40. 自然播完自动下一首不使用 origin localUser，不获得本地人工 supersede 权限；
     必须先用 queue.context.sync 更新唯一 Context，再发 passive update；
 41. Android 与 Windows 各一台真实 Flutter 客户端联调，记录可复现日志；
@@ -228,3 +229,27 @@
     revision_expired/revision_unknown/revision_ahead 的 broadcast.feedback.rejected；状态、deadline 和
     cursors 不变，被拒绝 clientSeq 不能复用。随后非终态收到新 deliveryId resync、完整 terminal 收到
     新 deliveryId stop、compact terminal 收到新 deliveryId restore；单独 status 不能代替该执行 delivery。
+78. ensure direct response、status.playbackContext、queue.context.sync 和所有复用 Context snapshot 的
+    消息都同时含 authorityClientId/authorityDeviceSessionId，且不含 playbackRate；DevicePlaybackState
+    仍保留实际 rate。
+79. stale_version、queue_required、restore_in_progress、Context/Handoff/Broadcast/Follow fence conflict
+    和 context_closed 都携带真正阻止操作的 playbackContextId 与 currentEpoch/version/queue/control；
+    user-scoped lookup 对跨用户与不存在返回相同结果，Handoff/volume target 不产生存在性侧信道；
+    device.list.volumeState 只对 negotiated remoteVolumeControl=true 的请求连接输出。
+80. Core playback.context.prepare 在 playbackPrepare=false、Handoff profile 关闭时仍正常 ACK/route/settle；
+    authority exact pair、player/canPlay 或 base/intents 不满足时零副作用拒绝。
+81. 普通 routed control 全部带 executionTimeoutMs；存在 pending lower track-changing transaction 时按最高
+    version 写 dependsOnControlVersion，传递依赖等待 canonical committed 后才执行，等待时间不消耗
+    execution timeout，effective-at 后迟到超过 1000ms 结算 effective_at_missed。
+82. dependency failure 按直接依赖和 controlVersion 顺序递归生成 dependency_failed；authority
+    disconnect、Socket replacement、restart 与 watchdog 只生成 execution_unknown。settled payload 含
+    requesting exact pair，并只发给仍匹配的原请求 Socket、当前 subscribers 与原 routed authority，按
+    sid 去重；replacement requester 不获历史 settlement。
+83. remote failed、execution_unknown 与 dependency_failed terminal gap 在 fresh actual fact 后各分配
+    一个 internal reconciliation R；旧 terminal 不变，Context version/必要 queueRevision 与 applied
+    推进到 R，Context 不含 playbackRate，inline failed 或 passive 路径都只有一份 canonical
+    confirmation，Follow/Broadcast 各只消费一次。
+84. close 缺少 expectedEpoch/baseVersion 为 bad_request，stale 返回四 cursor，非终态 Handoff 与所有
+    overlay/recovery fence 零副作用拒绝；首次 close 保存 closedFrom/final cursors，匹配重试重放 ACK，
+    不匹配 tombstone 返回 context_closed 且不递增。第一首 prev、最后一首 next 与最后一首自然结束按
+    distinct/no-repeat 边界矩阵执行，重复 terminal fact 不再次推进或派生。

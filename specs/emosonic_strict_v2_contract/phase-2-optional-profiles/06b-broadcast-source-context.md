@@ -34,6 +34,9 @@ Context cursors。它们只是源 cursor 的带名副本，不是第二套可独
 `broadcastRevision = previousBroadcastRevision + 1`；随后
 只向 source authority 发送第 6.7 节普通 `player.*` / `queue.playItem` command，向 ordinary participants
 发送第 6.10 节对应 Broadcast mirror push。source 不得收到会再次执行音频的 Broadcast control push。
+该普通 source command 必须携带 `executionTimeoutMs`，并按第 6.7 节的最高 pending lower
+track-changing transaction 规则可选携带 `dependsOnControlVersion`。dependency 等待不消耗 execution
+timeout，source command 与 ordinary mirror 的 effective-at 仍属于同一计划。
 
 当控制目标位置需要从 state=playing 的 source DevicePlaybackState 投影时，该状态也必须满足 2000ms
 freshness；过期返回 `conflict`，不得用旧 position 生成 source command 或 mirror push。paused/stopped
@@ -77,6 +80,9 @@ source remote committed 结果与 target 逐字段相等时不产生第二个 re
 - committed/failed 必须先按第 6.6 节结算或对账 source Context；与已分发 target 完全相同的 committed
   只结算 source transaction，不增加 broadcastRevision。产生实际差异时，才在同一提交中更新 source
   cursor 副本、令 `broadcastRevision = previousBroadcastRevision + 1` 并按上表推送唯一修正镜像；
+- source remote failed、execution_unknown 或 dependency_failed gap 必须先按第 6.7.3 节分配新的
+  internal reconciliation version R。Broadcast 只从 R 的 canonical actual fact 派生一次 correction，
+  不得从旧 terminal command 或 settlement 额外生成 revision；
 - source 的 localUser 状态/选歌以及 source authority 的 `queue.context.sync` 必须先修改唯一 source
   Context，再派生 Broadcast push；
 - source 播放器自然播完后进入下一首时，必须先按第 5.2.1 节用 `queue.context.sync`
@@ -85,6 +91,9 @@ source remote committed 结果与 target 逐字段相等时不产生第二个 re
   越过 source Context。活动 Broadcast 中该 queue mutation 必须只派生一个新
   `broadcastRevision` 和一次 `broadcast.queue.sync` mirror target；该 target 的位置必须从请求中的
   `positionSampledAtServerMs` 投影到 effectiveAtServerMs，不得从服务端接收时间起算；
+- source 已位于最后一首并自然结束时，必须走第 5.2.1 节唯一 passive automatic terminal 例外，先把
+  source Context 原子收敛为 stopped/0、version +1，再只派生一个 `broadcast.pause` revision；不得
+  构造 next/repeat 或第二个 terminal fact；
 - active Broadcast 中 source `queue.context.sync` 若要把非空 queue 清为 idle，服务端必须在同一
   原子串行提交中先用最后合法的非空 mirror target 生成唯一 terminal Broadcast revision、
   释放 ordinary mutation 屏障、安装 restorePending/outbox，再按普通 Context 规则把 source queue
