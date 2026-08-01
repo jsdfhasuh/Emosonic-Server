@@ -160,7 +160,8 @@ Context ID、suspended authority exact pair、epoch/version/queue/control/applie
    confirmation，不得为 event-confirmed 动作补发 ACK。Follow start 重放必须保留首次 frozen baseline，
    不得按重试时的新 Context 状态改写 ACK。
 4. 每个 Context 同时只能有一个非终态 handoff。同一 source/target 的 start 重试返回已有
-   `handoffId`/`prepareId`；不同 target 返回 `conflict`。
+   `handoffId`/`prepareId` 与首次 controlVersion；target 必须是 frozen client/device exact pair，不同
+   pair 返回 `conflict`。
 5. 同一已认证用户以相同 `clientId` 完成新注册后，新 sid 原子替换旧 sid，并立即断开旧 sid。
    authority 路由还必须匹配持久化的 `deviceSessionId`；相同 clientId、不同 deviceSessionId 的
    新连接不能仅凭注册自动继承旧 authority，只有随后合法的 `playback.context.ensure` 可以按第 11
@@ -266,7 +267,8 @@ Context ID、suspended authority exact pair、epoch/version/queue/control/applie
   failed feedback 发生时设备已成功执行的最高 revision，可以为 0。
 - `clientSeq`：必需的设备 feedback 序号，普通 `playback.update` 作用域为
   `(playbackContextId, clientId, connectionNonce, connectionEpoch)`；该作用域内从 1 单调递增，新物理
-  连接可从 1 重新开始。`device.volume.update` 使用独立的
+  连接可从 1 重新开始。`playback.handoff.complete.clientSeq` 复用 target 在同一 Context/连接上的该
+  作用域并消耗序号，不能与随后 playback.update 重复。`device.volume.update` 使用独立的
   `(user, clientId, deviceSessionId, connectionNonce, connectionEpoch)` 作用域；
   `broadcast.feedback` 使用独立的
   `(playbackContextId, broadcastId, clientId, deviceSessionId, connectionNonce, connectionEpoch)` 作用域；
@@ -294,7 +296,7 @@ Context ID、suspended authority exact pair、epoch/version/queue/control/applie
 | `broadcast.start` / `status` / `stop` | 不变 | 不变 | 不变 | 不变；只初始化、读取或终止派生 Broadcast lifecycle |
 | `broadcast.play` / `pause` / `seek` | 不变 | 与对应 source `player.*` 相同 | 不变 | 与对应 source `player.*` 相同；不得维护第二套播放 cursor |
 | `broadcast.playItem` | 不变 | 与 source `queue.playItem` 相同 | 与 source `queue.playItem` 相同 | 与 source `queue.playItem` 相同 |
-| handoff authority 原子切换 | +1 | +1 | 不变 | +1 |
+| handoff complete authority 原子切换 | +1 | +1 | 不变 | +1；commit N+1 在 complete 前只是 handoffId-scoped provisional version |
 | context close | 不变 | +1 后进入 terminal | 不变 | 不变 |
 
 请求中的 base cursor 必须精确等于服务器当前值；不相等返回 `stale_version`，不执行副作用。

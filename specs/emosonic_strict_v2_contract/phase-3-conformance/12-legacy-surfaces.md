@@ -10,7 +10,7 @@
 | `session.subscribe` / `session.unsubscribe` | strict 改用 `playback.context.subscribe` / `unsubscribe`。 |
 | `queue.session.sync` / `queue.local.set` / `queue.ready.complete` | strict queue 是 `queue.context.sync`，旧队列消息会被 router quarantine。 |
 | `sessionId`、`sourceSessionId` | strict playback 主键只能是 `playbackContextId`；设备稳定身份是 `deviceSessionId`。 |
-| 服务端业务 push / direct response 的 target 字段 | strict router 拒绝，服务端应按 Socket recipient 分发。客户端请求例外只有 `playback.handoff.start.targetClientId` 与 `device.setVolume` 的精确 target pair。 |
+| 服务端业务 push / direct response 的 target 字段 | strict router 拒绝，服务端应按 Socket recipient 分发。客户端请求例外只有 `playback.handoff.start.targetClientId/targetDeviceSessionId` 与 `device.setVolume` 的精确 target pair。 |
 | `player.setVolume` / `player.requestState` | strict 音量是设备级 `device.setVolume`；不要复用 legacy player action。`player.requestState` 仍未纳入。 |
 | `auth.login` / `device.register` actionless ACK | probe/negotiated client 会拒绝。 |
 

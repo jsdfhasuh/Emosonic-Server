@@ -88,7 +88,12 @@ server-only settlement/cascade、terminal-gap reconciliation、safe close、dist
 dedupe 和 error conformance 全部通过后，才可用 major `2`、minor `>=8` 的 `protocolVersion` 接受
 `playbackContextV2:true`，否则注册返回 `not_supported`。Handoff、Follow、Broadcast 是三个
 独立 profile，部署默认关闭；每个 profile 只有在本文对应状态机和双客户端 conformance 测试完成
-后才能在 `negotiatedCapabilities` 返回 true。Broadcast 还必须完成 source-derived start、source
+后才能在 `negotiatedCapabilities` 返回 true。Handoff readiness 必须覆盖 source/target exact-pair
+capability 与 current clock gate、fresh settled playing source、full lifecycle fences、target UI gate、
+continuity-first source retain、独立 provisional N+1 lane、prepare/commit/complete closed shape、50ms future/
+1000ms late/1000ms position proof、near-end fail-fast、complete clientSeq、atomic target DevicePlaybackState/
+authority switch、terminal exact pair、disconnect immediate cleanup、duplicate replay 与 enqueue failure；缺少
+任一项时不得允许 Handoff start。Broadcast 还必须完成 source-derived start、source
 Context control transaction/cursor 原子耦合、普通 playback.update playbackRate、派生 snapshot、
 playing-only start、跨连接 start intent、单 source 非终态约束、自动 source reconnect、ordinary
 applied/failed `broadcast.feedback`、participant deadline/status、覆盖全部 Context/binding mutation 的

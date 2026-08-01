@@ -2,7 +2,7 @@
 
 > [返回 r18 权威入口](../../emosonic_strict_v2_socketio_server_contract.md)
 > 文档修订：`2026-07-23-r18`；协议版本：`2.8.0`
-> 覆盖范围：原契约第 7 节 REQ-001—REQ-038、REQ-068—REQ-081。本文件是完整契约的一个规范分卷，不能脱离入口列出的公共规则单独解释。
+> 覆盖范围：原契约第 7 节 REQ-001—REQ-038、REQ-068—REQ-086。本文件是完整契约的一个规范分卷，不能脱离入口列出的公共规则单独解释。
 ## 7. 服务端与 Flutter 实现要求（EARS）
 
 **REQ-001 — ACK correlation**
@@ -43,7 +43,7 @@ cursor；资源解析必须先限定 authenticated user，跨用户与不存在�
 
 **REQ-009 — Handoff target 的方向性例外**
 当客户端发送 `playback.handoff.start` 时，服务端必须接受并验证 payload 内的
-`targetClientId`；当服务端向目标 Socket 或其他 context 成员推送 Handoff 消息时，服务端
+`targetClientId/targetDeviceSessionId` exact pair，并且只在 authenticated user 域解析；当服务端向目标 Socket 或其他 context 成员推送 Handoff 消息时，服务端
 不得在 envelope 或 payload 中复制该字段。
 
 **REQ-010 — 2.8.x cursor 契约**
@@ -98,6 +98,7 @@ Socket 发送第 4.4 节规定的 confirmation，且不得重复任何状态机�
 当服务端输出 Handoff errorCode 或 Broadcast participantStates 时，必须分别遵守第 5.4 节的稳定
 码格式和第 6.10 节的 target/deadlineBroadcastRevision/syncStatus、applied/failure、deadline 与
 last-feedback 成组字段规则。
+Handoff completed status/release 必须表达 new authority exact pair，不得只输出 clientId。
 
 **REQ-022 — 超限分层与顺序保持**
 当 transport message 超限时服务端必须关闭连接；当已解析业务字段超限时返回 correlated
@@ -164,6 +165,7 @@ Handoff target 能处理 server-routed playback.prepare。
 同一原子提交中先把 target idle Context 写入 terminal tombstone，再安装 transferred Context binding；
 如果 target Context 非 idle、存在非终态 prepare 或无法原子退休，则 Handoff 必须在 authority 切换前
 返回 conflict。任何分支都不得让 target pair 暴露两个 active Context。
+standby 从 preparing 起受 full lifecycle fence；只有 complete proof 原子事务可以退休它。
 
 **REQ-032 — Remote control settlement**
 当服务端接受 queue.playItem 或 player.* 时，必须为新 controlVersion 创建 pending 事务；correlated
@@ -294,3 +296,38 @@ recovery window；source closed 立即退出。follower disconnect 进入 reconn
 重发 start，stopPending 只重试 stop；app/server restart 都不得自动恢复音频，必须加载 SafetyLease 并
 保持 cleanupRequired fence。同一 source Context 可同时服务 Follow 与 Broadcast source，但 Follow
 follower、Broadcast ordinary、Handoff target execution overlay 在同一设备互斥。
+
+**REQ-082 — Handoff exact-pair eligibility and lifecycle fence**
+当服务端接受 Handoff start 时，source 必须是 current exact authority、clock-valid、fresh/settled/playing、
+queue-backed、applied==control 且无 pending；target 必须是 current exact pair、clock-valid、具备
+playbackContextV2/playbackPrepare/effectiveAt/canPlay/canPause/canSeek/全速率能力并无 overlay/lease。
+服务端必须从 preparing 到 terminal 同时 fence source Context、target pair 和 standby Context。source
+正常进度允许，实际 track/state/rate/localUser/自然变化必须先 source_changed 再提交；target UI 只允许
+volume 与 cleanup。source complete 前持续播放，complete 后立即 release。
+
+**REQ-083 — Provisional Handoff execution lane**
+当 Handoff ready 后，commit controlVersion=N+1 必须绑定 `(playbackContextId,epoch,handoffId)` 作为
+provisional version，进入独立 Handoff lane，不进入普通 control transaction/reducer/dependency/watchdog/
+reconciliation，也不发送 remoteCommand feedback。只有 completed 后 N+1 成为 canonical；失败且 lease
+失效后 Context 仍为 N，下一普通 mutation 可复用 N+1，旧消息必须匹配 handoffId/exact pair/physical
+Socket/lifecycle。
+
+**REQ-084 — Handoff actual proof and position bounds**
+当 target 发送 complete 时，必须提供 exact device、queueIndex/track、state=playing、position/sample
+time/rate、applied provisional N+1 与连续 clientSeq。服务端必须验证 current clock gate、sample future
+<=50ms、age<=2000ms、sample>=effective-at、execution late<=1000ms，并用 floor(delta*rate) 投影，
+reported 与 expected 差<=1000ms且满足 duration。known projected position 已到 duration 时必须在 commit
+前 source_changed fail-fast。
+
+**REQ-085 — Atomic Handoff authority switch**
+当 complete proof 成功时，服务端必须在一个事务中退休 standby、写完整 target DevicePlaybackState、
+切换 authority exact pair、epoch/version 各+1、queueRevision 不变、controlVersion=N+1并标记 completed。
+completed status/release 必须含 newAuthorityClientId/newAuthorityDeviceSessionId；complete.clientSeq 复用
+target 普通 playback.update 作用域并消耗序号。complete 是唯一 authority switch point。
+
+**REQ-086 — Handoff failure, disconnect and replay**
+当 target commit 执行失败时，必须用 target-only cancel reason/errorCode=commit_failed；target disconnect
+或 server restart 时 Flutter 立即取消 timer/lease、已起播则暂停且不发迟到 complete。prepare/commit
+无法可靠 enqueue 时立即 failed。duplicate start 重放首次 ACK，late ready 重放 status，duplicate complete
+重放 completed+Context status；任何重放不得重复退休、切换或 release。旧 source 收到 release/
+completed/Context status/bindings.changed 任一事实都必须停止旧 authority lease。

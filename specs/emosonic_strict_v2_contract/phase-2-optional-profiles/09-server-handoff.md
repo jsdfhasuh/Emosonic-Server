@@ -19,19 +19,27 @@
     "prepareId": "prepare-1",
     "sourceClientId": "phone-1",
     "authorityClientId": "phone-1",
+    "authorityDeviceSessionId": "device:phone-1",
     "deviceSessionId": "device:desktop-1",
     "queueSongIds": ["song-1", "song-2"],
     "currentIndex": 0,
     "trackId": "song-1",
     "positionMs": 1200,
-    "controlVersion": 13
+    "positionSampledAtServerMs": 1780000001150,
+    "playbackRate": 1.0,
+    "controlVersion": 13,
+    "sourceEpoch": 1,
+    "sourceVersion": 10,
+    "sourceQueueRevision": 8
   }
 }
 ```
 
 prepare payload 必需且只允许：`playbackContextId`、`handoffId`、`prepareId`、
-`sourceClientId`、`authorityClientId`、`deviceSessionId`、非空 distinct `queueSongIds`、合法
-`currentIndex`、`positionMs`、正整数 `controlVersion`。`trackId`、`timelineId` 可选；若有
+`sourceClientId`、`authorityClientId`、`authorityDeviceSessionId`、`deviceSessionId`、非空 distinct
+`queueSongIds`、合法 `currentIndex`、`positionMs`、`positionSampledAtServerMs`、合法
+`playbackRate`、正整数 `controlVersion/sourceEpoch/sourceVersion/sourceQueueRevision`。`trackId`、
+`timelineId` 可选；若有
 `trackId` 必须等于当前队列项。prepare 中禁止 `effectiveAtServerMs`，该字段只属于 commit。
 
 target exact pair 若存在 active/acquiring/restoring Follow overlay 或非终态/cleanupRequired
@@ -53,24 +61,29 @@ commit 使用 `player.play` 无 target，且包含 handoff 字段：
     "handoffId": "handoff-1",
     "controlVersion": 14,
     "sourceClientId": "phone-1",
+    "serverTimeMs": 1780000004500,
     "effectiveAtServerMs": 1780000005000,
-    "positionMs": 1200
+    "positionMs": 1200,
+    "playbackRate": 1.0
   }
 }
 ```
 
 commit payload 必需且只允许：`playbackContextId`、`handoffId`、正整数 `controlVersion`、
-`sourceClientId`、正整数 `effectiveAtServerMs`、`positionMs`。服务端发 commit 时进入
-`committing`，但此时 authority 仍是 source。
+`sourceClientId`、`serverTimeMs:int>=0`、正整数 `effectiveAtServerMs`、`positionMs`、合法
+`playbackRate`。`effectiveAtServerMs-serverTimeMs >= 250`。该 controlVersion 是 provisional N+1；
+payload 禁止普通 control 的 `executionTimeoutMs/dependsOnControlVersion`。服务端发 commit 时进入
+独立 Handoff execution lane 的 `committing`，但此时 canonical controlVersion=N、authority 仍是 source。
 
 随后相关成员收到的 schema 固定为：
 
 | action | 必需字段 | 条件可选字段 | 禁止规则 |
 | --- | --- | --- | --- |
-| `playback.handoff.release` | `playbackContextId`、`handoffId`、`instruction:"pause"`、`controlVersion`、`newAuthorityClientId` | 无 | 只在 completed 后发给旧 authority |
-| `playback.handoff.status` | `playbackContextId`、`handoffId`、`status`、`controlVersion` | `sourceClientId`；completed 时 `newAuthorityClientId:R`；failed/timedOut 时 `errorCode:R`、`errorMessage:O` | `status` 只能是第 5.4 节枚举 |
+| `playback.handoff.release` | `playbackContextId`、`handoffId`、`instruction:"pause"`、`controlVersion`、`newAuthorityClientId`、`newAuthorityDeviceSessionId` | 无 | 只在 completed 后发给旧 authority；controlVersion=N+1 canonical |
+| `playback.handoff.status` | `playbackContextId`、`handoffId`、`status`、`controlVersion` | `sourceClientId`；completed 时 `newAuthorityClientId:R`、`newAuthorityDeviceSessionId:R`；failed/timedOut 时 `errorCode:R`、`errorMessage:O` | `status` 只能是第 5.4 节枚举；committing 可报告 provisional N+1，failed/cancelled/timedOut 回到 canonical N，completed 为 canonical N+1 |
 | `playback.handoff.cancel` | `playbackContextId`、`handoffId`、`reason`、`controlVersion` | `errorCode`、`errorMessage` | 只对应 cancelled/timedOut/failed，不得用于 completed |
 
 这些 strict handoff push 都禁止 target / session，并广播给全部 Context subscribers（release 除外，
 它只发旧 authority）。服务端切 authority 后必须立即发 `playback.context.status`，令所有客户端
-收敛到新的 `authorityClientId` 与 epoch/cursor。
+收敛到新的 authority exact pair 与 epoch/cursor。completed status、Context status 与 release 必须在
+同一 complete 原子提交后构造；任一消息都不得在 proof 成功前声称新 authority。

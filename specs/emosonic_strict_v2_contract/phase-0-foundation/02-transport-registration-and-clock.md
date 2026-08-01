@@ -46,7 +46,7 @@ Flutter 使用：
    reply 必须复用它。业务 push（包括发给 authority 的 control）一律省略 `requestId`。
 3. `payload` 必须是 object。字段名大小写敏感。
 4. strict-v2 业务 payload（包括嵌套对象）禁止出现 `sessionId`。`sourceSessionId` 也不得用于 Follow。
-5. 客户端 → 服务端：strict 请求的顶层 `targetClientId` 一律禁止；payload target 只允许 `playback.handoff.start.targetClientId`，以及 `device.setVolume.targetClientId` / `targetDeviceSessionId`。这些字段表示业务目标，不是 Socket 投递指令。
+5. 客户端 → 服务端：strict 请求的顶层 `targetClientId` 一律禁止；payload target 只允许 `playback.handoff.start.targetClientId` / `targetDeviceSessionId`，以及 `device.setVolume.targetClientId` / `targetDeviceSessionId`。这些字段表示业务目标，不是 Socket 投递指令。
 6. 服务端 → 客户端：strict 业务 push / direct response 的顶层和 payload 均不得有 target 字段。`system.ack`、`system.error`、`system.pong`、`device.list` 的顶层 transport target 虽可被客户端容忍，但服务端仍应优先按实际 Socket 投递并省略该字段；payload 内始终禁止。
 7. 所有时间戳均为 Unix epoch **milliseconds**，除非字段名是旧的 `timestamp`（客户端也能读秒）。服务端应优先使用 `serverTimeMs` 或 `serverUpdatedAtMs` 的毫秒值。
 8. 缺失、空值、类型错误或超过长度限制的 `requestId` / `action` 无法形成合法 correlated
@@ -187,6 +187,12 @@ ordinary participant。
 `effectiveAtPlayback:true` 与第 3.5 节 clock gate；不得只为 Broadcast/Handoff 打开时钟协商而让
 Follow 使用无时钟 source fact。Follow source 自身不要求 `supportsFollow:true`，但必须是当前 Context
 authority player，协商 playbackContextV2/effectiveAtPlayback，并满足第 5.3.1 节 current-physical fact。
+
+Handoff source 必须是当前 authority player，协商 `canPause:true` 与
+`effectiveAtPlayback:true`，通过 current clock gate，并拥有 fresh/settled/playing actual fact。Handoff
+target 必须是同用户 current exact pair 的 player，并同时协商 playbackContextV2、playbackPrepare、
+effectiveAtPlayback、canPlay/canPause/canSeek，支持全部 0.5..2.0 rate 且通过 current clock gate。
+target capability 不得只按 clientId 或固定 shape 字段存在判断。
 
 `supportsBroadcast:true` 是复合执行承诺，不只表示理解 action 名。作为 source 或 ordinary participant
 的连接还必须协商 `playbackContextV2:true`、`effectiveAtPlayback:true`，具有 player 角色以及

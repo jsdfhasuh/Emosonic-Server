@@ -10,7 +10,10 @@
 - 传输使用 Socket.IO namespace `/emo`、事件名 `message`；
 - 所有 `system.ack` / `system.error` 必须以同一 `requestId` 关联，且 `payload.action` 必须回显原 action；direct action response 使用第 2.2、4.3 节规定的同 requestId 关联方式；
 - strict 注册成功后，所有发给 strict recipient 的入站 envelope 必须由统一发送工厂附加该 Socket 的顶层 `connectionNonce` 和 `connectionEpoch`；
-- strict-v2 业务 payload 中不得出现 `sessionId`。客户端请求不得使用顶层 `targetClientId`；payload target 只允许 `playback.handoff.start.targetClientId`，以及 `device.setVolume` 的 `targetClientId` / `targetDeviceSessionId`。服务端业务推送的顶层和 payload 均不得带 target 字段；
+- strict-v2 业务 payload 中不得出现 `sessionId`。客户端请求不得使用顶层 `targetClientId`；payload target 只允许 `playback.handoff.start` 与 `device.setVolume` 的 `targetClientId` / `targetDeviceSessionId` exact pair。服务端业务推送的顶层和 payload 均不得带 target 字段；
+- Handoff target 必须由 `playback.handoff.start.targetClientId/targetDeviceSessionId` exact pair 指定；
+  commit 的 N+1 是 handoffId-scoped provisional version，只有完整 actual proof 的 complete 才原子切换
+  authority。prepare/commit/complete 使用独立 execution lane，不进入普通 control reducer；
 - `device.list` 只发现设备；从目标 `authorityClientId` / `authorityDeviceSessionId` 到 active Context
   binding 的映射只能通过 `playback.context.list` 查询，客户端不得从任何 session/device ID 推导
   Context。多结果必须 fail-closed；binding 集合变化由 `playback.context.bindings.changed` 使客户端

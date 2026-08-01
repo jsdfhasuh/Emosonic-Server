@@ -41,6 +41,13 @@ exact pair/Context 是否正作为 Follow follower、Broadcast ordinary 或 Hand
 返回描述被占用 suspended Context 的 `conflict` 与完整四 cursor，零副作用。正常 source Context 可以
 同时被 Follow 和 Broadcast 读取/派生，不构成 source-side 互斥。
 
+Handoff target 必须由 `targetClientId/targetDeviceSessionId` exact pair 冻结；该 target 从
+`preparing`、`ready`、`committing` 直到 terminal 禁止普通 Context、queue/player、Follow、Broadcast
+和第二个 Handoff 写操作。Handoff commit 的 `controlVersion=N+1` 是 provisional version，只进入独立
+Handoff execution lane，不得进入普通 ControlTransactionCoordinator/reducer，不得生成普通
+`playback.update(origin:"remoteCommand")`，也不携带普通 control 的 dependency 或 execution timeout。
+只有 complete proof 原子成功后 N+1 才成为 canonical；失败、取消或超时后 canonical 仍为 N。
+
 close 还必须遵守以下安全闭合：
 
 - `expectedEpoch/baseVersion` 不等于 active Context 时返回 `stale_version` 与完整四 cursor；

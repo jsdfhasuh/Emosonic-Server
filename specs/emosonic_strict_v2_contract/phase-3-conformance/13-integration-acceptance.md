@@ -286,3 +286,36 @@
 94. 同一正常 source Context 同时拥有多个 Follow follower 和一个 Broadcast source时两个 profile 都
     正常派生同一 canonical fact；同一设备尝试 Follow follower、Broadcast ordinary、Handoff target
     任意两种 overlay 并发时第二个入口被拒绝，且两侧 recovery/fence 不互相删除。
+95. Handoff source 只有在 current exact authority、canPause/effectiveAt、clock-valid、queue-backed、
+    fresh settled playing、track/index/rate匹配、applied==control且无 pending 时可 start；idle 返回
+    queue_required，paused/stopped/stale/unsettled 返回 conflict。targetClientId/targetDeviceSessionId 只在
+    当前用户域解析，target 具备 playbackContextV2/playbackPrepare/effectiveAt/canPlay/canPause/canSeek/
+    全速率和 clock gate，错误 exact pair 零副作用。
+96. start 同时建立 source Context、target exact pair、target standby full lifecycle fence。source complete
+    前持续播放且普通 position/sample 前进允许；remote control/close/第二 Handoff/Broadcast/binding
+    mutation 被拒绝。source localUser、自然结束/切歌或实际 track/state/rate 变化先结算 source_changed，
+    target 收到取消后再提交 actual mutation。
+97. target 在 preparing/ready/committing 禁用 play/pause/seek/next/prev、queue mutation 与新
+    Follow/Broadcast/Handoff，只保留 volume/cancel cleanup；complete 后 source 立即 release。允许极短
+    overlap，但不存在 complete 前 authority switch 或 source pause。
+98. prepare 携带 playbackRate、positionSampledAtServerMs、sourceEpoch/sourceVersion/
+    sourceQueueRevision 与 source exact pair；commit 携带 serverTimeMs/effectiveAt/position/rate 和
+    provisional N+1，但不含 executionTimeout/dependency。commit 不进入普通 coordinator/reducer、不发
+    remoteCommand；failed/cancelled/timedOut lease 失效后 canonical 仍为 N，下一普通 mutation可复用 N+1。
+99. ready 后 source 只有 position/sample 正常前进时仍可 commit；track/state/rate/binding/cursor/pending
+    任一变化 source_changed。known duration 下 projected position 已到结尾时 commit 前 fail-fast，不发送
+    必然失败的 player.play。
+100. complete 必须含 exact device、queueIndex/track、playing、position/sample/rate、applied N+1 与
+     clientSeq；分别拒绝 sample future>50ms、age>2000ms、sample<effectiveAt、late>1000ms、错误 queue/
+     track/rate/duration，以及 floor 投影差>1000ms，三个 50/1000/1000 门槛互不替代。
+101. complete proof 原子退休 standby、写完整 target DevicePlaybackState、authority exact pair 切换、
+     epoch/version+1、queueRevision不变、controlVersion=N+1。completed status/release 同时含 new client/
+     device；complete.clientSeq 消耗 target 普通 playback.update 序号，旧 source 收到 release/completed/
+     Context status/bindings.changed 任一事实都停止旧 lease。
+102. target commit 失败只用 target-only cancel reason/errorCode=commit_failed；target Socket disconnect 或
+     server restart 时立即取消 timer/lease，已起播暂停且不得迟到 complete。source disconnect、prepare/
+     commit timeout 都保持 authority=N/source，不退休 standby或暴露两个 active Context。
+103. duplicate start 重放首次 preparing ACK，duplicate/late ready 重放 canonical status，duplicate
+     complete 重放 completed+Context status；prepare/commit 无法可靠 enqueue 立即 failed。所有重放都
+     不重复退休 standby、authority switch、cursor increment 或 release，并校验 handoffId/exact pair/
+     original physical Socket。

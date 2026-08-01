@@ -540,6 +540,12 @@ active Follow relationship 自动把 follower Socket 加入 source Context recip
 source authority exact pair 当前物理 Socket 的 DevicePlaybackState；旧 nonce、旧 epoch、未结算 fact
 不得进入 Follow mirror。Follow mirror 不作为新的 deviceStates 项写回 source 或 suspended Context。
 
+Handoff complete 成功后的首个 Context status 必须已经包含新的
+authorityClientId/authorityDeviceSessionId、递增后的 epoch/version、canonical provisional N+1
+controlVersion，以及由 complete proof 写入的 target 完整 DevicePlaybackState（queue track/state/position/
+sample time/playbackRate/applied N+1/clientSeq/serverUpdatedAtMs）。proof 前的 preparing/ready/committing
+status 不得提前改 authority pair、Context cursor 或把 target 临时起播事实写成 canonical。
+
 ### 6.4 `playback.context.closed`
 
 ```json

@@ -212,20 +212,81 @@ suspended Context fence；不得自动恢复 mirror audio。应用进程重启�
 ### 5.4 Handoff（target 需 negotiated `playbackPrepare:true` 且 `effectiveAtPlayback:true`）
 
 Handoff 发起者必须具有 controller 角色；source 必须是当前在线 authority 且
-negotiated `canPause:true`；target 必须是同用户在线 player，并协商到 `playbackPrepare:true`、
-`effectiveAtPlayback:true`、`canPlay:true`。只有服务端 Handoff conformance tests 已通过时才
+协商 `canPause:true`、`effectiveAtPlayback:true`，通过 current Socket clock gate，并拥有 fresh、
+settled、queue-backed、state=playing 的 current physical fact：track/index 匹配、
+appliedControlVersion==controlVersion、没有 pending control。idle source 返回 `queue_required`；
+paused/stopped/stale/unsettled source 返回无副作用 `conflict`。target 必须是同用户在线 exact pair 的
+player，并协商 `playbackContextV2:true`、`playbackPrepare:true`、`effectiveAtPlayback:true`、
+`canPlay:true`、`canPause:true`、`canSeek:true`，支持并保持 0.5..2.0 rate，且通过 current Socket clock
+gate。只有服务端 Handoff conformance tests 已通过时才
 开放该 profile，否则 negotiated handoff capabilities 为 false，请求返回 `capability_required`。
 
-`playback.handoff.start.payload.targetClientId` 是 Context/Handoff surface 的 payload target 例外；
+`playback.handoff.start.payload.targetClientId/targetDeviceSessionId` 是 Context/Handoff surface 的 payload target 例外；
 另一个设备级例外是第 5.2 节 `device.setVolume` 的精确 client/device pair。handoff target 只用于让服务端选择接管设备；服务端必须解析并授权该目标，然后按目标
 Socket 投递无 `targetClientId` 的 `playback.prepare`。不得把该请求字段复制进任何业务 push。
 
 | Action / type | payload | 服务端动作与响应 |
 | --- | --- | --- |
-| `playback.handoff.start` / `command` | `playbackContextId:R`、`targetClientId:R`、`baseControlVersion:R int>=0` | 原子创建 handoff 前检查 target 的唯一 Context：没有 Context 可继续；只有 idle Context 时记录为待退休 standby；非 idle Context 或 active prepare 返回 conflict。成功后 ACK 并给 target 发第 6.8 节 prepare；ACK payload **只允许且必须**有 `action`、`handoffId`、`prepareId`、`status:"preparing"`、`controlVersion`。 |
-| `playback.ready` / `event` | `playbackContextId:R`、`prepareId:R`、`handoffId:O`、`ready:R bool`、`errorCode:O`、`errorMessage:O` | target 预加载结果，不回 ACK。`ready:true` 时禁止 error 字段；`ready:false` 时 `errorCode:R`、`errorMessage:O`。成功进入 `ready`，失败进入 `failed`。 |
-| `playback.handoff.complete` / `event` | `playbackContextId:R`、`handoffId:R`、`positionMs:O int>=0` | target commit 后确认，不回 ACK。服务端在这里原子切换 authority/cursors，广播 completed status 和 context status，再向 source 发 release。 |
-| `playback.handoff.cancel` / `command` | `playbackContextId:R`、`handoffId:R`、`reason:O non-empty string` | 取消 idempotent；ACK 并向相关成员发 `playback.handoff.cancel` / `status`。 |
+| `playback.handoff.start` / `command` | `playbackContextId:R`、`targetClientId:R`、`targetDeviceSessionId:R`、`baseControlVersion:R int>=1` | 原子创建前按当前用户域解析 exact target pair，验证 source/target eligibility、全部 fence、target command lane/lease 与唯一 Context。target 没有 Context 可继续；只有 idle Context 时记录待退休 standby；非 idle/active prepare 返回 conflict。成功后 ACK 并给 target 发第 6.8 节 prepare；ACK payload **只允许且必须**有 `action`、`handoffId`、`prepareId`、`status:"preparing"`、`controlVersion:N`。 |
+| `playback.ready` / `event` | `playbackContextId:R`、`prepareId:R`、`handoffId:R`、`deviceSessionId:R`、`ready:R bool`、`errorCode:C string`、`errorMessage:O string` | 只有 frozen target 当前 physical Socket 可确认，不回 ACK。`ready:true` 禁止 error 字段；`ready:false` 要求 errorCode。成功进入 ready，失败进入 failed；duplicate/late 只重放 canonical status。 |
+| `playback.handoff.complete` / `event` | `playbackContextId:R`、`handoffId:R`、`deviceSessionId:R`、`queueIndex:R int>=0`、`trackId:R`、`state:R "playing"`、`positionMs:R int>=0`、`positionSampledAtServerMs:R int>=0`、`playbackRate:R number 0.5..2.0`、`appliedControlVersion:R int>=1`、`clientSeq:R int>=1` | frozen target commit 后提供完整 actual proof，不回 ACK。服务端通过第 5.4.3 节 proof 后在这里原子退休 standby、写 target DevicePlaybackState、切 authority/cursors，广播 completed status 和 Context status，再立即向旧 source release。 |
+| `playback.handoff.cancel` / `command` | `playbackContextId:R`、`handoffId:R`、`reason:O non-empty string`、`errorCode:C string`、`errorMessage:O string` | controller cancel 幂等；target commit 执行失败必须发送 `reason:"commit_failed"`、`errorCode:"commit_failed"`，errorMessage 可选。ACK 并向相关成员发送 canonical cancel/status。 |
+
+#### 5.4.1 Full lifecycle fence 与 continuity-first policy
+
+start 成功必须同时建立 source Context fence、target exact pair fence 和 target standby Context fence，
+从 preparing 覆盖 ready/committing 到 terminal。source 在 complete 前继续播放，正常 position/sample
+前进允许；remote player/queue/close、第二个 Handoff、Broadcast start/control 和 authority/binding
+mutation 返回 source 四 cursor `conflict`。source localUser、自然结束/切歌或实际 track/state/rate 变化
+时，服务端必须在同一临界区先把 Handoff 结算为 `failed/source_changed`、通知 target 取消 timer/lease，
+再提交 source actual mutation。
+
+target 本地 UI 在 preparing/ready/committing 禁用 play/pause/seek/next/prev、queue mutation 和新的
+Follow/Broadcast/Handoff，只保留 device volume 与 Handoff cancel/failure cleanup。target complete 前
+source 保持 authority 和音频；complete 原子成功后 authority 才切换，并立即向 source 发送 release。
+该 continuity-first 策略允许极短重叠，不承诺零重叠。
+
+#### 5.4.2 Independent provisional execution lane
+
+prepare 成功后、commit 前，服务端重新读取 source。正常 position/sample 前进不算 source_changed；
+track/state/rate/binding/cursor/pending 变化必须先结算 source_changed。commit 的 `controlVersion=N+1`
+是 `(playbackContextId, epoch, handoffId)` provisional version，不是 canonical cursor。它必须进入独立
+Handoff execution lane，不进入普通 ControlTransactionCoordinator/reducer，不发送 remoteCommand
+playback.update，也不携带普通 `executionTimeoutMs/dependsOnControlVersion`；只由 complete/cancel/
+timeout 结算。
+
+Flutter 只有在 completed status/Context status 后才把 N+1 当 canonical。failed/cancelled/timedOut 且
+target lease 失效后 canonical 仍为 N，下一普通 mutation 可以重新分配 N+1。任何旧 ready/commit/
+complete 必须同时匹配 handoffId、frozen exact pair、原 physical Socket 和非终态 lifecycle。
+
+#### 5.4.3 Complete proof、position projection 与 authority switch
+
+服务端用最新 source sample 生成 commit position。已知 duration 且 projectedPositionMs>=durationMs 时，
+必须在发送 commit 前 fail-fast 为 `failed/source_changed`，authority 保持 source。
+
+complete 必须验证 frozen target current Socket/pair、queueIndex/track/rate、
+`appliedControlVersion==provisional N+1`、state=playing、known duration bounds、target clock gate，以及：
+
+```text
+positionSampledAtServerMs <= currentServerTimeMs + 50
+currentServerTimeMs - positionSampledAtServerMs <= 2000
+positionSampledAtServerMs >= effectiveAtServerMs
+positionSampledAtServerMs - effectiveAtServerMs <= 1000
+
+deltaMs = max(0, positionSampledAtServerMs - effectiveAtServerMs)
+expectedPositionMs = commit.positionMs + floor(deltaMs * playbackRate)
+known duration 时 expectedPositionMs = min(expectedPositionMs, durationMs)
+abs(positionMs - expectedPositionMs) <= 1000
+```
+
+50ms future、1000ms execution late、1000ms position tolerance 是三个独立门槛。complete.clientSeq 复用
+target 后续普通 playback.update 的 `(playbackContextId,targetClientId,connectionNonce,connectionEpoch)`
+作用域并消耗序号。
+
+proof 成功时原子退休 target standby、写完整 target DevicePlaybackState、把 authority exact pair 切到
+target、令 `epoch += 1`、`version += 1`、`queueRevision` 不变、`controlVersion=N+1` 并将 Handoff 标记
+completed。completed status/release 必须同时包含 newAuthorityClientId 与
+newAuthorityDeviceSessionId；complete 是唯一 authority switch point。
 
 Handoff 状态机固定为：
 
@@ -236,24 +297,31 @@ preparing -> ready -> committing -> completed
 ```
 
 - `preparing` 从 start ACK 起最多 8 秒；未收到有效 ready 时进入 `timedOut`。
-- `ready` 后服务端必须给 target 发送含正整数 `effectiveAtServerMs` 的 commit，并进入
+- `ready` 后服务端重新验证 source 并给 target 发送第 6.9 节完整 provisional commit，随后进入
   `committing`；`effectiveAtServerMs - serverTimeMs >= 250`。
 - `committing` 最多 5 秒；未收到 complete 时进入 `timedOut`，authority 不变。
 - target 在 complete 前断开：`failed`；source 在 complete 前断开：`cancelled`；两者都不得
   切 authority。complete 的原子事务才是 authority switch point。
+- target Socket disconnect 或服务端 restart 时，target Flutter 必须立即取消 scheduled timer、失效
+  Handoff execution lease，已经起播则暂停，并禁止迟到 complete；不得等待 5 秒 timeout 才清理。
 - target 在 start 时拥有 idle standby Context 时，complete 原子事务必须先把 standby 写入 terminal
   tombstone，再把 source Context 绑定到 target；两步必须同成同败，并为 standby close、旧 source pair
   和新 target pair 发送对应 invalidation。target Context 已非 idle 或存在 active prepare 时不得进入
   authority switch。
 - `completed`、`failed`、`cancelled`、`timedOut` 是终态。终态重放不产生副作用。
+- duplicate start 重放首次 preparing ACK；duplicate/late ready 只重放 canonical status；duplicate
+  complete 重放 completed status 与当前 Context status，不重复退休 standby、切 authority 或 release。
+  prepare/commit 不能可靠加入 frozen target 当前发送路径时必须立即 failed，不等待超时。
 - `playback.handoff.status` / `cancel` 发给全部当前 Context subscribers；prepare 与 commit 只发
   target，release 只发 completed 后的旧 authority。complete 后再广播新的 Context status。
+- 旧 source 收到 release、completed status、新 Context status 或 bindings.changed 任一权威事实时，
+  必须立即失效旧 authority/audio execution lease并停止；不能依赖单一消息必达。
 - authority 永久离线时，2.8.x 不提供强制接管。controller 关闭旧 Context，目标 player 继续使用自己
   ensure 得到的唯一 Context；旧 ID 因 tombstone 不可复用。
 
 Handoff `errorCode` 必须匹配 `^[a-z][a-z0-9_]{0,63}$`。服务端标准值固定为
 `prepare_failed`、`prepare_timeout`、`commit_timeout`、`target_disconnected`、
-`source_disconnected`、`server_restart`。target 可在 `playback.ready.ready:false` 中返回符合相同
+`source_disconnected`、`server_restart`、`source_changed`、`commit_failed`。target 可在 `playback.ready.ready:false` 中返回符合相同
 格式的稳定扩展码。`errorMessage` 不得包含凭据、文件路径、堆栈或内部数据库信息。
 
 Handoff start、ready、complete、cancel 的每次状态推进都必须先检查第 5.3、5.5 节 Follow/Broadcast 写屏障：source

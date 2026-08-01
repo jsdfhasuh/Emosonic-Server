@@ -237,6 +237,11 @@ control 字段；除此之外，只有由
 active Broadcast control 产生的普通 command 才允许并必须成组携带 `effectiveAtServerMs` 与
 `serverTimeMs`，普通非 Broadcast command 禁止这两个字段。
 
+包含 `handoffId` 的 `player.play` 是唯一方向性例外：其 N+1 只进入 Handoff execution lane，不创建
+普通 ControlTransaction、不参与 dependency/watchdog/reconciliation、不推进 Context reducer，也不使用
+remoteCommand playback.update 结算。target 只通过完整 `playback.handoff.complete` actual proof 或
+cancel/timeout 结算该 provisional lease；failed/cancelled/timedOut 后普通 control 可以安全复用 N+1。
+
 #### 6.7.1 多客户端下如何确定唯一执行者
 
 `playbackContextId` 是 player control 的**业务路由地址**，不是要求所有客户端自行过滤的
