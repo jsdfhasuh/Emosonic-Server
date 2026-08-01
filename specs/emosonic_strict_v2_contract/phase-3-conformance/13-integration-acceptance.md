@@ -1,11 +1,16 @@
 # 阶段 3：已知边界与联调验收
 
 > [返回 r18 权威入口](../../emosonic_strict_v2_socketio_server_contract.md)
-> 文档修订：`2026-07-23-r18`；协议版本：`2.8.0`
+> 文档修订：`2026-08-01-r18`；协议版本：`2.8.0`
 > 覆盖范围：原契约第 9 节。本文件是完整契约的一个规范分卷，不能脱离入口列出的公共规则单独解释。
 ## 9. 已知边界与联调验收
 
 这是服务端与 Flutter 客户端共同遵守的规范，不证明当前任何一端已经完成实现。双方完成后必须验证：
+
+本页 1—110 项在 `2026-08-01-r18` 冻结时全部是 contract-defined acceptance；实现与证据状态以
+[r18 requirement mapping](../../../docs/verification/emosonic_strict_v2_r18_requirement_mapping.md) 为准。
+旧 pre-freeze 自动化或单端结果不得把新增/改变的 acceptance 标成 Verified；只有服务端 schema、服务端
+状态机、Flutter parser/controller、自动化测试与 Android+Windows 真机五个维度闭合后才可声明 ready。
 
 1. probe 注册成功后客户端保存 profile、主动重连、第二次 negotiated 注册成功；
 2. roles 单角色/双角色、完整 negotiatedCapabilities、Core not_supported 和 optional profile 降级；

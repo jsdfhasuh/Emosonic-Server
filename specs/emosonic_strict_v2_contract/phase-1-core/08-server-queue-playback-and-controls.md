@@ -1,7 +1,7 @@
 # 阶段 1：服务端 Queue、Playback 与 Routed Control 消息
 
 > [返回 r18 权威入口](../../emosonic_strict_v2_socketio_server_contract.md)
-> 文档修订：`2026-07-23-r18`；协议版本：`2.8.0`
+> 文档修订：`2026-08-01-r18`；协议版本：`2.8.0`
 > 覆盖范围：原契约第 6.5—6.7.1 节。本文件是完整契约的一个规范分卷，不能脱离入口列出的公共规则单独解释。
 
 任何 queue/playback reducer 或 routed-control admission 在处理 exact pair 的 suspended Context 前，都
@@ -271,8 +271,7 @@ deviceSessionId；不能只因 `clientId` 文本相同就把命令发给旧连�
 1. 使用请求的 `playbackContextId` 读取未关闭且属于当前用户的 Context。
 2. 校验请求者具有 controller 权限、属于允许的控制范围，并验证请求中的
    `baseControlVersion`。
-3. 从 Context 读取当前 `authorityClientId`，必要时同时读取
-   `authorityDeviceSessionId`。
+3. 从 Context 同时读取当前 `authorityClientId` 与 `authorityDeviceSessionId`。
 4. 从服务端连接注册表解析该 authority 当前唯一有效的 Socket.IO `sid`，并确认该
    `sid` 仍绑定到同一用户、client 和 device session。
 5. 若 authority 离线、映射缺失或已经被新连接替换，向请求者返回 correlated
@@ -293,7 +292,11 @@ deviceSessionId；不能只因 `clientId` 文本相同就把命令发给旧连�
 
 ```python
 context = get_context(request_payload["playbackContextId"])
-authority_sid = get_current_sid(context["authorityClientId"])
+authority_sid = get_current_sid(
+    authenticated_user_id,
+    context["authorityClientId"],
+    context["authorityDeviceSessionId"],
+)
 
 command = build_control(
     playback_context_id=context["playbackContextId"],

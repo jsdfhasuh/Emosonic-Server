@@ -1,7 +1,7 @@
 # 阶段 3：Broadcast 实现要求
 
 > [返回 r18 权威入口](../../emosonic_strict_v2_socketio_server_contract.md)
-> 文档修订：`2026-07-23-r18`；协议版本：`2.8.0`
+> 文档修订：`2026-08-01-r18`；协议版本：`2.8.0`
 > 覆盖范围：原契约第 7 节 REQ-039—REQ-067、REQ-088—REQ-090。本文件是完整契约的一个规范分卷，不能脱离入口列出的公共规则单独解释。
 **REQ-039 — Source-derived Broadcast projection**
 当服务端创建或更新 Broadcast 时，必须把 source PlaybackContext 作为唯一播放事实源；start 播放字段

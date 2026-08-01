@@ -1,7 +1,7 @@
 # 阶段 2：Broadcast Feedback、屏障与重连恢复
 
 > [返回 r18 权威入口](../../emosonic_strict_v2_socketio_server_contract.md)
-> 文档修订：`2026-07-23-r18`；协议版本：`2.8.0`
+> 文档修订：`2026-08-01-r18`；协议版本：`2.8.0`
 > 覆盖范围：原契约第 5.5.2 节。本文件是完整契约的一个规范分卷，不能脱离入口列出的公共规则单独解释。
 #### 5.5.2 Ordinary participant feedback、占用屏障与 source 重连
 
