@@ -189,6 +189,9 @@ deviceSession 变化或其他第 5.1 节定义的失效信号时先递增 genera
 player 完成 negotiated 注册后，必须先读取当时可用的本地播放恢复快照，再立即发送 ensure。第 5.5
 节已有 Broadcast 恢复记录的 ordinary pair 是唯一例外：它先进入 restoringOriginalContext 门控并等待
 服务端 active/terminal replay；只有 terminal 恢复完成或 tombstone 过期回退流程要求时才可发送 ensure。
+已有第 5.3 节非终态 FollowSafetyLease/cleanupRequired tombstone 的 exact pair 也不得用 ensure 穿透
+suspended Context fence；同进程 resume 重发 follow.start，stopPending/app restart 只重试 follow.stop。
+其他会创建、初始化、重绑或修改 snapshot 的 ensure 返回 suspended Context `conflict` 与四 cursor。
 若 matching ordinary pair 在 `restorePending:true` 期间仍发送 ensure，服务端必须以同 requestId 的
 `system.error(code:"restore_in_progress",retryable:true)` 终态结算该请求并缓存该拒绝；错误携带
 suspendedPlaybackContextId 与 `currentEpoch/currentVersion/currentQueueRevision/currentControlVersion`。
@@ -531,6 +534,11 @@ positionMs 为 0。
 position 表示 authority 仍在执行旧版本，可以暂时不同于主 snapshot 的最新控制目标。服务端必须按
 对应 applied transaction 或已持久化 applied snapshot 验证，不能只与主 snapshot 当前 track 比较。
 当 appliedControlVersion 追平 controlVersion 且没有 failed/superseded 对账时，两者必须收敛。
+
+active Follow relationship 自动把 follower Socket 加入 source Context recipient set。follower 必须先
+显式读取本节 status，再消费后续 source queue/status/playback.update canonical facts。服务端只能使用
+source authority exact pair 当前物理 Socket 的 DevicePlaybackState；旧 nonce、旧 epoch、未结算 fact
+不得进入 Follow mirror。Follow mirror 不作为新的 deviceStates 项写回 source 或 suspended Context。
 
 ### 6.4 `playback.context.closed`
 

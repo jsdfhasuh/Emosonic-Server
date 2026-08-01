@@ -80,6 +80,12 @@ participant 占用，或是否存在尚未完成的 `restorePending` fence：命
 重放；其他 intent 一律返回 `conflict`，不得创建第二个 broadcastId、嵌套镜像、覆盖已有 membership，
 也不得把仍在恢复原任务的 pair 重新选为 source 或 ordinary participant。
 
+同一正常 source Context 可以同时拥有 Follow followers 并作为 Broadcast source；Follow relationship
+不占用 source Context 的 Broadcast source slot。相反，同一 exact pair 的本地 execution overlay 必须
+互斥：active/reconnectGrace/cleanupRequired Follow follower 不得成为 Broadcast ordinary participant，
+Broadcast ordinary pair 也不得 start Follow；此类显式目标进入 skippedClientIds，隐式选择跳过。两种
+profile 的持久化 recovery/fence 独立，任何一方都不得删除或复用另一方记录。
+
 非终态 Broadcast 还必须为 source Context 建立 source-ownership fence：普通 source
 queue/player/playback.update 继续按本节执行，但 `playback.context.close`、Handoff start/complete、会改变
 authority/device binding 的 ensure 或其他 mutation 必须返回 `conflict`。相同 source pair 重连时，只允许

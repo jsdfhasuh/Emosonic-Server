@@ -27,6 +27,9 @@
    skippedClientIds；最终无可用 participant 时 start 返回 `rate_limited`。
    internal serverReconciliation record 计入 control transaction 持久化上限；当 terminal-gap 审计仍
    引用它时不得提前清理。普通 routed control 的 executionTimeoutMs 部署默认值为 15000。
+   每个 exact follower pair 最多一条非终态 FollowSafetyLease，每个 suspended Context 最多一个 Follow
+   overlay，每 authenticated user 最多 256 条 active/reconnectGrace/cleanupRequired Follow records。
+   cleanup 不受 rate limit，不能删除旧 lease 接受新 start。
 5. 必须设置 Engine.IO payload 上限不高于 256 KiB；transport 超限使用 message-too-big 行为断开，
    已进入 handler 的业务限制超限返回 correlated `bad_request`。malformed JSON、非 object
    envelope 不得进入 handler；格式合法但不在 allowlist 的 action 返回 `not_supported`；缺失或
@@ -61,7 +64,9 @@
   重新注册，并用新的 requestId 重新 list/subscribe/status。
 - graceful restart 必须先停止接收新连接，完成或明确失败正在结算的请求，停止创建新
   handoff/broadcast，再关闭 Socket。不能把未完成 handoff 恢复为 completed。
-- 重启时非终态 Handoff 进入 `failed`，`errorCode:"server_restart"`；Follow 全部清除；`active`
+- 重启时非终态 Handoff 进入 `failed`，`errorCode:"server_restart"`；Follow relationship/subscription 的
+  内存状态清除，但持久化 FollowSafetyLease 必须加载为 reconnectGrace/cleanupRequired 并恢复 suspended
+  Context fence，不得自动恢复 mirror audio；`active`
   或 `waitingForSource` Broadcast 进入 terminal stopped 并冻结 cursor。服务端必须持久化其 terminal
   tombstone、ACK outcome tombstone、target revision ledger、restorePending、recovery slot 与 per-pair delivery
   状态；已压缩 TerminalRecoveryRecord 同样必须持久化。等待相同 pair 重连后
@@ -97,6 +102,13 @@ status anchor、terminal Snapshot/feedback state 分域、stopped 原任务恢�
 结算、关闭后 deadline 字段/timer 语义、20 participant 上限和 `broadcast.feedback.rejected` 验收；缺少任一项时
 `supportsBroadcast` 必须协商为
 false。
+
+Follow readiness 必须完整覆盖 composite capability/effective-at clock、source current physical fact、
+playing/paused/stopped/idle/self gate、start 前 RecoveryRecord、完整 frozen baseline ACK、persistent
+FollowSafetyLease、全 suspended Context fence、per-pair/context/user limit、local mirror failure、source
+idle、cursor-safe restore、source recovery 与 reconnect grace 双 timer、server/app restart cleanup，以及
+Follow source 与 Broadcast source 共存和三种本地 overlay 互斥；缺少任一项时 `supportsFollow` 必须
+协商为 false。已有 SafetyLease 的 follow.stop/cleanup 仍必须可用。
 Broadcast profile 从 true 切为 false 时仍必须保持第 5.5 节 terminal drain 路径，直到已有
 restorePending/TerminalRecoveryRecord 全部闭合。
 metadata/profile 的 TOFU 成功不自动证明或开启任一可选 capability。

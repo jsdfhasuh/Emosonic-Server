@@ -112,8 +112,12 @@ feedback.state 等于 terminal Snapshot.state。
 服务端接受 start 时，必须为每个 ordinary participant 记录其当前唯一 authority PlaybackContext 为
 `suspendedPlaybackContextId`，并在 active 与 waitingForSource 期间建立覆盖 Context 与
 `(authorityClientId, authorityDeviceSessionId)` binding 的 pair-level 写屏障。没有唯一 Context、已被
-prepare/Handoff/其他 Broadcast 等瞬态执行占用、存在 `restorePending`，或无法原子建立屏障的目标进入
+prepare/Handoff/其他 Broadcast 或 Follow follower overlay 占用、存在 `restorePending`，或无法原子建立屏障的目标进入
 skippedClientIds。
+
+正常 source Context 可以同时被 Follow 读取和作为 Broadcast source；ordinary participant 的本地 overlay
+与 Follow follower、Handoff target execution 互斥。Broadcast start/terminal/recovery 不得清理
+FollowRecoveryRecord 或 FollowSafetyLease，Follow cleanup 也不得释放 Broadcast restorePending。
 
 该屏障必须由所有可能修改、关闭、初始化、重绑或转移 suspended Context/binding 的事务在同一临界区
 检查，至少包括 `queue.context.sync`、`playback.context.prepare` / `prepared`、全部普通 `player.*`、

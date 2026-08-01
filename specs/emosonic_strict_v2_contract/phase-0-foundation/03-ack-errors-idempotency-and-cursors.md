@@ -142,6 +142,10 @@ requestId/action 的失败请求都是 bootstrap error：仍须使用同 `reques
 `playback.context.status` 完成服务端当前状态读取；服务端不得把未关联的 status push 当成 subscribe 的结算。
 List/Ensure 不允许用简略 ACK 代替 direct response。
 
+`follow.start` 的 ACK 不是 action-only ACK；它必须按第 5.3.2 节返回 `status:"active"`、source/suspended
+Context ID、suspended authority exact pair、epoch/version/queue/control/applied frozen baseline。
+`follow.stop` 使用 action-only ACK。
+
 ### 4.4 幂等、重复请求与重连
 
 1. `playbackContextId` 由服务端在首次 ensure 时生成，客户端不得指定或复用。ID 一旦进入 closed
@@ -153,7 +157,8 @@ List/Ensure 不允许用简略 ACK 代替 direct response。
    缓存期外的长期幂等由 stable client ensure、Context/Handoff/Broadcast 等逻辑 ID 保证。
 3. 重复 subscribe/unsubscribe、close、`follow.start`/`stop`、handoff cancel/complete 和
    `broadcast.stop` 均必须幂等。资源已处于目标状态时返回与首次成功等价的 ACK 或 canonical
-   confirmation，不得为 event-confirmed 动作补发 ACK。
+   confirmation，不得为 event-confirmed 动作补发 ACK。Follow start 重放必须保留首次 frozen baseline，
+   不得按重试时的新 Context 状态改写 ACK。
 4. 每个 Context 同时只能有一个非终态 handoff。同一 source/target 的 start 重试返回已有
    `handoffId`/`prepareId`；不同 target 返回 `conflict`。
 5. 同一已认证用户以相同 `clientId` 完成新注册后，新 sid 原子替换旧 sid，并立即断开旧 sid。
@@ -221,6 +226,10 @@ List/Ensure 不允许用简略 ACK 代替 direct response。
     重放首次 outcome，不得删除旧 tombstone 后接受旧 intent。只有 source Context close 才可清理
     该 Context 的 ACK outcome tombstones；关闭前必须先终止非终态 Broadcast，compact per-pair
     recovery 记录仍保留到各自恢复确认。
+17. Follow 的跨连接长期安全状态由 exact-pair `FollowSafetyLease` 提供。相同 pair/source 与相同 frozen
+    baseline 的 start 可以恢复/重放已有 relationship；另一 source、另一 suspended Context 或不同
+    baseline 返回 `conflict`。stopPending 只能重试 stop。requestId cache、Socket 断开或服务端重启不得
+    删除未完成 SafetyLease、释放 cleanupRequired fence 或把 Follow 音频自动视为已恢复。
 
 ### 4.5 Cursor 的含义与递增矩阵
 

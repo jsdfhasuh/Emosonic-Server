@@ -34,6 +34,10 @@ prepare payload 必需且只允许：`playbackContextId`、`handoffId`、`prepar
 `currentIndex`、`positionMs`、正整数 `controlVersion`。`trackId`、`timelineId` 可选；若有
 `trackId` 必须等于当前队列项。prepare 中禁止 `effectiveAtServerMs`，该字段只属于 commit。
 
+target exact pair 若存在 active/acquiring/restoring Follow overlay 或非终态/cleanupRequired
+FollowSafetyLease，服务端不得发送 prepare；start 必须以描述 target suspended Context 的 `conflict` 与
+四 cursor 零副作用结算。进入 Handoff target execution 后也不得并发建立 Follow。
+
 ### 6.9 Handoff commit、release、status、cancel
 
 commit 使用 `player.play` 无 target，且包含 handoff 字段：

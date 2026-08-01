@@ -175,11 +175,18 @@ action”规则的 bootstrap 例外。
 `not_supported`，不返回 strict metadata，也不转入 legacy。可选 profile 未 ready 时注册仍可
 成功，但对应 negotiated 值必须为 false。
 
-协商结果还必须满足角色和能力依赖：`supportsFollow:true` 要求 player + canPlay；
+协商结果还必须满足角色和能力依赖：`supportsFollow:true` 要求 player、
+`playbackContextV2:true`、`effectiveAtPlayback:true`、`canPlay:true`、`canPause:true`、`canSeek:true`，并
+能够设置和保持任意合法 `0.5..2.0` playbackRate；固定 capability shape 不增加 rate 字段。
 `playbackPrepare:true` 只可授予能预加载 Handoff target 的 player；`effectiveAtPlayback:true` 只可授予
 能满足第 3.5 节时钟与迟到规则的 player。controller-only 连接可以协商 `supportsBroadcast:true` 以
 创建和控制 Broadcast，但只有同时具备 player + canPlay + canPause + canSeek 的连接才可成为
 ordinary participant。
+
+部署开启 Follow、Handoff 或 Broadcast 任一 profile 时，对应 player 的协商路径都必须覆盖
+`effectiveAtPlayback:true` 与第 3.5 节 clock gate；不得只为 Broadcast/Handoff 打开时钟协商而让
+Follow 使用无时钟 source fact。Follow source 自身不要求 `supportsFollow:true`，但必须是当前 Context
+authority player，协商 playbackContextV2/effectiveAtPlayback，并满足第 5.3.1 节 current-physical fact。
 
 `supportsBroadcast:true` 是复合执行承诺，不只表示理解 action 名。作为 source 或 ordinary participant
 的连接还必须协商 `playbackContextV2:true`、`effectiveAtPlayback:true`，具有 player 角色以及

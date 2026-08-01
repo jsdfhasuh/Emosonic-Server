@@ -2,7 +2,7 @@
 
 > [返回 r18 权威入口](../../emosonic_strict_v2_socketio_server_contract.md)
 > 文档修订：`2026-07-23-r18`；协议版本：`2.8.0`
-> 覆盖范围：原契约第 7 节 REQ-001—REQ-038、REQ-068—REQ-075。本文件是完整契约的一个规范分卷，不能脱离入口列出的公共规则单独解释。
+> 覆盖范围：原契约第 7 节 REQ-001—REQ-038、REQ-068—REQ-081。本文件是完整契约的一个规范分卷，不能脱离入口列出的公共规则单独解释。
 ## 7. 服务端与 Flutter 实现要求（EARS）
 
 **REQ-001 — ACK correlation**
@@ -39,6 +39,7 @@ cursor；资源解析必须先限定 authenticated user，跨用户与不存在�
 **REQ-008 — 可选模式**
 当连接未在 `negotiatedCapabilities` 获得 Follow、Broadcast 或 Handoff 所需能力时，服务端不得
 向该连接执行相应可选模式动作，并对请求返回 `capability_required`。
+已有 FollowSafetyLease 的 exact pair 必须始终允许 follow.stop/cleanup；这不允许创建新 relationship。
 
 **REQ-009 — Handoff target 的方向性例外**
 当客户端发送 `playback.handoff.start` 时，服务端必须接受并验证 payload 内的
@@ -77,7 +78,8 @@ cursor 不等于 canonical cursor 时，服务端必须返回 `stale_version` �
 
 **REQ-017 — 持久化终态与重启**
 当 Context close 或服务重启时，服务端必须按第 4.4、7.2 节持久化 tombstone/cursor 并显式终止
-瞬态 profile，不得恢复半完成 Handoff、Follow 或 Broadcast。
+瞬态 profile，不得恢复半完成 Handoff/Broadcast 或自动恢复 Follow 音频。非终态 FollowSafetyLease
+必须恢复为 reconnectGrace/cleanupRequired 并继续保护 suspended Context，直到 explicit cleanup。
 
 **REQ-018 — 接受与发送顺序**
 当服务端接受 authoritative mutation 时，必须先解析并验证全部收件人，然后完成原子状态与
@@ -253,3 +255,42 @@ context_closed/final cursors，不再次推进版本。
 重播第一首；最后一首 next 停在最后 index/stopped/0；最后一首自然结束只能使用严格的 passive
 automatic terminal 例外推进一次 Context version，不推进 queue/control cursor，并只派生一次
 Follow/Broadcast fact。
+
+**REQ-076 — Follow capability and current source fact**
+当 follower 协商 supportsFollow=true 时，必须同时具备 player、playbackContextV2、effectiveAtPlayback、
+canPlay/canPause/canSeek 和完整 0.5..2.0 rate 能力。source 不要求 supportsFollow，但必须是当前在线
+authority exact pair、通过 clock gate，并提供当前 physical nonce/epoch、settled track/rate fact；playing
+fact 两个时间都必须 <=2000ms，paused/stopped 不使用进度 freshness，idle start queue_required，self
+follow conflict。
+
+**REQ-077 — Crash-safe Follow baseline acquisition**
+当 Flutter 开始 Follow 时，必须在发送 start 前验证 suspended Context/command lane/lease/overlay 并
+持久化 acquiring FollowRecoveryRecord。服务端必须原子冻结 exact authority/cursor/applied baseline、
+建立 relationship/subscription/SafetyLease/fence，并在 start ACK 返回完整 baseline；Flutter 只有逐字段
+匹配并把 record 持久化为 active 后才可触碰音频，任一步失败都必须 fail-closed stop/stopPending。
+
+**REQ-078 — Persistent FollowSafetyLease and occupancy fence**
+当 Follow relationship 非终态或 cleanupRequired 时，服务端必须持久化 exact-pair SafetyLease，并阻止
+suspended Context 的 player/queue/prepare/update/close/ensure mutation、Handoff、Broadcast 和其他 Follow
+占用，返回四 cursor conflict。每 pair 最多一条非终态 lease、每 suspended Context 最多一个 Follow、
+每 user 最多 256 条；达到上限拒绝新 start，已有 start replay 与 stop/cleanup 永远允许，未完成 lease
+不得按 TTL 删除。
+
+**REQ-079 — Follow mirror isolation and local failure**
+当 follower 执行 source mirror 时，必须禁用本机 transport/queue control，仅保留 volume 与 stop，并且
+不得发送 normal playback.update 或新增 Follow feedback，不得写 source/suspended Context。source 转 idle
+时清空 mirror audio但保持 relationship/fence。任何本地 apply 失败必须按触碰音频前后分支恢复；恢复
+失败保持非播放和持久化 recovery/fence，不得提前 follow.stop。
+
+**REQ-080 — Cursor-safe Follow stop**
+当 Flutter 停止 Follow 时，必须先进入 restoring、停止 mirror/timer，再读取 suspended Context status
+并比较 frozen exact pair/cursors。完全相同才恢复原快照；cursor 更高、binding 改变或 closed 时必须
+丢弃旧快照并采用服务端当前状态。恢复成功后才发送 stop；ACK 后服务端原子释放 relationship/
+subscription/SafetyLease/fence，客户端最后清 RecoveryRecord，fence 释放前禁止 normal playback.update。
+
+**REQ-081 — Follow reconnect, restart and mode coexistence**
+当 source authority 离线、playing fact stale 或 status 恢复失败时，Follow 使用独立的最多 30 秒 source
+recovery window；source closed 立即退出。follower disconnect 进入 reconnectGrace，同进程 same pair 可
+重发 start，stopPending 只重试 stop；app/server restart 都不得自动恢复音频，必须加载 SafetyLease 并
+保持 cleanupRequired fence。同一 source Context 可同时服务 Follow 与 Broadcast source，但 Follow
+follower、Broadcast ordinary、Handoff target execution overlay 在同一设备互斥。

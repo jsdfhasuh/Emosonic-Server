@@ -44,6 +44,12 @@
 - `queueSongIds` 必须 distinct，且 r18 不支持 shuffle、repeat-one 或 repeat-all。第一首 `prev`
   重播第一首；最后一首 `next` 和最后一首自然结束都停在最后 index、position 0，后者只允许通过
   passive automatic terminal 例外推进一次 Context version；
+- Follow 是 Context 驱动的一对一软同步音频 overlay：follower 必须在 start 前持久化原任务与 frozen
+  baseline，服务端以 persistent FollowSafetyLease 冻结 suspended Context；start ACK baseline 完全匹配
+  后才能触碰音频。Follow mirror 不发送 playback.update 或独立 feedback，退出时按服务端当前 cursor
+  比较安全恢复；
+- 同一正常 source Context 可以同时服务多个 Follow follower 并作为 Broadcast source，但同一设备的
+  Follow follower、Broadcast ordinary participant 与 Handoff target execution overlay 互斥；
 - Broadcast 对普通 participant 是临时音频覆盖层：进入时冻结其原本地任务，terminal stop 后恢复
   原队列、索引、位置、速度和 playing/paused/stopped/idle 状态；source authority 的 Broadcast Context 就是
   自己正在执行并向其他设备复制的播放任务，结束时只解除复制关系，不 pause、不 seek、不切换或

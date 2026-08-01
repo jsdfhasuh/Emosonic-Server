@@ -43,8 +43,9 @@
     applied/failed/timedOut/lagging 的条件字段严格按第 6.10 节成组出现；
 16. transport message-too-big 断开、business limit bad_request、非法 requestId/action 断开，以及未知字段/null/rate 限额；
 17. nonce CSPRNG/128-bit 熵，以及 queueSongIds 在序列化、持久化和重启后的顺序保持；
-18. 单 worker 启动保护、Context/tombstone 重启恢复，以及 Handoff/Follow/Broadcast 显式终止；
-    重启必须同时覆盖 active 与 waitingForSource Broadcast；
+18. 单 worker 启动保护、Context/tombstone 重启恢复，以及 Handoff/Broadcast 显式终止；重启必须同时
+    覆盖 active 与 waitingForSource Broadcast。Follow 不恢复音频，但必须加载 SafetyLease 为
+    reconnectGrace/cleanupRequired 并恢复 suspended Context fence，等待 same-pair start/stop cleanup；
 19. Android 选择 Windows 后发现唯一 queue-backed Context，读取并应用 status 的队列/索引/播放状态/cursors，
    `player.pause` 在 Windows 执行，`queue.playItem` 切换正确歌曲；
 20. Windows 启动时已有恢复队列和当前歌曲，ensure 在没有服务端 Context 时直接创建 queue-backed
@@ -253,3 +254,35 @@
     overlay/recovery fence 零副作用拒绝；首次 close 保存 closedFrom/final cursors，匹配重试重放 ACK，
     不匹配 tombstone 返回 context_closed 且不递增。第一首 prev、最后一首 next 与最后一首自然结束按
     distinct/no-repeat 边界矩阵执行，重复 terminal fact 不再次推进或派生。
+85. supportsFollow 只有在 player/playbackContextV2/effectiveAt/canPlay/canPause/canSeek/全速率能力同时
+    满足时协商 true；任一开启 Follow/Handoff/Broadcast 的 player 路径都完成 clock warm-up，固定十字段
+    capability shape 不增加 rate 字段。
+86. Follow source fact 必须来自 authority exact pair 当前 nonce/epoch且 applied==control；playing 的两个
+    时间都 fresh，paused/stopped 不因无进度 heartbeat stale，idle start 返回 queue_required，self-follow
+    返回 conflict，全部失败零 relationship/fence 副作用。
+87. Flutter 在 follow.start 前验证 suspended Context/command lane/lease/overlay 并先持久化 acquiring
+    RecoveryRecord；服务端 start ACK 返回完整 frozen exact pair/cursors/applied baseline。逐字段匹配才
+    进入 audio overlay；baseline mismatch、prewrite 失败、ACK 前后 crash 与 active-record 写失败都只走
+    stop/stopPending cleanup，不触碰或误恢复镜像音频。
+88. FollowSafetyLease 在服务端重启后恢复 suspended Context fence；active/reconnectGrace/
+    cleanupRequired 都阻止 player/queue/prepare/update/close/ensure mutation、Handoff/Broadcast/另一个
+    Follow。每 pair 一条、每 Context 一个 overlay、每 user 256 条上限均 fail-closed，已有 start replay
+    和 stop/cleanup 不受上限影响。
+89. Follow overlay 禁用 play/pause/seek/next/prev/queue mutation，仅允许本机 volume 与 stop；mirror 不
+    发送 playback.update/follow.feedback、不写 source 或 suspended Context。source 转 idle 时清空 mirror
+    audio但保持 relationship/fence，重新 queue-backed 后继续同一 relationship。
+90. mirror queue load、seek、rate、play/pause 与媒体 apply 分别在触碰音频前后注入失败；前者保持原
+    任务并 stop，后者先恢复原任务再 stop。恢复失败保持非播放、RecoveryRecord/SafetyLease/fence，
+    不发送 stop，只做有界重试或断线。
+91. follow.stop 恢复覆盖 frozen binding/cursors 未变、任一 cursor 更高、binding 改变、Context closed
+    四分支；只有完全相同才采用原快照，其他分支采用服务端当前状态，不写回旧 queue/cursor。恢复后
+    stop ACK 原子释放 fence，最后清本地 record，之前不发送 normal playback.update。
+92. source authority 离线、playing fact stale 或 status 恢复失败进入独立 30 秒 source recovery，source
+    closed 立即退出；follower disconnect 进入 reconnectGrace，同进程 same pair 可重发 start，grace
+    到期转 cleanupRequired tombstone，旧 pair 下次注册不能直接写 suspended Context。
+93. stop ACK 丢失只重试 stop；app restart 不自动恢复 Follow audio，只读取 RecoveryRecord cleanup；
+    server restart 不自动恢复 mirror，只加载 SafetyLease/fence。相同 pair start/stop 完成前普通写保持
+    fail-closed。
+94. 同一正常 source Context 同时拥有多个 Follow follower 和一个 Broadcast source时两个 profile 都
+    正常派生同一 canonical fact；同一设备尝试 Follow follower、Broadcast ordinary、Handoff target
+    任意两种 overlay 并发时第二个入口被拒绝，且两侧 recovery/fence 不互相删除。

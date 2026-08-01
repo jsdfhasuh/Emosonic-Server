@@ -12,6 +12,10 @@ Flutter 必须按下列条件区分本机角色：
 2. ordinary participants 中存在 self 的冻结 client/device pair：`ordinaryParticipant`；
 3. 其他 owner/controller：`controllerOnly`。
 
+进入 `ordinaryParticipant` 前必须确认本机没有 active/acquiring/restoring Follow overlay 或 Handoff target
+execution；这些角色的本地音频 generation、恢复记录和持久化 fence 互斥。正常 sourceAuthority 可以
+同时是其他设备 Follow relationship 的 source，因为两者都只消费/派生同一个 source Context。
+
 sourceAuthority 收到 `broadcast.start` 时只能记录 lifecycle/broadcastId/intentId 并开始正常 source 状态上报；
 不得重新 apply queue、seek 到 snapshot position、设置 playbackRate、调用 play/pause 或创建恢复快照。
 后续 source 音频变化只由普通 Context command、本地人工操作或播放器自然事件驱动，Broadcast mirror

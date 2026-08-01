@@ -35,9 +35,11 @@ controller 可发起控制；当前 authority 必须是在线 player。所有资
 规则先限定用户域并对不可见 binding 返回成功空数组。Context authority 持久绑定 `authorityClientId` 与
 `authorityDeviceSessionId`；只有两者均匹配的重连才恢复 authority 路由。
 
-本节表格中的一般授权不覆盖第 5.5 节 Broadcast source-ownership/suspended-Context 写屏障。任何
-ensure、close、prepare、queue/player/update 或 binding mutation 在获得角色授权后仍必须检查该屏障；
-命中时按第 5.5 节返回 `conflict`。
+本节表格中的一般授权不覆盖第 5.3—5.5 节 Follow/Handoff/Broadcast lifecycle 与 occupancy fence。
+任何 ensure、close、prepare、queue/player/update 或 binding mutation 在获得角色授权后仍必须检查当前
+exact pair/Context 是否正作为 Follow follower、Broadcast ordinary 或 Handoff target overlay；命中时
+返回描述被占用 suspended Context 的 `conflict` 与完整四 cursor，零副作用。正常 source Context 可以
+同时被 Follow 和 Broadcast 读取/派生，不构成 source-side 互斥。
 
 close 还必须遵守以下安全闭合：
 
@@ -159,6 +161,9 @@ muted:O bool
 只有当前 Context authority 的当前 client/device/Socket 可以发送。服务端必须验证 authenticated user、
 authorityClientId、authorityDeviceSessionId、connectionNonce/connectionEpoch 和 clientSeq 作用域；
 controller-only 或旧 authority 返回 `forbidden`，旧 device session 返回 `conflict`。
+同一 exact pair 正处于 Follow follower overlay 时，mirror execution 禁止发送普通 playback.update；
+SafetyLease fence 必须在进入 reducer 前以 suspended Context `conflict` 拒绝，不能把 source mirror 写入
+follower 原 Context。
 
 公共状态规则：
 

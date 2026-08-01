@@ -80,6 +80,11 @@ serverUpdatedAtMs
 sessionId、authorityClientId、queueSongIds、
 currentIndex、queueRevision、version、baseControlVersion、observedControlVersion 和 target 字段。
 
+source Context 的 Follow subscribers 是合法 recipients，但只能把 canonical queue/status/update 作为
+本地 mirror 输入。follower overlay 不得把执行结果回送为普通 playback.update；服务端也不得从 Follow
+本地状态改写 source Context、suspended Context、control transaction 或 DevicePlaybackState。source
+进入 idle 时仍先提交唯一 source Context fact，follower 随后清空 mirror audio并保持 relationship。
+
 #### 6.6.1 Passive canonical update
 
 ```json

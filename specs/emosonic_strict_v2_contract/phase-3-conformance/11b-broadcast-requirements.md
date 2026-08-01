@@ -29,9 +29,12 @@ playbackRate 仍必须严格匹配 delivery target。
 当服务端接受 Broadcast start 时，服务端必须为每个 ordinary participant 原子记录并占用其唯一原
 authority Context；占用期间对该 suspended Context/binding 的 queue、prepare、player、playback.update、
 close、ensure 创建/初始化/重绑、Handoff/ready/authority switch 和其他 binding mutation 必须返回
-conflict 且无副作用。已经作为其他 Broadcast source/ordinary participant 的 Context 或 pair 不得再次
+conflict 且无副作用。已经作为其他 Broadcast source/ordinary participant 或 Follow follower 的 Context
+或 pair 不得再次
 占用。terminal stop、普通 mutation 屏障释放、restorePending 安装和 terminal snapshot 必须同成同败；source authority 的 Broadcast
 Context 不得被当作 suspended Context 拦截，但必须受第 5.5 节 source-ownership fence 约束。
+同一正常 source Context 可以同时拥有 Follow followers 与一个 Broadcast；两种 profile 必须保持各自的
+recovery/fence，不得相互清理。
 
 **REQ-042 — Participant restore versus source retain**
 当 Flutter ordinary participant 首次接受 Broadcast start 时，它必须先捕获一次入口恢复快照，并将
