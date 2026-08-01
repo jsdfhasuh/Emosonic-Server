@@ -25,6 +25,10 @@ recipient 构造的无 target envelope。上述 lifecycle/mirror/observation pus
 canonical `broadcast.feedback` confirmation 与 `broadcast.feedback.rejected` 分别使用本节后文的独立
 闭合 shape：
 
+`participants` 与 participantStates 的 exact client/device membership 在 start 提交时冻结，到 terminal
+保持不变。断线只改变 online；resync 不增加、删除或替换成员。r18 没有 leave/add/remove push 或
+status mutation。
+
 ```json
 {
   "playbackContextId": "playback:user:main",
@@ -182,6 +186,11 @@ positionMs/playbackRate 是 terminal mirror target，不是原任务实际状态
 broadcastId/terminal revision 的 terminal gate 输入，恢复原任务后使用 payload 中的 terminal target
 发送第 5.5.2 节完整 applied feedback。客户端向服务端发送 `broadcast.restore` 必须返回
 `not_supported`。
+
+未确认 pair 的 terminal `broadcast.stop` / `broadcast.restore` 必须在任何 suspended Context 普通
+command 之前可靠加入当前 Socket 发送路径。enqueue 失败时服务端立即断开该 Socket，并在下次注册
+用新 deliveryId 先 replay；不得绕过 terminal delivery gate。成功 enqueue 或 status 读取都不清
+restorePending，只有 matching terminal applied feedback 可以清除。
 
 服务端接受 ordinary participant 的 `broadcast.feedback` 后，只向请求 participant 的当前 Socket 发送以下 canonical
 confirmation，不向 owner、其他 participants 或 Context subscribers 广播：
@@ -353,6 +362,10 @@ delivery 是可执行输入。客户端可以用新 requestId 查询 `broadcast.
 - terminal applied 且 restorePending 已清除时额外输出 `restoreCompleted:true`；此时成组的
   queue/track/`state:"stopped"`/position/rate 是已销毁的 terminal mirror target，不是恢复后原任务的
   实际 transport。其他状态禁止 `restoreCompleted`。
+
+`syncStatus:"applied"` 只表示该 frozen participant 已应用所报告 revision 的 target；Broadcast 是
+soft sync，不保证随后与 source 的 drift 持续小于固定毫秒数。由于 feedback 没有 position sample
+time，positionMs 只能验证 int、非负和已知 duration 范围，不能用于构造 drift SLA。
 
 full ACK 顶层 payload 的 `serverTimeMs:int>=0` 是本次 status 读取的服务端时刻，不属于
 BroadcastSnapshot，也不增加 broadcastRevision。`broadcast.positionMs` 与

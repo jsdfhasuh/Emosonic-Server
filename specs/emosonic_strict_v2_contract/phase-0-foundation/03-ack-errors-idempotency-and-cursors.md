@@ -106,6 +106,21 @@ currentControlVersion
 涉及 source/target 两个 Context 时，这五个字段描述真正阻止操作的 Context；source Context ID 仍由
 原请求 payload 确定。纯 requestId fingerprint conflict 可以省略 Context cursor。
 
+terminal Broadcast 的 exact ordinary pair 存在 `restorePending:true` 时，服务端必须在 reducer、路由和
+任何 cursor mutation 前应用 action-aware gate。以下写操作统一返回
+`restore_in_progress/retryable:true` 与真正 suspended Context 的完整四 cursor，零副作用：会创建、
+初始化、重绑或改 snapshot 的 ensure、`playback.context.prepare/close`、`queue.context.sync`、
+`queue.playItem`、全部 `player.*`、`playback.update`、`playback.handoff.start/complete`、
+`playback.ready(ready:true)`、`playback.context.prepared(ready:true)`、`follow.start`、`broadcast.start`
+以及 authority/device binding mutation。
+
+gate 只允许 `playback.ready(ready:false,errorCode:"restore_in_progress")`、
+`playback.context.prepared(ready:false,errorCode:"restore_in_progress")`、`playback.handoff.cancel`、
+`follow.stop`、terminal `broadcast.feedback`、`broadcast.status`、Context list/status/subscribe/unsubscribe、
+`device.setVolume/device.volume.update/device.list`、`system.ping` 与 terminal replay。两个 negative
+confirmation 只能结算匹配的 raced prepare；不得初始化队列、推进 cursor、进入 Handoff commit 或
+清除 restorePending。active/waitingForSource occupancy 仍返回 `conflict`，不得与 terminal gate 混用。
+
 服务端选择错误前必须固定执行 `envelope/schema -> authentication -> registration/capability -> caller
 role -> authenticated-user-scoped lookup -> lifecycle/overlay/recovery fence -> base cursor -> mutation`。
 不得为了区分错误码做全局资源存在性查询。其他用户的资源与真正不存在的资源统一返回
@@ -231,6 +246,14 @@ Context ID、suspended authority exact pair、epoch/version/queue/control/applie
     baseline 的 start 可以恢复/重放已有 relationship；另一 source、另一 suspended Context 或不同
     baseline 返回 `conflict`。stopPending 只能重试 stop。requestId cache、Socket 断开或服务端重启不得
     删除未完成 SafetyLease、释放 cleanupRequired fence 或把 Follow 音频自动视为已恢复。
+18. 未确认 terminal recovery 的 exact pair 注册或重连后，服务端必须先把带新 deliveryId 的
+    `broadcast.stop` 或 `broadcast.restore` 可靠加入当前 Socket 发送路径，才可开放 suspended Context
+    普通业务。enqueue 失败必须立即断开；不得让该 Socket 先收到普通写 command。下次注册重新执行
+    terminal replay，直到 matching applied feedback 清除 restorePending。
+19. 管理端 recovery abandon 必须原子写入 `(authenticated user, clientId, deviceSessionId)` permanent
+    decommission tombstone。该 exact pair 后续不得完成注册、出现在 `device.list` 或接收 command；在线
+    Socket 必须在事务提交时撤销注册并断开。同一 clientId 使用新的 deviceSessionId 不匹配旧
+    tombstone，可以建立新生命周期。
 
 ### 4.5 Cursor 的含义与递增矩阵
 

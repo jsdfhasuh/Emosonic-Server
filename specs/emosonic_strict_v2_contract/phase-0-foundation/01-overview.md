@@ -59,7 +59,17 @@
   恢复 Context；源任务当时 playing 就继续播放，当时 paused 就保持暂停。source 继续使用普通
   `playback.update`，BroadcastSnapshot 只派生 source cursors；只有 ordinary participants 使用
   `broadcast.feedback`，且镜像执行不得污染其原 PlaybackContext。start 时 source 实际状态必须是
-  playing；start intent、terminal 补发与客户端恢复门控必须跨断线保持；
+  playing；Broadcast 只承诺 revision target 的软同步，不承诺持续 drift SLA；membership 从 start 到
+  terminal 固定，不支持 leave/add/remove；start intent、terminal 补发与客户端恢复门控必须跨断线保持；
+- ordinary pair 的 terminal `restorePending:true` 会冻结 suspended Context 全部普通写操作；服务端统一
+  返回带完整四 cursor 的 `restore_in_progress`，Flutter 不排队这些命令。只有只读/订阅、terminal
+  feedback、cancel/stop cleanup，以及 raced prepare 的 `ready:false` / `prepared:false` negative
+  confirmation 可以穿过 gate；terminal delivery 未可靠加入当前 Socket 发送路径时必须断开并在下次
+  注册先 replay；
+- recovery abandon 只属于管理端/调试 CLI，不是 Flutter strict realtime action。它必须原子清理
+  terminal recovery obligation、断开并移除在线 exact pair，同时写入永久
+  `(user, clientId, deviceSessionId)` decommission tombstone；同一 clientId 只能用新的 deviceSessionId
+  建立新生命周期；
 - 本契约要求 `protocolVersion` 的 major 为 `2` 且 minor 至少为 `8`。待机 Context、
   `playback.context.ensure`、`playback.context.prepare`、Context discovery 和设备级远程音量全部属于
   Core，不设置旧版本兼容 capability。低于 `2.8.0` 或 major 不为 `2` 时 Flutter 必须 fail-closed；

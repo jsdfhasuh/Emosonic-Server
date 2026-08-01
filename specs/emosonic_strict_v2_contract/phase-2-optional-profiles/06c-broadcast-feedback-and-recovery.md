@@ -38,6 +38,8 @@ feedback 必须匹配其所报告 revision 的该值；queueIndex/trackId/state/
 严格校验。feedback.positionMs 是设备应用后的实际观测值；服务端只校验它是 int、非负并位于服务端
 已知的当前媒体有效时长范围内，然后原样保存。因 feedback 没有位置采样时间，服务端不得使用 delivery
 计划时间、position 差值或网络到达时间做精确时间位置比对，也不得反过来改写 canonical anchor。
+因此 Broadcast 是 soft sync：`syncStatus:"applied"` 只证明 participant 已应用所报告 revision 的完整
+target，不证明随后持续 drift 小于固定阈值，也不得据此声明毫秒级同步 SLA。
 更高 revision 已分发时，仍可接受 retained
 旧 revision 的有效 delivery feedback，并按 lagging/最早未确认规则推进。只有同一 revision 被
 `broadcast.resync` 或 terminal replay 换成新 deliveryId 时，旧物理连接/旧 attempt 的结果才失效。若 Broadcast 或
@@ -129,16 +131,23 @@ authorityClientId/authorityDeviceSessionId 或 device→Context binding 的内�
 内容看似相同也不得被当成隐式写通道，participant 重连按本节的 Broadcast replay 恢复，不重新 ensure
 或捕获原 Context。
 
-Broadcast 已 terminal 且该 pair 仍为 `restorePending:true` 时，`playback.context.ensure` 使用更精确的
-结算：服务端返回同 requestId 的 `system.error(code:"restore_in_progress",retryable:true)`，携带
-suspendedPlaybackContextId 及当前 `currentVersion/currentQueueRevision/currentControlVersion`。该请求
-作为无副作用的已拒绝结果进入 requestId cache；相同 requestId 重放同一错误，不创建、初始化、重绑、
-修改 snapshot 或递增任一 cursor，也不清除 restorePending。terminal applied feedback 被接受并清除
-restorePending 后，客户端必须以新 requestId 重试 ensure。active/waitingForSource 占用屏障仍使用上一段
-`conflict`，不得与 terminal restorePending 错误码混用。若 suspended Context 已在恢复竞态中 closed，
-三个 current cursor 取 closed tombstone 的最终值，restore_in_progress 在 gate 清除前优先于
-context_closed；Flutter 必须先按第 5.5.3 节吸收 closed/binding 变化、完成 terminal feedback，再用新
-requestId ensure，不得靠 ensure 穿透 gate 创建替代 Context。
+Broadcast 已 terminal 且该 exact pair 仍为 `restorePending:true` 时，服务端必须把 occupancy fence
+替换为 action-aware write gate。会创建、初始化、重绑或改 snapshot 的 ensure、
+`playback.context.prepare/close`、`queue.context.sync`、`queue.playItem`、全部 `player.*`、
+`playback.update`、`playback.handoff.start/complete`、`playback.ready(ready:true)`、
+`playback.context.prepared(ready:true)`、`follow.start`、`broadcast.start` 及 authority/device binding
+mutation 都必须在 reducer/路由前返回 `system.error(code:"restore_in_progress",retryable:true)`，携带
+真正 `suspendedPlaybackContextId` 的
+`currentEpoch/currentVersion/currentQueueRevision/currentControlVersion`，并保持零副作用。
+
+只允许读取/订阅、`device.setVolume/device.volume.update/device.list`、`system.ping`、terminal replay、
+terminal `broadcast.feedback`、`broadcast.status`、`follow.stop`、`playback.handoff.cancel`，以及
+`playback.ready(ready:false,errorCode:"restore_in_progress")` / matching
+`playback.context.prepared(ready:false,errorCode:"restore_in_progress")`。两个 negative confirmation 只
+结算 raced prepare，不初始化队列、不推进 cursor、不进入 commit 且不清 gate。相同 requestId 的被拒
+请求重放相同 error；terminal applied feedback 清除 gate 后必须使用新 requestId。若 suspended Context
+已 closed，四个 cursor 取 closed tombstone final 值，gate 清除前 restore_in_progress 优先于
+context_closed。active/waitingForSource occupancy 仍使用上一段 `conflict`，不得混用错误码。
 
 source authority 断线时，服务端不得修改 source Context 或 source cursors；应原子地将
 `lifecycleState` 从 active 改为 waitingForSource、计算最后安全 pause anchor、令
@@ -147,7 +156,9 @@ source authority 断线时，服务端不得修改 source Context 或 source cur
 30 秒 timer；waiting 期间除 status/stop 外的 Broadcast mutation 返回 `conflict`。
 
 owner/controller 断线本身不改变 lifecycle，只要 source authority 仍在线，镜像继续；ordinary
-participant 断线只令该冻结 pair 的 online=false，屏障和 membership 保留到 terminal。相同 ordinary
+participant 断线只令该冻结 pair 的 online=false，屏障和 membership 保留到 terminal。membership 从
+start 原子提交到 terminal 固定，不支持 leave/add/remove，也不得因断线、能力变化或新 deviceSession
+注册重筛选/替换 participant。相同 ordinary
 pair 在 `active|waitingForSource` 重连并完成 register 后，服务端必须在接受该 pair 的普通 Context mutation 前只向该 pair 推送
 server-only `broadcast.resync`，其中持久化 BroadcastSnapshot 与 broadcastRevision 原样不变，同时生成
 新 `deliveryId`。lifecycleState=active 时，无论 Snapshot.state 为 playing、paused 还是 stopped，都必须
@@ -178,6 +189,12 @@ playing 使用新 effective-at 计划，paused/stopped 保持不播放。这是�
 Context mutation 屏障释放、每个 ordinary pair 的 `restorePending:true` 和 terminal snapshot 持久化
 必须原子提交；服务端完成提交后才可发送 ACK/terminal push。服务端重启或异常终止 Broadcast 时也
 必须执行同一提交，基础 PlaybackContext 内容和 cursor 保持不变。
+
+对每个在线未确认 ordinary pair，terminal `broadcast.stop` 或 compact `broadcast.restore` 必须先可靠
+加入该 pair 当前 Socket 的发送路径，服务端才能向该 Socket 开放 suspended Context 普通业务。
+enqueue 失败必须立即断开，不能保持连接并继续发送普通 command；下次注册仍先生成新 deliveryId 并
+replay terminal，再开放业务。发送成功本身不清 restorePending，只有 matching terminal applied
+feedback 才清 gate。
 
 服务端必须把 terminal Broadcast 作为可重放 tombstone/outbox 自 terminal 提交时起完整保留 7 天。
 完整记录必须包含 intentId、terminal BroadcastSnapshot、source 与 ordinary 的冻结 client/device pair、各
@@ -219,6 +236,14 @@ TerminalRecoveryRecord。该 pair 以同一 deviceSessionId 重连时，服务�
 currentDeliveryId 的完整 terminal
 applied feedback 后原子清除 restorePending 与 recovery record。source/controller 在完整记录已压缩后查询
 status 可得到 `not_found`，并按第 5.5.3 节只清 lifecycle/UI。
+
+无法由客户端恢复的 obligation 只能由管理端/调试 CLI 执行 recovery abandon；r18 不定义对应 Flutter
+realtime action。管理事务必须原子确认 Broadcast terminal 与 exact pair restorePending，删除 full/compact
+recovery obligation 和 ordinary fence、释放 recovery slot，写 abandoned tombstone 与 permanent
+`(user, clientId, deviceSessionId)` decommission tombstone，并撤销/断开在线 exact pair、从
+`device.list` 移除且停止 command routing。任一步失败全部回滚，不能只释放 fence。
+decommission tombstone 可压缩为最小 key，但只能随账号/用户数据整体删除；达到部署上限时必须限制
+新 deviceSession 创建，不能删除旧 tombstone。同一 clientId 的新 deviceSessionId 可建立新生命周期。
 
 Flutter 必须持久化最小恢复记录（broadcastId、source playbackContextId、
 suspendedPlaybackContextId、原任务恢复 generation 与原任务快照），但不得持久化镜像队列。应用启动发现该记录时必须在 register 前先进入

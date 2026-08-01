@@ -321,10 +321,14 @@ preparing -> ready -> committing -> completed
 
 Handoff `errorCode` 必须匹配 `^[a-z][a-z0-9_]{0,63}$`。服务端标准值固定为
 `prepare_failed`、`prepare_timeout`、`commit_timeout`、`target_disconnected`、
-`source_disconnected`、`server_restart`、`source_changed`、`commit_failed`。target 可在 `playback.ready.ready:false` 中返回符合相同
+`source_disconnected`、`server_restart`、`source_changed`、`commit_failed`、
+`restore_in_progress`。target 可在 `playback.ready.ready:false` 中返回符合相同
 格式的稳定扩展码。`errorMessage` 不得包含凭据、文件路径、堆栈或内部数据库信息。
 
 Handoff start、ready、complete、cancel 的每次状态推进都必须先检查第 5.3、5.5 节 Follow/Broadcast 写屏障：source
 Context 正在作为非终态 Broadcast source，或 source/target pair 的 Context 正在作为 ordinary
-participant/Follow follower suspended Context，或任一 source/target pair 存在 restorePending 时返回 `conflict`；不得
-准备、切 authority、退休 standby 或发送 release。
+participant/Follow follower suspended Context 时返回 `conflict`。任一 source/target exact pair 存在
+terminal `restorePending` 时，start、complete 与 `ready:true` 改为返回描述真正 suspended Context 的
+`restore_in_progress` 与完整四 cursor；不得准备、切 authority、退休 standby 或发送 release。
+`playback.ready(ready:false,errorCode:"restore_in_progress")` 只允许结算 matching raced prepare，不进入
+commit、不推进 cursor且不清 gate；`playback.handoff.cancel` 仍允许完成 cleanup。

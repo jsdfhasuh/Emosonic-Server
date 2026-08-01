@@ -24,6 +24,8 @@ Broadcast 的产品语义是把 `playbackContextId` 当前 source authority 正�
 participants 并同步播放，不是为 source 创建或切换到另一份播放任务。source Context 始终是源设备
 自己的任务；ordinary participants 才使用临时音频覆盖层。停止 Broadcast 只终止复制/同步关系，
 不得对 source transport 隐式执行 pause、stop、seek 或 queue replacement。
+同步承诺固定为 soft sync：`syncStatus:"applied"` 只证明设备应用了所报告 revision 的 target，不证明
+此后持续 drift 小于任何固定毫秒阈值。feedback.positionMs 只按类型、非负和已知媒体 duration 校验。
 
 本节中的 `participants` 只表示接收镜像的 ordinary participants，不包含 source authority。source 由
 `authorityClientId` / `authorityDeviceSessionId` 唯一标识，并通过普通 PlaybackContext command 与
@@ -31,6 +33,9 @@ participants 并同步播放，不是为 source 创建或切换到另一份播�
 ownerClientId 的当前 Socket 在本机角色是 controllerOnly 时可以收到第 6.10 节 Broadcast push
 观察副本，但 owner 不因此成为
 participant、不进入 participantStates，也不发送 feedback。
+最终 ordinary membership 在 start 原子提交时冻结，并保持到 terminal；r18 不提供 leave、add、remove
+participant action。断线只改变 frozen pair 的 online 状态，重连只恢复同一 membership，不能重筛选或
+替换 deviceSessionId。
 
 | Action / type | payload | 服务端动作与响应 |
 | --- | --- | --- |
@@ -41,7 +46,7 @@ participant、不进入 participantStates，也不发送 feedback。
 | `broadcast.seek` / `command` | `playbackContextId:R`、`broadcastId:R`、`positionMs:R int>=0`、`baseControlVersion:R int>=1` | 同上，按 `player.seek` 规则处理。 |
 | `broadcast.playItem` / `command` | `playbackContextId:R`、`broadcastId:R`、`queueIndex:R int>=0`、`baseQueueRevision:R int>=1`、`baseControlVersion:R int>=1` | 在 source Context 临界区按 `queue.playItem` 规则接受，推进 source cursors、路由 source authority，并向 ordinary participants 推送同一派生目标。 |
 | `broadcast.feedback` / `event` | 公共字段：`playbackContextId:R`、`broadcastId:R`、`deviceSessionId:R`、`deliveryId:R non-empty string`、`executionStatus:R applied\|failed`、`clientSeq:R int>=1`；条件字段见第 5.5.2 节 | ordinary participant 上报某个 mirror revision/delivery 的成功或失败结果。服务端验证 client/device/nonce、membership、lifecycle、revision、该 revision ledger 当前 deliveryId、track 证明和独立 clientSeq，原子更新 participantStates，并按第 6.10 节只向请求 Socket 发送 canonical confirmation；不回 ACK，不修改 source Context、Broadcast projection 或任何 cursor。ledger 无法匹配时改发 `broadcast.feedback.rejected`。 |
-| `broadcast.stop` / `command` | `playbackContextId:R`、`broadcastId:R` | 原子终止 mirror lifecycle、释放 ordinary Context mutation 屏障并安装 restorePending eligibility fence；ACK 并向 source 与 ordinary participants 推送 terminal `broadcast.stop`，不得修改 source Context/transport。terminal full tombstone/outbox 保留 7 天，后续未确认 pair 压缩为 TerminalRecoveryRecord 并以 `broadcast.restore` 补发到恢复确认。 |
+| `broadcast.stop` / `command` | `playbackContextId:R`、`broadcastId:R` | 原子终止 mirror lifecycle、释放 ordinary occupancy 屏障并安装 restorePending write fence；ACK 并向 source 与 ordinary participants 推送 terminal `broadcast.stop`，不得修改 source Context/transport。terminal full tombstone/outbox 保留 7 天，后续未确认 pair 压缩为 TerminalRecoveryRecord 并以 `broadcast.restore` 补发到恢复确认。terminal delivery 必须先可靠加入当前 pair 发送路径；enqueue 失败立即断开并在下次注册先 replay。 |
 
 start 的 authenticated client 是 `ownerClientId`。owner 和当前 Context authority 可以执行
 play/pause/seek/playItem/stop；ordinary participant 只能请求 status 和发送自己的 feedback，
@@ -55,6 +60,8 @@ feedback。所有参与者必须满足上述 negotiated 条件。显式列表中
 `broadcast.progress`、`broadcast.state.sync`、`broadcast.waiting`、`broadcast.resume`、
 `broadcast.resync`、`broadcast.restore`、`broadcast.feedback.rejected` 均为 server-only action；客户端
 发送任一个都返回 `not_supported`，不得把它们误当作新的控制入口。
+任何 leave/add/remove participant 或 recovery abandon realtime action 同样不属于 r18 surface，返回
+`not_supported`；recovery abandon 只允许管理端/调试 CLI 执行，并必须绑定 exact-pair decommission。
 每个 ordinary pair 在 start 成功时必须预留一个 per-user recovery slot，从 terminal 后恢复确认时释放；
 每 authenticated user 同时最多 256 个 slot。无可用 slot 的目标进入 skippedClientIds，不得先加入
 后在 terminal 时丢失 recovery record。
@@ -107,3 +114,8 @@ participants 的 wire shape 仍是 clientId 数组，但服务端创建 Broadcas
 participant 的 push、发送 feedback 或被 `online:true` 表示；相同 clientId 以不同 deviceSessionId
 注册不得继承 active Broadcast membership。相同 pair 重连后可以继续接收 active Broadcast，clientSeq
 按新的 nonce/epoch 作用域重新开始。
+
+terminal 后 frozen ordinary pair 的 `restorePending:true` 阻止其 suspended Context 的所有普通写动作，
+而不是只阻止再次进入 Broadcast。被阻止请求按第 4.2、5.5.2 节返回 `restore_in_progress` 与完整四
+cursor，Flutter 不得排队或重放；只读、terminal feedback 和明确 cleanup/negative confirmation 例外
+可以继续，直到 matching terminal applied feedback 原子清除 gate。

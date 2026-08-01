@@ -7,6 +7,11 @@
 
 下面所有业务消息都必须有顶层 `connectionNonce`、`connectionEpoch`，且不得有任何层级的 `sessionId`。服务端 strict 业务消息不得有 target 字段；收件人由 Socket.IO sid 决定。
 
+存在 permanent decommission tombstone 的 `(user, clientId, deviceSessionId)` 不得形成当前 Socket、出现
+在 `device.list` 或成为任何 command recipient。管理端 recovery abandon 提交该 tombstone 时，必须在
+同一事务撤销并断开仍在线的 exact pair、清除其在线音量状态和 device-list presence；同一 clientId
+只有换用新的 deviceSessionId 才能建立新生命周期。
+
 ### 6.0 设备级音量 command 与实际状态
 
 服务端接受 `device.setVolume` 后，只向精确匹配 `targetClientId` / `targetDeviceSessionId` 的当前
@@ -187,7 +192,7 @@ deviceSession 变化或其他第 5.1 节定义的失效信号时先递增 genera
 ### 6.2 `playback.context.ensure`：启动时确保唯一 Context
 
 player 完成 negotiated 注册后，必须先读取当时可用的本地播放恢复快照，再立即发送 ensure。第 5.5
-节已有 Broadcast 恢复记录的 ordinary pair 是唯一例外：它先进入 restoringOriginalContext 门控并等待
+节已有 Broadcast 恢复记录的 ordinary pair 是启动流程例外：它先进入 restoringOriginalContext 门控并等待
 服务端 active/terminal replay；只有 terminal 恢复完成或 tombstone 过期回退流程要求时才可发送 ensure。
 已有第 5.3 节非终态 FollowSafetyLease/cleanupRequired tombstone 的 exact pair 也不得用 ensure 穿透
 suspended Context fence；同进程 resume 重发 follow.start，stopPending/app restart 只重试 follow.stop。
@@ -198,6 +203,9 @@ suspendedPlaybackContextId 与 `currentEpoch/currentVersion/currentQueueRevision
 该结算不得创建、初始化、重绑、修改或关闭 Context，
 不得递增 cursor、发送 bindings.changed 或清除 restorePending。恢复完成后必须使用新 requestId 重试，
 旧 requestId 永远重放原错误。
+相同 action-aware gate 也冻结该 suspended Context 的 prepare/close/queue/player/update、
+Follow/Broadcast/Handoff start/complete 和 binding mutation；它们都必须在路由或 reducer 前以
+`restore_in_progress` 与同一完整四 cursor 拒绝。该规则不是 ensure-only 特例。
 本地已有队列时：
 
 ```json
@@ -438,7 +446,9 @@ controlVersion：
 ```
 
 `ready:true` 时 error 字段禁止，并且服务端必须验证 Context 已为非空；`ready:false` 时 errorCode 必需，
-只允许 `queue_required|restore_failed|prepare_timeout|authority_changed`。服务端不回 ACK，而是向当前
+只允许 `queue_required|restore_failed|prepare_timeout|authority_changed|restore_in_progress`。
+`restore_in_progress` 只允许当前 authority 对 matching raced prepare 做 negative cleanup；它只结算该
+prepare，不初始化队列、不推进 cursor、不提交 ready，也不清 restore fence。服务端不回 ACK，而是向当前
 Context subscribers 广播无 requestId 的同 action canonical result，并增加当时最新
 `controlVersion`。若 prepare 期间任一合法 queue sync 把 Context 变为非空，服务端可直接将该 prepare
 结算为 ready 并广播成功；之后到达的同 intentId `ready:true` 是幂等重复。10 秒到期时，Context 已

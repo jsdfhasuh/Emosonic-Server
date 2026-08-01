@@ -46,26 +46,31 @@ paused。恢复失败时保持非播放（入口 stopped 继续保持 stopped）
 返回的状态；不得持久化群播队列。
 
 从接受 terminal push 到原任务恢复完成，Flutter 必须进入仅本地的 `restoringOriginalContext` 门控；
-这是本契约对“服务端已经释放屏障、客户端仍在异步恢复”竞态的唯一解决方案。门控期间：
+它与服务端仍保持的 pair-level `restorePending` write gate 共同关闭“occupancy 已释放、客户端仍在异步
+恢复”的竞态。门控期间：
 
-1. 所有发给 suspendedPlaybackContextId 的普通 `player.*` / `queue.playItem` command 必须按
-   `(epoch, controlVersion)` 排队，不得与恢复队列并发执行；本地人工控制也必须排队或暂时禁用，
-   Flutter 自身不得在门控期间发起 ensure、close、prepare、Handoff 或其他 binding mutation；
-   若缺陷或竞态仍发送 ensure，服务端必须按第 5.5.2/6.2 节以 `restore_in_progress` 结算，Flutter 不得
-   把该错误当成 Context 不存在或改用新本地快照重试；
+1. Flutter 必须禁用而不是排队所有 ordinary Context 写操作和本地人工 transport/queue control；不得
+   发送 ensure、close、prepare、queue/player、playback.update、Follow/Broadcast/Handoff start/complete
+   或 binding mutation。若缺陷或竞态仍发送，服务端按第 4.2、5.5.2 节以
+   `restore_in_progress` 和 suspended Context 完整四 cursor 零副作用结算；Flutter 不得把该错误解释为
+   Context 不存在，不得改用本地快照或旧 base cursor 重试；
 2. 门控期间收到 `playback.prepare` 时不得预加载或延后到超时，必须立即发送
-   `playback.ready(ready:false,errorCode:"restore_in_progress")`；不得进入 Handoff commit；
-3. Flutter 不得发送由恢复动作产生的 localUser/passive `playback.update`，也不得用冻结快照覆盖已经
+   `playback.ready(ready:false,errorCode:"restore_in_progress")`；收到 matching raced Core prepare 时
+   立即发送 `playback.context.prepared(ready:false,errorCode:"restore_in_progress")`。两者只做 negative
+   cleanup，不得进入 Handoff commit、初始化队列或清 restore fence；
+3. Flutter 不得发送由恢复动作产生的 localUser/passive `playback.update`，不得重放恢复期间被用户
+   尝试的普通 command，也不得用冻结快照覆盖已经
    收到的更新版本服务端状态；
 4. 如果收到 `playback.context.closed`、`bindings.changed`、Handoff completed 或其他 authority/binding
    变化，必须取消冻结快照写入，读取服务端当前状态并应用服务端返回的状态；
-5. 原任务恢复成功后，按 controlVersion 顺序执行仍适用的排队命令；发现版本缺口、Context 已变化或
-   命令无法安全重放时，只读取一次服务端当前 status 并应用其状态，不猜测缺失命令；
-6. 只有恢复完成且排队命令已执行或由最新服务端状态吸收后，才能退出门控并对 terminal revision
+5. 原任务恢复期间发现 cursor gap、Context/binding 已变化或快照无法安全采用时，只读取一次服务端
+   当前 status 并应用其状态，不猜测缺失命令；恢复期用户意图全部丢弃，恢复完成后只能基于最新
+   canonical cursor 接受新的用户操作；
+6. 只有原任务恢复完成或被最新服务端状态安全吸收后，才能对 terminal revision
    按第 5.5.2 节发送单次完整 applied `broadcast.feedback`（`state:"stopped"`、
-   `restoreCompleted:true`）。服务端接受该 feedback 时原子
-   清除此 pair 的 restorePending；在此之前该 pair 不得成为新 Broadcast source/participant 或 Handoff
-   source/target。恢复失败时保持门控和非播放状态（入口 stopped 继续保持 stopped），发送 failed feedback 但不清除 restorePending，由 terminal
+   `restoreCompleted:true`）。服务端接受该 feedback 时原子清除此 pair 的 restorePending；Flutter
+   收到 canonical confirmation 后退出门控并重新启用普通操作。在此之前该 pair 的全部普通写都被
+   gate 阻止。恢复失败时保持门控和非播放状态（入口 stopped 继续保持 stopped），发送 failed feedback 但不清除 restorePending，由 terminal
    replay 在后续重连继续恢复。
 
 sourceAuthority 的 terminal stop 只清除 lifecycle 标记，不调用 pause/stop/seek/queue apply，不发送

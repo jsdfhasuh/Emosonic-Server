@@ -119,15 +119,17 @@
     revision/deliveryId/queueIndex/trackId/state，failed 必须带 failed revision/last applied/errorCode。合法 request
     只收到同 Socket、无 requestId confirmation，clientSeq 重复/冲突按第 4.5 节处理，
     Context/source/broadcast cursors 不变；positionMs 只校验 int、非负和媒体范围并保存实际观测值，
-    不按到达时间做精确位置比对，track/state/rate/revision/deliveryId 仍严格校验；
+    不按到达时间做精确位置比对，track/state/rate/revision/deliveryId 仍严格校验；applied 只证明 target
+    已应用，不声称持续 drift 小于固定阈值；
 48. ordinary participant 进入 Broadcast 后，其 suspended Context/binding 的 queue、prepare、player、
     update、close、ensure create/init/rebind、全部 Handoff/ready/authority switch 和其他 binding mutation
     均返回 conflict 且无执行/无 mutation；已被其他 Broadcast 占用的 source/ordinary pair 不能再次
     start；active source 的 close/Handoff/binding mutation 同样 conflict，waitingForSource 继续保持屏障；
     terminal 后 restorePending pair 不能成为新 Broadcast/Handoff 任一角色；
 49. ordinary participant 入口分别为 playing、paused、stopped、idle 时，terminal 后恢复完全相同的队列、索引、
-    冻结位置和 playbackRate，并分别继续播放、保持暂停、保持 stopped、恢复 idle；恢复期间后来普通 Context command
-    按 controlVersion 排队，playback.prepare 立即以 restore_in_progress 拒绝，binding 变化改为读取并
+    冻结位置和 playbackRate，并分别继续播放、保持暂停、保持 stopped、恢复 idle；恢复期间普通 Context
+    写和本地人工 control 均禁用且不排队，误发时以 restore_in_progress 和四 cursor 拒绝，
+    playback.prepare/Core prepare 立即 negative cleanup，binding 变化改为读取并
     应用服务端当前状态；恢复记录的 Context/applied cursor 只用于比较，不写回、不回退、
     不构造旧 base request，退出门控后才发送
     applied+restoreCompleted stopped feedback；失败反馈不清 restorePending，durable snapshot/outbox 从未出现群播队列；
@@ -140,7 +142,8 @@
 52. stop ACK、source/ordinary terminal push、重复 terminal 和 status 补偿交错时，每个 ordinary
     client/broadcastId 只 restore 一次并发送一次 stopped feedback；ordinary 离线时 tombstone/outbox
     完整保留 7 天，之后未确认 pair 原子压缩为 TerminalRecoveryRecord；相同 pair 重连先收到
-    同 revision terminal/broadcast.restore 再收到普通 Context command，重复补发不增 revision；source 只清
+    同 revision terminal/broadcast.restore 再收到普通 Context command，enqueue 失败立即断开且下次注册
+    先 replay，重复补发不增 revision；source 只清
     lifecycle，一切迟到 execution callback 被 generation/lease fence 丢弃；
 53. participant restore 首次失败时保持暂停、保留快照并只读取和应用一次服务端当前 canonical 状态；失败路径不得
     保存群播队列。真实设备日志必须同时记录 source-derived start、source/ordinary 角色、source
@@ -218,9 +221,9 @@
 73. terminal Snapshot.lifecycleState=stopped 而 Snapshot.state 保留最后 anchor；ordinary feedback.state
     固定 stopped 并可与 Snapshot.state 不同。入口 queue-backed stopped 的 participant 恢复相同
     queue/index/position/rate，保持 stopped 且没有自动 play/pause 调用。
-74. restorePending 期间发送 playback.context.ensure，得到同 requestId 的 restore_in_progress 和三个当前
-    cursors；Context/binding/cursor/push 均不变，相同 requestId 重放相同错误。terminal applied 清 gate 后，
-    新 requestId ensure 才可正常结算。
+74. restorePending 期间发送 playback.context.ensure，得到同 requestId 的 restore_in_progress 和
+    currentEpoch/version/queue/control 四个 cursor；Context/binding/cursor/push 均不变，相同 requestId
+    重放相同错误。terminal applied 清 gate 后，新 requestId ensure 才可正常结算。
 75. source 缺少 player、playbackContextV2、supportsBroadcast、effectiveAtPlayback、canPlay/canPause/
     canSeek、全速率能力、时钟门禁、在线 authority binding 或 fresh settled playing 任一条件时 start
     fail-closed；playbackPrepare/音量能力缺失不影响合格 source。
@@ -319,3 +322,21 @@
      complete 重放 completed+Context status；prepare/commit 无法可靠 enqueue 立即 failed。所有重放都
      不重复退休 standby、authority switch、cursor increment 或 release，并校验 handoffId/exact pair/
      original physical Socket。
+104. 对 restorePending suspended Context 逐项发送 ensure/init/rebind、prepare/close、queue sync/playItem、
+     player.*、playback.update、Handoff start/complete、ready/prepared positive、follow.start、
+     broadcast.start 与 binding mutation；全部返回 restore_in_progress、retryable=true 和真正 Context
+     四 cursor，且 reducer/command/cursor/binding/push 零副作用，Flutter 没有普通命令队列。
+105. gate 期间 list/status/subscribe/unsubscribe、device list/volume、ping、broadcast.status、terminal
+     feedback/replay、follow.stop、handoff.cancel 正常；matching raced playback.ready/prepared 发送
+     ready:false+restore_in_progress 只结算 prepare，不初始化队列、不推进 cursor、不 commit、不清 gate。
+106. 未确认 pair 注册时注入 terminal stop/restore enqueue failure，Socket 立即断开且没有先收到普通
+     Context command；下次注册用新 deliveryId 先 replay，只有 matching applied+restoreCompleted 清 gate。
+107. applied feedback 的 position 在合法 duration 内但相对 source 有任意 drift 时仍只表示 revision target
+     已应用；状态不宣称固定 drift SLA，越界 position 仍拒绝，证明 soft sync 语义。
+108. start 后 ordinary pair 断线、同 pair 重连、不同 deviceSession 注册及能力变化均不改变最终
+     membership；只有 frozen pair online/resync 变化，leave/add/remove action 均为 not_supported。
+109. 管理端 abandon 在线 restorePending pair 时，full/compact obligation、fence 和 slot 与 abandoned/
+     decommission tombstone 同事务提交；当前 Socket 被撤销并断开，pair 立即从 device.list 消失且不再
+     接收 command，任一步失败时全部状态保持原样。
+110. 被 decommission 的 exact `(user,clientId,deviceSessionId)` 跨重启永久不能注册或重现于 device.list；
+     清理/容量压力不能删除 tombstone，同 clientId 使用新 deviceSessionId 可以建立独立新生命周期。

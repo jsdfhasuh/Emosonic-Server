@@ -2,7 +2,7 @@
 
 > [返回 r18 权威入口](../../emosonic_strict_v2_socketio_server_contract.md)
 > 文档修订：`2026-07-23-r18`；协议版本：`2.8.0`
-> 覆盖范围：原契约第 7 节 REQ-001—REQ-038、REQ-068—REQ-086。本文件是完整契约的一个规范分卷，不能脱离入口列出的公共规则单独解释。
+> 覆盖范围：原契约第 7 节 REQ-001—REQ-038、REQ-068—REQ-087。本文件是完整契约的一个规范分卷，不能脱离入口列出的公共规则单独解释。
 ## 7. 服务端与 Flutter 实现要求（EARS）
 
 **REQ-001 — ACK correlation**
@@ -331,3 +331,11 @@ target 普通 playback.update 作用域并消耗序号。complete 是唯一 auth
 无法可靠 enqueue 时立即 failed。duplicate start 重放首次 ACK，late ready 重放 status，duplicate complete
 重放 completed+Context status；任何重放不得重复退休、切换或 release。旧 source 收到 release/
 completed/Context status/bindings.changed 任一事实都必须停止旧 authority lease。
+
+**REQ-087 — Action-aware Broadcast restore fence**
+当 exact ordinary pair 存在 terminal restorePending 时，服务端必须在 reducer/路由前以
+restore_in_progress 与真正 suspended Context 完整四 cursor 拒绝 ensure/prepare/close、queue/player/
+update、Follow/Broadcast/Handoff start/complete、ready/prepared positive 与 binding mutation；Flutter
+不得排队普通命令。只读、设备音量、terminal feedback/replay、follow.stop、handoff.cancel，以及
+matching raced ready/prepared negative cleanup 可以继续；negative 不得初始化、推进 cursor、commit 或
+清 gate。active/waiting occupancy 仍使用 conflict。

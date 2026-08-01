@@ -16,7 +16,7 @@ target 字段也禁止，例外只有第 5.2 节 `device.setVolume` 与第 5.4 �
 | Action / type | payload | 服务端动作与响应 |
 | --- | --- | --- |
 | `playback.context.list` / `state` | `authorityClientId:R string`、`authorityDeviceSessionId:R string` | 仅 controller 可查询。服务端只在当前 authenticated user 的 active Context 中按两个字段精确匹配，并用同 requestId direct 返回第 6.1 节的 0/1/多个 binding；不得 ACK、不得自动订阅、不得返回 queue/playback snapshot。 |
-| `playback.context.ensure` / `command` | `deviceSessionId:R string`、`queueSongIds:R distinct string[]`、`currentIndex:C int>=0`、`positionMs:R int>=0`、`state:R idle\|playing\|paused\|stopped` | 仅当前注册 player 可对自己调用；要求 `canPlay:true`，deviceSessionId 必须匹配当前连接。空队列要求 state=idle、positionMs=0 并省略 currentIndex；非空队列要求合法 currentIndex 且 state 非 idle。服务端按第 6.2 节原子返回、重绑、以本地快照初始化或创建该 stable clientId 的唯一 active Context，自动订阅当前 Socket，并使用同 requestId direct 返回完整 snapshot；不得 ACK，不接收 playbackContextId、trackId 或 target 字段。matching pair 为 restorePending 时是唯一失败结算例外：返回 `restore_in_progress` 且零副作用。 |
+| `playback.context.ensure` / `command` | `deviceSessionId:R string`、`queueSongIds:R distinct string[]`、`currentIndex:C int>=0`、`positionMs:R int>=0`、`state:R idle\|playing\|paused\|stopped` | 仅当前注册 player 可对自己调用；要求 `canPlay:true`，deviceSessionId 必须匹配当前连接。空队列要求 state=idle、positionMs=0 并省略 currentIndex；非空队列要求合法 currentIndex 且 state 非 idle。服务端按第 6.2 节原子返回、重绑、以本地快照初始化或创建该 stable clientId 的唯一 active Context，自动订阅当前 Socket，并使用同 requestId direct 返回完整 snapshot；不得 ACK，不接收 playbackContextId、trackId 或 target 字段。matching pair 为 restorePending 时返回 `restore_in_progress` 且零副作用。 |
 | `playback.context.subscribe` / `state` | `playbackContextId:R` | 将当前 Socket 加入该 context recipient set并返回 ACK；客户端随后显式请求 status。 |
 | `playback.context.unsubscribe` / `state` | `playbackContextId:R` | 移除 context recipient；返回 ACK。 |
 | `playback.context.status` / `state` | `playbackContextId:R` | 返回第 6.3 的完整 status（同 requestId 直接 action response）。 |
@@ -47,6 +47,13 @@ Handoff target 必须由 `targetClientId/targetDeviceSessionId` exact pair 冻�
 Handoff execution lane，不得进入普通 ControlTransactionCoordinator/reducer，不得生成普通
 `playback.update(origin:"remoteCommand")`，也不携带普通 control 的 dependency 或 execution timeout。
 只有 complete proof 原子成功后 N+1 才成为 canonical；失败、取消或超时后 canonical 仍为 N。
+
+当请求 exact pair 存在 Broadcast terminal `restorePending:true` 时，服务端必须在上述普通 lifecycle
+规则之前按第 4.2 节 action-aware gate 冻结 suspended Context。ensure、prepare、close、queue/player、
+playback.update、Follow/Broadcast/Handoff start/complete 与 binding mutation 均返回
+`restore_in_progress` 和完整四 cursor，不得路由或修改状态；Flutter 不得在本地排队这些普通命令。
+只读/订阅、设备音量、cleanup stop/cancel、terminal feedback，以及匹配 raced prepare 的
+`ready:false` / `prepared:false` negative confirmation 可以继续。
 
 close 还必须遵守以下安全闭合：
 
@@ -110,7 +117,7 @@ close 还必须遵守以下安全闭合：
 | Action / type | payload | 服务端动作与响应 |
 | --- | --- | --- |
 | `queue.context.sync` / `state` | `playbackContextId:R`、`deviceSessionId:R`、`queueSongIds:R distinct string[]`、`currentIndex:C int>=0`、`positionMs:R int>=0`、`positionSampledAtServerMs:R int>=0`、`baseQueueRevision:R int>=0`、`baseControlVersion:C int>=0` | 仅当前 authority 可发送，deviceSessionId 必须匹配 authority 连接。空队列时 currentIndex 必须省略且 positionMs 必须为 0；非空队列时 currentIndex 必需且合法。采样时间按第 5.2.1 节验证；队列内容变化校验 baseQueueRevision；index、当前 track 或 idle/non-empty 边界变化时 baseControlVersion 必需。position 自然前进不要求 baseControlVersion。按第 4.5 节递增 cursor，ACK 并推送第 6.5 节 canonical queue state。 |
-| `playback.context.prepared` / `event` | `playbackContextId:R`、`deviceSessionId:R`、`intentId:R`、`ready:R bool`、`errorCode:C queue_required\|restore_failed\|prepare_timeout\|authority_changed`、`errorMessage:O string` | 当前 authority 对 prepare 给出 event-confirmed 结果。`ready:true` 时 Context 必须已通过 queue sync 变成非空，error 字段禁止；`ready:false` 时 errorCode 必需。服务端不回 ACK，按第 6.2.3 节广播结果。 |
+| `playback.context.prepared` / `event` | `playbackContextId:R`、`deviceSessionId:R`、`intentId:R`、`ready:R bool`、`errorCode:C queue_required\|restore_failed\|prepare_timeout\|authority_changed\|restore_in_progress`、`errorMessage:O string` | 当前 authority 对 prepare 给出 event-confirmed 结果。`ready:true` 时 Context 必须已通过 queue sync 变成非空，error 字段禁止；`ready:false` 时 errorCode 必需。restore_in_progress 只允许结算 matching raced prepare，且不得初始化队列、推进 cursor 或清 restore fence。服务端不回 ACK，按第 6.2.3 节广播结果。 |
 | `playback.update` / `event` | 第 5.2.1 节的公共字段，以及由 `origin` / `executionStatus` 决定的闭合条件字段 | 仅当前 authority player 可发送。passive 只更新事实；remoteCommand 结算服务端已接受的控制事务；localUser 表示已经完成的 Windows 本地人工操作并由服务端分配新版本。三种 shape 都使用第 6.6 节无 requestId canonical confirmation 结算，不回 ACK。 |
 | `queue.playItem` / `command` | `playbackContextId:R`、`queueIndex:R int>=0`、`baseQueueRevision:R int>=0`、`baseControlVersion:R int>=0` | 验证 cursors 后选择队列项，向 authority 发送第 6.7 的 server-routed control，返回 ACK；所有 recipients 接收 queue/context state 更新。不同 Socket 间不承诺到达顺序。 |
 | `player.play` / `command` | `playbackContextId:R`、`baseControlVersion:R int>=0`、`positionMs:O int>=0` | 验证 authority/cursor 后递增控制版本，并向 authority 发送无 target 的第 6.7 control。 |

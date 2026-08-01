@@ -3,6 +3,14 @@
 > [返回 r18 权威入口](../../emosonic_strict_v2_socketio_server_contract.md)
 > 文档修订：`2026-07-23-r18`；协议版本：`2.8.0`
 > 覆盖范围：原契约第 6.5—6.7.1 节。本文件是完整契约的一个规范分卷，不能脱离入口列出的公共规则单独解释。
+
+任何 queue/playback reducer 或 routed-control admission 在处理 exact pair 的 suspended Context 前，都
+必须先检查 Broadcast terminal `restorePending`。命中时 `queue.context.sync`、`queue.playItem`、全部
+`player.*` 与 `playback.update` 统一以 `restore_in_progress` 和完整四 cursor 零副作用拒绝；不得创建
+ControlTransaction、分配版本、发送 command 或把请求留在服务端队列。Flutter 同样不得在
+`restoringOriginalContext` 期间排队普通命令。未确认 terminal delivery 必须先可靠加入当前 pair 的
+Socket 发送路径；enqueue 失败立即断开，下次注册先 replay，不能先发送本节普通 control。
+
 ### 6.5 `queue.context.sync`
 
 ```json

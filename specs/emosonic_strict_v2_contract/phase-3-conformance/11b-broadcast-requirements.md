@@ -2,7 +2,7 @@
 
 > [返回 r18 权威入口](../../emosonic_strict_v2_socketio_server_contract.md)
 > 文档修订：`2026-07-23-r18`；协议版本：`2.8.0`
-> 覆盖范围：原契约第 7 节 REQ-039—REQ-067。本文件是完整契约的一个规范分卷，不能脱离入口列出的公共规则单独解释。
+> 覆盖范围：原契约第 7 节 REQ-039—REQ-067、REQ-088—REQ-090。本文件是完整契约的一个规范分卷，不能脱离入口列出的公共规则单独解释。
 **REQ-039 — Source-derived Broadcast projection**
 当服务端创建或更新 Broadcast 时，必须把 source PlaybackContext 作为唯一播放事实源；start 播放字段
 只能从状态为 playing 的已结算 source Context/DevicePlaybackState 派生，paused/stopped 不得 start。
@@ -23,7 +23,8 @@ clientSeq 及所报告 revision ledger 的当前 deliveryId，只更新该 parti
 发送该 action 必须 forbidden；任何 feedback 都不得修改 BroadcastSnapshot、PlaybackContext、control
 transaction 或 cursor。feedback.positionMs 只校验 int、非负和媒体有效时长范围并保存为设备实际
 观测值；因无位置采样时间，不得做精确时间位置比对。revision、deliveryId、track/queue、state 与
-playbackRate 仍必须严格匹配 delivery target。
+playbackRate 仍必须严格匹配 delivery target。syncStatus=applied 只证明 revision target 已应用，
+不得解释为持续 drift 小于固定毫秒阈值。
 
 **REQ-041 — Broadcast participant Context barrier**
 当服务端接受 Broadcast start 时，服务端必须为每个 ordinary participant 原子记录并占用其唯一原
@@ -43,9 +44,10 @@ recovery/fence，不得相互清理。
 服务端 cursor；服务端存在更高版本时必须应用服务端当前状态。source authority 不恢复另一 Context，
 而是保留源 Context/队列/当前位置并
 保持当前实际 playing/paused transport 连续运行，不得执行额外 pause/stop/seek；controller-only 不
-操作音频。ordinary participant 从 terminal 到恢复完成必须保持 restoringOriginalContext 门控，按
-controlVersion 排队后来普通命令，binding 变化时改为读取并应用服务端当前状态；恢复及排队完成前
-不得发送 stopped feedback。任何群播内部操作均不得上报为 localUser。
+操作音频。ordinary participant 从 terminal 到恢复完成必须保持 restoringOriginalContext 门控，禁用
+且不得排队普通 Context 写命令或本地人工 transport/queue 操作；binding 变化时改为读取并应用服务端
+当前状态。恢复完成前不得发送 stopped feedback，恢复期用户意图不得在 gate 清除后重放。任何群播
+内部操作均不得上报为 localUser。
 
 **REQ-043 — Source reconnect follows actual state**
 当 active Broadcast 的 source authority 断线时，服务端必须进入 waitingForSource、保持 source Context
@@ -61,7 +63,8 @@ broadcastId 用同一个一次性 gate 合并 terminal push、重复消息和 st
 第二个 restore/retain 或 stopped feedback。服务端必须把 terminal tombstone/outbox 保留至少 7 天；
 未确认 ordinary pair 重连时必须在普通 Context command 之前补发同一 terminal Snapshot，且补发不推进
 broadcastRevision；Snapshot/revision 不变，但新物理连接使用新 deliveryId。7 天后可按第 5.5.2 节原子压缩完整记录，但每个未确认 pair 的
-TerminalRecoveryRecord/restorePending 必须保留到恢复确认。
+TerminalRecoveryRecord/restorePending 必须保留到恢复确认。terminal push/restore 无法可靠加入当前
+Socket 发送路径时必须立即断开，下次注册先 replay；不得先开放普通业务。
 
 **REQ-045 — Broadcast progress revision**
 当服务端实际发送一次合并进度或其他新 Broadcast 内容时，必须在同一提交中严格执行一次
@@ -78,10 +81,12 @@ playbackContextV2、canPlay/canPause/canSeek、effectiveAtPlayback，并能够�
 
 **REQ-047 — Restore-pending re-entry fence**
 当 ordinary participant 进入 terminal 后，服务端必须保留 pair-level restorePending，直到接受 terminal
-revision 的 applied feedback 且 restoreCompleted=true。该 fence 不阻止普通 Context command，但必须
-阻止该 pair 成为新 Broadcast source/participant 或 Handoff source/target；failed/timedOut feedback 不得
-清除 fence。restorePending 期间误发 playback.context.ensure 必须以可重放的
-`restore_in_progress` 无副作用结算，携带当前 Context cursors；不得创建、初始化、重绑或修改 Context。
+revision 的 applied feedback 且 restoreCompleted=true。该 fence 必须阻止 suspended Context 的全部
+普通写、该 pair 成为新 Follow/Broadcast/Handoff source/target 及任何 binding mutation；被阻止动作以
+可重放 `restore_in_progress` 和真正 suspended Context 完整四 cursor 零副作用结算，Flutter 不得排队。
+failed/timedOut feedback 不得清除 fence。只读/订阅、设备音量、terminal feedback/replay、
+follow.stop、handoff.cancel 与 matching raced ready/prepared negative cleanup 可以继续；negative 不得
+初始化、推进 cursor、commit 或清 fence。
 
 **REQ-048 — Fresh source state**
 当 authority state=playing 时，客户端必须至少每 1000ms 发送 passive playback.update。Broadcast start
@@ -123,6 +128,7 @@ broadcastRevision；服务端必须只向该 pair 发送 `broadcast.resync`，�
 新 deliveryId；active 无论 playing/paused/stopped 都生成新 effective-at，waitingForSource 可以省略。
 服务端令 target/deadlineBroadcastRevision 等于补发 revision，并按新 effective-at 或本次 delivery
 创建时间重置 pending/deadline。旧 deliveryId 反馈不得关闭新 deadline；不同 deviceSessionId 不得继承。
+membership 从 start 到 terminal 固定，断线/重连只改变 online，不支持 leave/add/remove 或重新筛选。
 
 **REQ-054 — Natural source track transition**
 当 source authority 因自然播完进入下一首时，客户端必须先通过 `queue.context.sync`
@@ -209,3 +215,22 @@ deliveryId；旧 attempt 的迟到结果不得推进 participantStates 或关闭
 状态或 cursor。随后必须按 lifecycle 用新 deliveryId 发送 resync、完整 terminal stop 或 compact
 terminal restore；status 只读，不能替代该执行 delivery。客户端停止旧 feedback，被拒绝 clientSeq 已
 结算，后续 feedback 必须针对新 deliveryId 并使用更高序号。
+
+**REQ-088 — Broadcast soft sync and fixed membership**
+当 participant 报告 applied 时，该状态只证明 revision target 已应用，不证明持续 drift 小于固定毫秒
+阈值；position 只做类型、非负和已知 duration 校验。start 原子提交的 exact-pair membership 必须冻结到
+terminal；断线只改变 online，相同 pair 重连只 resync，不支持 leave/add/remove、deviceSession 替换或
+重新筛选。
+
+**REQ-089 — Terminal delivery before ordinary business**
+当未确认 restorePending pair 注册或重连时，服务端必须先把带 current deliveryId 的 terminal stop 或
+restore 可靠加入当前 Socket 发送路径，才可开放 suspended Context 普通业务。enqueue 失败必须立即
+断开，下次注册先 replay；不得先发送普通 command。enqueue/status 不清 gate，只有 matching terminal
+applied+restoreCompleted feedback 可以清除。
+
+**REQ-090 — Atomic recovery abandon and permanent decommission**
+当管理端/调试 CLI abandon recovery 时，事务必须原子确认 terminal/restorePending、删除 full/compact
+obligation 与 fence、释放 slot、写 abandoned 和 `(user,clientId,deviceSessionId)` permanent decommission
+tombstone、撤销并断开在线 exact pair、从 device.list 移除且停止路由；失败全部回滚。r18 不提供
+Flutter realtime abandon action。tombstone 只能随账号数据整体删除；资源到上限时限制新
+deviceSession，不能删旧 tombstone，同 clientId 的新 deviceSessionId 可重新开始。

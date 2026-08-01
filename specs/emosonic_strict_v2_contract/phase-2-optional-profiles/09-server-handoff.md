@@ -46,6 +46,12 @@ target exact pair 若存在 active/acquiring/restoring Follow overlay 或非终�
 FollowSafetyLease，服务端不得发送 prepare；start 必须以描述 target suspended Context 的 `conflict` 与
 四 cursor 零副作用结算。进入 Handoff target execution 后也不得并发建立 Follow。
 
+若 prepare 已可靠入队但 target exact pair 随后进入 Broadcast terminal restore gate，target 当前 Socket
+必须立即发送 matching `playback.ready(ready:false,errorCode:"restore_in_progress")`。服务端只结算该
+raced prepare 并发送 canonical failed status；不得发送 commit、分配 provisional version、推进 Context
+cursor 或清除 restorePending。gate 期间新的 start/complete/ready:true 返回描述真正 suspended Context
+的 `restore_in_progress` 与完整四 cursor；cancel cleanup 仍允许。
+
 ### 6.9 Handoff commit、release、status、cancel
 
 commit 使用 `player.play` 无 target，且包含 handoff 字段：

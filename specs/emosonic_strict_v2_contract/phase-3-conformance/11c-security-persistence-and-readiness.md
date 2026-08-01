@@ -50,7 +50,9 @@
    Broadcast 还必须保留最近 512 个 target revision ledger，且 10 分钟反馈窗口内的 revision
    不得删除；压缩时 terminal target 的 queueIndex/trackId/position/rate 必须转入 compact record。
    清理必须按 terminalAtServerMs 建立索引，且不得在同一 broadcastId 仍处于
-   active/waitingForSource 时运行。
+   active/waitingForSource 时运行。recovery abandon 生成的 exact-pair decommission tombstone 永久
+   保留，可压缩为 `(user,clientId,deviceSessionId)` 最小 key，但只能随账号/用户数据整体删除；部署
+   达到其存储上限时必须限制新 deviceSession 创建，不得删除旧 tombstone 腾位。
 
 ### 7.2 单实例、持久化与重启
 
@@ -75,6 +77,8 @@
   `dependency_failed`；不得保留旧 controlVersion 重投、假装 committed 或任意选择 failed/superseded。
   随后只能按 terminal-gap reconciliation 与 fresh actual fact 收敛。
 - `connectionEpoch` 每个新物理连接固定为 1；不得持久化或复用旧 nonce。
+- permanent decommission tombstone 必须跨重启加载，并在创建 sid/device presence 前拒绝 exact pair；
+  被 decommission 的 pair 不得重新出现在 device.list 或接收 terminal/普通 command。
 
 ### 7.3 Capability profile readiness
 
@@ -104,7 +108,9 @@ playbackRate 执行承诺、自然切歌 Context-first、source 转 idle 的原�
 冻结、restore cursor 只比较不写回、bounded intent tombstones、controllerOnly owner 观察副本和
 participant/source 双分支、确定性 source→push action、per-pair deliveryId/`broadcast.resync`、不可变
 status anchor、terminal Snapshot/feedback state 分域、stopped 原任务恢复、restorePending ensure
-结算、关闭后 deadline 字段/timer 语义、20 participant 上限和 `broadcast.feedback.rejected` 验收；缺少任一项时
+结算、action-aware 全写冻结与 negative cleanup、Flutter 不排队、soft sync/fixed membership、terminal
+delivery enqueue-fail disconnect/replay、atomic abandon/permanent decommission、关闭后 deadline
+字段/timer 语义、20 participant 上限和 `broadcast.feedback.rejected` 验收；缺少任一项时
 `supportsBroadcast` 必须协商为
 false。
 
