@@ -16,7 +16,11 @@ class StrictV2ConformanceTestCase(unittest.TestCase):
         with strict_v2_conformance._CONFORMANCE_PATH.open(encoding="utf-8") as manifest_file:
             return json.load(manifest_file)
 
-    def _load_from_temporary_manifest(self, value):
+    def _load_from_temporary_manifest(
+        self,
+        value,
+        allow_local_test_evidence=False,
+    ):
         with tempfile.TemporaryDirectory() as directory:
             manifest_path = Path(directory) / "strict_v2_conformance.json"
             if isinstance(value, str):
@@ -29,18 +33,68 @@ class StrictV2ConformanceTestCase(unittest.TestCase):
                 manifest_path,
             ):
                 strict_v2_conformance._load_conformance_readiness.cache_clear()
-                return strict_v2_conformance.get_code_conformance_readiness()
+                return strict_v2_conformance.get_code_conformance_readiness(
+                    allow_local_test_evidence
+                )
 
-    def test_shipped_manifest_starts_with_every_profile_disabled(self):
+    def test_local_test_manifest_fails_closed_outside_test_mode(self):
+        self.assertFalse(
+            any(strict_v2_conformance.get_code_conformance_readiness().values())
+        )
+
+    def test_packaged_r11_manifest_stays_disabled_until_evidence_is_complete(self):
+        expected = {
+            "core": False,
+            "follow": False,
+            "handoff": False,
+            "broadcast": False,
+        }
+
         self.assertEqual(
-            strict_v2_conformance.get_code_conformance_readiness(),
+            strict_v2_conformance.get_code_conformance_readiness(True),
+            expected,
+        )
+        manifest = self._read_manifest()
+        for profile, value in manifest["profiles"].items():
+            with self.subTest(profile=profile):
+                self.assertFalse(value["codeConformanceReady"])
+                self.assertEqual(value["evidence"], [])
+
+    def test_local_test_evidence_requires_explicit_test_mode(self):
+        manifest = self._read_manifest()
+        for profile in manifest["profiles"].values():
+            profile["codeConformanceReady"] = True
+            profile["evidence"] = ["local-test-only:test_supysonic:r8"]
+
+        self.assertFalse(
+            any(self._load_from_temporary_manifest(manifest).values())
+        )
+        self.assertEqual(
+            self._load_from_temporary_manifest(
+                manifest,
+                allow_local_test_evidence=True,
+            ),
             {
-                "core": False,
-                "follow": False,
-                "handoff": False,
-                "broadcast": False,
+                "core": True,
+                "follow": True,
+                "handoff": True,
+                "broadcast": True,
             },
         )
+
+    def test_local_test_evidence_prefix_cannot_be_obscured(self):
+        for evidence in (
+            " local-test-only:test_supysonic",
+            "LOCAL-TEST-ONLY:test_supysonic",
+        ):
+            with self.subTest(evidence=evidence):
+                manifest = self._read_manifest()
+                manifest["profiles"]["core"]["codeConformanceReady"] = True
+                manifest["profiles"]["core"]["evidence"] = [evidence]
+
+                self.assertFalse(
+                    any(self._load_from_temporary_manifest(manifest).values())
+                )
 
     def test_frozen_contract_matches_code_and_manifest_hash(self):
         contract_path = (
@@ -75,6 +129,7 @@ class StrictV2ConformanceTestCase(unittest.TestCase):
     def test_ready_profile_requires_evidence(self):
         manifest = self._read_manifest()
         manifest["profiles"]["core"]["codeConformanceReady"] = True
+        manifest["profiles"]["core"]["evidence"] = []
 
         self.assertFalse(any(self._load_from_temporary_manifest(manifest).values()))
 

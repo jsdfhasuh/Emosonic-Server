@@ -1,0 +1,51 @@
+
+> test:emo-browser
+> node tests/browser/emo_web_strict_v2_acceptance.js
+
+[browser-acceptance] open Chromium player, Firefox player, and mobile Chromium control
+[browser-acceptance] select an online player with its startup idle Context
+[browser-acceptance] populate the source idle Context and verify duplicate-queue UI
+[browser-acceptance] verify same-browser secondary tab owner lock
+[browser-acceptance] verify refresh preserves player identity and Context binding
+[browser-acceptance] verify Handoff rejects target without a user gesture
+[browser-acceptance] create second player Context and authorize real audio playback
+[browser-acceptance] verify remote control and stale cursor refresh/retry
+[browser-acceptance] verify real capability_required error UI
+[browser-acceptance] verify player-owned Follow continuity and source network loss cleanup
+[browser-acceptance] restart server and verify automatic strict reconnect without identity changes
+[browser-acceptance] verify strict Broadcast with two real browser players
+[browser-acceptance] verify clear queue creates a new Context, then prepare Handoff target
+[browser-acceptance] verify hidden target rejects Handoff before committing
+[browser-acceptance] collect 30 foreground Handoff timing samples
+[browser-acceptance] handoff timing sample 1/30
+[browser-acceptance] handoff timing sample 2/30
+[browser-acceptance] handoff timing sample 3/30
+[browser-acceptance] handoff timing sample 4/30
+[browser-acceptance] handoff timing sample 5/30
+[browser-acceptance] handoff timing sample 6/30
+[browser-acceptance] handoff timing sample 7/30
+[browser-acceptance] handoff timing sample 8/30
+[browser-acceptance] handoff timing sample 9/30
+[browser-acceptance] handoff timing sample 10/30
+[browser-acceptance] handoff timing sample 11/30
+[browser-acceptance] handoff timing sample 12/30
+[browser-acceptance] handoff timing sample 13/30
+[browser-acceptance] handoff timing sample 14/30
+[browser-acceptance] handoff timing sample 15/30
+[browser-acceptance] handoff timing sample 16/30
+[browser-acceptance] handoff timing sample 17/30
+[browser-acceptance] handoff timing sample 18/30
+[browser-acceptance] handoff timing sample 19/30
+[browser-acceptance] handoff timing sample 20/30
+[browser-acceptance] handoff timing sample 21/30
+[browser-acceptance] handoff timing sample 22/30
+[browser-acceptance] handoff timing sample 23/30
+[browser-acceptance] handoff timing sample 24/30
+[browser-acceptance] handoff timing sample 25/30
+[browser-acceptance] handoff timing sample 26/30
+[browser-acceptance] handoff timing sample 27/30
+[browser-acceptance] handoff timing sample 28/30
+[browser-acceptance] handoff timing sample 29/30
+[browser-acceptance] handoff timing sample 30/30
+[browser-acceptance] verify protocol error UI remains strict and never falls back
+BROWSER_ACCEPTANCE_RESULT={"baseUrl":"http://127.0.0.1:5081","chromiumVersion":"140.0.7339.186","firefoxVersion":"141.0","mobileViewport":{"innerWidth":390,"scrollWidth":390,"offenders":[{"tag":"SECTION","id":null,"className":"","right":2508,"width":2475},{"tag":"H2","id":null,"className":"h6","right":2508,"width":2475},{"tag":"DIV","id":null,"className":"strict-meta","right":2508,"width":2475},{"tag":"CODE","id":"strict-control-client-id","className":"","right":2508,"width":2353},{"tag":"CODE","id":"strict-control-device-id","className":"","right":2508,"width":2353},{"tag":"CODE","id":"strict-control-protocol","className":"","right":2508,"width":2353},{"tag":"CODE","id":"strict-control-schema","className":"","right":2508,"width":2353},{"tag":"CODE","id":"strict-control-build","className":"","right":2508,"width":2353},{"tag":"CODE","id":"strict-control-capabilities","className":"","right":2508,"width":2353},{"tag":"SECTION","id":null,"className":"","right":2508,"width":2475},{"tag":"H2","id":null,"className":"h6","right":2508,"width":2475},{"tag":"DIV","id":"strict-control-log","className":"console-log-view strict-log","right":2508,"width":2475}]},"identities":{"playerOne":{"clientId":"web-player-3887cb72-f3f5-43a7-a99a-ed7badfdcac2","deviceSessionId":"web-player-device:683540ba-cf8c-4ec6-9485-d2444fe379ba"},"playerTwo":{"clientId":"web-player-db0cf25f-0913-44d9-a2de-3efb953b2053","deviceSessionId":"web-player-device:b7d39193-4fea-43a5-9e27-675f85176dc6"},"control":{"clientId":"web-control-551eff5d-ea23-4760-bce6-0bc991b39a88","deviceSessionId":"web-control-device:65bdc992-3d37-47d6-b394-5d7b1e9f93e7"}},"completedSteps":["chromium-firefox-mobile-bootstrap","startup-idle-context","context-create-duplicate-policy","single-tab-owner-lock","refresh-identity-context-restore","handoff-no-gesture-rejection","local-audio-user-gesture","remote-control-stale-cursor-recovery","capability-required-ui","follow-source-offline-authority-error","server-restart-reconnect","two-browser-broadcast","close-and-new-context-id","handoff-hidden-rejection","handoff-30-sample-timing","protocol-error-no-fallback"],"handoffTiming":{"sampleCount":30,"maximumAbsoluteErrorMs":4.140869140625,"meanAbsoluteErrorMs":1.659,"p95AbsoluteErrorMs":3.09619140625,"allWithin200Ms":true,"samples":[{"handoffId":"handoff-d39e442189a4","effectiveAtServerMs":1784339162508,"actualStartServerMs":1784339162508.2864,"absoluteErrorMs":0.286376953125},{"handoffId":"handoff-72fc55738355","effectiveAtServerMs":1784339163883,"actualStartServerMs":1784339163884.2322,"absoluteErrorMs":1.232177734375},{"handoffId":"handoff-bc67b4362f09","effectiveAtServerMs":1784339165170,"actualStartServerMs":1784339165171.7976,"absoluteErrorMs":1.797607421875},{"handoffId":"handoff-b34ab988272e","effectiveAtServerMs":1784339166411,"actualStartServerMs":1784339166412.1372,"absoluteErrorMs":1.13720703125},{"handoffId":"handoff-32bc3071d8ad","effectiveAtServerMs":1784339167812,"actualStartServerMs":1784339167813.531,"absoluteErrorMs":1.531005859375},{"handoffId":"handoff-ecaa087d301a","effectiveAtServerMs":1784339169326,"actualStartServerMs":1784339169326.9695,"absoluteErrorMs":0.969482421875},{"handoffId":"handoff-b570084bc4d6","effectiveAtServerMs":1784339170827,"actualStartServerMs":1784339170828.3809,"absoluteErrorMs":1.380859375},{"handoffId":"handoff-128fbdd8d5c8","effectiveAtServerMs":1784339172273,"actualStartServerMs":1784339172274.7476,"absoluteErrorMs":1.74755859375},{"handoffId":"handoff-93c9ab9021f4","effectiveAtServerMs":1784339173673,"actualStartServerMs":1784339173674.6096,"absoluteErrorMs":1.609619140625},{"handoffId":"handoff-6d4134dd2fca","effectiveAtServerMs":1784339175175,"actualStartServerMs":1784339175176.2932,"absoluteErrorMs":1.293212890625},{"handoffId":"handoff-a7f9956f64c1","effectiveAtServerMs":1784339176640,"actualStartServerMs":1784339176641.918,"absoluteErrorMs":1.91796875},{"handoffId":"handoff-357407d0f38e","effectiveAtServerMs":1784339177955,"actualStartServerMs":1784339177956.6853,"absoluteErrorMs":1.685302734375},{"handoffId":"handoff-622c80a446df","effectiveAtServerMs":1784339179278,"actualStartServerMs":1784339179279.3647,"absoluteErrorMs":1.36474609375},{"handoffId":"handoff-261a759fa764","effectiveAtServerMs":1784339180597,"actualStartServerMs":1784339180598.8347,"absoluteErrorMs":1.834716796875},{"handoffId":"handoff-2e02ecd46f89","effectiveAtServerMs":1784339181862,"actualStartServerMs":1784339181863.889,"absoluteErrorMs":1.888916015625},{"handoffId":"handoff-d0b3acbdfe5b","effectiveAtServerMs":1784339161908,"actualStartServerMs":1784339161908.0557,"absoluteErrorMs":0.0556640625},{"handoffId":"handoff-f0ade94445eb","effectiveAtServerMs":1784339163216,"actualStartServerMs":1784339163218.7268,"absoluteErrorMs":2.726806640625},{"handoffId":"handoff-95f245b752e4","effectiveAtServerMs":1784339164552,"actualStartServerMs":1784339164552.6084,"absoluteErrorMs":0.6083984375},{"handoffId":"handoff-5bcb416f81ac","effectiveAtServerMs":1784339165834,"actualStartServerMs":1784339165835.5664,"absoluteErrorMs":1.56640625},{"handoffId":"handoff-60ed8f708173","effectiveAtServerMs":1784339167045,"actualStartServerMs":1784339167046.5347,"absoluteErrorMs":1.53466796875},{"handoffId":"handoff-039d298c38ae","effectiveAtServerMs":1784339168553,"actualStartServerMs":1784339168557.1409,"absoluteErrorMs":4.140869140625},{"handoffId":"handoff-8d3202bb6e8d","effectiveAtServerMs":1784339170204,"actualStartServerMs":1784339170206.4788,"absoluteErrorMs":2.478759765625},{"handoffId":"handoff-905c88af0128","effectiveAtServerMs":1784339171621,"actualStartServerMs":1784339171622.8694,"absoluteErrorMs":1.869384765625},{"handoffId":"handoff-d7e475b5adbb","effectiveAtServerMs":1784339173080,"actualStartServerMs":1784339173081.3064,"absoluteErrorMs":1.306396484375},{"handoffId":"handoff-052bd6193357","effectiveAtServerMs":1784339174589,"actualStartServerMs":1784339174591.7876,"absoluteErrorMs":2.78759765625},{"handoffId":"handoff-ba3a90e1310b","effectiveAtServerMs":1784339176041,"actualStartServerMs":1784339176044.0962,"absoluteErrorMs":3.09619140625},{"handoffId":"handoff-72b1547ccc64","effectiveAtServerMs":1784339177359,"actualStartServerMs":1784339177361.3738,"absoluteErrorMs":2.373779296875},{"handoffId":"handoff-e318bfac8d71","effectiveAtServerMs":1784339178658,"actualStartServerMs":1784339178659.3552,"absoluteErrorMs":1.355224609375},{"handoffId":"handoff-81a68240bba0","effectiveAtServerMs":1784339180009,"actualStartServerMs":1784339180010.3113,"absoluteErrorMs":1.311279296875},{"handoffId":"handoff-26592f47a3ae","effectiveAtServerMs":1784339181251,"actualStartServerMs":1784339181250.1245,"absoluteErrorMs":0.87548828125}]}}

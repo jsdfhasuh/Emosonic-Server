@@ -1,5 +1,10 @@
 # Goal: 实现 Emosonic 跟播 Follow Playback v1
 
+> **Superseded / legacy Goal.** 本文仅保留为历史实现证据，不是 strict-v2 r5
+> Follow contract。当前权威要求见
+> `specs/emosonic_strict_v2_socketio_server_contract.md` 和
+> `docs/goal/emosonic_strict_v2_r5_server_adaptation.md`。
+
 ## 一、总体目标
 
 在现有 SocketIO 播放体系基础上，实现第一版“跟播”能力。

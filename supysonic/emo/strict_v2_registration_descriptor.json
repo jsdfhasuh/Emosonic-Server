@@ -1,6 +1,6 @@
 {
   "protocolName": "emosonic-playback-context-v2-registration",
-  "protocolVersion": "2.1.0",
+  "protocolVersion": "2.8.0",
   "coveredActions": {
     "clientToServer": [
       "device.register"
@@ -63,6 +63,9 @@
           },
           "supportsBroadcast": {
             "type": "boolean"
+          },
+          "remoteVolumeControl": {
+            "type": "boolean"
           }
         },
         "required": [
@@ -74,7 +77,8 @@
           "canSeek",
           "canSetVolume",
           "supportsFollow",
-          "supportsBroadcast"
+          "supportsBroadcast",
+          "remoteVolumeControl"
         ],
         "additionalProperties": false
       },
@@ -170,8 +174,7 @@
             "$ref": "#/$defs/nonEmptyString"
           },
           "schemaHash": {
-            "type": "string",
-            "pattern": "^[0-9a-f]{64}$"
+            "description": "Optional deployment observation; never used for negotiation"
           },
           "serverBuildCommit": {
             "type": "string",
@@ -187,7 +190,6 @@
         },
         "required": [
           "protocolVersion",
-          "schemaHash",
           "serverBuildCommit",
           "connectionNonce",
           "connectionEpoch"

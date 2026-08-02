@@ -13,6 +13,9 @@ from click import command, option, Option
 from click.exceptions import UsageError, ClickException
 from click.types import Choice
 
+from ..config import IniConfig
+from ..emo.strict_v2_safety import validate_strict_v2_worker_count
+
 
 _servers = [
     e.name[:-3]
@@ -119,6 +122,12 @@ def main(server, host, port, socket, processes, threads):
     if socket is not None:
         host = None
         port = None
+
+    runtime_config = IniConfig.from_common_locations()
+    try:
+        validate_strict_v2_worker_count(processes, runtime_config.WEBAPP)
+    except RuntimeError as exc:
+        raise ClickException(str(exc)) from exc
 
     server(
         host=host, port=port, socket=socket, processes=processes, threads=threads

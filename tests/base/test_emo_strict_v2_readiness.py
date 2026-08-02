@@ -1,8 +1,11 @@
 import unittest
+from unittest import mock
 
 from supysonic.emo.strict_v2_readiness import (
     CoreProfileNotReady,
     get_effective_profile_readiness,
+    is_local_test_evidence_allowed,
+    is_local_test_evidence_requested,
     negotiate_capabilities,
 )
 
@@ -19,6 +22,7 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
             "canSetVolume": True,
             "supportsFollow": True,
             "supportsBroadcast": True,
+            "remoteVolumeControl": True,
         }
         self.code_ready = {
             "core": True,
@@ -52,6 +56,68 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
                 self.code_ready,
             )["handoff"]
         )
+
+    def test_local_test_evidence_requires_explicit_development_gate(self):
+        self.assertFalse(is_local_test_evidence_requested({}))
+        self.assertFalse(
+            is_local_test_evidence_requested(
+                {"emo_strict_v2_allow_local_test_evidence": "off"}
+            )
+        )
+        self.assertTrue(
+            is_local_test_evidence_requested(
+                {"emo_strict_v2_allow_local_test_evidence": "on"}
+            )
+        )
+        self.assertFalse(is_local_test_evidence_allowed({}))
+        self.assertFalse(
+            is_local_test_evidence_allowed(
+                {"emo_strict_v2_allow_local_test_evidence": True}
+            )
+        )
+        self.assertFalse(
+            is_local_test_evidence_allowed(
+                {"emo_development_mode": True}
+            )
+        )
+        self.assertTrue(
+            is_local_test_evidence_allowed(
+                {
+                    "emo_development_mode": "on",
+                    "emo_strict_v2_allow_local_test_evidence": "yes",
+                }
+            )
+        )
+        self.assertTrue(is_local_test_evidence_allowed({}, app_testing=True))
+
+    def test_evidence_switch_does_not_change_runtime_readiness(self):
+        deployment = dict(
+            self.deployment_enabled,
+            emo_development_mode=True,
+            emo_strict_v2_allow_local_test_evidence=True,
+        )
+
+        with mock.patch(
+            "supysonic.emo.strict_v2_readiness.get_code_conformance_readiness",
+            return_value=self.code_ready,
+        ) as readiness:
+            self.assertEqual(
+                get_effective_profile_readiness(deployment),
+                self.code_ready,
+            )
+
+            negotiated = negotiate_capabilities(
+                self.capabilities,
+                ["player", "controller"],
+                deployment,
+            )
+
+        self.assertEqual(readiness.call_count, 2)
+        self.assertTrue(negotiated["playbackContextV2"])
+        self.assertTrue(negotiated["supportsFollow"])
+        self.assertTrue(negotiated["playbackPrepare"])
+        self.assertTrue(negotiated["effectiveAtPlayback"])
+        self.assertTrue(negotiated["supportsBroadcast"])
 
     def test_core_not_ready_fails_closed(self):
         with self.assertRaises(CoreProfileNotReady):
@@ -106,6 +172,48 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
         self.assertFalse(negotiated["supportsFollow"])
         self.assertFalse(negotiated["playbackPrepare"])
         self.assertFalse(negotiated["effectiveAtPlayback"])
+        self.assertFalse(negotiated["supportsBroadcast"])
+
+    def test_effective_at_is_independent_from_playback_prepare(self):
+        capabilities = dict(
+            self.capabilities,
+            playbackPrepare=False,
+            effectiveAtPlayback=True,
+        )
+
+        negotiated = negotiate_capabilities(
+            capabilities,
+            ["player"],
+            self.deployment_enabled,
+            self.code_ready,
+        )
+
+        self.assertFalse(negotiated["playbackPrepare"])
+        self.assertTrue(negotiated["effectiveAtPlayback"])
+
+    def test_fixed_remote_volume_capability_is_role_gated(self):
+        player = negotiate_capabilities(
+            self.capabilities,
+            ["player"],
+            self.deployment_enabled,
+            self.code_ready,
+        )
+        controller = negotiate_capabilities(
+            dict(self.capabilities, canSetVolume=False),
+            ["controller"],
+            self.deployment_enabled,
+            self.code_ready,
+        )
+        incapable_player = negotiate_capabilities(
+            dict(self.capabilities, canSetVolume=False),
+            ["player"],
+            self.deployment_enabled,
+            self.code_ready,
+        )
+
+        self.assertTrue(player["remoteVolumeControl"])
+        self.assertTrue(controller["remoteVolumeControl"])
+        self.assertFalse(incapable_player["remoteVolumeControl"])
 
 
 if __name__ == "__main__":

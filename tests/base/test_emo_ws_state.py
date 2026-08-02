@@ -1,7 +1,10 @@
+import threading
 import unittest
+from unittest import mock
 
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 
 MODULE_PATH = Path(__file__).resolve().parents[2] / "supysonic" / "emo" / "ws_state.py"
@@ -15,11 +18,28 @@ ClientSeqStaleError = MODULE.ClientSeqStaleError
 QueueRevisionMismatchError = MODULE.QueueRevisionMismatchError
 PlaybackAuthorityMismatchError = MODULE.PlaybackAuthorityMismatchError
 PlaybackContextConflictError = MODULE.PlaybackContextConflictError
+BroadcastInactiveError = MODULE.BroadcastInactiveError
 
 
 class EmoWebSocketStateTestCase(unittest.TestCase):
     def setUp(self):
         self.state = WebSocketState()
+
+    def test_connection_nonce_uses_32_byte_csprng_source(self):
+        with mock.patch.object(
+            MODULE.secrets,
+            "token_urlsafe",
+            return_value="test-nonce",
+        ) as nonce_generator:
+            session = self.state.try_register_session(
+                "sid-csprng",
+                "192.0.2.1",
+                max_unauthenticated=1,
+                now=100,
+            )
+
+        nonce_generator.assert_called_once_with(32)
+        self.assertEqual(session["connectionNonce"], "test-nonce")
 
     def test_register_and_unregister_client(self):
         self.state.register_session("sid-1", now=100)
@@ -45,6 +65,54 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
         self.assertEqual(session_info["userName"], "alice")
         self.assertEqual(removed["deviceName"], "Living Room")
         self.assertIsNone(self.state.get_sid_for_client("player-1"))
+
+    def test_clock_gate_is_connection_scoped_and_registration_resets_it(self):
+        self.state.register_session("sid-1", now=100)
+        self.state.authenticate_session("sid-1", "alice")
+        self.assertIsNone(self.state.record_clock_ping("sid-1", now=100))
+        self.state.register_client(
+            "sid-1",
+            "player-1",
+            {"userName": "alice", "roles": ["player"]},
+            now=100,
+        )
+        for offset in (0.1, 0.2, 0.3):
+            self.state.record_clock_ping("sid-1", now=100 + offset)
+        gate = self.state.get_clock_gate_for_client("alice", "player-1")
+        self.assertEqual(gate["clockPingCount"], 3)
+        self.assertEqual(gate["lastClockPingAtMs"], 100300)
+
+        self.state.register_client(
+            "sid-1",
+            "player-1",
+            {"userName": "alice", "roles": ["player"]},
+            now=101,
+        )
+        reset = self.state.get_clock_gate_for_client("alice", "player-1")
+        self.assertEqual(reset["clockPingCount"], 0)
+        self.assertIsNone(reset["lastClockPingAtMs"])
+
+    def test_replacement_connection_does_not_inherit_clock_gate(self):
+        for sid in ("sid-old", "sid-new"):
+            self.state.register_session(sid, now=100)
+            self.state.authenticate_session(sid, "alice")
+        self.state.register_client(
+            "sid-old",
+            "player-1",
+            {"userName": "alice", "roles": ["player"]},
+            now=100,
+        )
+        for offset in (0.1, 0.2, 0.3):
+            self.state.record_clock_ping("sid-old", now=100 + offset)
+        self.state.register_client(
+            "sid-new",
+            "player-1",
+            {"userName": "alice", "roles": ["player"]},
+            now=101,
+        )
+        gate = self.state.get_clock_gate_for_client("alice", "player-1")
+        self.assertEqual(gate["sid"], "sid-new")
+        self.assertEqual(gate["clockPingCount"], 0)
 
     def test_same_client_id_is_isolated_by_authenticated_user(self):
         for sid, user_name in (("sid-alice", "alice"), ("sid-bob", "bob")):
@@ -104,6 +172,60 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
             "phone-1",
         )
 
+    def test_strict_controller_recipient_filter_is_user_role_and_capability_scoped(self):
+        clients = (
+            (
+                "sid-alice-controller",
+                "alice",
+                "alice-controller",
+                ["controller"],
+                True,
+            ),
+            (
+                "sid-alice-player",
+                "alice",
+                "alice-player",
+                ["player"],
+                True,
+            ),
+            (
+                "sid-alice-legacy",
+                "alice",
+                "alice-legacy",
+                ["controller"],
+                False,
+            ),
+            (
+                "sid-bob-controller",
+                "bob",
+                "bob-controller",
+                ["controller"],
+                True,
+            ),
+        )
+        for sid, user_name, client_id, roles, strict in clients:
+            self.state.register_session(sid, now=100)
+            self.state.authenticate_session(sid, user_name)
+            self.state.register_client(
+                sid,
+                client_id,
+                {
+                    "userName": user_name,
+                    "roles": roles,
+                    "capabilities": {"playbackContextV2": strict},
+                },
+                now=100,
+            )
+
+        self.assertEqual(
+            self.state.list_strict_controller_sids("alice"),
+            ["sid-alice-controller"],
+        )
+        self.assertEqual(
+            self.state.list_strict_controller_sids("bob"),
+            ["sid-bob-controller"],
+        )
+
     def test_each_registered_session_has_unique_connection_evidence(self):
         self.state.register_session("sid-1", now=100)
         self.state.register_session("sid-2", now=100)
@@ -116,6 +238,111 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
         self.assertNotEqual(
             first_session["connectionNonce"],
             second_session["connectionNonce"],
+        )
+
+    def test_connection_limits_are_checked_atomically(self):
+        start = threading.Barrier(3)
+        registered = []
+
+        def register(sid):
+            start.wait()
+            registered.append(
+                self.state.try_register_session(
+                    sid,
+                    "192.0.2.1",
+                    max_unauthenticated=1,
+                    now=100,
+                )
+                is not None
+            )
+
+        threads = [
+            threading.Thread(target=register, args=("sid-%d" % index,))
+            for index in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        start.wait()
+        for thread in threads:
+            thread.join(1)
+
+        self.assertEqual(sorted(registered), [False, True])
+
+        accepted_sid = next(iter(self.state._sessions))
+        self.state.register_session("sid-other", remote_address="192.0.2.2", now=100)
+        auth_start = threading.Barrier(3)
+        authenticated = []
+
+        def authenticate(sid):
+            auth_start.wait()
+            authenticated.append(
+                self.state.try_authenticate_session(
+                    sid,
+                    "alice",
+                    max_authenticated=1,
+                )
+                is not None
+            )
+
+        auth_threads = [
+            threading.Thread(target=authenticate, args=(sid,))
+            for sid in (accepted_sid, "sid-other")
+        ]
+        for thread in auth_threads:
+            thread.start()
+        auth_start.wait()
+        for thread in auth_threads:
+            thread.join(1)
+
+        self.assertEqual(sorted(authenticated), [False, True])
+
+    def test_double_handoff_start_has_one_atomic_winner(self):
+        start = threading.Barrier(3)
+        results = []  # type: List[Tuple[str, Optional[str]]]
+
+        def create_handoff(index: int) -> None:
+            start.wait()
+            try:
+                handoff = self.state.create_playback_handoff(
+                    "handoff-%d" % index,
+                    "request-%d" % index,
+                    "context-1",
+                    "alice",
+                    "source-1",
+                    "target-%d" % index,
+                    1,
+                    2,
+                    {"handoffControlVersion": 2},
+                    prepare_id="prepare-%d" % index,
+                    origin_client_id="controller-%d" % index,
+                    now=100,
+                )
+                results.append(("accepted", handoff["handoffId"]))
+            except PlaybackAuthorityMismatchError:
+                results.append(("conflict", None))
+
+        threads = [
+            threading.Thread(target=create_handoff, args=(index,))
+            for index in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        start.wait()
+        for thread in threads:
+            thread.join(1)
+
+        self.assertEqual(
+            sorted(result[0] for result in results),
+            ["accepted", "conflict"],
+        )
+        winner_id = next(
+            handoff_id
+            for result, handoff_id in results
+            if result == "accepted"
+        )
+        self.assertEqual(
+            self.state.get_playback_handoff(winner_id)["status"],
+            "preparing",
         )
 
     def test_touch_session_updates_client_last_seen(self):
@@ -244,6 +471,7 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
             now=10,
         )
         self.assertEqual(context["authorityClientId"], "phone-1")
+        self.assertEqual(context["authorityDeviceSessionId"], "root:phone")
 
         updated_context, authoritative = self.state.apply_authority_playback_update(
             "playback:alice:main",
@@ -278,6 +506,82 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
         self.assertEqual(unchanged_context["authorityClientId"], "phone-1")
         self.assertEqual(unchanged_context["positionMs"], 100)
         self.assertEqual(pc_feedback["positionMs"], 999)
+
+    def test_playback_context_queue_uses_strict_snapshot_cursors(self):
+        initial = self.state.update_playback_context_queue(
+            "playback:alice:main",
+            "root:phone",
+            ["song-1"],
+            source_client_id="phone-1",
+            user_name="alice",
+            now=10,
+        )
+        self.assertEqual(initial["state"], "paused")
+        self.assertEqual(initial["queueRevision"], 1)
+        self.assertEqual(initial["controlVersion"], 1)
+        self.assertEqual(initial["version"], 1)
+        self.assertEqual(initial["epoch"], 1)
+
+        queue_only = self.state.update_playback_context_queue(
+            "playback:alice:main",
+            "root:phone",
+            ["song-1", "song-2"],
+            source_client_id="phone-1",
+            user_name="alice",
+            now=11,
+        )
+        self.assertEqual(queue_only["queueRevision"], 2)
+        self.assertEqual(queue_only["controlVersion"], 1)
+        self.assertEqual(queue_only["version"], 2)
+        self.assertEqual(queue_only["epoch"], 1)
+
+        position = self.state.update_playback_context_queue(
+            "playback:alice:main",
+            "root:phone",
+            ["song-1", "song-2"],
+            position_ms=500,
+            source_client_id="phone-1",
+            user_name="alice",
+            now=12,
+        )
+        self.assertEqual(position["queueRevision"], 3)
+        self.assertEqual(position["controlVersion"], 2)
+        self.assertEqual(position["version"], 3)
+        self.assertEqual(position["epoch"], 1)
+        self.assertEqual(position["positionSampledAtServerMs"], 12000)
+
+        cleared = self.state.update_playback_context_queue(
+            "playback:alice:main",
+            "root:phone",
+            [],
+            source_client_id="phone-1",
+            user_name="alice",
+            now=13,
+        )
+        self.assertEqual(cleared["state"], "idle")
+        self.assertEqual(cleared["positionMs"], 0)
+        self.assertIsNone(cleared["trackId"])
+        self.assertEqual(cleared["queueRevision"], 4)
+        self.assertEqual(cleared["controlVersion"], 3)
+        self.assertEqual(cleared["version"], 4)
+        self.assertEqual(cleared["epoch"], 1)
+
+        rebound = self.state.update_playback_context_queue(
+            "playback:alice:main",
+            "root:phone-reconnected",
+            [],
+            source_client_id="phone-1",
+            user_name="alice",
+            now=14,
+        )
+        self.assertEqual(
+            rebound["authorityDeviceSessionId"],
+            "root:phone-reconnected",
+        )
+        self.assertEqual(rebound["queueRevision"], 5)
+        self.assertEqual(rebound["controlVersion"], 4)
+        self.assertEqual(rebound["version"], 5)
+        self.assertEqual(rebound["epoch"], 2)
 
     def test_authority_device_volume_does_not_update_playback_context_volume(self):
         self.state.update_playback_context_queue(
@@ -346,6 +650,65 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
 
         self.assertTrue(authoritative)
         self.assertEqual(logical_context["volume"], 40)
+
+    def test_online_device_volume_state_is_sequence_checked_and_cleared(self):
+        self.state.register_session("sid-1")
+        self.state.authenticate_session("sid-1", "alice")
+        self.state.register_client(
+            "sid-1",
+            "phone-1",
+            {
+                "userName": "alice",
+                "deviceSessionId": "device:phone-1",
+                "deviceName": "Phone",
+                "roles": ["player"],
+            },
+        )
+        nonce = self.state.get_session("sid-1")["connectionNonce"]
+
+        first, created = self.state.record_strict_device_volume_state(
+            "alice",
+            "phone-1",
+            "device:phone-1",
+            {"volume": 65, "clientSeq": 1},
+            nonce,
+            now=10,
+        )
+        replay, replay_created = self.state.record_strict_device_volume_state(
+            "alice",
+            "phone-1",
+            "device:phone-1",
+            {"volume": 65, "clientSeq": 1},
+            nonce,
+            now=11,
+        )
+
+        self.assertTrue(created)
+        self.assertFalse(replay_created)
+        self.assertEqual(replay, first)
+        self.assertEqual(first["serverUpdatedAtMs"], 10000)
+        self.assertEqual(
+            self.state.get_device_volume_state(
+                "alice", "phone-1", "device:phone-1"
+            )["volume"],
+            65,
+        )
+
+        with self.assertRaises(ClientSeqStaleError):
+            self.state.record_strict_device_volume_state(
+                "alice",
+                "phone-1",
+                "device:phone-1",
+                {"volume": 70, "clientSeq": 1},
+                nonce,
+            )
+
+        self.state.unregister_session("sid-1")
+        self.assertIsNone(
+            self.state.get_device_volume_state(
+                "alice", "phone-1", "device:phone-1"
+            )
+        )
 
     def test_authority_playback_update_can_require_existing_context(self):
         context, authoritative = self.state.apply_authority_playback_update(
@@ -773,6 +1136,134 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
         self.assertEqual(queue["controlVersion"], 4)
         self.assertEqual(queue["queueRevision"], 2)
         self.assertEqual(queue["epoch"], 3)
+
+    def test_broadcast_deadline_and_explicit_stop_have_one_terminal_winner(self):
+        self.state.create_broadcast(
+            "broadcast-stop-race",
+            "alice",
+            "authority-1",
+            ["authority-1", "participant-1"],
+            ["song-1"],
+            current_index=0,
+            position_ms=0,
+            state_name="playing",
+            updated_by_client_id="authority-1",
+            authority_client_id="authority-1",
+            now=1,
+        )
+        deadline_ms = 2000
+        suspended = self.state.suspend_broadcast_for_authority_disconnect(
+            "broadcast-stop-race",
+            "authority-1",
+            "device:authority-1",
+            deadline_ms,
+            now=1,
+        )
+        self.assertEqual(suspended["version"], 2)
+        self.assertEqual(suspended["controlVersion"], 2)
+        barrier = threading.Barrier(2)
+
+        def expire_deadline():
+            barrier.wait()
+            stopped = self.state.stop_broadcast_if_authority_deadline(
+                "broadcast-stop-race",
+                deadline_ms,
+                now=3,
+            )
+            return "timer_won" if stopped is not None else "timer_lost"
+
+        def explicit_stop():
+            barrier.wait()
+            try:
+                self.state.stop_broadcast(
+                    "broadcast-stop-race",
+                    "controller-1",
+                    expected_version=2,
+                    now=3,
+                )
+                return "mutation_won"
+            except BroadcastInactiveError:
+                return "mutation_lost"
+
+        results = []
+        threads = (
+            threading.Thread(target=lambda: results.append(expire_deadline())),
+            threading.Thread(target=lambda: results.append(explicit_stop())),
+        )
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertIn(
+            set(results),
+            (
+                {"timer_won", "mutation_lost"},
+                {"timer_lost", "mutation_won"},
+            ),
+        )
+        final = self.state.get_broadcast("broadcast-stop-race")
+        self.assertEqual(final["state"], "stopped")
+        self.assertEqual(final["version"], 3)
+        self.assertNotIn("authorityDisconnectDeadlineMs", final)
+        self.assertFalse(self.state.is_broadcast_active("broadcast-stop-race"))
+        if "timer_won" in results:
+            self.assertEqual(final["controlVersion"], 2)
+        else:
+            self.assertEqual(final["controlVersion"], 3)
+
+    def test_restart_restore_discards_all_transient_profile_state(self):
+        self.state.start_follow_relationship(
+            "follower-1",
+            "device:follower-1",
+            "source-1",
+            "device:source-1",
+            "alice",
+            source_playback_context_id="context-1",
+            now=1,
+        )
+        self.state.create_playback_handoff(
+            "handoff-1",
+            "handoff-request-1",
+            "context-1",
+            "alice",
+            "source-1",
+            "target-1",
+            1,
+            2,
+            {"handoffControlVersion": 2},
+            prepare_id="prepare-1",
+            origin_client_id="controller-1",
+            now=1,
+        )
+        self.state.create_prepare(
+            "prepare-1",
+            "playback.handoff.start",
+            "context-1",
+            ["target-1"],
+            ["target-1"],
+            2,
+            {"playbackContextId": "context-1"},
+            1000,
+            2000,
+        )
+        self.state.create_broadcast(
+            "broadcast-1",
+            "alice",
+            "source-1",
+            ["source-1", "target-1"],
+            ["song-1"],
+            state_name="playing",
+            authority_client_id="source-1",
+            now=1,
+        )
+
+        self.state.restore_strict_playback_contexts([])
+
+        self.assertIsNone(self.state.get_follow_relationship("follower-1"))
+        self.assertIsNone(self.state.get_playback_handoff("handoff-1"))
+        self.assertIsNone(self.state.get_prepare("prepare-1"))
+        self.assertEqual(self.state.list_broadcasts(user_name="alice"), [])
 
     def test_broadcast_playback_context_upsert_tracks_broadcast_state(self):
         context = self.state.upsert_broadcast_playback_context(

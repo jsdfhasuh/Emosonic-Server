@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "protocolVersion": "2.1.0",
-  "contractSha256": "ca069c6ad52447ea4f7ace7d795460c5ec759e5708b2f45acfbe50903aa4b3a3",
+  "protocolVersion": "2.8.0",
+  "contractSha256": "2580851b2059d1d80b2059fe37f2b6e16d156787b741035436009baa3e8af90e",
   "sharedErrorConditionFields": [
     "playbackContextId",
     "currentControlVersion",
@@ -26,9 +26,9 @@
       "profile": "core",
       "type": "device",
       "contractSection": "3.3",
-      "payloadSchema": {"closed": true, "required": ["clientId:string", "deviceSessionId:string", "deviceName:string", "roles:player|controller[]", "capabilities:9-bool-object"], "optional": ["alias:string"]},
+      "payloadSchema": {"closed": true, "required": ["clientId:string", "deviceSessionId:string", "deviceName:string", "roles:player|controller[]", "capabilities:exactly-10-bool-object"], "optional": ["alias:string"]},
       "settlement": "correlated_ack",
-      "serverPushes": ["device.list"],
+      "serverPushes": [],
       "roleCapabilityGate": "authenticated; Core must be ready",
       "cursorMutation": "none",
       "errorConditionFields": ["retryAfterMs"]
@@ -44,6 +44,39 @@
       "cursorMutation": "none",
       "errorConditionFields": ["retryAfterMs"]
     },
+    "device.setVolume": {
+      "profile": "core",
+      "type": "command",
+      "contractSection": "5.2/6.0",
+      "payloadSchema": {"closed": true, "required": ["targetClientId:string", "targetDeviceSessionId:string", "volume:int:0..100"], "optional": []},
+      "settlement": "correlated_ack",
+      "serverPushes": ["device.setVolume"],
+      "roleCapabilityGate": "same-user remoteVolumeControl controller; online target player with remoteVolumeControl and canSetVolume",
+      "cursorMutation": "none; PlaybackContext is not accessed",
+      "errorConditionFields": ["retryAfterMs"]
+    },
+    "device.volume.update": {
+      "profile": "core",
+      "type": "event",
+      "contractSection": "5.2/6.0",
+      "payloadSchema": {"closed": true, "required": ["deviceSessionId:string", "volume:int:0..100", "clientSeq:int>=1"], "optional": []},
+      "settlement": "event_confirmed",
+      "serverPushes": ["device.volume.update"],
+      "roleCapabilityGate": "registered source player with matching device, remoteVolumeControl and canSetVolume",
+      "cursorMutation": "online device state clientSeq advances; Context unchanged",
+      "errorConditionFields": ["currentClientSeq", "retryAfterMs"]
+    },
+    "playback.context.list": {
+      "profile": "core",
+      "type": "state",
+      "contractSection": "5.1/6.1",
+      "payloadSchema": {"closed": true, "required": ["authorityClientId:string", "authorityDeviceSessionId:string"], "optional": []},
+      "settlement": "correlated_direct_response",
+      "serverPushes": [],
+      "roleCapabilityGate": "same-user registered strict controller",
+      "cursorMutation": "none",
+      "errorConditionFields": ["retryAfterMs"]
+    },
     "system.ping": {
       "profile": "core",
       "type": "system",
@@ -55,15 +88,15 @@
       "cursorMutation": "none",
       "errorConditionFields": ["retryAfterMs"]
     },
-    "playback.context.create": {
+    "playback.context.ensure": {
       "profile": "core",
       "type": "command",
-      "contractSection": "5.1/6.1",
-      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "deviceSessionId:string", "queueSongIds:distinct-string[]", "currentIndex:int>=0", "positionMs:int>=0", "state:playing|paused|stopped"], "optional": []},
+      "contractSection": "5.1/6.2",
+      "payloadSchema": {"closed": true, "required": ["deviceSessionId:string", "queueSongIds:distinct-string[]", "positionMs:int>=0", "state:idle|playing|paused|stopped"], "optional": ["currentIndex:int>=0"]},
       "settlement": "correlated_direct_response",
-      "serverPushes": [],
+      "serverPushes": ["playback.context.bindings.changed"],
       "roleCapabilityGate": "same-device player",
-      "cursorMutation": "initialize epoch/version/queueRevision/controlVersion to 1",
+      "cursorMutation": "create at 1 or conditionally advance when initializing/rebinding",
       "errorConditionFields": ["playbackContextId", "currentControlVersion", "currentQueueRevision", "currentVersion", "retryAfterMs"]
     },
     "playback.context.subscribe": {
@@ -91,7 +124,7 @@
     "playback.context.status": {
       "profile": "core",
       "type": "state",
-      "contractSection": "5.1/6.2",
+      "contractSection": "5.1/6.3",
       "payloadSchema": {"closed": true, "required": ["playbackContextId:string"], "optional": []},
       "settlement": "correlated_direct_response",
       "serverPushes": [],
@@ -99,13 +132,24 @@
       "cursorMutation": "none",
       "errorConditionFields": ["playbackContextId", "retryAfterMs"]
     },
+    "playback.context.prepare": {
+      "profile": "core",
+      "type": "command",
+      "contractSection": "5.1/6.2.1-6.2.3",
+      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "intentId:string", "baseControlVersion:int>=0"], "optional": ["initialQueueSongIds:non-empty-distinct-string[]", "currentIndex:int>=0", "positionMs:int>=0"]},
+      "settlement": "correlated_ack",
+      "serverPushes": ["playback.context.prepare", "playback.context.prepared"],
+      "roleCapabilityGate": "same-user controller; unique online authority; idle Context",
+      "cursorMutation": "none",
+      "errorConditionFields": ["playbackContextId", "currentControlVersion", "currentQueueRevision", "currentVersion", "retryAfterMs"]
+    },
     "playback.context.close": {
       "profile": "core",
       "type": "command",
-      "contractSection": "5.1/6.3",
+      "contractSection": "5.1/6.4",
       "payloadSchema": {"closed": true, "required": ["playbackContextId:string"], "optional": []},
       "settlement": "correlated_ack",
-      "serverPushes": ["playback.context.closed"],
+      "serverPushes": ["playback.context.closed", "playback.context.bindings.changed"],
       "roleCapabilityGate": "current authority or same-user controller",
       "cursorMutation": "version +1; terminal tombstone",
       "errorConditionFields": ["playbackContextId", "currentControlVersion", "currentQueueRevision", "currentVersion", "retryAfterMs"]
@@ -113,29 +157,40 @@
     "queue.context.sync": {
       "profile": "core",
       "type": "state",
-      "contractSection": "5.2/6.4",
-      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "deviceSessionId:string", "queueSongIds:distinct-string[]", "currentIndex:int>=0", "positionMs:int>=0", "baseQueueRevision:int>=0"], "optional": ["baseControlVersion:int>=0"]},
+      "contractSection": "5.2/6.5",
+      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "deviceSessionId:string", "queueSongIds:distinct-string[]", "positionMs:int>=0", "positionSampledAtServerMs:int>=0", "baseQueueRevision:int>=1"], "optional": ["currentIndex:int>=0", "baseControlVersion:int>=1"]},
       "settlement": "correlated_ack",
       "serverPushes": ["queue.context.sync"],
       "roleCapabilityGate": "current authority with matching device",
       "cursorMutation": "version +1; queueRevision +1; conditional controlVersion +1",
       "errorConditionFields": ["playbackContextId", "currentControlVersion", "currentQueueRevision", "currentVersion", "retryAfterMs"]
     },
+    "playback.context.prepared": {
+      "profile": "core",
+      "type": "event",
+      "contractSection": "5.2/6.2.3",
+      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "deviceSessionId:string", "intentId:string", "ready:bool"], "optional": ["errorCode:string", "errorMessage:string"]},
+      "settlement": "event_confirmed",
+      "serverPushes": ["playback.context.prepared"],
+      "roleCapabilityGate": "current authority with matching device and prepare intent",
+      "cursorMutation": "none",
+      "errorConditionFields": ["playbackContextId", "currentControlVersion", "currentQueueRevision", "currentVersion", "retryAfterMs"]
+    },
     "playback.update": {
       "profile": "core",
       "type": "event",
-      "contractSection": "5.2/6.5",
-      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "deviceSessionId:string", "state:playing|paused|stopped", "positionMs:int>=0", "clientSeq:int>=1"], "optional": ["trackId:string", "volume:int:0..100", "muted:bool"]},
+      "contractSection": "5.2/6.6",
+      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "deviceSessionId:string", "origin:passive|remoteCommand|localUser", "state:idle|playing|paused|stopped", "positionMs:int>=0", "positionSampledAtServerMs:int>=0", "playbackRate:number", "clientSeq:int>=1"], "optional": ["trackId:string", "volume:int:0..100", "muted:bool", "executionStatus:committed|failed", "commandControlVersion:int>=1", "appliedControlVersion:int>=1", "intentId:string", "epoch:int>=1", "observedControlVersion:int>=1", "queueIndex:int>=0", "errorCode:string", "errorMessage:string"]},
       "settlement": "event_confirmed",
       "serverPushes": ["playback.update"],
       "roleCapabilityGate": "registered source with matching device",
-      "cursorMutation": "Context cursors unchanged; DeviceState clientSeq advances",
+      "cursorMutation": "shape-dependent applied/control/queue/version mutation",
       "errorConditionFields": ["playbackContextId", "currentClientSeq", "retryAfterMs"]
     },
     "queue.playItem": {
       "profile": "core",
       "type": "command",
-      "contractSection": "5.2/6.6",
+      "contractSection": "5.2/6.7",
       "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "queueIndex:int>=0", "baseQueueRevision:int>=0", "baseControlVersion:int>=0"], "optional": []},
       "settlement": "correlated_ack",
       "serverPushes": ["queue.playItem", "queue.context.sync", "playback.context.status"],
@@ -146,7 +201,7 @@
     "player.play": {
       "profile": "core",
       "type": "command",
-      "contractSection": "5.2/6.6",
+      "contractSection": "5.2/6.7",
       "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "baseControlVersion:int>=0"], "optional": ["positionMs:int>=0"]},
       "settlement": "correlated_ack",
       "serverPushes": ["player.play", "playback.context.status"],
@@ -157,7 +212,7 @@
     "player.pause": {
       "profile": "core",
       "type": "command",
-      "contractSection": "5.2/6.6",
+      "contractSection": "5.2/6.7",
       "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "baseControlVersion:int>=0"], "optional": ["positionMs:int>=0"]},
       "settlement": "correlated_ack",
       "serverPushes": ["player.pause", "playback.context.status"],
@@ -168,7 +223,7 @@
     "player.seek": {
       "profile": "core",
       "type": "command",
-      "contractSection": "5.2/6.6",
+      "contractSection": "5.2/6.7",
       "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "baseControlVersion:int>=0", "positionMs:int>=0"], "optional": []},
       "settlement": "correlated_ack",
       "serverPushes": ["player.seek", "playback.context.status"],
@@ -179,7 +234,7 @@
     "player.next": {
       "profile": "core",
       "type": "command",
-      "contractSection": "5.2/6.6",
+      "contractSection": "5.2/6.7",
       "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "baseControlVersion:int>=0"], "optional": []},
       "settlement": "correlated_ack",
       "serverPushes": ["player.next", "queue.context.sync", "playback.context.status"],
@@ -190,7 +245,7 @@
     "player.prev": {
       "profile": "core",
       "type": "command",
-      "contractSection": "5.2/6.6",
+      "contractSection": "5.2/6.7",
       "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "baseControlVersion:int>=0"], "optional": []},
       "settlement": "correlated_ack",
       "serverPushes": ["player.prev", "queue.context.sync", "playback.context.status"],
@@ -223,7 +278,7 @@
     "playback.handoff.start": {
       "profile": "handoff",
       "type": "command",
-      "contractSection": "5.4/6.7",
+      "contractSection": "5.4/6.8",
       "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "targetClientId:string", "baseControlVersion:int>=0"], "optional": []},
       "settlement": "correlated_ack",
       "serverPushes": ["playback.prepare"],
@@ -234,7 +289,7 @@
     "playback.ready": {
       "profile": "handoff",
       "type": "event",
-      "contractSection": "5.4/6.8",
+      "contractSection": "5.4/6.9",
       "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "prepareId:string", "ready:bool"], "optional": ["handoffId:string", "errorCode:string", "errorMessage:string"]},
       "settlement": "event_confirmed",
       "serverPushes": ["player.play", "playback.handoff.status"],
@@ -245,10 +300,10 @@
     "playback.handoff.complete": {
       "profile": "handoff",
       "type": "event",
-      "contractSection": "5.4/6.8",
+      "contractSection": "5.4/6.9",
       "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "handoffId:string"], "optional": ["positionMs:int>=0"]},
       "settlement": "event_confirmed",
-      "serverPushes": ["playback.handoff.status", "playback.context.status", "playback.handoff.release"],
+      "serverPushes": ["playback.handoff.status", "playback.context.status", "playback.handoff.release", "playback.context.bindings.changed"],
       "roleCapabilityGate": "bound handoff target in committing",
       "cursorMutation": "epoch/version/controlVersion +1; authority switches atomically",
       "errorConditionFields": ["playbackContextId", "currentControlVersion", "currentQueueRevision", "currentVersion", "retryAfterMs"]
@@ -256,7 +311,7 @@
     "playback.handoff.cancel": {
       "profile": "handoff",
       "type": "command",
-      "contractSection": "5.4/6.8",
+      "contractSection": "5.4/6.9",
       "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "handoffId:string"], "optional": ["reason:string"]},
       "settlement": "correlated_ack",
       "serverPushes": ["playback.handoff.cancel", "playback.handoff.status"],
@@ -267,18 +322,18 @@
     "broadcast.start": {
       "profile": "broadcast",
       "type": "command",
-      "contractSection": "5.5/6.9",
-      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "queueSongIds:distinct-string[]", "currentIndex:int>=0", "positionMs:int>=0"], "optional": ["participants:distinct-string[]", "autoPlay:bool"]},
+      "contractSection": "5.5/6.10",
+      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "intentId:string"], "optional": ["participants:distinct-string[]"]},
       "settlement": "correlated_ack",
       "serverPushes": ["broadcast.start"],
       "roleCapabilityGate": "supportsBroadcast authority or controller; eligible same-user participants",
-      "cursorMutation": "initialize broadcast cursors",
+      "cursorMutation": "Broadcast revision starts at 1; source cursors unchanged",
       "errorConditionFields": ["playbackContextId", "currentControlVersion", "currentQueueRevision", "currentVersion", "retryAfterMs"]
     },
     "broadcast.status": {
       "profile": "broadcast",
       "type": "state",
-      "contractSection": "5.5/6.9",
+      "contractSection": "5.5/6.10",
       "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "broadcastId:string"], "optional": []},
       "settlement": "correlated_ack",
       "serverPushes": [],
@@ -289,62 +344,62 @@
     "broadcast.play": {
       "profile": "broadcast",
       "type": "command",
-      "contractSection": "5.5/6.9",
-      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "broadcastId:string"], "optional": []},
+      "contractSection": "5.5/6.10",
+      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "broadcastId:string", "baseControlVersion:int>=1"], "optional": []},
       "settlement": "correlated_ack",
       "serverPushes": ["broadcast.play"],
       "roleCapabilityGate": "supportsBroadcast owner or current authority",
-      "cursorMutation": "version/controlVersion +1",
+      "cursorMutation": "source version/controlVersion and Broadcast revision +1 atomically",
       "errorConditionFields": ["playbackContextId", "currentControlVersion", "currentVersion", "retryAfterMs"]
     },
     "broadcast.pause": {
       "profile": "broadcast",
       "type": "command",
-      "contractSection": "5.5/6.9",
-      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "broadcastId:string"], "optional": []},
+      "contractSection": "5.5/6.10",
+      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "broadcastId:string", "baseControlVersion:int>=1"], "optional": []},
       "settlement": "correlated_ack",
       "serverPushes": ["broadcast.pause"],
       "roleCapabilityGate": "supportsBroadcast owner or current authority",
-      "cursorMutation": "version/controlVersion +1",
+      "cursorMutation": "source version/controlVersion and Broadcast revision +1 atomically",
       "errorConditionFields": ["playbackContextId", "currentControlVersion", "currentVersion", "retryAfterMs"]
     },
     "broadcast.seek": {
       "profile": "broadcast",
       "type": "command",
-      "contractSection": "5.5/6.9",
-      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "broadcastId:string", "positionMs:int>=0"], "optional": []},
+      "contractSection": "5.5/6.10",
+      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "broadcastId:string", "positionMs:int>=0", "baseControlVersion:int>=1"], "optional": []},
       "settlement": "correlated_ack",
       "serverPushes": ["broadcast.seek"],
       "roleCapabilityGate": "supportsBroadcast owner or current authority",
-      "cursorMutation": "version/controlVersion +1",
+      "cursorMutation": "source version/controlVersion and Broadcast revision +1 atomically",
       "errorConditionFields": ["playbackContextId", "currentControlVersion", "currentVersion", "retryAfterMs"]
     },
     "broadcast.playItem": {
       "profile": "broadcast",
       "type": "command",
-      "contractSection": "5.5/6.9",
-      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "broadcastId:string", "queueIndex:int>=0"], "optional": []},
+      "contractSection": "5.5/6.10",
+      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "broadcastId:string", "queueIndex:int>=0", "baseQueueRevision:int>=1", "baseControlVersion:int>=1"], "optional": []},
       "settlement": "correlated_ack",
       "serverPushes": ["broadcast.playItem"],
       "roleCapabilityGate": "supportsBroadcast owner or current authority",
-      "cursorMutation": "version/queueRevision/controlVersion +1",
+      "cursorMutation": "source version/queueRevision/controlVersion and Broadcast revision +1 atomically",
       "errorConditionFields": ["playbackContextId", "currentControlVersion", "currentQueueRevision", "currentVersion", "retryAfterMs"]
     },
-    "broadcast.queue.sync": {
+    "broadcast.feedback": {
       "profile": "broadcast",
-      "type": "state",
-      "contractSection": "5.5/6.9",
-      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "broadcastId:string", "queueSongIds:distinct-string[]", "currentIndex:int>=0", "positionMs:int>=0"], "optional": ["baseQueueRevision:int>=0", "baseControlVersion:int>=0"]},
-      "settlement": "correlated_ack",
-      "serverPushes": ["broadcast.queue.sync"],
-      "roleCapabilityGate": "supportsBroadcast owner or current authority",
-      "cursorMutation": "version +1; conditional queueRevision/controlVersion +1",
+      "type": "event",
+      "contractSection": "5.5/6.10",
+      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "broadcastId:string", "deviceSessionId:string", "deliveryId:string", "executionStatus:applied|failed", "clientSeq:int>=1"], "optional": ["appliedBroadcastRevision:int>=1", "queueIndex:int>=0", "trackId:string", "state:string", "positionMs:int>=0", "playbackRate:number", "restoreCompleted:bool", "failedBroadcastRevision:int>=1", "lastAppliedBroadcastRevision:int>=0", "errorCode:string", "errorMessage:string"]},
+      "settlement": "event_confirmed",
+      "serverPushes": ["broadcast.feedback", "broadcast.feedback.rejected", "broadcast.resync", "broadcast.restore"],
+      "roleCapabilityGate": "exact frozen ordinary client/device pair only",
+      "cursorMutation": "none; updates participant delivery settlement only",
       "errorConditionFields": ["playbackContextId", "currentControlVersion", "currentQueueRevision", "currentVersion", "retryAfterMs"]
     },
     "broadcast.stop": {
       "profile": "broadcast",
       "type": "command",
-      "contractSection": "5.5/6.9",
+      "contractSection": "5.5/6.10",
       "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "broadcastId:string"], "optional": []},
       "settlement": "correlated_ack",
       "serverPushes": ["broadcast.stop"],
@@ -354,27 +409,466 @@
     }
   },
   "requirements": {
-    "REQ-001": {"profiles": ["core"], "testModules": ["tests.base.test_emo_strict_v2_core"]},
-    "REQ-002": {"profiles": ["core"], "testModules": ["tests.base.test_emo_strict_v2_core"]},
-    "REQ-003": {"profiles": ["core"], "testModules": ["tests.base.test_emo_protocol_metadata", "tests.base.test_emo_strict_v2_core"]},
-    "REQ-004": {"profiles": ["core", "follow", "handoff", "broadcast"], "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_follow", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast"]},
-    "REQ-005": {"profiles": ["core"], "testModules": ["tests.base.test_emo_strict_v2_core"]},
-    "REQ-006": {"profiles": ["core", "handoff", "broadcast"], "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast"]},
-    "REQ-007": {"profiles": ["core", "follow", "handoff", "broadcast"], "testModules": ["tests.base.test_emo_strict_v2_core"]},
-    "REQ-008": {"profiles": ["follow", "handoff", "broadcast"], "testModules": ["tests.base.test_emo_strict_v2_follow", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast"]},
-    "REQ-009": {"profiles": ["handoff"], "testModules": ["tests.base.test_emo_strict_v2_handoff"]},
-    "REQ-010": {"profiles": ["core"], "testModules": ["tests.base.test_emo_strict_v2_core"]},
-    "REQ-011": {"profiles": ["core", "follow", "handoff", "broadcast"], "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_follow", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast"]},
-    "REQ-012": {"profiles": ["core", "follow", "handoff", "broadcast"], "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_follow", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast"]},
-    "REQ-013": {"profiles": ["core", "handoff", "broadcast"], "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast"]},
-    "REQ-014": {"profiles": ["core", "follow", "handoff", "broadcast"], "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_follow", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast"]},
-    "REQ-015": {"profiles": ["core", "follow", "handoff", "broadcast"], "testModules": ["tests.base.test_emo_strict_v2_conformance", "tests.base.test_emo_strict_v2_core"]},
-    "REQ-016": {"profiles": ["core", "follow", "handoff", "broadcast"], "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_follow", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast"]},
-    "REQ-017": {"profiles": ["core", "follow", "handoff", "broadcast"], "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_follow", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast", "tests.base.test_emo_schema_migration"]},
-    "REQ-018": {"profiles": ["core", "handoff", "broadcast"], "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast"]},
-    "REQ-019": {"profiles": ["core"], "testModules": ["tests.base.test_emo_strict_v2_core"]},
-    "REQ-020": {"profiles": ["core", "handoff"], "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_handoff"]},
-    "REQ-021": {"profiles": ["handoff", "broadcast"], "testModules": ["tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast"]},
-    "REQ-022": {"profiles": ["core", "broadcast"], "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_broadcast"]}
+    "REQ-001": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_missing_request_id_disconnects_without_fabricated_error",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_correlatable_bootstrap_schema_error_returns_bad_request",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_controller_control_routes_only_to_bound_authority_then_acks"
+      ]
+    },
+    "REQ-002": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_core_disabled_returns_not_supported_without_registering",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_ready_core_registers_single_role_and_returns_full_negotiation"
+      ]
+    },
+    "REQ-003": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_protocol_metadata", "tests.base.test_emo_strict_v2_conformance"],
+      "testMethods": [
+        "tests.base.test_emo_protocol_metadata.EmoProtocolMetadataTestCase.test_descriptor_exposes_initial_protocol_version",
+        "tests.base.test_emo_strict_v2_conformance.StrictV2ConformanceTestCase.test_frozen_contract_matches_code_and_manifest_hash"
+      ]
+    },
+    "REQ-004": {
+      "profiles": ["core", "follow", "handoff", "broadcast"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_follow", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_each_physical_socket_uses_distinct_128_bit_nonce_and_epoch",
+        "tests.base.test_emo_strict_v2_follow.StrictV2FollowTestCase.test_start_retry_and_stop_use_ack_only_settlement",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_success_uses_strict_settlement_schema_and_atomic_authority_switch",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_authority_start_status_and_stop_use_closed_r5_schemas",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_multi_participant_pushes_are_sorted_and_use_recipient_provenance"
+      ]
+    },
+    "REQ-005": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_controller_control_routes_only_to_bound_authority_then_acks",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_cross_user_status_and_subscribe_are_forbidden"
+      ]
+    },
+    "REQ-006": {
+      "profiles": ["core", "handoff", "broadcast"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_controller_control_routes_only_to_bound_authority_then_acks",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_success_uses_strict_settlement_schema_and_atomic_authority_switch",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_authority_start_status_and_stop_use_closed_r5_schemas"
+      ]
+    },
+    "REQ-007": {
+      "profiles": ["core", "follow", "handoff", "broadcast"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_follow", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_correlatable_bootstrap_schema_error_returns_bad_request",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_queue_sync_advances_only_contract_cursors_and_rejects_stale_base",
+        "tests.base.test_emo_strict_v2_follow.StrictV2FollowTestCase.test_capability_role_device_and_user_gates",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_start_requires_controller_and_target_prepare_capabilities",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_cross_user_target_and_authority_capability_are_closed_failures"
+      ]
+    },
+    "REQ-008": {
+      "profiles": ["follow", "handoff", "broadcast"],
+      "testModules": ["tests.base.test_emo_strict_v2_follow", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_follow.StrictV2FollowTestCase.test_capability_role_device_and_user_gates",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_start_requires_controller_and_target_prepare_capabilities",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_source_requires_can_pause",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_cross_user_target_and_authority_capability_are_closed_failures"
+      ]
+    },
+    "REQ-009": {
+      "profiles": ["handoff"],
+      "testModules": ["tests.base.test_emo_strict_v2_handoff"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_success_uses_strict_settlement_schema_and_atomic_authority_switch",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_cancel_and_complete_reject_session_id_before_mutation"
+      ]
+    },
+    "REQ-010": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_queue_sync_advances_only_contract_cursors_and_rejects_stale_base",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_all_core_controls_follow_cursor_matrix_and_wire_schema"
+      ]
+    },
+    "REQ-011": {
+      "profiles": ["core", "follow", "handoff", "broadcast"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_follow", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_register_post_ack_push_failure_does_not_emit_second_settlement",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_controller_control_routes_only_to_bound_authority_then_acks",
+        "tests.base.test_emo_strict_v2_follow.StrictV2FollowTestCase.test_start_retry_and_stop_use_ack_only_settlement",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_success_uses_strict_settlement_schema_and_atomic_authority_switch",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_authority_start_status_and_stop_use_closed_r5_schemas"
+      ]
+    },
+    "REQ-012": {
+      "profiles": ["core", "follow", "handoff", "broadcast"],
+      "testModules": ["tests.base.test_emo_strict_v2_runtime", "tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_follow", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_runtime.StrictV2RuntimeTestCase.test_entries_expire_after_sixty_seconds",
+        "tests.base.test_emo_strict_v2_runtime.StrictV2RuntimeTestCase.test_disconnect_cleanup_is_scoped_to_connection_nonce",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_register_repeated_100_times_replays_without_second_mutation",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_register_post_ack_push_failure_does_not_emit_second_settlement",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_reused_register_request_id_with_different_payload_conflicts",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_disconnect_clears_request_cache_for_connection_nonce",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_duplicate_playback_update_replays_only_canonical_confirmation",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_context_ensure_response_emit_failure_replays_persisted_response",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_queue_sync_ack_backpressure_replays_without_second_mutation",
+        "tests.base.test_emo_strict_v2_follow.StrictV2FollowTestCase.test_start_retry_and_stop_use_ack_only_settlement",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_same_source_target_retry_reuses_handoff_and_prepare",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_start_ack_emit_failure_still_sends_one_prepare_and_replays_ack",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_authority_start_status_and_stop_use_closed_r5_schemas"
+      ]
+    },
+    "REQ-013": {
+      "profiles": ["core", "handoff", "broadcast"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_queue_sync_cursor_matrix_and_closed_push_schema",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_all_core_controls_follow_cursor_matrix_and_wire_schema",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_success_uses_strict_settlement_schema_and_atomic_authority_switch",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_control_actions_use_action_only_ack_and_canonical_cursor_matrix",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_queue_sync_requires_conditional_base_cursors_and_reports_stale_version"
+      ]
+    },
+    "REQ-014": {
+      "profiles": ["core", "follow", "handoff", "broadcast"],
+      "testModules": ["tests.base.test_emo_strict_v2_contract", "tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_contract.StrictV2ContractTestCase.test_rejects_unknown_envelope_and_payload_fields",
+        "tests.base.test_emo_strict_v2_contract.StrictV2ContractTestCase.test_rejects_unknown_null_and_forbidden_output_fields",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_strict_emit_rejects_invalid_output_before_socketio_send",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_cancel_and_complete_reject_session_id_before_mutation",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_authority_start_status_and_stop_use_closed_r5_schemas"
+      ]
+    },
+    "REQ-015": {
+      "profiles": ["core", "follow", "handoff", "broadcast"],
+      "testModules": ["tests.base.test_emo_strict_v2_conformance", "tests.base.test_emo_strict_v2_core"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_conformance.StrictV2ConformanceTestCase.test_local_test_manifest_fails_closed_outside_test_mode",
+        "tests.base.test_emo_strict_v2_conformance.StrictV2ConformanceTestCase.test_local_test_evidence_requires_explicit_test_mode",
+        "tests.base.test_emo_strict_v2_conformance.StrictV2ConformanceTestCase.test_missing_manifest_fails_closed",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_code_disabled_optional_profiles_override_enabled_deployment"
+      ]
+    },
+    "REQ-016": {
+      "profiles": ["core", "follow", "handoff", "broadcast"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_follow", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_control_rejects_missing_capability_and_replaced_authority_device",
+        "tests.base.test_emo_strict_v2_follow.StrictV2FollowTestCase.test_capability_role_device_and_user_gates",
+        "tests.base.test_emo_strict_v2_follow.StrictV2FollowTestCase.test_follow_relationship_does_not_grant_source_control",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_start_requires_controller_and_target_prepare_capabilities",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_source_requires_can_pause",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_all_requested_participants_can_be_skipped_while_authority_is_forced",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_controller_owner_forces_authority_and_sorts_filtered_participants"
+      ]
+    },
+    "REQ-017": {
+      "profiles": ["core", "follow", "handoff", "broadcast"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_state", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast", "tests.base.test_emo_schema_migration"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_closed_context_is_a_terminal_tombstone",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_context_ensure_retry_after_runtime_reset_uses_persisted_context",
+        "tests.base.test_emo_ws_state.EmoWebSocketStateTestCase.test_restart_restore_discards_all_transient_profile_state",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_restart_fails_nonterminal_handoff_with_server_restart",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_disconnect_cancel_push_failure_still_emits_terminal_status",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_authority_disconnect_live_background_timer_stops_broadcast",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_pause_push_failure_still_schedules_authority_timeout",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_authority_disconnect_timeout_and_restart_stop_freeze_control_cursor",
+        "tests.base.test_emo_schema_migration.EmoSchemaMigrationTestCase.test_sqlite_20260708_upgrade_preserves_context_and_normalizes_cursors"
+      ]
+    },
+    "REQ-018": {
+      "profiles": ["core", "handoff", "broadcast"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_control_does_not_mutate_when_authority_emit_capacity_is_unavailable",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_register_post_ack_push_failure_does_not_emit_second_settlement",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_context_ensure_response_emit_failure_replays_persisted_response",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_playback_update_push_failure_replays_persisted_confirmation",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_queue_sync_ack_backpressure_replays_without_second_mutation",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_queue_sync_commits_before_emit_and_recovers_after_push_failure",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_cancel_push_failures_keep_single_ack_settlement",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_ready_false_cancel_push_failure_replays_failed_confirmation",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_prepare_timeout_cancel_push_failure_still_emits_status",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_commit_timeout_cancel_push_failure_still_emits_status",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_disconnect_cancel_push_failure_still_emits_terminal_status",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_start_ack_emit_failure_still_sends_one_prepare_and_replays_ack",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_start_prepare_push_failure_keeps_ack_and_idempotent_handoff",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_ready_commit_push_failure_replays_committing_confirmation",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_complete_push_failure_preserves_commit_and_replays_confirmation",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_success_uses_strict_settlement_schema_and_atomic_authority_switch",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_handoff_authority_is_canonical_for_subsequent_broadcast",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_partial_start_push_failure_keeps_canonical_broadcast_recoverable",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_simultaneous_start_has_one_atomic_winner_per_context"
+      ]
+    },
+    "REQ-019": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_state"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_each_physical_socket_uses_distinct_128_bit_nonce_and_epoch",
+        "tests.base.test_emo_ws_state.EmoWebSocketStateTestCase.test_connection_nonce_uses_32_byte_csprng_source"
+      ]
+    },
+    "REQ-020": {
+      "profiles": ["core", "handoff"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_handoff"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_duplicate_playback_update_replays_only_canonical_confirmation",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_playback_update_push_failure_replays_persisted_confirmation",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_ready_false_cancel_push_failure_replays_failed_confirmation",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_success_uses_strict_settlement_schema_and_atomic_authority_switch"
+      ]
+    },
+    "REQ-021": {
+      "profiles": ["handoff", "broadcast"],
+      "testModules": ["tests.base.test_emo_strict_v2_contract", "tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_strict_v2_broadcast"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_contract.StrictV2ContractTestCase.test_rejects_invalid_ready_field_combinations",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_ready_false_is_event_confirmed_failed_status",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_ready_false_cancel_push_failure_replays_failed_confirmation",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_prepare_timeout_is_terminal_and_keeps_source_authority",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_prepare_timeout_cancel_push_failure_still_emits_status",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_commit_timeout_cancel_push_failure_still_emits_status",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_non_authority_feedback_is_rejected_and_participant_cannot_control"
+      ]
+    },
+    "REQ-022": {
+      "profiles": ["core", "broadcast"],
+      "testModules": ["tests.base.test_emo_strict_v2_safety", "tests.base.test_emo_strict_v2_contract", "tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_broadcast"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_safety.StrictV2SafetyTestCase.test_actual_polling_transport_rejects_257_kib_payload",
+        "tests.base.test_emo_strict_v2_contract.StrictV2ContractTestCase.test_rejects_business_and_transport_limits",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_context_ensure_persists_exact_initial_snapshot_and_subscribes",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_controller_owner_forces_authority_and_sorts_filtered_participants"
+      ]
+    },
+    "REQ-023": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_contract", "tests.base.test_emo_ws_store", "tests.base.test_emo_strict_v2_core", "tests.base.test_emo_schema_migration"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_contract.StrictV2ContractTestCase.test_validates_closed_context_list_request_schema",
+        "tests.base.test_emo_strict_v2_contract.StrictV2ContractTestCase.test_validates_context_list_and_binding_event_outputs",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_list_active_playback_context_bindings_filters_exact_pair_and_user",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_context_list_discovers_exact_persisted_pair_and_replays_by_request_id",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_context_list_is_controller_only_and_hides_other_scopes",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_context_list_returns_persisted_binding_when_authority_is_offline",
+        "tests.base.test_emo_schema_migration.EmoSchemaMigrationTestCase.test_all_provider_schemas_and_migrations_declare_strict_context_fields"
+      ]
+    },
+    "REQ-024": {
+      "profiles": ["core", "handoff"],
+      "testModules": ["tests.base.test_emo_strict_v2_contract", "tests.base.test_emo_ws_state", "tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_handoff"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_contract.StrictV2ContractTestCase.test_validates_context_list_and_binding_event_outputs",
+        "tests.base.test_emo_strict_v2_contract.StrictV2ContractTestCase.test_rejects_invalid_context_list_and_binding_event_outputs",
+        "tests.base.test_emo_ws_state.EmoWebSocketStateTestCase.test_strict_controller_recipient_filter_is_user_role_and_capability_scoped",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_binding_events_fan_out_to_same_user_strict_controllers_only",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_binding_event_backpressure_disconnects_only_stale_controller",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_binding_event_emit_failure_disconnects_only_stale_controller",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_acceptance_fault_marker_disconnects_only_target_controller",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_acceptance_fault_marker_is_ignored_outside_local_test_mode",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_success_uses_strict_settlement_schema_and_atomic_authority_switch"
+      ]
+    },
+    "REQ-025": {
+      "profiles": ["core", "handoff"],
+      "testModules": ["tests.base.test_emo_ws_store", "tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_handoff"],
+      "testMethods": [
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_control_fails_closed_when_authority_pair_has_multiple_active_contexts",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_create_and_control_are_linearized_by_authority_pair",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_close_and_control_are_linearized_by_context_and_authority_pair",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_handoff_and_control_are_linearized_by_authority_pair",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_close_and_complete_handoff_are_linearized_by_context_tombstone",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_ensure_keeps_one_context_per_authority_pair",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_success_uses_strict_settlement_schema_and_atomic_authority_switch"
+      ]
+    },
+    "REQ-026": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_contract", "tests.base.test_emo_ws_state", "tests.base.test_emo_strict_v2_core", "tests.base.test_emo_web_strict_v2"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_contract.StrictV2ContractTestCase.test_validates_device_volume_request_and_feedback",
+        "tests.base.test_emo_strict_v2_contract.StrictV2ContractTestCase.test_validates_device_volume_outputs_and_extended_device_list",
+        "tests.base.test_emo_ws_state.EmoWebSocketStateTestCase.test_online_device_volume_state_is_sequence_checked_and_cleared",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_device_volume_controls_online_idle_player_and_reports_actual_state",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_device_volume_requires_extended_capability_and_exact_live_pair",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_device_volume_does_not_mutate_active_playback_context",
+        "tests.base.test_emo_web_strict_v2.EmoWebStrictV2TestCase.test_web_remote_volume_controls_online_player_without_context",
+        "tests.base.test_emo_web_strict_v2.EmoWebStrictV2TestCase.test_strict_pages_render_device_volume_controls"
+      ]
+    },
+    "REQ-027": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_contract", "tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store", "tests.base.test_emo_web_strict_v2"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_contract.StrictV2ContractTestCase.test_validates_ensure_idle_and_queue_backed_shapes",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_context_ensure_creates_idle_initializes_and_rebinds_same_id",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_ensure_creates_idle_initializes_same_context_and_rebinds",
+        "tests.base.test_emo_web_strict_v2.EmoWebStrictV2TestCase.test_exact_web_player_and_control_payloads_complete_core_round_trip"
+      ]
+    },
+    "REQ-028": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_contract", "tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_contract.StrictV2ContractTestCase.test_validates_idle_context_prepare_and_settled_outputs",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_context_ensure_creates_idle_initializes_and_rebinds_same_id",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_queue_sync_crosses_idle_boundary_with_closed_snapshot"
+      ]
+    },
+    "REQ-029": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_contract", "tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_contract.StrictV2ContractTestCase.test_validates_prepare_and_prepared_request_shapes",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_context_prepare_routes_once_and_prepared_ready_is_event_confirmed",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_prepare_transaction_enforces_one_active_intent_and_terminal_replay"
+      ]
+    },
+    "REQ-030": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_idle_context_control_fails_with_queue_required_without_routing"
+      ]
+    },
+    "REQ-031": {
+      "profiles": ["handoff"],
+      "testModules": ["tests.base.test_emo_ws_store", "tests.base.test_emo_strict_v2_handoff"],
+      "testMethods": [
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_handoff_start_rejects_non_idle_or_preparing_target_context",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_success_uses_strict_settlement_schema_and_atomic_authority_switch",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_start_rejects_target_context_that_is_no_longer_idle"
+      ]
+    },
+    "REQ-032": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_remote_control_persists_pending_deadline_and_watchdog_settles_unknown",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_r11_passive_and_remote_committed_updates_advance_applied_cursor",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_control_transaction_is_persistent_ordered_and_terminal_idempotent"
+      ]
+    },
+    "REQ-033": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_r11_passive_and_remote_committed_updates_advance_applied_cursor",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_strict_playback_update_commits_pending_and_advances_applied_cursor"
+      ]
+    },
+    "REQ-034": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_stale_applied_update_returns_passive_correction_only_to_source",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_stale_applied_feedback_returns_source_only_correction_without_mutation"
+      ]
+    },
+    "REQ-035": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_local_user_update_allocates_server_version_and_supersedes_pending",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_local_user_update_allocates_version_and_supersedes_pending"
+      ]
+    },
+    "REQ-036": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_local_user_update_allocates_server_version_and_supersedes_pending",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_local_intent_replays_first_canonical_result_and_rejects_conflict"
+      ]
+    },
+    "REQ-037": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_r11_failed_track_change_emits_one_settled_per_dependent_version",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_failed_track_change_cascades_dependency_terminals_in_version_order"
+      ]
+    },
+    "REQ-038": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_local_user_update_allocates_server_version_and_supersedes_pending",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_local_user_update_allocates_version_and_supersedes_pending"
+      ]
+    },
+    "REQ-039": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_r11_failed_track_change_emits_one_settled_per_dependent_version",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_failed_track_change_cascades_dependency_terminals_in_version_order"
+      ]
+    },
+    "REQ-040": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_remote_control_persists_pending_deadline_and_watchdog_settles_unknown",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_windows_execution_timeout_is_feedback_not_server_settled"
+      ]
+    },
+    "REQ-041": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_authority_disconnect_settles_pending_unknown_without_playback_update",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_socket_replacement_settles_old_pending_and_never_replays_command",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_restart_marks_pending_unknown_without_replaying_to_reconnected_player"
+      ]
+    },
+    "REQ-042": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_stale_applied_update_returns_passive_correction_only_to_source",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_stale_applied_feedback_returns_source_only_correction_without_mutation"
+      ]
+    },
+    "REQ-043": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_contract", "tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_contract.StrictV2ContractTestCase.test_validates_idle_context_prepare_and_settled_outputs",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_remote_control_persists_pending_deadline_and_watchdog_settles_unknown",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_r11_failed_track_change_emits_one_settled_per_dependent_version",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_control_transaction_is_persistent_ordered_and_terminal_idempotent"
+      ]
+    },
+    "REQ-044": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_conformance"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_windows_execution_timeout_is_feedback_not_server_settled",
+        "tests.base.test_emo_strict_v2_conformance.StrictV2ConformanceTestCase.test_packaged_r11_manifest_stays_disabled_until_evidence_is_complete"
+      ]
+    },
+    "REQ-045": {
+      "profiles": ["core"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_web_strict_v2"],
+      "testMethods": [
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_remote_control_persists_pending_deadline_and_watchdog_settles_unknown",
+        "tests.base.test_emo_web_strict_v2.EmoWebStrictV2TestCase.test_exact_web_player_and_control_payloads_complete_core_round_trip"
+      ]
+    }
   }
 }

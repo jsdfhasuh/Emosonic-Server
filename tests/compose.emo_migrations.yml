@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:16.9-alpine
+    environment:
+      POSTGRES_DB: supysonic_test
+      POSTGRES_PASSWORD: supysonic
+      POSTGRES_USER: supysonic
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U supysonic -d supysonic_test"]
+      interval: 1s
+      timeout: 5s
+      retries: 30
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  mysql:
+    image: mysql:8.4.5
+    environment:
+      MYSQL_DATABASE: supysonic_test
+      MYSQL_PASSWORD: supysonic
+      MYSQL_ROOT_PASSWORD: supysonic-root
+      MYSQL_USER: supysonic
+    ports:
+      - "53306:3306"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mysqladmin ping --host=127.0.0.1 --user=supysonic --password=supysonic --silent",
+        ]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+    tmpfs:
+      - /var/lib/mysql

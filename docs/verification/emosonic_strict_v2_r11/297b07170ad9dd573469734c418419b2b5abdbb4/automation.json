@@ -1,0 +1,151 @@
+{
+  "identity": {
+    "contractSha256": "4bf1a099fd3c060514215c202b7bb3c82b80e9c73959c39782541d8cda9dea96",
+    "protocolVersion": "2.4.0",
+    "readiness": {
+      "broadcast": false,
+      "core": false,
+      "follow": false,
+      "handoff": false
+    },
+    "requirements": [
+      "REQ-001",
+      "REQ-002",
+      "REQ-003",
+      "REQ-004",
+      "REQ-005",
+      "REQ-006",
+      "REQ-007",
+      "REQ-008",
+      "REQ-009",
+      "REQ-010",
+      "REQ-011",
+      "REQ-012",
+      "REQ-013",
+      "REQ-014",
+      "REQ-015",
+      "REQ-016",
+      "REQ-017",
+      "REQ-018",
+      "REQ-019",
+      "REQ-020",
+      "REQ-021",
+      "REQ-022",
+      "REQ-023",
+      "REQ-024",
+      "REQ-025",
+      "REQ-026",
+      "REQ-027",
+      "REQ-028",
+      "REQ-029",
+      "REQ-030",
+      "REQ-031",
+      "REQ-032",
+      "REQ-033",
+      "REQ-034",
+      "REQ-035",
+      "REQ-036",
+      "REQ-037",
+      "REQ-038",
+      "REQ-039",
+      "REQ-040",
+      "REQ-041",
+      "REQ-042",
+      "REQ-043",
+      "REQ-044",
+      "REQ-045"
+    ],
+    "schemaHash": "77684c5689082b75eb2ac3daed06821cebdcae7c25536d0c977700c3bdd3d68e",
+    "serverBuildCommit": "297b07170ad9dd573469734c418419b2b5abdbb4"
+  },
+  "results": [
+    {
+      "command": [
+        "/root/enter/bin/python",
+        "script/verify_emo_strict_v2_ears.py"
+      ],
+      "cwd": "/workspace/supysonic",
+      "durationSeconds": 17.46,
+      "exitCode": 0,
+      "log": "01-ears.log",
+      "logSha256": "3673538a68a15171c54aa634f42a0d01039425c60aa9a04198ac98b607b27841",
+      "name": "ears"
+    },
+    {
+      "command": [
+        "/root/enter/bin/python",
+        "script/verify_emo_strict_v2_packaging.py"
+      ],
+      "cwd": "/workspace/supysonic",
+      "durationSeconds": 29.564,
+      "exitCode": 0,
+      "log": "02-packaging.log",
+      "logSha256": "0681a2c8d2f0cc86b57f89f1df76f7cea5568e9421435cb807ec1748cd5ae8da",
+      "name": "packaging"
+    },
+    {
+      "command": [
+        "sh",
+        "tests/emo_migrations/run.sh"
+      ],
+      "cwd": "/workspace/supysonic",
+      "durationSeconds": 34.751,
+      "exitCode": 0,
+      "log": "03-database_migrations.log",
+      "logSha256": "1e5b6ad27caf7316c722a0ca92ce705318ebf0110c5296d8edb0e8258eae5f16",
+      "name": "database_migrations"
+    },
+    {
+      "command": [
+        "node",
+        "--test",
+        "tests/js/emo_strict_v2_client.test.js"
+      ],
+      "cwd": "/workspace/supysonic",
+      "durationSeconds": 0.223,
+      "exitCode": 0,
+      "log": "04-javascript.log",
+      "logSha256": "6cb16d9c9dd77cb54536b13e1868000af25f363d653f242d32d96ce24e6393e5",
+      "name": "javascript"
+    },
+    {
+      "command": [
+        "npm",
+        "run",
+        "test:emo-browser"
+      ],
+      "cwd": "/workspace/supysonic",
+      "durationSeconds": 53.635,
+      "exitCode": 0,
+      "log": "05-browser.log",
+      "logSha256": "a2a4b7d81977b2acebf6f121798dd6f8ac73a8004ba98170880e65f92284fadd",
+      "name": "browser"
+    },
+    {
+      "command": [
+        "make",
+        "html"
+      ],
+      "cwd": "/workspace/supysonic/docs",
+      "durationSeconds": 1.693,
+      "exitCode": 0,
+      "log": "06-docs.log",
+      "logSha256": "23d684fc6327cb12bfd55f2440e273484acdbc4b71309fa2d8521747a8fa9a1a",
+      "name": "docs"
+    },
+    {
+      "command": [
+        "/root/enter/bin/python",
+        "-m",
+        "unittest"
+      ],
+      "cwd": "/workspace/supysonic",
+      "durationSeconds": 388.24,
+      "exitCode": 0,
+      "log": "07-full_unittest.log",
+      "logSha256": "8215db5861de437ae60b938a0d1e569d5ecbc6f514d42236bd8f90619406a6da",
+      "name": "full_unittest"
+    }
+  ],
+  "success": true
+}

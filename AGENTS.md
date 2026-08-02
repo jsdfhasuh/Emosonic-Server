@@ -6,6 +6,20 @@ Practical guide for coding agents working in `supysonic`.
 - Base decisions on repository evidence.
 - Verify modified behavior with reproducible commands.
 
+## Personal Project Workflow
+- This is a personal development and test project, not a multi-team release
+  process. Keep the workflow lightweight.
+- When the user explicitly asks for an in-scope change, implement it, run the
+  relevant tests, commit it, and push it without adding repeated approval or
+  release-ceremony steps.
+- Do not add readiness, metadata pinning, evidence, manifest, or sign-off gates
+  unless the authoritative contract actually requires them.
+- Production safety must still fail closed. Explicit development/test switches
+  must enable local integration without being blocked by production evidence
+  collection or exact `schemaHash`/`serverBuildCommit` expectations.
+- Ask only when an action is destructive, requires a material product choice,
+  or falls outside the scope the user authorized.
+
 ## Verified Project Facts
 - Language/runtime: Python.
 - Build backend: `setuptools.build_meta` (`pyproject.toml`).
