@@ -31,7 +31,10 @@
         "minLength": 1
       },
       "requestId": {
-        "type": "string",
+        "type": [
+          "string",
+          "null"
+        ],
         "minLength": 1
       },
       "strictCapabilities": {
@@ -45,47 +48,12 @@
           },
           "effectiveAtPlayback": {
             "type": "boolean"
-          },
-          "canPlay": {
-            "type": "boolean"
-          },
-          "canPause": {
-            "type": "boolean"
-          },
-          "canSeek": {
-            "type": "boolean"
-          },
-          "canSetVolume": {
-            "type": "boolean"
-          },
-          "supportsFollow": {
-            "type": "boolean"
-          },
-          "supportsBroadcast": {
-            "type": "boolean"
           }
         },
         "required": [
-          "playbackContextV2",
-          "playbackPrepare",
-          "effectiveAtPlayback",
-          "canPlay",
-          "canPause",
-          "canSeek",
-          "canSetVolume",
-          "supportsFollow",
-          "supportsBroadcast"
+          "playbackContextV2"
         ],
-        "additionalProperties": false
-      },
-      "strictRoles": {
-        "type": "array",
-        "items": {
-          "enum": ["player", "controller"]
-        },
-        "minItems": 1,
-        "maxItems": 2,
-        "uniqueItems": true
+        "additionalProperties": true
       },
       "strictRegistrationPayload": {
         "type": "object",
@@ -97,13 +65,19 @@
             "$ref": "#/$defs/nonEmptyString"
           },
           "deviceName": {
-            "$ref": "#/$defs/nonEmptyString"
+            "type": "string"
           },
           "alias": {
-            "$ref": "#/$defs/nonEmptyString"
+            "type": "string"
+          },
+          "deviceAlias": {
+            "type": "string"
           },
           "roles": {
-            "$ref": "#/$defs/strictRoles"
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           },
           "capabilities": {
             "$ref": "#/$defs/strictCapabilities"
@@ -112,11 +86,14 @@
         "required": [
           "clientId",
           "deviceSessionId",
-          "deviceName",
-          "roles",
           "capabilities"
         ],
-        "additionalProperties": false
+        "not": {
+          "required": [
+            "sessionId"
+          ]
+        },
+        "additionalProperties": true
       },
       "strictClient": {
         "type": "object",
@@ -128,7 +105,10 @@
             "$ref": "#/$defs/nonEmptyString"
           },
           "roles": {
-            "$ref": "#/$defs/strictRoles"
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           },
           "capabilities": {
             "$ref": "#/$defs/strictCapabilities"
@@ -152,7 +132,6 @@
         "required": [
           "clientId",
           "deviceSessionId",
-          "deviceName",
           "roles",
           "capabilities"
         ],
@@ -198,7 +177,7 @@
         "type": "object",
         "properties": {
           "type": {
-            "const": "device"
+            "type": "string"
           },
           "action": {
             "const": "device.register"
@@ -211,12 +190,10 @@
           }
         },
         "required": [
-          "type",
           "action",
-          "requestId",
           "payload"
         ],
-        "additionalProperties": false
+        "additionalProperties": true
       },
       "strictRegisterAck": {
         "type": "object",
@@ -233,40 +210,21 @@
           "timestamp": {
             "type": "number"
           },
-          "connectionNonce": {
-            "$ref": "#/$defs/nonEmptyString"
-          },
-          "connectionEpoch": {
-            "type": "integer",
-            "const": 1
-          },
           "payload": {
             "type": "object",
             "properties": {
-              "action": {
-                "const": "device.register"
-              },
-              "clientId": {
-                "$ref": "#/$defs/nonEmptyString"
-              },
-              "deviceSessionId": {
-                "$ref": "#/$defs/nonEmptyString"
-              },
-              "negotiatedCapabilities": {
-                "$ref": "#/$defs/strictCapabilities"
+              "client": {
+                "$ref": "#/$defs/strictClient"
               },
               "strictV2": {
                 "$ref": "#/$defs/strictMetadata"
               }
             },
             "required": [
-              "action",
-              "clientId",
-              "deviceSessionId",
-              "negotiatedCapabilities",
+              "client",
               "strictV2"
             ],
-            "additionalProperties": false
+            "additionalProperties": true
           }
         },
         "required": [
@@ -276,7 +234,7 @@
           "timestamp",
           "payload"
         ],
-        "additionalProperties": false
+        "additionalProperties": true
       },
       "registerError": {
         "type": "object",
@@ -293,36 +251,21 @@
           "timestamp": {
             "type": "number"
           },
-          "connectionNonce": {
-            "$ref": "#/$defs/nonEmptyString"
-          },
-          "connectionEpoch": {
-            "type": "integer",
-            "const": 1
-          },
           "payload": {
             "type": "object",
             "properties": {
-              "action": {
-                "const": "device.register"
-              },
               "code": {
                 "$ref": "#/$defs/nonEmptyString"
               },
               "message": {
                 "$ref": "#/$defs/nonEmptyString"
-              },
-              "retryable": {
-                "type": "boolean"
               }
             },
             "required": [
-              "action",
               "code",
-              "message",
-              "retryable"
+              "message"
             ],
-            "additionalProperties": false
+            "additionalProperties": true
           }
         },
         "required": [
@@ -332,7 +275,7 @@
           "timestamp",
           "payload"
         ],
-        "additionalProperties": false
+        "additionalProperties": true
       }
     }
   }
