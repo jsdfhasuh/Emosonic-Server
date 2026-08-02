@@ -76,6 +76,8 @@ class DefaultConfig:
         "recommend_playlist_size": 50,
         "recommend_playlist_archive_enabled": True,
         "recommend_playlist_retention_days": 5,
+        "recommend_playlist_rotation_ratio": 0.3,
+        "recommend_playlist_rotation_lookback_days": 3,
         "mood_scene_playlists_daily_refresh": True,
         "mood_scene_playlists_refresh_interval": 300,
         "mood_scene_playlist_size": 30,

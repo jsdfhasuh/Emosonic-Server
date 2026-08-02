@@ -8,7 +8,15 @@
 import unittest
 import uuid
 
-from supysonic.db import Folder, Artist, Album, Track, User, ClientPrefs
+from supysonic.db import (
+    Album,
+    Artist,
+    ClientPrefs,
+    Folder,
+    Track,
+    User,
+    User_Play_Activity,
+)
 
 from .apitestbase import ApiTestBase
 
@@ -184,6 +192,33 @@ class AnnotationTestCase(ApiTestBase):
         self._make_request("scrobble", {"id": str(self.trackid)})
         self._make_request("scrobble", {"id": str(self.trackid), "submission": True})
         self._make_request("scrobble", {"id": str(self.trackid), "submission": False})
+
+    def test_scrobble_records_activity_only_for_completed_submission(self):
+        self._make_request(
+            "scrobble",
+            {"id": str(self.trackid), "submission": False},
+            skip_post=True,
+        )
+
+        self.assertEqual(
+            User_Play_Activity.select()
+            .where(User_Play_Activity.user == self.user)
+            .count(),
+            0,
+        )
+
+        self._make_request(
+            "scrobble",
+            {"id": str(self.trackid), "submission": True},
+            skip_post=True,
+        )
+
+        self.assertEqual(
+            User_Play_Activity.select()
+            .where(User_Play_Activity.user == self.user)
+            .count(),
+            1,
+        )
 
 
 if __name__ == "__main__":

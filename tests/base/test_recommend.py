@@ -524,6 +524,80 @@ class RecommendTestCase(TestBase):
         self.assertEqual(second_created, 0)
         self.assertEqual(Playlist.select().where(Playlist.user == self.user).count(), 1)
 
+    def test_daily_playlist_rotates_without_new_play_activity(self):
+        self._record_play(self.listened_tracks[0], 2)
+        self._create_recommended_playlist(
+            "2026-05-02",
+            *self.candidate_tracks,
+        )
+        for index in range(3):
+            fresh_artist = Artist.create(name=f"Fresh Artist {index}")
+            fresh_album = Album.create(
+                name=f"Fresh Album {index}",
+                artist=fresh_artist,
+            )
+            self._create_track(
+                f"Fresh Candidate {index}",
+                40 + index,
+                genre="ambient",
+                artist=fresh_artist,
+                album=fresh_album,
+            )
+        self.config.DAEMON["recommend_playlist_rotation_ratio"] = 2 / 3
+        self.config.DAEMON["recommend_playlist_rotation_lookback_days"] = 3
+        activity_count = User_Play_Activity.select().where(
+            User_Play_Activity.user == self.user
+        ).count()
+
+        created = create_recommend_playlist(
+            num_songs=3,
+            user=self.user,
+            day="2026-05-03",
+            config=self.config,
+        )
+
+        playlist = Playlist.get(
+            (Playlist.user == self.user)
+            & (Playlist.name == "alice's 2026-05-03 recommend playlist")
+        )
+        recommended_ids = {track.id for track in playlist.get_tracks()}
+        previous_ids = {track.id for track in self.candidate_tracks}
+        self.assertEqual(created, 1)
+        self.assertEqual(len(recommended_ids), 3)
+        self.assertGreaterEqual(len(recommended_ids - previous_ids), 2)
+        self.assertEqual(
+            User_Play_Activity.select()
+            .where(User_Play_Activity.user == self.user)
+            .count(),
+            activity_count,
+        )
+
+    def test_daily_playlist_fills_from_recent_tracks_for_small_catalog(self):
+        self._record_play(self.listened_tracks[0], 2)
+        self._create_recommended_playlist(
+            "2026-05-02",
+            self.candidate_tracks[0],
+            self.candidate_tracks[1],
+        )
+        self.config.DAEMON["recommend_playlist_rotation_ratio"] = 1.0
+        self.config.DAEMON["recommend_playlist_rotation_lookback_days"] = 3
+
+        created = create_recommend_playlist(
+            num_songs=3,
+            user=self.user,
+            day="2026-05-03",
+            config=self.config,
+        )
+
+        playlist = Playlist.get(
+            (Playlist.user == self.user)
+            & (Playlist.name == "alice's 2026-05-03 recommend playlist")
+        )
+        recommended_ids = {track.id for track in playlist.get_tracks()}
+        self.assertEqual(created, 1)
+        self.assertEqual(len(recommended_ids), 3)
+        self.assertIn(self.candidate_tracks[2].id, recommended_ids)
+
     def test_create_recommend_playlist_archives_recommendations_older_than_retention_window(self):
         self._record_play(self.listened_tracks[0], 2)
         self._record_play(self.listened_tracks[1], 1)

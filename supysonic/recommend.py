@@ -1,12 +1,14 @@
 import hashlib
 import logging
+import math
 import os
 import re
 import time
 
 from datetime import datetime, timedelta
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set
+
 from peewee import fn
-from typing import Dict, Mapping, Optional, Sequence
 
 from .config import DefaultConfig
 from .db import Playlist, Track, TrackMetadata, User, User_Play_Activity
@@ -30,6 +32,8 @@ RECOMMENDED_PLAYLIST_COMMENTS = (
 RECOMMENDED_PLAYLIST_DAY_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 SAFE_ARCHIVE_SEGMENT_RE = re.compile(r"[^A-Za-z0-9._@-]+")
 DEFAULT_RECOMMEND_PLAYLIST_RETENTION_DAYS = 5
+DEFAULT_RECOMMEND_PLAYLIST_ROTATION_RATIO = 0.3
+DEFAULT_RECOMMEND_PLAYLIST_ROTATION_LOOKBACK_DAYS = 3
 RECOMMENDATION_SCORE_WEIGHTS = {
     "genre_match": 0.24,
     "artist_affinity": 0.20,
@@ -403,12 +407,14 @@ def _dailyRecommendationJitter(track, recommendationDay) -> float:
 
 
 def _buildRecommendedTracks(
-    trackPlayCounts,
-    numSongs,
-    excludedTrackIds=None,
-    preferences=None,
-    recommendationDay=None,
-):
+    trackPlayCounts: Mapping[object, int],
+    numSongs: int,
+    excludedTrackIds: Optional[Iterable[object]] = None,
+    preferences: Optional[Mapping[str, object]] = None,
+    recommendationDay: Optional[str] = None,
+    recentTrackIds: Optional[Iterable[object]] = None,
+    minimumFreshTracks: int = 0,
+) -> List[Track]:
     if numSongs <= 0:
         return []
 
@@ -465,7 +471,24 @@ def _buildRecommendedTracks(
     scoredCandidates.sort(
         key=lambda item: (-item[0], -item[1], -item[2], item[3], item[4])
     )
-    return [track for _, _, _, _, _, track in scoredCandidates[:numSongs]]
+    rankedTracks = [track for _, _, _, _, _, track in scoredCandidates]
+    recentTrackIds = {str(trackId) for trackId in recentTrackIds or ()}
+    minimumFreshTracks = min(numSongs, max(0, int(minimumFreshTracks or 0)))
+    if not recentTrackIds or minimumFreshTracks == 0:
+        return rankedTracks[:numSongs]
+
+    freshTracks = [
+        track for track in rankedTracks if str(track.id) not in recentTrackIds
+    ][:minimumFreshTracks]
+    selectedTrackIds = {str(track.id) for track in freshTracks}
+    for track in rankedTracks:
+        if len(selectedTrackIds) >= numSongs:
+            break
+        selectedTrackIds.add(str(track.id))
+
+    return [
+        track for track in rankedTracks if str(track.id) in selectedTrackIds
+    ][:numSongs]
 
 
 def _setPlaylistTracks(playlist, tracks):
@@ -495,6 +518,53 @@ def _get_recommend_playlist_retention_days(config: Optional[object] = None) -> i
         retentionDays = DEFAULT_RECOMMEND_PLAYLIST_RETENTION_DAYS
 
     return max(1, retentionDays)
+
+
+def _get_recommend_playlist_rotation_ratio(
+    config: Optional[object] = None,
+) -> float:
+    daemonConfig = getattr(config, "DAEMON", None)
+    ratio = DEFAULT_RECOMMEND_PLAYLIST_ROTATION_RATIO
+    if isinstance(daemonConfig, dict):
+        ratio = daemonConfig.get("recommend_playlist_rotation_ratio", ratio)
+
+    try:
+        ratio = float(ratio)
+    except (TypeError, ValueError):
+        ratio = DEFAULT_RECOMMEND_PLAYLIST_ROTATION_RATIO
+
+    return min(1.0, max(0.0, ratio))
+
+
+def _get_recommend_playlist_rotation_lookback_days(
+    config: Optional[object] = None,
+) -> int:
+    daemonConfig = getattr(config, "DAEMON", None)
+    lookbackDays = DEFAULT_RECOMMEND_PLAYLIST_ROTATION_LOOKBACK_DAYS
+    if isinstance(daemonConfig, dict):
+        lookbackDays = daemonConfig.get(
+            "recommend_playlist_rotation_lookback_days",
+            lookbackDays,
+        )
+
+    try:
+        lookbackDays = int(lookbackDays)
+    except (TypeError, ValueError):
+        lookbackDays = DEFAULT_RECOMMEND_PLAYLIST_ROTATION_LOOKBACK_DAYS
+
+    return max(1, lookbackDays)
+
+
+def _get_minimum_fresh_track_count(
+    numSongs: int,
+    config: Optional[object] = None,
+) -> int:
+    if numSongs <= 0:
+        return 0
+    ratio = _get_recommend_playlist_rotation_ratio(config)
+    if ratio <= 0:
+        return 0
+    return min(numSongs, max(1, math.ceil(numSongs * ratio)))
 
 
 def _recommend_playlist_archive_enabled(config: Optional[object] = None) -> bool:
@@ -531,6 +601,36 @@ def _get_recommendation_date_for_playlist(playlist):
         return created.date()
 
     return _parse_recommendation_date(getRecommendationDay())
+
+
+def _get_recent_recommended_track_ids(
+    user: User,
+    currentDay: str,
+    lookbackDays: int,
+) -> Set[str]:
+    currentDate = _parse_recommendation_date(currentDay)
+    if currentDate is None:
+        return set()
+
+    cutoffDate = currentDate - timedelta(days=max(1, lookbackDays))
+    recentTrackIds: Set[str] = set()
+    query = Playlist.select().where(
+        (Playlist.user == user) & recommended_playlist_where()
+    )
+    for playlist in query:
+        playlistDate = _get_recommendation_date_for_playlist(playlist)
+        if (
+            playlistDate is None
+            or playlistDate >= currentDate
+            or playlistDate < cutoffDate
+        ):
+            continue
+        recentTrackIds.update(
+            trackId.strip()
+            for trackId in str(playlist.tracks or "").split(",")
+            if trackId.strip()
+        )
+    return recentTrackIds
 
 
 def _serialize_recommend_playlist_track(track, reason: str = ""):
@@ -647,6 +747,11 @@ def _createRecommendPlaylistForUser(
         return None, False
 
     recommendationDay = getRecommendationDay() if day is None else day
+    recentTrackIds = _get_recent_recommended_track_ids(
+        user,
+        recommendationDay,
+        _get_recommend_playlist_rotation_lookback_days(config),
+    )
     _archive_old_recommended_playlists_for_user(
         user, recommendationDay, config=config
     )
@@ -665,6 +770,8 @@ def _createRecommendPlaylistForUser(
         excludedTrackIds=preferences["disliked_song_ids"],
         preferences=preferences,
         recommendationDay=recommendationDay,
+        recentTrackIds=recentTrackIds,
+        minimumFreshTracks=_get_minimum_fresh_track_count(numSongs, config),
     )
     if not recommendedTracks:
         return None, False
@@ -677,10 +784,12 @@ def _createRecommendPlaylistForUser(
     _setPlaylistTracks(playlist, recommendedTracks)
     playlist.save()
     logger.info(
-        "Created recommended playlist %s for %s with %d tracks",
+        "Created recommended playlist %s for %s with %d tracks, "
+        "%d outside recent recommendations",
         playlist.name,
         user.name,
         len(recommendedTracks),
+        sum(str(track.id) not in recentTrackIds for track in recommendedTracks),
     )
     return playlist, True
 

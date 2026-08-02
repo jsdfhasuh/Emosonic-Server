@@ -116,6 +116,14 @@ log_backup_count = 7
 log_level = INFO
 log_rotate = yes
 
+; Minimum share of each daily recommendation playlist that was not present in
+; recent recommendation playlists. Set to 0 to disable. Default: 0.3
+recommend_playlist_rotation_ratio = 0.3
+
+; Number of previous natural days treated as recent recommendation exposure.
+; Default: 3
+recommend_playlist_rotation_lookback_days = 3
+
 ; Enable daemon-driven daily mood/scene playlist refresh. Default: on.
 ; This does not call an LLM; it uses existing high-quality semantic metadata.
 mood_scene_playlists_daily_refresh = on
