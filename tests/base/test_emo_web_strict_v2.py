@@ -167,6 +167,7 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
         supports_follow=False,
         supports_broadcast=False,
         supports_handoff=False,
+        effective_at_playback=False,
     ):
         password = self.issue_credential().json["oneTimePassword"]
         client = self.connect()
@@ -187,7 +188,9 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
         capabilities["supportsBroadcast"] = supports_broadcast
         capabilities["playbackPrepare"] = supports_handoff
         capabilities["effectiveAtPlayback"] = (
-            supports_handoff or supports_broadcast
+            effective_at_playback
+            or supports_handoff
+            or supports_broadcast
         )
         client.emit("message", request_message, namespace="/emo")
         messages = self.messages(client)
@@ -973,6 +976,7 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
             "web-player-follower",
             "web-player-device:follower",
             supports_follow=True,
+            effective_at_playback=True,
         )
         self.messages(source)
 

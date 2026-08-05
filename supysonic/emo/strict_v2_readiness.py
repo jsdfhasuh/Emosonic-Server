@@ -75,12 +75,10 @@ def get_effective_profile_readiness(
     code_readiness: Optional[Mapping[str, bool]] = None,
     allow_local_test_evidence: Optional[bool] = None,
 ) -> Dict[str, bool]:
-    code = dict(
-        code_readiness
-        or get_code_conformance_readiness(
-            bool(allow_local_test_evidence)
-        )
-    )
+    if code_readiness is None:
+        code = get_code_conformance_readiness(bool(allow_local_test_evidence))
+    else:
+        code = dict(code_readiness)
     deployment = get_deployment_readiness(webapp_config)
     return {
         profile: bool(code.get(profile, False) and deployment[profile])
@@ -103,6 +101,8 @@ def negotiate_capabilities(
         raise ValueError(
             "client capabilities must contain exactly the 10 booleans"
         )
+    if not client_capabilities["playbackContextV2"]:
+        raise ValueError("client capabilities.playbackContextV2 must be true")
 
     role_set = set(roles)
     readiness = get_effective_profile_readiness(
@@ -117,27 +117,36 @@ def negotiate_capabilities(
         capability: bool(client_capabilities[capability])
         for capability in STRICT_CAPABILITIES
     }
-    negotiated["playbackContextV2"] = True
-
-    can_follow = "player" in role_set and negotiated["canPlay"]
-    negotiated["supportsFollow"] = bool(
-        readiness["follow"] and negotiated["supportsFollow"] and can_follow
-    )
-
-    can_handoff_target = "player" in role_set and negotiated["canPlay"]
-    negotiated["playbackPrepare"] = bool(
-        readiness["handoff"]
-        and negotiated["playbackPrepare"]
-        and can_handoff_target
+    is_player = "player" in role_set
+    effective_at_requested = negotiated["effectiveAtPlayback"]
+    playback_prepare_requested = negotiated["playbackPrepare"]
+    effective_at_ready = bool(
+        is_player
+        and (readiness["follow"] or readiness["handoff"] or readiness["broadcast"])
     )
     negotiated["effectiveAtPlayback"] = bool(
-        (readiness["handoff"] or readiness["broadcast"])
+        effective_at_requested and effective_at_ready
+    )
+    negotiated["supportsFollow"] = bool(
+        readiness["follow"]
+        and negotiated["supportsFollow"]
+        and is_player
+        and negotiated["playbackContextV2"]
         and negotiated["effectiveAtPlayback"]
-        and can_handoff_target
+        and negotiated["canPlay"]
+        and negotiated["canPause"]
+        and negotiated["canSeek"]
+    )
+
+    negotiated["playbackPrepare"] = bool(
+        readiness["handoff"]
+        and playback_prepare_requested
+        and is_player
     )
 
     can_execute_broadcast_audio = bool(
-        "player" in role_set
+        is_player
+        and negotiated["playbackContextV2"]
         and negotiated["effectiveAtPlayback"]
         and negotiated["canPlay"]
         and negotiated["canPause"]

@@ -38,7 +38,11 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
             "owner-1",
             "device:owner-1",
             ["player"],
-            capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": False,
+            },
         )
         follower = self.connect_device(
             "alice",
@@ -46,7 +50,11 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
             "follower-1",
             "device:follower-1",
             ["player"],
-            capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": True,
+            },
         )
         self.get_messages(owner)
         self.get_messages(follower)
@@ -93,7 +101,11 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
             "owner-1",
             "device:owner-1",
             ["player"],
-            capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": False,
+            },
         )
         second_owner = self.connect_device(
             "alice",
@@ -101,7 +113,11 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
             "owner-2",
             "device:owner-2",
             ["player"],
-            capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": False,
+            },
         )
         follower = self.connect_device(
             "alice",
@@ -109,7 +125,11 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
             "follower-1",
             "device:follower-1",
             ["player"],
-            capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": True,
+            },
         )
         for client in (first_owner, second_owner, follower):
             self.get_messages(client)
@@ -150,7 +170,11 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
             "owner-1",
             "device:owner-1",
             ["player"],
-            capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": True,
+            },
         )
         unsupported = self.connect_device(
             "alice",
@@ -169,7 +193,11 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
             "controller-1",
             "device:controller-1",
             ["controller"],
-            capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": True,
+            },
         )
         bob = self.connect_device(
             "bob",
@@ -177,7 +205,11 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
             "bob-player-1",
             "device:bob-player-1",
             ["player"],
-            capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": True,
+            },
         )
         for client in (owner, unsupported, controller, bob):
             self.get_messages(client)
@@ -230,7 +262,11 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
             "owner-1",
             "device:owner-1",
             ["player"],
-            capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": False,
+            },
         )
         follower = self.connect_device(
             "alice",
@@ -238,7 +274,11 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
             "follower-1",
             "device:follower-1",
             ["player"],
-            capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": True,
+            },
         )
         self.get_messages(owner)
         self.get_messages(follower)
@@ -278,7 +318,11 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
             "owner-2",
             "device:owner-2",
             ["player"],
-            capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": False,
+            },
         )
         self.get_messages(second_context_owner)
         self.ensure_playback_context(
@@ -312,7 +356,11 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
             "follower-1",
             "device:follower-1",
             ["player", "controller"],
-            capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": True,
+            },
         )
         self.get_messages(owner)
         self.get_messages(follower)

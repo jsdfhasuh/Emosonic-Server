@@ -1,5 +1,6 @@
 import copy
 import json
+import math
 import unittest
 from pathlib import Path
 
@@ -47,6 +48,210 @@ class StrictV2ContractTestCase(unittest.TestCase):
 
         self.assertEqual(normalized["payload"]["roles"], ["player", "controller"])
 
+    def test_rejects_invalid_roles_without_type_errors(self):
+        invalid_roles = (
+            [],
+            ["player", "player"],
+            ["observer"],
+            None,
+            True,
+            1,
+            [None],
+            [["player"]],
+            [{"role": "player"}],
+        )
+
+        for roles in invalid_roles:
+            request = self._register_request()
+            request["payload"]["roles"] = roles
+            with self.subTest(roles=roles):
+                with self.assertRaises(StrictRequestValidationError):
+                    validate_strict_request(request)
+
+    def test_accepts_only_finite_request_timestamps(self):
+        for timestamp in (1, 1.5):
+            request = self._register_request()
+            request["timestamp"] = timestamp
+            with self.subTest(timestamp=timestamp):
+                self.assertEqual(validate_strict_request(request)["timestamp"], timestamp)
+
+        for timestamp in (True, None, math.nan, math.inf, -math.inf):
+            request = self._register_request()
+            request["timestamp"] = timestamp
+            with self.subTest(timestamp=timestamp):
+                with self.assertRaises(StrictRequestValidationError):
+                    validate_strict_request(request)
+
+    def test_rejects_invalid_string_enum_types(self):
+        ensure = {
+            "type": "command",
+            "action": "playback.context.ensure",
+            "requestId": "ensure-enum-1",
+            "payload": {
+                "deviceSessionId": "device:player-1",
+                "queueSongIds": [],
+                "positionMs": 0,
+                "state": "idle",
+            },
+        }
+        update = {
+            "type": "event",
+            "action": "playback.update",
+            "requestId": "update-enum-1",
+            "payload": {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "remoteCommand",
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 100,
+                "positionSampledAtServerMs": 1000,
+                "playbackRate": 1.0,
+                "clientSeq": 1,
+                "executionStatus": "committed",
+                "commandControlVersion": 2,
+                "appliedControlVersion": 2,
+            },
+        }
+        cases = (
+            (ensure, "state"),
+            (update, "origin"),
+            (update, "executionStatus"),
+        )
+        for base, field_name in cases:
+            for invalid_value in (None, [], {}, True, "unknown"):
+                request = copy.deepcopy(base)
+                request["payload"][field_name] = invalid_value
+                with self.subTest(field_name=field_name, value=invalid_value):
+                    with self.assertRaises(StrictRequestValidationError):
+                        validate_strict_request(request)
+
+    def test_rejects_boolean_integer_fields(self):
+        cases = (
+            (
+                "playback.context.prepare",
+                {
+                    "playbackContextId": "context-1",
+                    "intentId": "intent-1",
+                    "baseControlVersion": 1,
+                },
+                "baseControlVersion",
+            ),
+            (
+                "queue.playItem",
+                {
+                    "playbackContextId": "context-1",
+                    "queueIndex": 0,
+                    "baseQueueRevision": 1,
+                    "baseControlVersion": 1,
+                },
+                "baseQueueRevision",
+            ),
+            (
+                "player.seek",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                    "positionMs": 100,
+                },
+                "positionMs",
+            ),
+            (
+                "device.volume.update",
+                {
+                    "deviceSessionId": "device:player-1",
+                    "volume": 50,
+                    "clientSeq": 1,
+                },
+                "clientSeq",
+            ),
+            (
+                "device.setVolume",
+                {
+                    "targetClientId": "player-1",
+                    "targetDeviceSessionId": "device:player-1",
+                    "volume": 50,
+                },
+                "volume",
+            ),
+        )
+        message_types = {
+            "playback.context.prepare": "command",
+            "queue.playItem": "command",
+            "player.seek": "command",
+            "device.volume.update": "event",
+            "device.setVolume": "command",
+        }
+        for action, payload, field_name in cases:
+            for invalid_value in (True, False):
+                request = {
+                    "type": message_types[action],
+                    "action": action,
+                    "requestId": "%s-bool" % field_name,
+                    "payload": dict(payload, **{field_name: invalid_value}),
+                }
+                with self.subTest(action=action, field_name=field_name, value=invalid_value):
+                    with self.assertRaises(StrictRequestValidationError):
+                        validate_strict_request(request)
+
+    def test_rejects_optional_null_and_requester_spoof_fields(self):
+        register = self._register_request()
+        register["payload"]["alias"] = None
+        with self.assertRaises(StrictRequestValidationError):
+            validate_strict_request(register)
+
+        actions = (
+            (
+                "player.play",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                    "positionMs": None,
+                },
+            ),
+            (
+                "queue.playItem",
+                {
+                    "playbackContextId": "context-1",
+                    "queueIndex": 0,
+                    "baseQueueRevision": 1,
+                    "baseControlVersion": 1,
+                },
+            ),
+        )
+        spoof_fields = (
+            "requestingClientId",
+            "requestingDeviceSessionId",
+            "requestingConnectionNonce",
+            "requestingConnectionEpoch",
+        )
+        for action, payload in actions:
+            for field_name in spoof_fields:
+                request = {
+                    "type": "command",
+                    "action": action,
+                    "requestId": "%s-%s" % (action, field_name),
+                    "payload": dict(payload, **{field_name: "spoofed"}),
+                }
+                with self.subTest(action=action, field_name=field_name):
+                    with self.assertRaises(StrictRequestValidationError):
+                        validate_strict_request(request)
+
+        for field_name in ("targetClientId", "targetDeviceSessionId"):
+            request = {
+                "type": "command",
+                "action": "player.play",
+                "requestId": "target-%s" % field_name,
+                "payload": {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                    field_name: "target",
+                },
+            }
+            with self.subTest(field_name=field_name):
+                with self.assertRaises(StrictRequestValidationError):
+                    validate_strict_request(request)
+
     def test_rejects_uncorrelatable_request_id_and_action(self):
         for field_name, value in (("requestId", ""), ("requestId", None), ("action", "x" * 65)):
             request = self._register_request()
@@ -69,11 +274,13 @@ class StrictV2ContractTestCase(unittest.TestCase):
             self.assertEqual(context.exception.code, "bad_request")
 
     def test_rejects_nested_session_id(self):
-        request = self._register_request()
-        request["payload"]["capabilities"]["sessionId"] = "legacy"
+        for field_name in ("sessionId", "sourceSessionId"):
+            request = self._register_request()
+            request["payload"]["capabilities"][field_name] = "legacy"
 
-        with self.assertRaisesRegex(StrictRequestValidationError, "sessionId"):
-            validate_strict_request(request)
+            with self.subTest(field_name=field_name):
+                with self.assertRaisesRegex(StrictRequestValidationError, "sessionId"):
+                    validate_strict_request(request)
 
     def test_target_fields_are_closed_to_handoff_and_device_volume(self):
         request = {
@@ -118,6 +325,38 @@ class StrictV2ContractTestCase(unittest.TestCase):
         self.assertTrue(
             normalized["payload"]["capabilities"]["remoteVolumeControl"]
         )
+
+    def test_requires_exact_boolean_capability_set(self):
+        capability_names = tuple(self._register_request()["payload"]["capabilities"])
+        for field_name in capability_names:
+            missing = self._register_request()
+            del missing["payload"]["capabilities"][field_name]
+            with self.subTest(kind="missing", field_name=field_name):
+                with self.assertRaises(StrictRequestValidationError):
+                    validate_strict_request(missing)
+
+            invalid = self._register_request()
+            invalid["payload"]["capabilities"][field_name] = None
+            with self.subTest(kind="null", field_name=field_name):
+                with self.assertRaises(StrictRequestValidationError):
+                    validate_strict_request(invalid)
+
+            for value in (0, 1, "true"):
+                invalid = self._register_request()
+                invalid["payload"]["capabilities"][field_name] = value
+                with self.subTest(kind="type", field_name=field_name, value=value):
+                    with self.assertRaises(StrictRequestValidationError):
+                        validate_strict_request(invalid)
+
+        extra = self._register_request()
+        extra["payload"]["capabilities"]["supportsHandoff"] = True
+        with self.assertRaises(StrictRequestValidationError):
+            validate_strict_request(extra)
+
+        disabled_context = self._register_request()
+        disabled_context["payload"]["capabilities"]["playbackContextV2"] = False
+        with self.assertRaises(StrictRequestValidationError):
+            validate_strict_request(disabled_context)
 
     def test_rejects_business_and_transport_limits(self):
         request = {

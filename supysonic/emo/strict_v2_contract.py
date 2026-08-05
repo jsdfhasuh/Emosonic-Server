@@ -316,10 +316,14 @@ def _validate_capabilities(value: object) -> Dict[str, bool]:
 def _validate_roles(value: object) -> Tuple[str, ...]:
     if not isinstance(value, list) or not value:
         raise StrictRequestValidationError("roles must be a non-empty array")
-    if len(value) > 2 or len(set(value)) != len(value):
-        raise StrictRequestValidationError("roles must contain distinct player/controller values")
+    if len(value) > 2:
+        raise StrictRequestValidationError("roles must contain at most two values")
+    if not all(isinstance(role, str) for role in value):
+        raise StrictRequestValidationError("roles must contain string values")
     if not all(role in {"player", "controller"} for role in value):
         raise StrictRequestValidationError("roles contain an unsupported value")
+    if len(set(value)) != len(value):
+        raise StrictRequestValidationError("roles must contain distinct player/controller values")
     return tuple(role for role in ("player", "controller") if role in value)
 
 
@@ -363,7 +367,12 @@ def _validate_field(
         if not isinstance(value, bool):
             raise StrictRequestValidationError("%s must be a boolean" % field_name)
     elif field_name == "state":
-        if value not in {"idle", "playing", "paused", "stopped"}:
+        if not isinstance(value, str) or value not in {
+            "idle",
+            "playing",
+            "paused",
+            "stopped",
+        }:
             raise StrictRequestValidationError("state is invalid")
     elif field_name == "queueSongIds":
         if not isinstance(value, list):
@@ -389,7 +398,11 @@ def _validate_field(
     elif field_name == "capabilities":
         payload[field_name] = _validate_capabilities(value)
     elif field_name == "origin":
-        if value not in {"passive", "remoteCommand", "localUser"}:
+        if not isinstance(value, str) or value not in {
+            "passive",
+            "remoteCommand",
+            "localUser",
+        }:
             raise StrictRequestValidationError("origin is invalid")
     elif field_name == "executionStatus":
         allowed_statuses = (
@@ -397,7 +410,7 @@ def _validate_field(
             if action == "broadcast.feedback"
             else {"committed", "failed"}
         )
-        if value not in allowed_statuses:
+        if not isinstance(value, str) or value not in allowed_statuses:
             raise StrictRequestValidationError("executionStatus is invalid")
     else:
         raise StrictRequestValidationError("No validator exists for %s" % field_name)
@@ -641,6 +654,10 @@ def validate_strict_request(message: object) -> Dict[str, object]:
     if "timestamp" in message and (
         not isinstance(message["timestamp"], (int, float))
         or isinstance(message["timestamp"], bool)
+        or (
+            isinstance(message["timestamp"], float)
+            and not math.isfinite(message["timestamp"])
+        )
     ):
         raise StrictRequestValidationError("timestamp must be a number")
 

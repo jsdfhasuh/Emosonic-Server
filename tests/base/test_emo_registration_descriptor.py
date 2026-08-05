@@ -78,6 +78,32 @@ class EmoRegistrationDescriptorTestCase(unittest.TestCase):
     def test_descriptor_accepts_a_strict_registration_request(self):
         self.assertTrue(self.validator.is_valid(self._strict_register_request()))
 
+    def test_descriptor_accepts_optional_finite_request_timestamp(self):
+        for timestamp in (1, 1.5):
+            request = self._strict_register_request()
+            request["timestamp"] = timestamp
+            with self.subTest(timestamp=timestamp):
+                self.assertTrue(self.validator.is_valid(request))
+
+    def test_descriptor_rejects_invalid_request_timestamp(self):
+        for timestamp in (True, "1000", None):
+            request = self._strict_register_request()
+            request["timestamp"] = timestamp
+            with self.subTest(timestamp=timestamp):
+                self.assertFalse(self.validator.is_valid(request))
+
+    def test_descriptor_rejects_unknown_request_and_capability_fields(self):
+        unknown_envelope = self._strict_register_request()
+        unknown_envelope["unexpected"] = True
+        unknown_payload = self._strict_register_request()
+        unknown_payload["payload"]["unexpected"] = True
+        unknown_capability = self._strict_register_request()
+        unknown_capability["payload"]["capabilities"]["supportsHandoff"] = True
+
+        for request in (unknown_envelope, unknown_payload, unknown_capability):
+            with self.subTest(request=request):
+                self.assertFalse(self.validator.is_valid(request))
+
     def test_descriptor_rejects_a_session_id_in_strict_registration(self):
         request = self._strict_register_request()
         request["payload"]["sessionId"] = "legacy-room"
@@ -117,12 +143,18 @@ class EmoRegistrationDescriptorTestCase(unittest.TestCase):
     def test_descriptor_requires_all_capabilities_and_accepts_single_role(self):
         missing_capability = self._strict_register_request()
         del missing_capability["payload"]["capabilities"]["supportsBroadcast"]
+        non_boolean_capability = self._strict_register_request()
+        non_boolean_capability["payload"]["capabilities"]["canPlay"] = 1
+        disabled_context = self._strict_register_request()
+        disabled_context["payload"]["capabilities"]["playbackContextV2"] = False
         single_role = self._strict_register_request()
         single_role["payload"]["roles"] = ["player"]
         duplicate_roles = self._strict_register_request()
         duplicate_roles["payload"]["roles"] = ["player", "player"]
 
         self.assertFalse(self.validator.is_valid(missing_capability))
+        self.assertFalse(self.validator.is_valid(non_boolean_capability))
+        self.assertFalse(self.validator.is_valid(disabled_context))
         self.assertTrue(self.validator.is_valid(single_role))
         self.assertFalse(self.validator.is_valid(duplicate_roles))
 

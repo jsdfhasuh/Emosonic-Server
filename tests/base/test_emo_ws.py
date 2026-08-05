@@ -7224,7 +7224,11 @@ class EmoWebSocketTestCase(unittest.TestCase):
       "phone-1",
       "root:phone",
       ["player"],
-      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+      capabilities={
+        CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+        "effectiveAtPlayback": True,
+        "supportsFollow": False,
+      },
     )
     laptop = self.connect_device(
       "alice",
@@ -7232,7 +7236,11 @@ class EmoWebSocketTestCase(unittest.TestCase):
       "laptop-1",
       "root:laptop",
       ["player"],
-      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+      capabilities={
+        CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+        "effectiveAtPlayback": True,
+        "supportsFollow": True,
+      },
     )
     self.get_messages(phone)
     self.get_messages(laptop)
@@ -7316,7 +7324,11 @@ class EmoWebSocketTestCase(unittest.TestCase):
       "phone-1",
       "root:phone",
       ["player"],
-      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+      capabilities={
+        CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+        "effectiveAtPlayback": True,
+        "supportsFollow": False,
+      },
     )
     laptop = self.connect_device(
       "alice",
@@ -7324,7 +7336,11 @@ class EmoWebSocketTestCase(unittest.TestCase):
       "laptop-1",
       "root:laptop",
       ["player"],
-      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+      capabilities={
+        CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+        "effectiveAtPlayback": True,
+        "supportsFollow": True,
+      },
     )
     self.get_messages(phone)
     self.get_messages(laptop)
@@ -7392,7 +7408,11 @@ class EmoWebSocketTestCase(unittest.TestCase):
       "phone-1",
       "root:phone",
       ["player"],
-      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+      capabilities={
+        CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+        "effectiveAtPlayback": True,
+        "supportsFollow": False,
+      },
     )
     laptop = self.connect_device(
       "alice",
@@ -7400,7 +7420,11 @@ class EmoWebSocketTestCase(unittest.TestCase):
       "laptop-1",
       "root:laptop",
       ["player"],
-      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+      capabilities={
+        CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+        "effectiveAtPlayback": True,
+        "supportsFollow": True,
+      },
     )
     self.get_messages(phone)
     self.get_messages(laptop)

@@ -208,6 +208,9 @@
           "requestId": {
             "$ref": "#/$defs/requestId"
           },
+          "timestamp": {
+            "type": "number"
+          },
           "payload": {
             "$ref": "#/$defs/strictRegistrationPayload"
           }

@@ -57,6 +57,24 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
             )["handoff"]
         )
 
+    def test_explicit_empty_code_readiness_fails_closed(self):
+        readiness = get_effective_profile_readiness(
+            self.deployment_enabled,
+            {},
+        )
+
+        self.assertEqual(
+            readiness,
+            {"core": False, "follow": False, "handoff": False, "broadcast": False},
+        )
+        with self.assertRaises(CoreProfileNotReady):
+            negotiate_capabilities(
+                self.capabilities,
+                ["player"],
+                self.deployment_enabled,
+                {},
+            )
+
     def test_local_test_evidence_requires_explicit_development_gate(self):
         self.assertFalse(is_local_test_evidence_requested({}))
         self.assertFalse(
@@ -159,7 +177,7 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
         self.assertFalse(negotiated["effectiveAtPlayback"])
         self.assertTrue(negotiated["supportsBroadcast"])
 
-    def test_player_without_can_play_cannot_negotiate_follow_or_handoff(self):
+    def test_player_without_can_play_keeps_prepare_but_not_composites(self):
         capabilities = dict(self.capabilities, canPlay=False)
 
         negotiated = negotiate_capabilities(
@@ -170,8 +188,8 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
         )
 
         self.assertFalse(negotiated["supportsFollow"])
-        self.assertFalse(negotiated["playbackPrepare"])
-        self.assertFalse(negotiated["effectiveAtPlayback"])
+        self.assertTrue(negotiated["playbackPrepare"])
+        self.assertTrue(negotiated["effectiveAtPlayback"])
         self.assertFalse(negotiated["supportsBroadcast"])
 
     def test_effective_at_is_independent_from_playback_prepare(self):
@@ -190,6 +208,171 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
 
         self.assertFalse(negotiated["playbackPrepare"])
         self.assertTrue(negotiated["effectiveAtPlayback"])
+
+        capabilities = dict(
+            self.capabilities,
+            effectiveAtPlayback=False,
+            playbackPrepare=True,
+        )
+        negotiated = negotiate_capabilities(
+            capabilities,
+            ["player"],
+            self.deployment_enabled,
+            self.code_ready,
+        )
+
+        self.assertTrue(negotiated["playbackPrepare"])
+        self.assertFalse(negotiated["effectiveAtPlayback"])
+
+    def test_effective_at_uses_follow_only_readiness(self):
+        code_ready = dict(
+            self.code_ready,
+            handoff=False,
+            broadcast=False,
+        )
+
+        negotiated = negotiate_capabilities(
+            self.capabilities,
+            ["player"],
+            self.deployment_enabled,
+            code_ready,
+        )
+
+        self.assertTrue(negotiated["effectiveAtPlayback"])
+        self.assertTrue(negotiated["supportsFollow"])
+        self.assertFalse(negotiated["playbackPrepare"])
+        self.assertFalse(negotiated["supportsBroadcast"])
+
+    def test_effective_at_is_false_without_optional_profile_readiness(self):
+        code_ready = dict(
+            self.code_ready,
+            follow=False,
+            handoff=False,
+            broadcast=False,
+        )
+
+        negotiated = negotiate_capabilities(
+            self.capabilities,
+            ["player"],
+            self.deployment_enabled,
+            code_ready,
+        )
+
+        self.assertFalse(negotiated["effectiveAtPlayback"])
+        self.assertFalse(negotiated["supportsFollow"])
+        self.assertFalse(negotiated["playbackPrepare"])
+        self.assertFalse(negotiated["supportsBroadcast"])
+
+    def test_playback_prepare_does_not_require_can_play(self):
+        capabilities = dict(self.capabilities, canPlay=False)
+
+        negotiated = negotiate_capabilities(
+            capabilities,
+            ["player"],
+            self.deployment_enabled,
+            self.code_ready,
+        )
+
+        self.assertTrue(negotiated["playbackPrepare"])
+
+    def test_follow_requires_each_static_dependency(self):
+        cases = (
+            ("supportsFollow request", {"supportsFollow": False}, self.code_ready),
+            ("player role", {}, self.code_ready),
+            ("effectiveAtPlayback", {"effectiveAtPlayback": False}, self.code_ready),
+            ("canPlay", {"canPlay": False}, self.code_ready),
+            ("canPause", {"canPause": False}, self.code_ready),
+            ("canSeek", {"canSeek": False}, self.code_ready),
+            (
+                "Follow readiness",
+                {},
+                dict(self.code_ready, follow=False),
+            ),
+        )
+
+        for label, capability_changes, code_ready in cases:
+            capabilities = dict(self.capabilities, **capability_changes)
+            roles = [] if label == "player role" else ["player"]
+            negotiated = negotiate_capabilities(
+                capabilities,
+                roles,
+                self.deployment_enabled,
+                code_ready,
+            )
+            with self.subTest(dependency=label):
+                self.assertFalse(negotiated["supportsFollow"])
+
+    def test_direct_negotiation_rejects_false_playback_context_capability(self):
+        capabilities = dict(self.capabilities, playbackContextV2=False)
+
+        with self.assertRaises(ValueError):
+            negotiate_capabilities(
+                capabilities,
+                ["player"],
+                self.deployment_enabled,
+                self.code_ready,
+            )
+
+    def test_broadcast_controller_and_player_composites(self):
+        controller_only = dict(
+            self.capabilities,
+            playbackContextV2=False,
+            effectiveAtPlayback=False,
+            canPlay=False,
+            canPause=False,
+            canSeek=False,
+        )
+        with self.assertRaises(ValueError):
+            negotiate_capabilities(
+                controller_only,
+                ["controller"],
+                self.deployment_enabled,
+                self.code_ready,
+            )
+
+        controller_only["playbackContextV2"] = True
+        negotiated = negotiate_capabilities(
+            controller_only,
+            ["controller"],
+            self.deployment_enabled,
+            self.code_ready,
+        )
+        self.assertTrue(negotiated["supportsBroadcast"])
+
+        for field_name in (
+            "effectiveAtPlayback",
+            "canPlay",
+            "canPause",
+            "canSeek",
+        ):
+            capabilities = dict(self.capabilities, **{field_name: False})
+            negotiated = negotiate_capabilities(
+                capabilities,
+                ["player"],
+                self.deployment_enabled,
+                self.code_ready,
+            )
+            with self.subTest(field_name=field_name):
+                self.assertFalse(negotiated["supportsBroadcast"])
+
+        negotiated = negotiate_capabilities(
+            self.capabilities,
+            ["player"],
+            self.deployment_enabled,
+            self.code_ready,
+        )
+        self.assertTrue(negotiated["supportsBroadcast"])
+
+    def test_negotiated_capabilities_are_exactly_ten_booleans(self):
+        negotiated = negotiate_capabilities(
+            self.capabilities,
+            ["player", "controller"],
+            self.deployment_enabled,
+            self.code_ready,
+        )
+
+        self.assertEqual(set(negotiated), set(self.capabilities))
+        self.assertTrue(all(isinstance(value, bool) for value in negotiated.values()))
 
     def test_fixed_remote_volume_capability_is_role_gated(self):
         player = negotiate_capabilities(
