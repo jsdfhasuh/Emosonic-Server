@@ -8,7 +8,9 @@
 >
 > 工作分支：`agent/strict-v2-r5-server-adaptation`
 >
-> 起始基线：`08dc67a2a00a5f80311af02fabfa56a5ddf4bb51`
+> 起始实现基线：`7abed609b386ff1dcaeeee65c89b8cff95dd0e0c`
+>
+> 冻结文档基线：`08dc67a2a00a5f80311af02fabfa56a5ddf4bb51`
 >
 > 冻结契约：`2026-08-01-r18` / `protocolVersion 2.8.0`
 >
@@ -16,7 +18,7 @@
 
 ## 1. 执行结论
 
-本计划把服务端实现拆成八个阶段。**一次 Luna 会话只执行一个 Phase**，不得把 Phase 0—7 一次性全部交给 Luna。
+本计划把服务端实现拆成可独立验收的阶段。当前顺序为 `Phase 0 → Phase 1A → Phase 2 → Phase 1B → Phase 3A/3B/3C → Phase 4 → Phase 5 → Phase 6 → Phase 7`。**一次 Luna 会话只执行一个 Phase 或一个明确的子阶段**，不得把多个阶段一次性交给 Luna。
 
 每个 Phase 都必须遵循同一门禁：
 
@@ -31,7 +33,7 @@
 9. 等待远端 CI 的 Python 3.9、Python 3.12、Database Migrations、Docker Build；
 10. 远端 CI 绿色后才允许开始下一 Phase。
 
-任一门禁失败时，Luna 必须停止当前 Phase，保留未提交改动，报告精确命令、失败测试、堆栈和涉及文件。不得带着红色状态继续后续 Phase。
+任一门禁失败时，Luna 必须停止当前 Phase，保留未提交改动，报告精确命令、失败测试、堆栈和涉及文件。不得带着红色状态继续后续 Phase。任何 server→client output validator 只有在其 canonical source、runtime producer 和对应测试同一阶段闭合后才允许 active；不得先收紧 validator，再用 `None`、空串、当前 Socket、当前 authority、latest session 或 placeholder 补值。
 
 ## 2. 权威来源与当前基线
 
@@ -131,6 +133,26 @@ Luna 不得假设服务端“从零实现”，也不得重写已有 store。当
 
 当前 Handoff 已有“数据库事务内切 authority”的骨架；应保留并扩展，不得另写第二套切换路径。缺口主要是 exact target pair、durable fence/provisional state、完整 proof、fingerprint/replay 和 disconnect/restart 处理。
 
+### 2.5 Phase 1 blocker audit checkpoint
+
+本 checkpoint 是实施事实记录，不是部署证据、`serverBuildCommit`、`schemaHash` 或正式合规证据：
+
+- Phase 0 已在 `7abed609b386ff1dcaeeee65c89b8cff95dd0e0c` 通过本地和远端门禁；
+- 原 Phase 1 尝试没有提交；
+- 审计时存在 4 个未提交 WIP 文件：
+  - `supysonic/emo/strict_v2_contract.py`
+  - `supysonic/emo/strict_v2_readiness.py`
+  - `supysonic/emo/strict_v2_registration_descriptor.json`
+  - `supysonic/emo/ws.py`
+- WIP diff 为 `332 insertions`、`57 deletions`；
+- WIP 已保存为 stash OID `bc7c734546898f1c801fcfc7f32a7f175a7c4392`；
+- WIP binary diff SHA-256 为 `ed6ee061021cd4393eb2bfac5faa7ae580901e95f20d144f18da1988f4aa898d`；
+- 62 项定向测试结果为 `6 failures`、`5 errors`；
+- 其中前 10 项属于旧 schema、manifest、fixture 或断言基线未同步；
+- 第 11 项暴露 requester settlement 缺少 durable canonical source；
+- 原 Phase 1 未完成，Phase 2 尚未开始；
+- 这些 WIP 和失败结果不能作为实现证据；stash OID 只用于本地 WIP 备份，不能作为部署信息、`serverBuildCommit`、`schemaHash` 或正式合规证据。
+
 ## 3. 永久禁止事项
 
 以下限制适用于所有 Phase：
@@ -186,10 +208,11 @@ Luna 不得假设服务端“从零实现”，也不得重写已有 store。当
 
 | Phase | 目标 | 允许进入下一阶段的条件 | 建议提交 |
 |---|---|---|---|
-| 0 | 冻结身份和 CI 基线 | 六个现有失败消失，完整测试与远端四 job 绿色 | `chore: align frozen r18 conformance baseline` |
-| 1 | Wire schema、identity、capability、fixtures | 所有 schema/readiness/fixture 正负例绿色 | `feat: align strict-v2 r18 wire schemas` |
-| 2 | DB、store、原子事务基础 | 三数据库迁移、reload、rollback 绿色 | `feat: add r18 persistence foundations` |
-| 3 | Core settlement、reconciliation、close、queue terminal | Core acceptance 与完整回归绿色 | 分 3 个绿色提交 |
+| 0 | 冻结身份和 CI 基线 | 已完成于 `7abed609`；本地和远端四 job 真实绿色 | `chore: align frozen r18 conformance baseline` |
+| 1A | 共享的非持久化 request validation 基础、closed object 工具、静态 capability policy | 只有不提前激活不完整 runtime 的 schema/policy 测试绿色 | `feat: add strict-v2 phase1a validation foundations` |
+| 2 | Core durable persistence foundation、startup recovery、restart-safe store API | requester/routed physical identity、eligibility、safe-close 基础和三数据库 migration/reload/upgrade 绿色 | `feat: add r18 persistence foundations` |
+| 1B | 只接入已有 canonical source 的共享 live serializer/runtime policy | activation matrix 所有 action 的 source、producer、测试同阶段闭合 | `feat: activate strict-v2 live serializers` |
+| 3A/3B/3C | Core safe close、settlement、reconciliation、queue terminal | 各子阶段独立定向、完整回归和远端四 job 绿色 | 分 3 个绿色提交 |
 | 4 | Follow 服务端闭环 | Follow restart/reconnect/cleanup 门禁绿色 | 分 3 个绿色提交 |
 | 5 | Handoff 独立 provisional lane | proof、原子 complete、disconnect/replay 绿色 | 分 3 个绿色提交 |
 | 6 | Broadcast final-r18 restore/terminal/decommission | 新旧 Broadcast 全组合绿色 | 分 3 个绿色提交 |
@@ -251,9 +274,11 @@ git diff --check
 chore: align frozen r18 conformance baseline
 ```
 
-推送后等待远端四个 job。任一失败则停止，不进入 Phase 1。
+推送后等待远端四个 job。任一失败则停止，不进入 Phase 1A。
 
-## 7. Phase 1：Wire schema、exact identity、capability 与 fixtures
+Phase 0 当前状态：已完成。实现基线为 `7abed609b386ff1dcaeeee65c89b8cff95dd0e0c`，本地和远端 Python Tests 3.9、Python Tests 3.12、Database Migrations、Docker Build 均真实通过。后续实现不得把 Phase 0 的绿色结果解释为 Phase 1A、Phase 1B 或 Phase 2 的证据。
+
+## 7. Phase 1A：共享非持久化基础
 
 ### 7.1 覆盖范围
 
@@ -267,31 +292,20 @@ chore: align frozen r18 conformance baseline
 - `supysonic/emo/strict_v2_contract.py`
 - `supysonic/emo/strict_v2_readiness.py`
 - `supysonic/emo/strict_v2_registration_descriptor.json`
-- schema 输出组装涉及的 `supysonic/emo/ws.py`
-- 最小必要的 `supysonic/emo/ws_state.py`
+- 仅在公共 serializer/policy 工具确有必要时读取 `supysonic/emo/ws.py`；本阶段不得激活不完整 output producer
 - `tests/fixtures/emo_strict_v2/**`
-- contract/readiness/manifest/fixture 测试
+- contract/readiness/manifest/fixture 的纯 schema/policy 测试
 
-此 Phase 不得实现 Core、Follow、Handoff、Broadcast 的完整业务状态机，不得新建业务表。
+此 Phase 不得实现 Core、Follow、Handoff、Broadcast 的完整业务状态机，不得新建业务表，也不得激活缺少 canonical runtime source 的 server→client output validator 或 producer。
 
-### 7.3 必须闭合的 wire shape
+### 7.3 允许落地的共享基础
 
-- active Context snapshot 必须含精确 `authorityClientId + authorityDeviceSessionId`；Context 不含 `playbackRate`；
-- `system.error` 在适用错误上输出阻塞请求的 `currentEpoch/currentVersion/currentQueueRevision/currentControlVersion`；
-- error lookup 必须 user-scoped，验证顺序与契约一致；
-- `playback.context.close` request 要求 `expectedEpoch/baseVersion`；
-- ordinary routed control 输出 `executionTimeoutMs`，适用时输出 `dependsOnControlVersion`；
-- `playback.control.settled` 要求 `requestingDeviceSessionId`，并闭合 committed/failed/execution_unknown/dependency_failed 分支；
-- Follow start ACK 含冻结 suspended baseline 的全部字段；
-- `playback.handoff.start` 要求 `targetDeviceSessionId`；
-- `playback.ready` 要求 `handoffId + deviceSessionId`；
-- `playback.handoff.complete` 要求完整 actual proof：queue/track/state/position/sample time/rate/applied version/clientSeq；
-- cancel/status/release/prepare/commit request、ACK、push 与错误分支全部使用最终 r18 shape；
-- Core negative prepared 的 `restore_in_progress` 使用完整 Cursor 与 one-of 约束；
-- `device.list.volumeState` 只有 negotiated `remoteVolumeControl=true` 才输出和解析；
-- Core prepare 不依赖 Handoff 的 `playbackPrepare` capability；
-- Follow/Handoff/Broadcast negotiated capability 使用完整复合依赖；
-- 所有对象仍保持 closed，未知字段、缺字段、非法 enum、非法 null 必须拒绝。
+- 提取并测试 closed object、类型、范围、enum、one-of、unknown-field、显式 `null` 和 bool/int 区分等公共验证工具；
+- 只启用与当前 handler 已经一致的 request validation 基础；若最终 request shape 会让旧 handler 接受后执行不完整语义，该 action validator 留到对应 domain phase；
+- 实现静态 Follow/Handoff/Broadcast composite capability policy，不把静态协商当作 current physical Socket、clock、freshness 或 runtime gate；
+- 保持 registration/capability descriptor closed，并拒绝客户端自报 requester identity；
+- 为上述共享基础增加最小正例、缺字段、未知字段、非法 `null`、类型错误、bool 冒充 int、enum、范围和 one-of 负例；
+- 任何 output validator 只允许作为未激活的 schema definition 存在，不能被 `_emit_message`、direct response 或 recipient serializer 使用。
 
 ### 7.4 Capability 不变量
 
@@ -310,21 +324,43 @@ chore: align frozen r18 conformance baseline
 - 每个 forbidden/unknown 字段；
 - optional 字段显式 null；
 - enum/范围/one-of 冲突；
-- request validator 和 output validator 对称检查。
+- request validator、closed object 工具和未激活 output schema inventory 的边界检查；最终 output 对称测试留给 activation matrix 对应阶段。
 
-定向 schema/readiness/fixture 测试通过后，再运行完整 unittest、net suite、`git diff --check` 和远端四 job。
+定向 Phase 1A schema/readiness/policy 测试通过后，再运行完整 unittest、net suite、`git diff --check` 和远端四 job。Phase 1A 绿色不等于任何最终 output shape 已经可发出。
 
 建议提交：
 
 ```text
-feat: align strict-v2 r18 wire schemas
+feat: add strict-v2 phase1a validation foundations
 ```
 
-## 8. Phase 2：持久化与原子事务基础
+### 7.6 Action activation matrix
+
+矩阵中的“active validator 最早阶段”指 validator、canonical source、runtime producer 和测试可以同阶段闭合的最早阶段；在此之前只能保留未激活的契约资料，不能由占位值满足校验。
+
+| action/behavior | active validator 最早阶段 | durable source 阶段 | runtime producer 阶段 | 测试阶段 | 当前状态 |
+|---|---|---|---|---|---|
+| Context `authorityDeviceSessionId` | Phase 1B | 现有 live Context canonical 字段 | Phase 1B live serializer | Phase 1B | 基线字段可读；WIP 未激活 |
+| live `system.error` four cursors | Phase 1B | 现有 live Context canonical cursors | Phase 1B | Phase 1B | 旧 output shape；不得从用户或当前 Socket 补值 |
+| closed/tombstone `system.error` four cursors | Phase 3A | Phase 3A close tombstone | Phase 3A ACK/replay | Phase 3A | 尚无 durable closed source |
+| `playback.context.close` | Phase 3A | Phase 3A tombstone/outcome | Phase 3A close admission/replay | Phase 3A | 旧 request 只有 Context ID |
+| `executionEligibleAtMs` | Phase 3B | Phase 2 transaction | Phase 3B admission/dependency/watchdog | Phase 3B | 当前只可靠保存 accepted/deadline 旧语义 |
+| `dependsOnControlVersion` | Phase 3B | Phase 2 transaction | Phase 3B ordinary control routing | Phase 3B | 不能在最终 dependency 未落库前激活 |
+| `playback.control.settled` | Phase 3B | Phase 2 requester/routed identity and terminal fields | Phase 3B settlement/recipient routing | Phase 3B | 当前 WIP 曾提前读取不存在的 requester session |
+| Follow frozen baseline ACK | Phase 4B | Phase 4A `FollowSafetyLease` | Phase 4B | Phase 4A/4B | 当前 handler 仍发送 action-only ACK |
+| Handoff prepare/commit/status/release/complete proof | Phase 5B/5C | Phase 5A/5B durable fence/provisional/outcome | Phase 5B/5C | Phase 5A/5B/5C | 现有骨架缺 exact physical generation/full proof closure |
+| `restore_in_progress` | Phase 6A | Phase 6 restore state | Phase 6A negative prepared/restore output | Phase 6A | 不在 Phase 1A/1B 提前激活 |
+| `device.list.volumeState` capability trimming | Phase 1B | 现有 volume state + negotiated capability | Phase 1B recipient serializer | Phase 1B | 只向 `remoteVolumeControl=true` recipient 输出 |
+| recovery abandon/decommission | Phase 6C | Phase 6 terminal/decommission tombstone | Phase 6C | Phase 6B/6C | 现有 Broadcast 基础尚未闭合永久 exact-pair 语义 |
+| Core prepare independence from Handoff capability | Phase 1B | 现有 capability/readiness source | Phase 1B Core gate/serializer | Phase 1B | 基线 runtime 仍有 `playbackPrepare` gate，不能被静态 policy 掩盖 |
+
+核心规则：任何 active output validator 都必须和 canonical source、runtime producer、recipient routing 及对应测试在同一阶段闭合。不得使用 `None`、空串、默认 cursor、当前 recipient 身份、当前 authority、latest session、raw SID 或其他 placeholder 临时填充。
+
+## 8. Phase 2：Core durable persistence foundation
 
 ### 8.1 目标
 
-在写业务 handler 前建立后续状态机共用的持久化模型、锁、store API、bounded retention 和 restart/reload 基础。禁止先用内存临时字段“把状态机跑通”。
+在写最终业务 handler 或 output producer 前建立后续阶段共用的 canonical durable source、锁、restart-safe store API、startup recovery、bounded retention 和 migration 基础。禁止先用内存临时字段“把状态机跑通”。Phase 2 只建立 durable source，不激活 `playback.control.settled`、Follow 或 Handoff 的最终 producer。
 
 ### 8.2 主要文件范围
 
@@ -340,30 +376,51 @@ feat: align strict-v2 r18 wire schemas
 ### 8.3 必须持久化的基础
 
 - Context exact authority pair；
-- closed tombstone 的 `closedFrom*`、final 四 Cursor 和 ACK outcome；
-- ordinary control transaction 的 requester/routed exact pair、dependency、eligibility、watchdog 和 terminal 字段；
+- ordinary control admission 必须原子保存 requester 的 `clientId`、`deviceSessionId`、`connectionNonce`、`connectionEpoch`；
+- ordinary control admission 必须原子保存 routed authority 的 `clientId`、`deviceSessionId`、`routedConnectionNonce`、`routedConnectionEpoch`；
+- 客户端不得自报 requester identity；不得持久化 raw Socket SID；上述字段必须来自 admission 时已认证并在锁内重验的 physical Socket；
+- requester nonce/epoch 和 routed nonce/epoch 只用于服务端 physical connection matching，不进入 wire payload；
+- closed tombstone 的 `closedFrom*`、final 四 Cursor 和 durable ACK/error outcome；
+- ordinary control transaction 的 dependency、`dependsOnControlVersion`、`executionEligibleAtMs`、watchdog 和 terminal 字段；
 - `executionEligibleAtMs`，不能仅用 acceptedAt 推算；
 - terminal-gap reconciliation record；
-- FollowSafetyLease、relationship/fence/reconnectGrace/cleanupRequired 状态；
-- Handoff provisional/fence/standby/terminal 状态；
-- Broadcast restore、terminal、abandon、decommission 状态；
-- bounded retention、查询索引和清理条件。
+- bounded retention、查询索引和清理条件；
+- startup recovery 能够在任何 admission、dispatch、watchdog、outbox drain、profile recovery 或 readiness 之前恢复上述 Core durable source。
 
 建议字段清单必须在编码前与冻结分卷逐项核对；字段名可服从仓库现有命名规范，但语义不得缺失：
 
 | 领域 | 至少需要的持久化语义 |
 |---|---|
-| Control | `requesting_device_session_id`、routed authority device、`depends_on_control_version`、`execution_eligible_at_ms`、effective/deadline、terminal kind/code/message、direct dependency、reconciliation linkage |
-| Close | request fingerprint、`closedFromEpoch/Version`、final queue/control/applied cursor、durable ACK/error outcome |
-| Follow | user、follower exact pair、source/suspended Context、suspended authority exact pair、冻结 epoch/version/queue/control/applied baseline、phase、reconnect deadline、created/updated |
-| Handoff | source/target exact pairs、current physical nonce或connection generation、base/provisional version、effective/deadline、prepare/commit/complete/cancel fingerprint、proof、durable terminal outcome |
-| Recovery | Broadcast/recovery reference、abandon fingerprint/outcome、永久 exact-pair decommission tombstone、时间与原因 |
+| Control | requester 四元组、routed authority 四元组、`depends_on_control_version`、`execution_eligible_at_ms`、effective/deadline、terminal kind/code/message、direct dependency、reconciliation linkage |
+| Close | request fingerprint、`closedFromEpoch/Version`、final epoch/version/queue/control cursor、durable ACK/error outcome |
+| Recovery | startup recovery marker、旧 pending 的 safe terminal outcome、幂等重启记录、bounded retention 和清理条件 |
 
-`FollowSafetyLease.phase` 至少需要表达 `active`、`reconnectGrace`、`cleanupRequired`。如果现有代码还需要短暂 acquiring/stopPending 状态，必须说明它是 durable phase 还是单事务内部状态，并为 crash point 写测试，不能只留在内存。
+FollowSafetyLease、Handoff provisional/fence/standby、Broadcast restore/decommission 的 domain-specific durable state 在各自 Phase 4/5/6 建立和激活；Phase 2 只能提供其依赖的 transaction/lock/reload 基础，不提前发送最终 wire output。
 
-永久 decommission 表的唯一键必须至少是 `(user, client_id, device_session_id)`。tombstone 不得受普通容量清理或 TTL 删除；容量达到上限时应拒绝新的 deviceSession，不能驱逐旧 tombstone。
+### 8.4 Startup recovery 与旧行规则
 
-### 8.4 迁移规则
+startup recovery 必须在以下行为之前完成：
+
+- 新 admission；
+- pending dispatch；
+- watchdog；
+- outbox drain；
+- profile 恢复；
+- 对外 readiness。
+
+旧行处理必须遵守：
+
+- 不得根据 `clientId`、authority、当前 Socket、`DevicePlaybackState` 或“唯一在线设备”推断缺失 identity；
+- 不得使用空串、默认 UUID、`unknown`、`0` 或其他 sentinel；
+- 旧 terminal 行原样保留；
+- 缺完整 physical generation 的旧 pending 根事务以内部 `execution_unknown` 安全终止；
+- 其依赖链递归为 `dependency_failed`；
+- 旧 pending 不再 eligible、不挂新 watchdog、不重新 dispatch、不推进 canonical cursor；
+- 重复启动必须幂等；
+- 缺 requester exact pair 的 legacy outcome 不生成非法 settled wire payload，只保留 durable terminal/reconciliation 状态；
+- migration 测试必须包含非空旧 transaction，不能只测空表升级。
+
+### 8.5 迁移规则
 
 - 选择一个高于当前 `20260728` 的新 schema version；三数据库使用相同语义和版本；
 - 只增加新 migration，不改旧 migration；
@@ -371,9 +428,9 @@ feat: align strict-v2 r18 wire schemas
 - nullable/default 只用于兼容升级过程，runtime 写入后必须满足最终不变量；
 - 对 SQLite、MySQL、PostgreSQL 都验证升级、重复启动、rollback 和 schema version；
 - 不连接或修改用户的真实媒体库/生产数据库。
-- 给既有行 backfill 时不得生成假的 `deviceSessionId`，也不得让旧 pending transaction 看起来仍可执行；无法证明执行结果的旧 pending 状态应按冻结契约的 restart/unknown 规则安全终结。
+- append-only migration 不得修改旧 migration；给既有行 backfill 时不得生成假的 `deviceSessionId`，也不得让旧 pending transaction 看起来仍可执行；无法证明执行结果的旧 pending 状态应按上述 restart/unknown 规则安全终结。
 
-### 8.5 测试门禁
+### 8.6 测试门禁
 
 - 全新数据库建库；
 - 从上一 schema version 升级；
@@ -382,12 +439,47 @@ feat: align strict-v2 r18 wire schemas
 - store round-trip；
 - server restart/reload 不丢 cursor、terminal、lease、fence；
 - 注入 commit/emit/enqueue 失败时无部分状态；
-- bounded cleanup 不删除仍有安全含义的 terminal、cleanupRequired lease 或永久 tombstone。
+- bounded cleanup 不删除仍有安全含义的 Phase 2 terminal、legacy outcome 或 recovery marker；`cleanupRequired` lease 和永久 tombstone 的清理测试留在 Phase 4/6。
 
 建议提交：
 
 ```text
 feat: add r18 persistence foundations
+```
+
+## 8A. Phase 1B：共享 live serializer 与 runtime policy 接入
+
+### 8A.1 覆盖范围
+
+Phase 1B 只接入已经具有 canonical source、不会触发 tombstone 或 domain state machine 依赖的共享 live behavior：
+
+- active Context 的 `authorityClientId + authorityDeviceSessionId`；
+- 仅 live Context 能证明的 four cursor error enrichment；
+- negotiated capability recipient trimming，包括 `remoteVolumeControl` 对 `device.list.volumeState` 的裁剪；
+- Core prepare 不依赖 Handoff `playbackPrepare` capability；
+- 已在 Phase 2 建立 durable source、且其最终 runtime producer 也在本阶段闭合的共享 serializer/policy。
+
+### 8A.2 明确禁止提前激活的 output
+
+以下行为必须留到对应 domain phase，不得在 Phase 1B 通过当前 Context、当前 authority、当前 recipient 或 latest session 拼装：
+
+- closed/tombstone `system.error` replay；
+- `playback.control.settled`；
+- Follow frozen baseline ACK；
+- Handoff prepare/commit/status/release/complete proof；
+- Broadcast restore、abandon、terminal 或 decommission output。
+
+### 8A.3 测试门禁
+
+- 每个 active serializer 都要有 canonical source、recipient routing、最小/完整正例和缺字段、unknown、`null`、类型、范围、one-of 负例；
+- 验证 Core prepare capability independence 不会绕过 current physical Socket、role、clock、freshness 或 rate gate；
+- 先运行 Phase 1B 定向测试，再运行完整 unittest、net suite、`git diff --check`；
+- 只有本地绿色才允许提交、推送并等待远端四 job。
+
+建议提交：
+
+```text
+feat: activate strict-v2 live serializers
 ```
 
 ## 9. Phase 3：Core control、settlement、reconciliation、safe close 与 queue terminal
@@ -406,7 +498,11 @@ feat: add r18 persistence foundations
 - exact authority pair snapshot/routing；
 - user-scoped error lookup 与 four cursor；
 - close admission、fence、tombstone、ACK replay；
-- close 重试只按 `closedFromEpoch/closedFromVersion` 命中。
+- tombstone 至少保存 user/tenant scope、`playbackContextId`、action domain、request fingerprint、`expectedEpoch/baseVersion`、`closedFromEpoch/closedFromVersion`、final epoch/version/queueRevision/controlVersion 和 durable ACK/error outcome；
+- 原子区分 live Context、exact tombstone match、mismatched tombstone、neither 和 live+tombstone invariant breach；
+- close 重试只有 exact fingerprint/cursor match 才能零写入重放原 outcome；不得按 `playbackContextId` 单独命中，不得向 foreign user 暴露存在性或 cursor；
+- 不得把 `appliedControlVersion` 当成四 Cursor 之一，不得为信息不足的 closed row 伪造 replayable success，不得自行发明契约未规定的 TTL；
+- close tombstone 与永久 device-decommission tombstone 分开建模。
 - 在 Core handler 接入统一 gate 和固定锁序：排序后的 Context IDs → 排序后的 exact device pairs → profile resource key → DB transaction；不得在进程锁或 DB transaction 内执行 Socket emit。
 
 绿色提交：
@@ -423,9 +519,12 @@ feat: enforce r18 context identity and safe close
 - dependency terminal 后才设置 `executionEligibleAtMs`；
 - timeout 从 eligibility 开始；
 - watchdog = `eligibleAt + executionTimeoutMs + 2000`；
-- committed/failed/execution_unknown terminal；
+- 内部 transaction terminal outcome 与 wire status/errorCode 分开建模；内部可以记录 committed/failed/execution_unknown/dependency_failed，但 `playback.control.settled` wire payload 的 `status` 固定为 `failed`；
+- `playback.control.settled.errorCode` 只允许 `execution_unknown` 或 `dependency_failed`，不得扩展 committed settled；ordinary remote command 的 committed/failed 继续使用 `playback.update`；
 - recursive dependency cascade，每项记录直接依赖；
-- settlement 发给 requesting exact pair；
+- admission 原子保存 requester `clientId/deviceSessionId/connectionNonce/connectionEpoch` 和 routed authority `clientId/deviceSessionId/routedConnectionNonce/routedConnectionEpoch`；客户端不得自报 requester 字段，不持久化 raw Socket SID；
+- settlement 收件人集合严格由三条独立路径组成：当前 Context subscribers、完整匹配原 requester pair+nonce+epoch 的 physical Socket、完整匹配原 authority pair+routed nonce+routed epoch 的 physical Socket；最终按 SID 去重；
+- 同一 client/device 的 replacement Socket 不得仅凭 requester 身份补收旧 settlement；后来成为 subscriber 时只能通过 subscriber 路径收到一次；
 - unknown/failed 不伪造 `playback.update`。
 
 绿色提交：
@@ -460,7 +559,11 @@ feat: reconcile r18 terminal control gaps
 - inline failed reconciliation 与 passive later reconciliation；
 - localUser/supersede/authority change 并发；
 - close 与 pending control/Follow/Handoff/Broadcast fence 冲突；
+- close 的 live、exact tombstone、mismatched tombstone、neither 和 invariant breach 分支；
+- close replay 的 fingerprint/cursor、foreign user isolation、duplicate close 和 restart replay；
 - duplicate terminal、duplicate close、stale cursor、future epoch；
+- requester exact pair、nonce/epoch、authority routed generation、Socket replacement 和 subscriber 去重；
+- 缺 requester physical identity 的旧 pending transaction、startup recovery、重复启动和不重新 dispatch；
 - first-prev、last-next、single-item queue、natural end 重复 callback；
 - commit、emit、enqueue 故障注入。
 
@@ -481,6 +584,9 @@ Phase 3 三个子阶段都要各自完成定向测试、完整测试、独立提
 - source current physical fact、clock 与 freshness；
 - frozen suspended baseline ACK；
 - persistent FollowSafetyLease；
+- source/follower/suspended authority exact identity 和契约要求的 physical generation；
+- immutable frozen baseline、phase/deadline/fence、start/stop/cleanup fingerprint；
+- durable ACK/error/terminal outcome、reconnectGrace、cleanupRequired；
 - suspended Context fence；
 - relationship/subscription；
 - source recovery window；
@@ -536,6 +642,9 @@ feat: implement r18 follow recovery cleanup
 - follower overlay 与 Broadcast ordinary/Handoff target 按契约互斥；
 - stop/cleanup 不得因达到 pair/context/user 上限而被拒绝；
 - ACK baseline 每个字段都来自同一冻结事务快照。
+- FollowSafetyLease、fence 和 frozen baseline 必须在同一锁序和同一 DB transaction 内落库，commit 后才发送 ACK/push；
+- ACK replay 只能读取 durable outcome，不能重新读取 live Context 拼装；
+- 不得使用 raw SID、pair-only physical fallback 或当前最新 session 替代 durable physical generation。
 
 ### 10.5 Follow 测试矩阵
 
@@ -581,6 +690,7 @@ feat: complete r18 handoff atomically
 ### 11.3 Handoff 硬不变量
 
 - target 必须是 exact `targetClientId + targetDeviceSessionId`；
+- source/target 必须同时绑定 nonce + epoch physical generation；不得以 pair-only、raw SID 或 latest online session fallback；
 - source Context、target pair、standby Context 从 start 到 terminal 全程 fenced；
 - provisional `N+1` 以 `(playbackContextId, epoch, handoffId)` 隔离；
 - provisional lane 不创建普通 control transaction，不参加 dependency/watchdog/reconciliation；
@@ -589,6 +699,7 @@ feat: complete r18 handoff atomically
 - source actual 改变时先产生 `source_changed`，再提交 canonical fact；
 - complete 验证 future ≤ 50ms、sample age ≤ 2000ms、late ≤ 1000ms、position error ≤ 1000ms，并满足 sample 相对 effectiveAt 的约束；
 - `complete.clientSeq` 消耗 target 的普通 `playback.update` 序列空间；
+- start/ready/complete/cancel/release 的 fingerprint、durable terminal/replay outcome 和 lifecycle/effective/deadline 必须持久化；
 - failed/cancel/restart 后 canonical controlVersion 仍是 N，普通事务可以合法使用 N+1；
 - duplicate replay 不得再次退休 standby、切换 authority、增加 cursor 或释放 fence。
 
@@ -662,6 +773,8 @@ feat: decommission r18 broadcast pairs atomically
 - membership 是固定 exact-pair 集合，不动态增删；
 - soft-sync 的 applied 不是持续 drift SLA；
 - recovery abandon 与 permanent exact-pair decommission 同一事务；
+- recovery reference、abandon fingerprint/outcome 和永久 `(user, clientId, deviceSessionId)` decommission tombstone 必须 durable；
+- decommission tombstone 不受普通容量清理或 TTL 删除；创建 presence/SID 之前拒绝旧 pair，在线旧 Socket 同步断开，普通重连不能复活；
 - permanent tombstone 只能随账号整体删除；
 - decommission 必须在创建 presence/sid 之前拒绝，在线旧 Socket 同步断开；
 - 被 decommission 的旧 deviceSession 永久拒绝，不能被普通重连复活。
@@ -770,7 +883,9 @@ Docker Build：
 
 若答案是 `no`，Luna 必须停止，不得自行开始下一 Phase。
 
-## 15. 首次发送给 Luna 的 Phase 0 提示词
+## 15. 历史 Phase 0 启动提示词（已完成，不得再次执行）
+
+以下提示词仅保留 Phase 0 的历史执行记录。Phase 0 已在 `7abed609` 完成；不得用本节重新启动 Phase 0，也不得把其中的旧起始基线当作当前实现基线。
 
 ```text
 请在仓库 jsdfhasuh/Emosonic-Server 的分支
