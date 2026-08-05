@@ -76,12 +76,21 @@ class StrictV2ManifestTestCase(unittest.TestCase):
                 self.assertEqual(validator.optional, optional)
 
     def test_authoritative_contract_covers_every_r18_requirement(self):
+        entry = self.contract_path.read_text(encoding="utf-8")
+        authoritative_sources = (
+            "emosonic_strict_v2_contract/phase-3-conformance/"
+            "11a-common-and-core-requirements.md",
+            "emosonic_strict_v2_contract/phase-3-conformance/"
+            "11b-broadcast-requirements.md",
+        )
+        for source in authoritative_sources:
+            with self.subTest(source=source):
+                self.assertIn(source, entry)
+
         requirements = set()
         contract_root = self.contract_path.parent / "emosonic_strict_v2_contract"
-        for filename in (
-            "phase-3-conformance/11a-common-and-core-requirements.md",
-            "phase-3-conformance/11b-broadcast-requirements.md",
-        ):
+        for source in authoritative_sources:
+            filename = source.split("emosonic_strict_v2_contract/", 1)[1]
             requirements.update(
                 re.findall(
                     r"\*\*(REQ-\d{3})\s+—",
@@ -90,7 +99,7 @@ class StrictV2ManifestTestCase(unittest.TestCase):
             )
         self.assertEqual(
             requirements,
-            {"REQ-%03d" % number for number in range(1, 68)},
+            {"REQ-%03d" % number for number in range(1, 91)},
         )
 
     def test_historical_realtime_goals_are_marked_superseded(self):

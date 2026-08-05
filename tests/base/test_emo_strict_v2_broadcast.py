@@ -140,6 +140,29 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             namespace="/emo",
         )
 
+    def refresh_strict_clock_gate(self, client, request_prefix):
+        for index in range(3):
+            request_id = "%s-%d" % (request_prefix, index)
+            client.emit(
+                "message",
+                {
+                    "type": "system",
+                    "action": "system.ping",
+                    "requestId": request_id,
+                    "payload": {},
+                },
+                namespace="/emo",
+            )
+            messages = self.get_messages(client)
+            self.assertTrue(
+                any(
+                    message["action"] == "system.pong"
+                    and message["requestId"] == request_id
+                    for message in messages
+                ),
+                messages,
+            )
+
     def set_source_context_state(self, state_name):
         record = db.EmoPlaybackContext.get(
             db.EmoPlaybackContext.playback_context_id
@@ -2430,7 +2453,7 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         )
 
     def test_recovery_slot_exhaustion_returns_rate_limited_without_rows(self):
-        _authority, _participant, controller = self.connect_broadcast_devices()
+        authority, participant, controller = self.connect_broadcast_devices()
         for index in range(256):
             db.EmoBroadcastFence.create(
                 resource_key="occupied-slot:%d" % index,
@@ -2440,7 +2463,9 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
                 phase="restorePending",
                 recovery_slot_reserved=1,
             )
-        self.report_source_state(_authority, client_seq=2)
+        self.refresh_strict_clock_gate(authority, "recovery-authority-clock")
+        self.refresh_strict_clock_gate(participant, "recovery-participant-clock")
+        self.report_source_state(authority, client_seq=2)
         messages = self.start_strict_broadcast(
             controller,
             participants=["participant-1"],
