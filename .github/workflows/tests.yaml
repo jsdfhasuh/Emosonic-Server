@@ -116,6 +116,7 @@ jobs:
 
       - name: Record database images and versions
         run: |
+          set -o pipefail
           evidence="$RUNNER_TEMP/emosonic-migration-evidence.txt"
           postgres_id=$(docker compose -f tests/compose.emo_migrations.yml ps -q postgres)
           mysql_id=$(docker compose -f tests/compose.emo_migrations.yml ps -q mysql)
@@ -132,6 +133,7 @@ jobs:
           SUPYSONIC_TEST_MYSQL_URI: mysql://supysonic:supysonic@127.0.0.1:53306/supysonic_test
           SUPYSONIC_TEST_POSTGRES_URI: postgresql://supysonic:supysonic@127.0.0.1:55432/supysonic_test
         run: |
+          set -o pipefail
           python -m unittest -v tests.base.test_emo_schema_migration 2>&1 | tee -a "$SUPYSONIC_MIGRATION_EVIDENCE_FILE"
 
       - name: Stop migration databases

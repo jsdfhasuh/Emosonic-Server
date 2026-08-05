@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -27,6 +28,32 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
         db.EmoBroadcastFeedbackSettlement,
         db.EmoBroadcastTerminalRecovery,
     )
+    BROADCAST_TIME_FIELDS = {
+        "emo_broadcast": ("created_at", "updated_at"),
+        "emo_broadcast_intent_outcome": ("created_at", "updated_at"),
+        "emo_broadcast_fence": ("created_at", "updated_at"),
+        "emo_broadcast_participant": ("created_at", "updated_at"),
+        "emo_broadcast_revision": ("created_at",),
+        "emo_broadcast_delivery": ("created_at", "updated_at"),
+        "emo_broadcast_feedback_settlement": ("created_at",),
+        "emo_broadcast_terminal_recovery": ("created_at", "updated_at"),
+    }
+
+    @staticmethod
+    def _sql_identifier_tokens(sql: str) -> set[str]:
+        sql_without_comments = re.sub(
+            r"--[^\r\n]*|/\*.*?\*/",
+            " ",
+            sql,
+            flags=re.DOTALL,
+        )
+        return {
+            token.upper()
+            for token in re.findall(
+                r"[A-Za-z_][A-Za-z0-9_]*",
+                sql_without_comments,
+            )
+        }
 
     @staticmethod
     def _record_external_evidence(
@@ -455,6 +482,32 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 for field_name in required_fields:
                     self.assertIn(field_name, base_schema)
                     self.assertIn(field_name, migration)
+                timestamp_type = "TIMESTAMP" if provider == "postgres" else "DATETIME"
+                for sql_name, sql in (
+                    ("base schema", base_schema),
+                    ("broadcast migration", broadcast_migration),
+                ):
+                    if provider == "postgres":
+                        self.assertNotIn(
+                            "DATETIME",
+                            self._sql_identifier_tokens(sql),
+                            "%s contains an independent DATETIME type token" % sql_name,
+                        )
+                    for table_name, field_names in self.BROADCAST_TIME_FIELDS.items():
+                        table_match = re.search(
+                            r"CREATE TABLE IF NOT EXISTS\s+%s\s*\((.*?)\);"
+                            % re.escape(table_name),
+                            sql,
+                            flags=re.DOTALL | re.IGNORECASE,
+                        )
+                        self.assertIsNotNone(table_match, table_name)
+                        table_sql = table_match.group(1)
+                        for field_name in field_names:
+                            self.assertRegex(
+                                table_sql,
+                                r"\b%s\s+%s\b"
+                                % (re.escape(field_name), timestamp_type),
+                            )
                 self.assertIn("queue_revision", migration)
                 self.assertIn("control_version", migration)
                 self.assertIn("version", migration)

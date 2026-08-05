@@ -572,8 +572,8 @@ CREATE TABLE IF NOT EXISTS emo_broadcast (
     authority_disconnect_deadline_ms BIGINT,
     terminal_at_ms BIGINT,
     full_expires_at_ms BIGINT,
-    created_at DATETIME NOT NULL,
-    updated_at DATETIME NOT NULL
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_emo_broadcast_context_lifecycle
 ON emo_broadcast (user_name, playback_context_id, lifecycle_state);
@@ -597,8 +597,8 @@ CREATE TABLE IF NOT EXISTS emo_broadcast_intent_outcome (
     start_ack_json TEXT NOT NULL,
     terminal_broadcast_revision INTEGER,
     stop_ack_json TEXT,
-    created_at DATETIME NOT NULL,
-    updated_at DATETIME NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
     UNIQUE(user_name, playback_context_id, owner_client_id, intent_id)
 );
 CREATE INDEX IF NOT EXISTS idx_emo_broadcast_intent_context
@@ -615,8 +615,8 @@ CREATE TABLE IF NOT EXISTS emo_broadcast_fence (
     client_id VARCHAR(128),
     device_session_id VARCHAR(128),
     recovery_slot_reserved INTEGER NOT NULL DEFAULT 0,
-    created_at DATETIME NOT NULL,
-    updated_at DATETIME NOT NULL
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_emo_broadcast_fence_broadcast
 ON emo_broadcast_fence (broadcast_id, role, phase);
@@ -657,8 +657,8 @@ CREATE TABLE IF NOT EXISTS emo_broadcast_participant (
     last_feedback_client_seq INTEGER,
     last_feedback_at_ms BIGINT,
     restore_completed INTEGER NOT NULL DEFAULT 0,
-    created_at DATETIME NOT NULL,
-    updated_at DATETIME NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
     UNIQUE(broadcast_id, client_id, device_session_id)
 );
 CREATE INDEX IF NOT EXISTS idx_emo_broadcast_participant_restore
@@ -673,7 +673,7 @@ CREATE TABLE IF NOT EXISTS emo_broadcast_revision (
     snapshot_json TEXT NOT NULL,
     canonical_action VARCHAR(32) NOT NULL,
     created_at_ms BIGINT NOT NULL,
-    created_at DATETIME NOT NULL,
+    created_at TIMESTAMP NOT NULL,
     UNIQUE(broadcast_id, broadcast_revision)
 );
 CREATE INDEX IF NOT EXISTS idx_emo_broadcast_revision_created
@@ -695,8 +695,8 @@ CREATE TABLE IF NOT EXISTS emo_broadcast_delivery (
     is_current INTEGER NOT NULL DEFAULT 1,
     delivery_status VARCHAR(32) NOT NULL DEFAULT 'pending',
     created_at_ms BIGINT NOT NULL,
-    created_at DATETIME NOT NULL,
-    updated_at DATETIME NOT NULL
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_emo_broadcast_delivery_current
 ON emo_broadcast_delivery (
@@ -718,7 +718,7 @@ CREATE TABLE IF NOT EXISTS emo_broadcast_feedback_settlement (
     canonical_result_json TEXT NOT NULL,
     follow_up_delivery_id VARCHAR(128),
     created_at_ms BIGINT NOT NULL,
-    created_at DATETIME NOT NULL,
+    created_at TIMESTAMP NOT NULL,
     UNIQUE(
         playback_context_id, broadcast_id, client_id, device_session_id,
         connection_nonce, connection_epoch, client_seq
@@ -750,8 +750,8 @@ CREATE TABLE IF NOT EXISTS emo_broadcast_terminal_recovery (
     terminal_position_ms BIGINT NOT NULL,
     terminal_playback_rate DOUBLE PRECISION NOT NULL,
     terminal_at_server_ms BIGINT NOT NULL,
-    created_at DATETIME NOT NULL,
-    updated_at DATETIME NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
     UNIQUE(user_name, client_id, device_session_id)
 );
 CREATE INDEX IF NOT EXISTS idx_emo_broadcast_recovery_terminal
