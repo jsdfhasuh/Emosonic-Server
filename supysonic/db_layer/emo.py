@@ -76,6 +76,17 @@ class EmoPlaybackContext(_Model):
     epoch = IntegerField(default=1)
     playback_json = TextField(null=True)
     closed_at = DateTimeField(null=True)
+    close_action = CharField(64, null=True)
+    close_request_fingerprint = CharField(64, null=True)
+    close_expected_epoch = IntegerField(null=True)
+    close_base_version = IntegerField(null=True)
+    closed_from_epoch = IntegerField(null=True)
+    closed_from_version = IntegerField(null=True)
+    final_epoch = IntegerField(null=True)
+    final_version = IntegerField(null=True)
+    final_queue_revision = IntegerField(null=True)
+    final_control_version = IntegerField(null=True)
+    close_outcome_json = TextField(null=True)
     created_at = DateTimeField(default=now)
     updated_at = DateTimeField(default=now)
 
@@ -127,17 +138,24 @@ class EmoPlaybackControlTransaction(_Model):
     authority_device_session_id = CharField(128)
     routed_connection_nonce = CharField(128)
     routed_connection_epoch = IntegerField(default=1)
+    requesting_device_session_id = CharField(128, null=True)
+    requesting_connection_nonce = CharField(128, null=True)
+    requesting_connection_epoch = IntegerField(null=True)
     action = CharField(64)
     accepted_target_json = TextField()
     status = CharField(32, default="pending")
     error_code = CharField(64, null=True)
     depends_on_control_version = IntegerField(null=True)
-    accepted_at_ms = IntegerField()
+    accepted_at_ms = BigIntegerField()
     execution_timeout_ms = IntegerField()
-    watchdog_deadline_at_ms = IntegerField()
+    watchdog_deadline_at_ms = BigIntegerField(null=True)
+    effective_at_server_ms = BigIntegerField(null=True)
+    execution_eligible_at_ms = BigIntegerField(null=True)
+    error_message = TextField(null=True)
     applied_control_version = IntegerField(null=True)
     terminal_fingerprint = CharField(64, null=True)
-    terminal_at_ms = IntegerField(null=True)
+    terminal_at_ms = BigIntegerField(null=True)
+    reconciled_by_control_version = IntegerField(null=True)
     created_at = DateTimeField(default=now)
     updated_at = DateTimeField(default=now)
 
@@ -158,6 +176,64 @@ class EmoPlaybackControlTransaction(_Model):
                     'epoch',
                     'status',
                     'command_control_version',
+                ),
+                False,
+            ),
+            (
+                (
+                    'requesting_client_id',
+                    'requesting_device_session_id',
+                    'requesting_connection_nonce',
+                    'requesting_connection_epoch',
+                    'status',
+                ),
+                False,
+            ),
+            (
+                (
+                    'authority_client_id',
+                    'authority_device_session_id',
+                    'routed_connection_nonce',
+                    'routed_connection_epoch',
+                    'status',
+                ),
+                False,
+            ),
+        )
+
+
+class EmoPlaybackControlReconciliation(_Model):
+    id = PrimaryKeyField()
+    playback_context_id = CharField(128)
+    user_name = CharField(64)
+    epoch = IntegerField()
+    reconciliation_control_version = IntegerField()
+    from_applied_control_version = IntegerField()
+    through_control_version = IntegerField()
+    trigger_kind = CharField(64)
+    trigger_command_control_version = IntegerField(null=True)
+    actual_fact_fingerprint = CharField(64)
+    actual_fact_json = TextField()
+    canonical_update_json = TextField()
+    server_updated_at_ms = BigIntegerField()
+    created_at = DateTimeField(default=now)
+    updated_at = DateTimeField(default=now)
+
+    class Meta:
+        indexes = (
+            (
+                (
+                    'playback_context_id',
+                    'epoch',
+                    'reconciliation_control_version',
+                ),
+                True,
+            ),
+            (
+                (
+                    'playback_context_id',
+                    'epoch',
+                    'through_control_version',
                 ),
                 False,
             ),

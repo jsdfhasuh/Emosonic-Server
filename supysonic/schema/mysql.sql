@@ -324,6 +324,17 @@ CREATE TABLE IF NOT EXISTS emo_playback_context (
     epoch INTEGER NOT NULL DEFAULT 1,
     playback_json TEXT,
     closed_at DATETIME,
+    close_action VARCHAR(64),
+    close_request_fingerprint VARCHAR(64),
+    close_expected_epoch INTEGER,
+    close_base_version INTEGER,
+    closed_from_epoch INTEGER,
+    closed_from_version INTEGER,
+    final_epoch INTEGER,
+    final_version INTEGER,
+    final_queue_revision INTEGER,
+    final_control_version INTEGER,
+    close_outcome_json TEXT,
     created_at DATETIME NOT NULL,
     updated_at DATETIME NOT NULL
 ) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
@@ -368,6 +379,9 @@ CREATE TABLE IF NOT EXISTS emo_playback_control_transaction (
     authority_device_session_id VARCHAR(128) NOT NULL,
     routed_connection_nonce VARCHAR(128) NOT NULL,
     routed_connection_epoch INTEGER NOT NULL DEFAULT 1,
+    requesting_device_session_id VARCHAR(128),
+    requesting_connection_nonce VARCHAR(128),
+    requesting_connection_epoch INTEGER,
     action VARCHAR(64) NOT NULL,
     accepted_target_json TEXT NOT NULL,
     status VARCHAR(32) NOT NULL DEFAULT 'pending',
@@ -375,10 +389,14 @@ CREATE TABLE IF NOT EXISTS emo_playback_control_transaction (
     depends_on_control_version INTEGER,
     accepted_at_ms BIGINT NOT NULL,
     execution_timeout_ms INTEGER NOT NULL,
-    watchdog_deadline_at_ms BIGINT NOT NULL,
+    watchdog_deadline_at_ms BIGINT,
+    effective_at_server_ms BIGINT,
+    execution_eligible_at_ms BIGINT,
+    error_message TEXT,
     applied_control_version INTEGER,
     terminal_fingerprint VARCHAR(64),
     terminal_at_ms BIGINT,
+    reconciled_by_control_version INTEGER,
     created_at DATETIME NOT NULL,
     updated_at DATETIME NOT NULL,
     UNIQUE KEY uniq_emo_control_context_epoch_version (
@@ -387,6 +405,38 @@ CREATE TABLE IF NOT EXISTS emo_playback_control_transaction (
     KEY idx_emo_control_pending_deadline (status, watchdog_deadline_at_ms),
     KEY idx_emo_control_context_status (
         playback_context_id, epoch, status, command_control_version
+    ),
+    KEY idx_emo_control_request_generation (
+        requesting_client_id, requesting_device_session_id,
+        requesting_connection_nonce, requesting_connection_epoch, status
+    ),
+    KEY idx_emo_control_authority_generation (
+        authority_client_id, authority_device_session_id,
+        routed_connection_nonce, routed_connection_epoch, status
+    )
+) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS emo_playback_control_reconciliation (
+    id CHAR(32) PRIMARY KEY,
+    playback_context_id VARCHAR(128) NOT NULL,
+    user_name VARCHAR(64) NOT NULL,
+    epoch INTEGER NOT NULL,
+    reconciliation_control_version INTEGER NOT NULL,
+    from_applied_control_version INTEGER NOT NULL,
+    through_control_version INTEGER NOT NULL,
+    trigger_kind VARCHAR(64) NOT NULL,
+    trigger_command_control_version INTEGER,
+    actual_fact_fingerprint VARCHAR(64) NOT NULL,
+    actual_fact_json TEXT NOT NULL,
+    canonical_update_json TEXT NOT NULL,
+    server_updated_at_ms BIGINT NOT NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    UNIQUE KEY uniq_emo_reconcile_context_epoch_version (
+        playback_context_id, epoch, reconciliation_control_version
+    ),
+    KEY idx_emo_reconcile_gap (
+        playback_context_id, epoch, through_control_version
     )
 ) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
