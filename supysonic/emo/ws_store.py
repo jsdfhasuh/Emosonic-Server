@@ -15,6 +15,7 @@ from ..db import (
     EmoDevicePlaybackState,
     EmoLocalQueue,
     EmoPlaybackControlTransaction,
+    EmoPlaybackControlReconciliation,
     EmoPlaybackContext,
     EmoPlaybackHandoff,
     EmoPlaybackLocalIntent,
@@ -83,6 +84,10 @@ class PlaybackContextQueueRequiredError(Exception):
 
 
 class PlaybackControlTransactionConflictError(Exception):
+    pass
+
+
+class PlaybackControlReconciliationConflictError(Exception):
     pass
 
 
@@ -449,13 +454,135 @@ def _json_fingerprint(value):
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def _load_json_object(value):
+def _load_json_object(value, required=False):
+    if value is None:
+        if required:
+            raise ValueError("Persisted JSON object is missing")
+        return None
     if not value:
+        if required:
+            raise ValueError("Persisted JSON object is empty")
         return None
     loaded = json.loads(value)
     if not isinstance(loaded, dict):
         raise ValueError("Persisted transaction JSON must be an object")
     return loaded
+
+
+def _require_non_empty_string(value, field_name, max_length=None):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("%s must be a non-empty string" % field_name)
+    if max_length is not None and len(value.encode("utf-8")) > max_length:
+        raise ValueError("%s exceeds maximum length" % field_name)
+    return value
+
+
+def _require_integer(value, field_name, minimum=None):
+    if type(value) is not int:
+        raise ValueError("%s must be an integer" % field_name)
+    if minimum is not None and value < minimum:
+        raise ValueError("%s must be >= %d" % (field_name, minimum))
+    return value
+
+
+def _validate_control_transaction_inputs(
+    user_name,
+    epoch,
+    command_control_version,
+    requesting_client_id,
+    authority_client_id,
+    authority_device_session_id,
+    routed_connection_nonce,
+    routed_connection_epoch,
+    accepted_target,
+    accepted_at_ms,
+    execution_timeout_ms,
+    requesting_device_session_id=None,
+    requesting_connection_nonce=None,
+    requesting_connection_epoch=None,
+    effective_at_server_ms=None,
+):
+    _require_non_empty_string(user_name, "userName", 64)
+    _require_integer(epoch, "epoch", 1)
+    _require_integer(command_control_version, "commandControlVersion", 1)
+    _require_non_empty_string(requesting_client_id, "requestingClientId", 128)
+    _require_non_empty_string(authority_client_id, "authorityClientId", 128)
+    _require_non_empty_string(
+        authority_device_session_id,
+        "authorityDeviceSessionId",
+        128,
+    )
+    _require_non_empty_string(
+        routed_connection_nonce,
+        "routedConnectionNonce",
+        128,
+    )
+    _require_integer(routed_connection_epoch, "routedConnectionEpoch", 1)
+    _require_integer(accepted_at_ms, "acceptedAtMs", 0)
+    _require_integer(execution_timeout_ms, "executionTimeoutMs", 1)
+    if not isinstance(accepted_target, dict):
+        raise ValueError("acceptedTarget must be an object")
+
+    generation = (
+        requesting_device_session_id,
+        requesting_connection_nonce,
+        requesting_connection_epoch,
+    )
+    if any(value is None for value in generation) and not all(
+        value is None for value in generation
+    ):
+        raise ValueError(
+            "Requester physical generation must be provided as a complete tuple"
+        )
+    if all(value is not None for value in generation):
+        _require_non_empty_string(
+            requesting_device_session_id,
+            "requestingDeviceSessionId",
+            128,
+        )
+        _require_non_empty_string(
+            requesting_connection_nonce,
+            "requestingConnectionNonce",
+            128,
+        )
+        _require_integer(requesting_connection_epoch, "requestingConnectionEpoch", 1)
+
+    if effective_at_server_ms is not None:
+        _require_integer(effective_at_server_ms, "effectiveAtServerMs", 0)
+
+
+def _control_transaction_identity(
+    user_name,
+    requesting_client_id,
+    requesting_device_session_id,
+    requesting_connection_nonce,
+    requesting_connection_epoch,
+    authority_client_id,
+    authority_device_session_id,
+    routed_connection_nonce,
+    routed_connection_epoch,
+    action,
+    accepted_target_json,
+    accepted_at_ms,
+    execution_timeout_ms,
+    effective_at_server_ms,
+):
+    return (
+        user_name,
+        requesting_client_id,
+        requesting_device_session_id,
+        requesting_connection_nonce,
+        requesting_connection_epoch,
+        authority_client_id,
+        authority_device_session_id,
+        routed_connection_nonce,
+        routed_connection_epoch,
+        action,
+        accepted_target_json,
+        accepted_at_ms,
+        execution_timeout_ms,
+        effective_at_server_ms,
+    )
 
 
 def serializePlaybackControlTransaction(record):
@@ -472,38 +599,76 @@ def serializePlaybackControlTransaction(record):
         "routedConnectionNonce": record.routed_connection_nonce,
         "routedConnectionEpoch": record.routed_connection_epoch,
         "action": record.action,
-        "acceptedTarget": _load_json_object(record.accepted_target_json),
+        "acceptedTarget": _load_json_object(
+            record.accepted_target_json,
+            required=True,
+        ),
         "status": record.status,
         "acceptedAtMs": record.accepted_at_ms,
         "executionTimeoutMs": record.execution_timeout_ms,
-        "watchdogDeadlineAtMs": record.watchdog_deadline_at_ms,
     }
     optional = {
+        "requestingDeviceSessionId": record.requesting_device_session_id,
+        "requestingConnectionNonce": record.requesting_connection_nonce,
+        "requestingConnectionEpoch": record.requesting_connection_epoch,
+        "effectiveAtServerMs": record.effective_at_server_ms,
+        "executionEligibleAtMs": record.execution_eligible_at_ms,
+        "watchdogDeadlineAtMs": record.watchdog_deadline_at_ms,
         "errorCode": record.error_code,
+        "errorMessage": record.error_message,
         "dependsOnControlVersion": record.depends_on_control_version,
         "appliedControlVersion": record.applied_control_version,
         "terminalFingerprint": record.terminal_fingerprint,
         "terminalAtMs": record.terminal_at_ms,
+        "reconciledByControlVersion": record.reconciled_by_control_version,
     }
     payload.update({key: value for key, value in optional.items() if value is not None})
     return payload
 
 
-def _control_transaction_identity(
+def _create_playback_control_transaction_record(
+    playback_context_id,
     user_name,
+    epoch,
+    command_control_version,
     requesting_client_id,
     authority_client_id,
     authority_device_session_id,
     routed_connection_nonce,
     routed_connection_epoch,
     action,
-    accepted_target_json,
+    accepted_target,
     accepted_at_ms,
     execution_timeout_ms,
+    requesting_device_session_id=None,
+    requesting_connection_nonce=None,
+    requesting_connection_epoch=None,
+    effective_at_server_ms=None,
 ):
-    return (
+    _validate_control_transaction_inputs(
+        user_name,
+        epoch,
+        command_control_version,
+        requesting_client_id,
+        authority_client_id,
+        authority_device_session_id,
+        routed_connection_nonce,
+        routed_connection_epoch,
+        accepted_target,
+        accepted_at_ms,
+        execution_timeout_ms,
+        requesting_device_session_id,
+        requesting_connection_nonce,
+        requesting_connection_epoch,
+        effective_at_server_ms,
+    )
+    accepted_target_json = _canonical_json(accepted_target)
+    identity = _control_transaction_identity(
         user_name,
         requesting_client_id,
+        requesting_device_session_id,
+        requesting_connection_nonce,
+        requesting_connection_epoch,
         authority_client_id,
         authority_device_session_id,
         routed_connection_nonce,
@@ -512,7 +677,64 @@ def _control_transaction_identity(
         accepted_target_json,
         accepted_at_ms,
         execution_timeout_ms,
+        effective_at_server_ms,
     )
+    existing = EmoPlaybackControlTransaction.get_or_none(
+        (EmoPlaybackControlTransaction.playback_context_id == playback_context_id)
+        & (EmoPlaybackControlTransaction.epoch == epoch)
+        & (
+            EmoPlaybackControlTransaction.command_control_version
+            == command_control_version
+        )
+    )
+    if existing is not None:
+        existing_identity = _control_transaction_identity(
+            existing.user_name,
+            existing.requesting_client_id,
+            existing.requesting_device_session_id,
+            existing.requesting_connection_nonce,
+            existing.requesting_connection_epoch,
+            existing.authority_client_id,
+            existing.authority_device_session_id,
+            existing.routed_connection_nonce,
+            existing.routed_connection_epoch,
+            existing.action,
+            existing.accepted_target_json,
+            existing.accepted_at_ms,
+            existing.execution_timeout_ms,
+            existing.effective_at_server_ms,
+        )
+        if existing_identity != identity:
+            raise PlaybackControlTransactionConflictError(
+                "Control transaction identity conflict"
+            )
+        return existing, False
+
+    watchdog_deadline_at_ms = None
+    if requesting_device_session_id is None:
+        watchdog_deadline_at_ms = accepted_at_ms + execution_timeout_ms + 2000
+    record = EmoPlaybackControlTransaction.create(
+        playback_context_id=playback_context_id,
+        user_name=user_name,
+        epoch=epoch,
+        command_control_version=command_control_version,
+        requesting_client_id=requesting_client_id,
+        authority_client_id=authority_client_id,
+        authority_device_session_id=authority_device_session_id,
+        routed_connection_nonce=routed_connection_nonce,
+        routed_connection_epoch=routed_connection_epoch,
+        requesting_device_session_id=requesting_device_session_id,
+        requesting_connection_nonce=requesting_connection_nonce,
+        requesting_connection_epoch=requesting_connection_epoch,
+        action=action,
+        accepted_target_json=accepted_target_json,
+        status="pending",
+        accepted_at_ms=accepted_at_ms,
+        execution_timeout_ms=execution_timeout_ms,
+        watchdog_deadline_at_ms=watchdog_deadline_at_ms,
+        effective_at_server_ms=effective_at_server_ms,
+    )
+    return record, True
 
 
 @_serialize_strict_playback_context_mutation
@@ -530,52 +752,15 @@ def createPlaybackControlTransaction(
     accepted_target,
     accepted_at_ms,
     execution_timeout_ms,
+    requesting_device_session_id=None,
+    requesting_connection_nonce=None,
+    requesting_connection_epoch=None,
+    effective_at_server_ms=None,
 ):
-    if execution_timeout_ms < 1:
-        raise ValueError("executionTimeoutMs must be positive")
-    accepted_target_json = _canonical_json(accepted_target)
-    identity = _control_transaction_identity(
-        user_name,
-        requesting_client_id,
-        authority_client_id,
-        authority_device_session_id,
-        routed_connection_nonce,
-        routed_connection_epoch,
-        action,
-        accepted_target_json,
-        accepted_at_ms,
-        execution_timeout_ms,
-    )
     open_connection(reuse=True)
     try:
         with _strict_playback_context_transaction():
-            existing = EmoPlaybackControlTransaction.get_or_none(
-                (EmoPlaybackControlTransaction.playback_context_id == playback_context_id)
-                & (EmoPlaybackControlTransaction.epoch == epoch)
-                & (
-                    EmoPlaybackControlTransaction.command_control_version
-                    == command_control_version
-                )
-            )
-            if existing is not None:
-                existing_identity = _control_transaction_identity(
-                    existing.user_name,
-                    existing.requesting_client_id,
-                    existing.authority_client_id,
-                    existing.authority_device_session_id,
-                    existing.routed_connection_nonce,
-                    existing.routed_connection_epoch,
-                    existing.action,
-                    existing.accepted_target_json,
-                    existing.accepted_at_ms,
-                    existing.execution_timeout_ms,
-                )
-                if existing_identity != identity:
-                    raise PlaybackControlTransactionConflictError(
-                        "Control transaction identity conflict"
-                    )
-                return serializePlaybackControlTransaction(existing), False
-            record = EmoPlaybackControlTransaction.create(
+            record, created = _create_playback_control_transaction_record(
                 playback_context_id=playback_context_id,
                 user_name=user_name,
                 epoch=epoch,
@@ -586,13 +771,15 @@ def createPlaybackControlTransaction(
                 routed_connection_nonce=routed_connection_nonce,
                 routed_connection_epoch=routed_connection_epoch,
                 action=action,
-                accepted_target_json=accepted_target_json,
-                status="pending",
+                accepted_target=accepted_target,
                 accepted_at_ms=accepted_at_ms,
                 execution_timeout_ms=execution_timeout_ms,
-                watchdog_deadline_at_ms=(accepted_at_ms + execution_timeout_ms + 2000),
+                requesting_device_session_id=requesting_device_session_id,
+                requesting_connection_nonce=requesting_connection_nonce,
+                requesting_connection_epoch=requesting_connection_epoch,
+                effective_at_server_ms=effective_at_server_ms,
             )
-            return serializePlaybackControlTransaction(record), True
+            return serializePlaybackControlTransaction(record), created
     finally:
         close_connection()
 
@@ -639,27 +826,38 @@ def listPendingPlaybackControlTransactionsForAuthorityConnection(
     authority_client_id: str,
     authority_device_session_id: str,
     routed_connection_nonce: str,
+    routed_connection_epoch: Optional[int] = None,
 ) -> List[Dict[str, object]]:
+    _require_non_empty_string(user_name, "userName", 64)
+    _require_non_empty_string(authority_client_id, "authorityClientId", 128)
+    _require_non_empty_string(
+        authority_device_session_id,
+        "authorityDeviceSessionId",
+        128,
+    )
+    _require_non_empty_string(routed_connection_nonce, "routedConnectionNonce", 128)
+    if routed_connection_epoch is not None:
+        _require_integer(routed_connection_epoch, "routedConnectionEpoch", 1)
     open_connection(reuse=True)
     try:
+        conditions = [
+            EmoPlaybackControlTransaction.user_name == user_name,
+            EmoPlaybackControlTransaction.authority_client_id
+            == authority_client_id,
+            EmoPlaybackControlTransaction.authority_device_session_id
+            == authority_device_session_id,
+            EmoPlaybackControlTransaction.routed_connection_nonce
+            == routed_connection_nonce,
+            EmoPlaybackControlTransaction.status == "pending",
+        ]
+        if routed_connection_epoch is not None:
+            conditions.append(
+                EmoPlaybackControlTransaction.routed_connection_epoch
+                == routed_connection_epoch
+            )
         query = (
             EmoPlaybackControlTransaction.select()
-            .where(
-                (EmoPlaybackControlTransaction.user_name == user_name)
-                & (
-                    EmoPlaybackControlTransaction.authority_client_id
-                    == authority_client_id
-                )
-                & (
-                    EmoPlaybackControlTransaction.authority_device_session_id
-                    == authority_device_session_id
-                )
-                & (
-                    EmoPlaybackControlTransaction.routed_connection_nonce
-                    == routed_connection_nonce
-                )
-                & (EmoPlaybackControlTransaction.status == "pending")
-            )
+            .where(*conditions)
             .order_by(
                 EmoPlaybackControlTransaction.playback_context_id,
                 EmoPlaybackControlTransaction.epoch,
@@ -689,12 +887,17 @@ def listAllPendingPlaybackControlTransactions() -> List[Dict[str, object]]:
 
 
 def listExpiredPlaybackControlTransactions(deadline_at_ms):
+    _require_integer(deadline_at_ms, "deadlineAtMs", 0)
     open_connection(reuse=True)
     try:
         query = (
             EmoPlaybackControlTransaction.select()
             .where(
                 (EmoPlaybackControlTransaction.status == "pending")
+                & (
+                    EmoPlaybackControlTransaction.watchdog_deadline_at_ms
+                    .is_null(False)
+                )
                 & (
                     EmoPlaybackControlTransaction.watchdog_deadline_at_ms
                     <= deadline_at_ms
@@ -713,6 +916,63 @@ def listExpiredPlaybackControlTransactions(deadline_at_ms):
 
 
 @_serialize_strict_playback_context_mutation
+def markPlaybackControlTransactionExecutionEligible(
+    playback_context_id,
+    epoch,
+    command_control_version,
+    execution_eligible_at_ms,
+):
+    _require_integer(epoch, "epoch", 1)
+    _require_integer(command_control_version, "commandControlVersion", 1)
+    _require_integer(execution_eligible_at_ms, "executionEligibleAtMs", 0)
+    open_connection(reuse=True)
+    try:
+        with _strict_playback_context_transaction():
+            record = EmoPlaybackControlTransaction.get_or_none(
+                (EmoPlaybackControlTransaction.playback_context_id == playback_context_id)
+                & (EmoPlaybackControlTransaction.epoch == epoch)
+                & (
+                    EmoPlaybackControlTransaction.command_control_version
+                    == command_control_version
+                )
+            )
+            if record is None:
+                return None, False
+            if record.status != "pending":
+                raise PlaybackControlTransactionConflictError(
+                    "Terminal control transaction cannot become eligible"
+                )
+            if (
+                record.effective_at_server_ms is not None
+                and execution_eligible_at_ms < record.effective_at_server_ms
+            ):
+                raise ValueError(
+                    "executionEligibleAtMs precedes effectiveAtServerMs"
+                )
+            if record.execution_eligible_at_ms is not None:
+                if record.execution_eligible_at_ms != execution_eligible_at_ms:
+                    raise PlaybackControlTransactionConflictError(
+                        "Execution eligibility conflicts"
+                    )
+                return serializePlaybackControlTransaction(record), False
+            record.execution_eligible_at_ms = execution_eligible_at_ms
+            record.watchdog_deadline_at_ms = (
+                execution_eligible_at_ms + record.execution_timeout_ms + 2000
+            )
+            record.updated_at = now()
+            record.save(
+                only=(
+                    EmoPlaybackControlTransaction.execution_eligible_at_ms,
+                    EmoPlaybackControlTransaction.watchdog_deadline_at_ms,
+                    EmoPlaybackControlTransaction.updated_at,
+                )
+            )
+            return serializePlaybackControlTransaction(record), True
+    finally:
+        close_connection()
+
+
+@_serialize_strict_playback_context_mutation
 def settlePlaybackControlTransaction(
     playback_context_id,
     epoch,
@@ -722,14 +982,21 @@ def settlePlaybackControlTransaction(
     error_code=None,
     depends_on_control_version=None,
     applied_control_version=None,
+    error_message=None,
 ):
     if status not in {"committed", "failed", "superseded"}:
         raise ValueError("Invalid control transaction terminal status")
+    _require_integer(terminal_at_ms, "terminalAtMs", 0)
+    if error_message is not None and not isinstance(error_message, str):
+        raise ValueError("errorMessage must be a string")
+    if status != "failed" and error_message is not None:
+        raise ValueError("Only failed transactions may contain errorMessage")
     terminal = {
         "status": status,
         "errorCode": error_code,
         "dependsOnControlVersion": depends_on_control_version,
         "appliedControlVersion": applied_control_version,
+        "errorMessage": error_message,
     }
     terminal_fingerprint = _json_fingerprint(terminal)
     open_connection(reuse=True)
@@ -755,6 +1022,7 @@ def settlePlaybackControlTransaction(
                 EmoPlaybackControlTransaction.update(
                     status=status,
                     error_code=error_code,
+                    error_message=error_message,
                     depends_on_control_version=depends_on_control_version,
                     applied_control_version=applied_control_version,
                     terminal_fingerprint=terminal_fingerprint,
@@ -773,6 +1041,301 @@ def settlePlaybackControlTransaction(
                 )
             record = EmoPlaybackControlTransaction.get_by_id(record.id)
             return serializePlaybackControlTransaction(record), True
+    finally:
+        close_connection()
+
+
+def serializePlaybackControlReconciliation(record):
+    if record is None:
+        return None
+    payload = {
+        "playbackContextId": record.playback_context_id,
+        "userName": record.user_name,
+        "epoch": record.epoch,
+        "reconciliationControlVersion": record.reconciliation_control_version,
+        "fromAppliedControlVersion": record.from_applied_control_version,
+        "throughControlVersion": record.through_control_version,
+        "triggerKind": record.trigger_kind,
+        "actualFactFingerprint": record.actual_fact_fingerprint,
+        "actualFact": _load_json_object(record.actual_fact_json, required=True),
+        "canonicalUpdate": _load_json_object(
+            record.canonical_update_json,
+            required=True,
+        ),
+        "serverUpdatedAtMs": record.server_updated_at_ms,
+    }
+    if record.trigger_command_control_version is not None:
+        payload[
+            "triggerCommandControlVersion"
+        ] = record.trigger_command_control_version
+    return payload
+
+
+def _validate_reconciliation_inputs(
+    playback_context_id,
+    user_name,
+    epoch,
+    reconciliation_control_version,
+    from_applied_control_version,
+    through_control_version,
+    trigger_kind,
+    actual_fact,
+    canonical_update,
+    server_updated_at_ms,
+    trigger_command_control_version,
+):
+    _require_non_empty_string(playback_context_id, "playbackContextId", 128)
+    _require_non_empty_string(user_name, "userName", 64)
+    _require_integer(epoch, "epoch", 1)
+    _require_integer(
+        reconciliation_control_version,
+        "reconciliationControlVersion",
+        1,
+    )
+    _require_integer(
+        from_applied_control_version,
+        "fromAppliedControlVersion",
+        0,
+    )
+    _require_integer(through_control_version, "throughControlVersion", 1)
+    if reconciliation_control_version <= through_control_version:
+        raise ValueError(
+            "reconciliationControlVersion must exceed throughControlVersion"
+        )
+    _require_non_empty_string(trigger_kind, "triggerKind", 64)
+    if trigger_command_control_version is not None:
+        _require_integer(
+            trigger_command_control_version,
+            "triggerCommandControlVersion",
+            1,
+        )
+    _require_integer(server_updated_at_ms, "serverUpdatedAtMs", 0)
+    if not isinstance(actual_fact, dict):
+        raise ValueError("actualFact must be an object")
+    if not isinstance(canonical_update, dict):
+        raise ValueError("canonicalUpdate must be an object")
+
+
+def _reconciliation_identity(
+    record_or_playback_context_id,
+    user_name=None,
+    epoch=None,
+    reconciliation_control_version=None,
+    from_applied_control_version=None,
+    through_control_version=None,
+    trigger_kind=None,
+    trigger_command_control_version=None,
+    actual_fact_fingerprint=None,
+    actual_fact_json=None,
+    canonical_update_json=None,
+    server_updated_at_ms=None,
+):
+    if isinstance(record_or_playback_context_id, EmoPlaybackControlReconciliation):
+        record = record_or_playback_context_id
+        return _reconciliation_identity(
+            record.playback_context_id,
+            record.user_name,
+            record.epoch,
+            record.reconciliation_control_version,
+            record.from_applied_control_version,
+            record.through_control_version,
+            record.trigger_kind,
+            record.trigger_command_control_version,
+            record.actual_fact_fingerprint,
+            record.actual_fact_json,
+            record.canonical_update_json,
+            record.server_updated_at_ms,
+        )
+    return (
+        record_or_playback_context_id,
+        user_name,
+        epoch,
+        reconciliation_control_version,
+        from_applied_control_version,
+        through_control_version,
+        trigger_kind,
+        trigger_command_control_version,
+        actual_fact_fingerprint,
+        actual_fact_json,
+        canonical_update_json,
+        server_updated_at_ms,
+    )
+
+
+def createPlaybackControlReconciliation(
+    playback_context_id,
+    user_name,
+    epoch,
+    reconciliation_control_version,
+    from_applied_control_version,
+    through_control_version,
+    trigger_kind,
+    actual_fact,
+    canonical_update,
+    server_updated_at_ms,
+    trigger_command_control_version=None,
+):
+    _validate_reconciliation_inputs(
+        playback_context_id,
+        user_name,
+        epoch,
+        reconciliation_control_version,
+        from_applied_control_version,
+        through_control_version,
+        trigger_kind,
+        actual_fact,
+        canonical_update,
+        server_updated_at_ms,
+        trigger_command_control_version,
+    )
+    actual_fact_json = _canonical_json(actual_fact)
+    canonical_update_json = _canonical_json(canonical_update)
+    actual_fact_fingerprint = _json_fingerprint(actual_fact)
+    identity = _reconciliation_identity(
+        playback_context_id,
+        user_name,
+        epoch,
+        reconciliation_control_version,
+        from_applied_control_version,
+        through_control_version,
+        trigger_kind,
+        trigger_command_control_version,
+        actual_fact_fingerprint,
+        actual_fact_json,
+        canonical_update_json,
+        server_updated_at_ms,
+    )
+    with _strict_playback_context_lock(playback_context_id):
+        open_connection(reuse=True)
+        try:
+            with _strict_playback_context_transaction():
+                record = EmoPlaybackControlReconciliation.get_or_none(
+                    (EmoPlaybackControlReconciliation.playback_context_id
+                     == playback_context_id)
+                    & (EmoPlaybackControlReconciliation.epoch == epoch)
+                    & (
+                        EmoPlaybackControlReconciliation.reconciliation_control_version
+                        == reconciliation_control_version
+                    )
+                )
+                if record is not None:
+                    if _reconciliation_identity(record) != identity:
+                        raise PlaybackControlReconciliationConflictError(
+                            "Reconciliation record identity conflict"
+                        )
+                    return serializePlaybackControlReconciliation(record), False
+                record = EmoPlaybackControlReconciliation.create(
+                    playback_context_id=playback_context_id,
+                    user_name=user_name,
+                    epoch=epoch,
+                    reconciliation_control_version=reconciliation_control_version,
+                    from_applied_control_version=from_applied_control_version,
+                    through_control_version=through_control_version,
+                    trigger_kind=trigger_kind,
+                    trigger_command_control_version=(
+                        trigger_command_control_version
+                    ),
+                    actual_fact_fingerprint=actual_fact_fingerprint,
+                    actual_fact_json=actual_fact_json,
+                    canonical_update_json=canonical_update_json,
+                    server_updated_at_ms=server_updated_at_ms,
+                    created_at=now(),
+                    updated_at=now(),
+                )
+                return serializePlaybackControlReconciliation(record), True
+        finally:
+            close_connection()
+
+
+def getPlaybackControlReconciliation(
+    playback_context_id,
+    epoch,
+    reconciliation_control_version,
+):
+    _require_non_empty_string(playback_context_id, "playbackContextId", 128)
+    _require_integer(epoch, "epoch", 1)
+    _require_integer(
+        reconciliation_control_version,
+        "reconciliationControlVersion",
+        1,
+    )
+    open_connection(reuse=True)
+    try:
+        record = EmoPlaybackControlReconciliation.get_or_none(
+            (EmoPlaybackControlReconciliation.playback_context_id
+             == playback_context_id)
+            & (EmoPlaybackControlReconciliation.epoch == epoch)
+            & (
+                EmoPlaybackControlReconciliation.reconciliation_control_version
+                == reconciliation_control_version
+            )
+        )
+        return serializePlaybackControlReconciliation(record)
+    finally:
+        close_connection()
+
+
+def listPlaybackControlReconciliations(playback_context_id, epoch):
+    _require_non_empty_string(playback_context_id, "playbackContextId", 128)
+    _require_integer(epoch, "epoch", 1)
+    open_connection(reuse=True)
+    try:
+        query = (
+            EmoPlaybackControlReconciliation.select()
+            .where(
+                (EmoPlaybackControlReconciliation.playback_context_id
+                 == playback_context_id)
+                & (EmoPlaybackControlReconciliation.epoch == epoch)
+            )
+            .order_by(
+                EmoPlaybackControlReconciliation.reconciliation_control_version
+            )
+        )
+        return [serializePlaybackControlReconciliation(record) for record in query]
+    finally:
+        close_connection()
+
+
+def serializePlaybackContextCloseTombstone(record):
+    if record is None:
+        return None
+    payload = {
+        "playbackContextId": record.playback_context_id,
+        "userName": record.user_name,
+        "lifecycle": record.lifecycle,
+    }
+    optional = {
+        "closeAction": record.close_action,
+        "closeRequestFingerprint": record.close_request_fingerprint,
+        "closeExpectedEpoch": record.close_expected_epoch,
+        "closeBaseVersion": record.close_base_version,
+        "closedFromEpoch": record.closed_from_epoch,
+        "closedFromVersion": record.closed_from_version,
+        "finalEpoch": record.final_epoch,
+        "finalVersion": record.final_version,
+        "finalQueueRevision": record.final_queue_revision,
+        "finalControlVersion": record.final_control_version,
+    }
+    payload.update({key: value for key, value in optional.items() if value is not None})
+    if record.close_outcome_json is not None:
+        payload["closeOutcome"] = _load_json_object(
+            record.close_outcome_json,
+            required=True,
+        )
+    return payload
+
+
+def getPlaybackContextCloseTombstone(playback_context_id, user_name):
+    _require_non_empty_string(playback_context_id, "playbackContextId", 128)
+    _require_non_empty_string(user_name, "userName", 64)
+    open_connection(reuse=True)
+    try:
+        record = EmoPlaybackContext.get_or_none(
+            (EmoPlaybackContext.playback_context_id == playback_context_id)
+            & (EmoPlaybackContext.user_name == user_name)
+            & (EmoPlaybackContext.lifecycle == "closed")
+        )
+        return serializePlaybackContextCloseTombstone(record)
     finally:
         close_connection()
 
@@ -1168,9 +1731,15 @@ def applyStrictPlaybackUpdate(
                     else "failed"
                 )
                 terminal_error = payload.get("errorCode")
+                terminal_error_message = (
+                    payload.get("errorMessage")
+                    if terminal_status == "failed"
+                    else None
+                )
                 terminal_identity = {
                     "status": terminal_status,
                     "errorCode": terminal_error,
+                    "errorMessage": terminal_error_message,
                     "appliedControlVersion": applied,
                     "state": payload["state"],
                     "trackId": payload.get("trackId"),
@@ -1186,6 +1755,7 @@ def applyStrictPlaybackUpdate(
                 else:
                     transaction.status = terminal_status
                     transaction.error_code = terminal_error
+                    transaction.error_message = terminal_error_message
                     transaction.applied_control_version = applied
                     transaction.terminal_fingerprint = terminal_fingerprint
                     transaction.terminal_at_ms = server_updated_at_ms
@@ -1256,6 +1826,7 @@ def applyStrictPlaybackUpdate(
                                     {
                                         "status": "failed",
                                         "errorCode": "dependency_failed",
+                                        "errorMessage": None,
                                         "dependsOnControlVersion": command_version,
                                         "appliedControlVersion": applied,
                                     }
@@ -1370,6 +1941,7 @@ def applyStrictPlaybackUpdate(
                     pending.terminal_fingerprint = _json_fingerprint(
                         {
                             "status": "superseded",
+                            "errorMessage": None,
                             "appliedControlVersion": applied,
                         }
                     )
@@ -2929,7 +3501,23 @@ def mutateStrictPlaybackContextControl(
     execution_timeout_ms=None,
     accepted_target_extra=None,
     post_mutation_hook=None,
+    requesting_device_session_id=None,
+    requesting_connection_nonce=None,
+    requesting_connection_epoch=None,
+    effective_at_server_ms=None,
 ):
+    if requesting_client_id is None and any(
+        value is not None
+        for value in (
+            requesting_device_session_id,
+            requesting_connection_nonce,
+            requesting_connection_epoch,
+            effective_at_server_ms,
+        )
+    ):
+        raise ValueError(
+            "Requester transaction fields require requestingClientId"
+        )
     open_connection(reuse=True)
     try:
         initial_record = _getStrictPlaybackContextRecord(
@@ -2992,6 +3580,24 @@ def mutateStrictPlaybackContextControl(
                 if record.current_index <= 0:
                     raise ValueError("player.prev queueIndex is out of bounds")
                 current_index = record.current_index - 1
+            if requesting_client_id is not None:
+                _validate_control_transaction_inputs(
+                    user_name,
+                    record.epoch,
+                    record.control_version + 1,
+                    requesting_client_id,
+                    authority_client_id,
+                    authority_device_session_id,
+                    routed_connection_nonce,
+                    routed_connection_epoch,
+                    {},
+                    accepted_at_ms,
+                    execution_timeout_ms,
+                    requesting_device_session_id,
+                    requesting_connection_nonce,
+                    requesting_connection_epoch,
+                    effective_at_server_ms,
+                )
             if current_index is not None:
                 record.current_index = current_index
                 record.track_id = queue_song_ids[current_index]
@@ -3010,17 +3616,6 @@ def mutateStrictPlaybackContextControl(
             record.save()
             result = _playback_context_payload(record)
             if requesting_client_id is not None:
-                if (
-                    not authority_client_id
-                    or not authority_device_session_id
-                    or not routed_connection_nonce
-                    or accepted_at_ms is None
-                    or execution_timeout_ms is None
-                    or execution_timeout_ms < 1
-                ):
-                    raise ValueError(
-                        "Strict control transaction routing fields are required"
-                    )
                 accepted_target = {
                     "action": action,
                     "state": record.state,
@@ -3037,7 +3632,7 @@ def mutateStrictPlaybackContextControl(
                     accepted_target["queueRevision"] = record.queue_revision
                 if accepted_target_extra:
                     accepted_target.update(dict(accepted_target_extra))
-                transaction_record = EmoPlaybackControlTransaction.create(
+                transaction_record, _created = _create_playback_control_transaction_record(
                     playback_context_id=playback_context_id,
                     user_name=user_name,
                     epoch=record.epoch,
@@ -3048,13 +3643,13 @@ def mutateStrictPlaybackContextControl(
                     routed_connection_nonce=routed_connection_nonce,
                     routed_connection_epoch=routed_connection_epoch,
                     action=action,
-                    accepted_target_json=_canonical_json(accepted_target),
-                    status="pending",
+                    accepted_target=accepted_target,
                     accepted_at_ms=accepted_at_ms,
                     execution_timeout_ms=execution_timeout_ms,
-                    watchdog_deadline_at_ms=(
-                        accepted_at_ms + execution_timeout_ms + 2000
-                    ),
+                    requesting_device_session_id=requesting_device_session_id,
+                    requesting_connection_nonce=requesting_connection_nonce,
+                    requesting_connection_epoch=requesting_connection_epoch,
+                    effective_at_server_ms=effective_at_server_ms,
                 )
                 result["_controlTransaction"] = (
                     serializePlaybackControlTransaction(transaction_record)

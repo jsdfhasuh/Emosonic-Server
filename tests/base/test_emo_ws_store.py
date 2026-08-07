@@ -1,4 +1,6 @@
 import concurrent.futures
+import hashlib
+import json
 import os
 import tempfile
 import threading
@@ -14,6 +16,7 @@ from supysonic.emo.ws_store import (
     PlaybackContextIntentConflictError,
     PlaybackContextStaleVersionError,
     PlaybackControlTransactionConflictError,
+    PlaybackControlReconciliationConflictError,
     PlaybackHandoffTargetConflictError,
     PlaybackLocalIntentConflictError,
     PlaybackPrepareAlreadyActiveError,
@@ -24,6 +27,7 @@ from supysonic.emo.ws_store import (
     completeStrictPlaybackHandoff,
     createPlaybackContextState,
     createPlaybackControlTransaction,
+    createPlaybackControlReconciliation,
     createPlaybackPrepareTransaction,
     createStrictPlaybackHandoff,
     createStrictPlaybackContextState,
@@ -37,6 +41,8 @@ from supysonic.emo.ws_store import (
     getPlaybackContextState,
     getPlaybackContextWithDeviceStates,
     getPlaybackControlTransaction,
+    getPlaybackControlReconciliation,
+    getPlaybackContextCloseTombstone,
     getPlaybackHandoff,
     getPlaybackHandoffByRequest,
     getPlaybackPrepareTransaction,
@@ -47,6 +53,7 @@ from supysonic.emo.ws_store import (
     listActivePlaybackContextBindings,
     listAllPendingPlaybackControlTransactions,
     listExpiredPlaybackControlTransactions,
+    listPlaybackControlReconciliations,
     listExpiredPlaybackPrepareTransactions,
     listPendingPlaybackControlTransactions,
     listPendingPlaybackControlTransactionsForAuthorityConnection,
@@ -62,11 +69,15 @@ from supysonic.emo.ws_store import (
     savePlaybackState,
     saveQueueState,
     serializeDevicePlaybackStateV2,
+    serializePlaybackContextCloseTombstone,
+    serializePlaybackControlTransaction,
+    serializePlaybackControlReconciliation,
     serializePlaybackContextV2,
     settlePlaybackControlTransaction,
     settlePlaybackPrepareTransaction,
     terminateStrictPlaybackHandoff,
     updatePlaybackContextState,
+    markPlaybackControlTransactionExecutionEligible,
 )
 
 
@@ -79,6 +90,38 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
     def tearDown(self):
         db.release_database()
         os.remove(self.db_path)
+
+    def _create_exact_transaction(
+        self,
+        command_control_version=2,
+        requesting_device_session_id="device:controller-1",
+        requesting_connection_nonce="requester-nonce-1",
+        requesting_connection_epoch=3,
+        routed_connection_epoch=1,
+        effective_at_server_ms=1500,
+        accepted_at_ms=1000,
+        execution_timeout_ms=15000,
+        action="player.next",
+    ):
+        return createPlaybackControlTransaction(
+            "context-1",
+            "alice",
+            1,
+            command_control_version,
+            "controller-1",
+            "player-1",
+            "device:player-1",
+            "authority-nonce-1",
+            routed_connection_epoch,
+            action,
+            {"queueIndex": 1, "trackId": "song-2"},
+            accepted_at_ms,
+            execution_timeout_ms,
+            requesting_device_session_id=requesting_device_session_id,
+            requesting_connection_nonce=requesting_connection_nonce,
+            requesting_connection_epoch=requesting_connection_epoch,
+            effective_at_server_ms=effective_at_server_ms,
+        )
 
     def test_save_and_load_queue_state(self):
         saveQueueState(
@@ -1704,6 +1747,576 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 18001,
                 applied_control_version=2,
             )
+
+    def test_exact_control_transaction_round_trips_requester_and_new_fields(self):
+        transaction, created = self._create_exact_transaction(
+            effective_at_server_ms=1500,
+        )
+
+        self.assertTrue(created)
+        self.assertEqual(transaction["requestingDeviceSessionId"], "device:controller-1")
+        self.assertEqual(transaction["requestingConnectionNonce"], "requester-nonce-1")
+        self.assertEqual(transaction["requestingConnectionEpoch"], 3)
+        self.assertEqual(transaction["effectiveAtServerMs"], 1500)
+        self.assertNotIn("executionEligibleAtMs", transaction)
+        self.assertNotIn("watchdogDeadlineAtMs", transaction)
+        self.assertEqual(
+            transaction["acceptedTarget"],
+            {"queueIndex": 1, "trackId": "song-2"},
+        )
+        self.assertNotIn("id", transaction)
+        self.assertEqual(
+            getPlaybackControlTransaction("context-1", 1, 2),
+            transaction,
+        )
+
+        db.release_database()
+        db.init_database("sqlite:///" + self.db_path)
+        self.assertEqual(
+            getPlaybackControlTransaction("context-1", 1, 2),
+            transaction,
+        )
+
+    def test_control_transaction_requester_generation_is_all_or_none(self):
+        invalid_inputs = (
+            {"requesting_device_session_id": None},
+            {"requesting_connection_nonce": None},
+            {"requesting_connection_epoch": None},
+            {
+                "requesting_device_session_id": "",
+                "requesting_connection_nonce": "nonce",
+                "requesting_connection_epoch": 1,
+            },
+            {
+                "requesting_device_session_id": "device",
+                "requesting_connection_nonce": "nonce",
+                "requesting_connection_epoch": True,
+            },
+            {
+                "requesting_device_session_id": "device",
+                "requesting_connection_nonce": "nonce",
+                "requesting_connection_epoch": 0,
+            },
+        )
+        for index, overrides in enumerate(invalid_inputs, start=2):
+            arguments = {
+                "requesting_device_session_id": "device:controller-1",
+                "requesting_connection_nonce": "requester-nonce-1",
+                "requesting_connection_epoch": 3,
+            }
+            arguments.update(overrides)
+            with self.assertRaises(ValueError):
+                self._create_exact_transaction(
+                    command_control_version=index,
+                    **arguments,
+                )
+            self.assertEqual(
+                db.EmoPlaybackControlTransaction.select().count(),
+                0,
+            )
+
+    def test_exact_control_transaction_creation_is_idempotent_by_full_identity(self):
+        first, created = self._create_exact_transaction()
+        replay, replay_created = self._create_exact_transaction()
+        self.assertTrue(created)
+        self.assertFalse(replay_created)
+        self.assertEqual(replay, first)
+
+        conflicting_arguments = (
+            {"requesting_device_session_id": "device:replacement"},
+            {"requesting_connection_nonce": "requester-nonce-2"},
+            {"requesting_connection_epoch": 4},
+            {"routed_connection_epoch": 2},
+            {"effective_at_server_ms": 1600},
+        )
+        for overrides in conflicting_arguments:
+            with self.assertRaises(PlaybackControlTransactionConflictError):
+                self._create_exact_transaction(**overrides)
+
+    def test_execution_eligibility_is_atomic_idempotent_and_starts_watchdog(self):
+        self._create_exact_transaction(effective_at_server_ms=1500, execution_timeout_ms=100)
+        self.assertEqual(listExpiredPlaybackControlTransactions(100000), [])
+
+        eligible, changed = markPlaybackControlTransactionExecutionEligible(
+            "context-1",
+            1,
+            2,
+            1600,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(eligible["executionEligibleAtMs"], 1600)
+        self.assertEqual(eligible["watchdogDeadlineAtMs"], 3700)
+        self.assertEqual(listExpiredPlaybackControlTransactions(3699), [])
+        self.assertEqual(
+            [item["commandControlVersion"]
+             for item in listExpiredPlaybackControlTransactions(3700)],
+            [2],
+        )
+
+        persisted = db.EmoPlaybackControlTransaction.get(
+            (db.EmoPlaybackControlTransaction.playback_context_id == "context-1")
+            & (db.EmoPlaybackControlTransaction.epoch == 1)
+            & (db.EmoPlaybackControlTransaction.command_control_version == 2)
+        )
+        updated_at = persisted.updated_at
+        replay, replay_changed = markPlaybackControlTransactionExecutionEligible(
+            "context-1",
+            1,
+            2,
+            1600,
+        )
+        self.assertFalse(replay_changed)
+        self.assertEqual(replay, eligible)
+        self.assertEqual(
+            db.EmoPlaybackControlTransaction.get_by_id(persisted.id).updated_at,
+            updated_at,
+        )
+        with self.assertRaises(PlaybackControlTransactionConflictError):
+            markPlaybackControlTransactionExecutionEligible(
+                "context-1",
+                1,
+                2,
+                1601,
+            )
+
+        missing = markPlaybackControlTransactionExecutionEligible(
+            "missing-context",
+            1,
+            1,
+            100,
+        )
+        self.assertEqual(missing, (None, False))
+        with self.assertRaises(ValueError):
+            markPlaybackControlTransactionExecutionEligible(
+                "context-1",
+                1,
+                2,
+                True,
+            )
+
+        self._create_exact_transaction(
+            command_control_version=3,
+            effective_at_server_ms=2000,
+        )
+        with self.assertRaises(ValueError):
+            markPlaybackControlTransactionExecutionEligible(
+                "context-1",
+                1,
+                3,
+                1999,
+            )
+        self.assertNotIn(
+            "executionEligibleAtMs",
+            getPlaybackControlTransaction("context-1", 1, 3),
+        )
+
+        self._create_exact_transaction(command_control_version=4)
+        settlePlaybackControlTransaction(
+            "context-1",
+            1,
+            4,
+            "failed",
+            2000,
+            error_code="execution_unknown",
+        )
+        with self.assertRaises(PlaybackControlTransactionConflictError):
+            markPlaybackControlTransactionExecutionEligible(
+                "context-1",
+                1,
+                4,
+                2000,
+            )
+
+    def test_expired_control_query_excludes_nullable_and_terminal_deadlines(self):
+        self._create_exact_transaction(command_control_version=2)
+        createPlaybackControlTransaction(
+            "context-1",
+            "alice",
+            1,
+            3,
+            "controller-1",
+            "player-1",
+            "device:player-1",
+            "authority-nonce-1",
+            1,
+            "player.pause",
+            {"state": "paused"},
+            1000,
+            15000,
+        )
+        createPlaybackControlTransaction(
+            "context-1",
+            "alice",
+            1,
+            4,
+            "controller-1",
+            "player-1",
+            "device:player-1",
+            "authority-nonce-1",
+            1,
+            "player.play",
+            {"state": "playing"},
+            1000,
+            15000,
+        )
+        settlePlaybackControlTransaction(
+            "context-1",
+            1,
+            4,
+            "failed",
+            2000,
+            error_code="execution_unknown",
+        )
+        self.assertEqual(
+            [item["commandControlVersion"]
+             for item in listExpiredPlaybackControlTransactions(18000)],
+            [3],
+        )
+        with self.assertRaises(ValueError):
+            listExpiredPlaybackControlTransactions(False)
+
+    def test_authority_pending_query_matches_routed_epoch_when_supplied(self):
+        self._create_exact_transaction(command_control_version=2, routed_connection_epoch=1)
+        self._create_exact_transaction(command_control_version=3, routed_connection_epoch=2)
+
+        self.assertEqual(
+            [item["commandControlVersion"]
+             for item in listPendingPlaybackControlTransactionsForAuthorityConnection(
+                 "alice",
+                 "player-1",
+                 "device:player-1",
+                 "authority-nonce-1",
+             )],
+            [2, 3],
+        )
+        self.assertEqual(
+            [item["commandControlVersion"]
+             for item in listPendingPlaybackControlTransactionsForAuthorityConnection(
+                 "alice",
+                 "player-1",
+                 "device:player-1",
+                 "authority-nonce-1",
+                 1,
+             )],
+            [2],
+        )
+        self.assertEqual(
+            [item["commandControlVersion"]
+             for item in listPendingPlaybackControlTransactionsForAuthorityConnection(
+                 "alice",
+                 "player-1",
+                 "device:player-1",
+                 "authority-nonce-1",
+                 2,
+             )],
+            [3],
+        )
+
+    def test_terminal_error_message_is_persistent_and_part_of_idempotency(self):
+        self._create_exact_transaction(command_control_version=2)
+        terminal, changed = settlePlaybackControlTransaction(
+            "context-1",
+            1,
+            2,
+            "failed",
+            2000,
+            error_code="dependency_failed",
+            error_message="dependency command failed",
+        )
+        self.assertTrue(changed)
+        self.assertEqual(terminal["errorMessage"], "dependency command failed")
+        self.assertIsNotNone(terminal["terminalFingerprint"])
+        replay, replay_changed = settlePlaybackControlTransaction(
+            "context-1",
+            1,
+            2,
+            "failed",
+            2000,
+            error_code="dependency_failed",
+            error_message="dependency command failed",
+        )
+        self.assertFalse(replay_changed)
+        self.assertEqual(replay, terminal)
+        with self.assertRaises(PlaybackControlTransactionConflictError):
+            settlePlaybackControlTransaction(
+                "context-1",
+                1,
+                2,
+                "failed",
+                2000,
+                error_code="dependency_failed",
+                error_message="different diagnostic",
+            )
+
+        self._create_exact_transaction(command_control_version=3)
+        with self.assertRaises(ValueError):
+            settlePlaybackControlTransaction(
+                "context-1",
+                1,
+                3,
+                "committed",
+                2000,
+                error_message="not allowed",
+            )
+        db.release_database()
+        db.init_database("sqlite:///" + self.db_path)
+        self.assertEqual(
+            getPlaybackControlTransaction("context-1", 1, 2),
+            terminal,
+        )
+
+    def test_transaction_serializer_fails_closed_for_malformed_target_json(self):
+        record = db.EmoPlaybackControlTransaction.create(
+            playback_context_id="context-1",
+            user_name="alice",
+            epoch=1,
+            command_control_version=2,
+            requesting_client_id="controller-1",
+            authority_client_id="player-1",
+            authority_device_session_id="device:player-1",
+            routed_connection_nonce="authority-nonce-1",
+            routed_connection_epoch=1,
+            action="player.pause",
+            accepted_target_json="not-json",
+            status="pending",
+            accepted_at_ms=1000,
+            execution_timeout_ms=15000,
+        )
+        with self.assertRaises(ValueError):
+            serializePlaybackControlTransaction(record)
+
+    def test_reconciliation_store_is_canonical_idempotent_and_persistent(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            0,
+            "playing",
+        )
+        before_context = getPlaybackContextState("context-1")
+        actual_fact = {"positionMs": 120, "state": "playing"}
+        canonical_update = {"appliedControlVersion": 1, "positionMs": 120}
+        first, created = createPlaybackControlReconciliation(
+            "context-1",
+            "alice",
+            1,
+            2,
+            0,
+            1,
+            "terminal_gap",
+            actual_fact,
+            canonical_update,
+            2000,
+            trigger_command_control_version=1,
+        )
+        self.assertTrue(created)
+        expected_fingerprint = hashlib.sha256(
+            json.dumps(
+                actual_fact,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(first["actualFactFingerprint"], expected_fingerprint)
+        self.assertEqual(
+            serializePlaybackControlReconciliation(
+                db.EmoPlaybackControlReconciliation.get_by_id(
+                    db.EmoPlaybackControlReconciliation.select()
+                    .where(
+                        db.EmoPlaybackControlReconciliation.playback_context_id
+                        == "context-1"
+                    )
+                    .get()
+                    .id
+                )
+            ),
+            first,
+        )
+        replay, replay_created = createPlaybackControlReconciliation(
+            "context-1",
+            "alice",
+            1,
+            2,
+            0,
+            1,
+            "terminal_gap",
+            actual_fact,
+            canonical_update,
+            2000,
+            trigger_command_control_version=1,
+        )
+        self.assertFalse(replay_created)
+        self.assertEqual(replay, first)
+        for overrides in (
+            {"actual_fact": {"positionMs": 121, "state": "playing"}},
+            {"canonical_update": {"appliedControlVersion": 2}},
+            {"trigger_kind": "other"},
+            {"server_updated_at_ms": 2001},
+        ):
+            arguments = {
+                "playback_context_id": "context-1",
+                "user_name": "alice",
+                "epoch": 1,
+                "reconciliation_control_version": 2,
+                "from_applied_control_version": 0,
+                "through_control_version": 1,
+                "trigger_kind": "terminal_gap",
+                "actual_fact": actual_fact,
+                "canonical_update": canonical_update,
+                "server_updated_at_ms": 2000,
+                "trigger_command_control_version": 1,
+            }
+            arguments.update(overrides)
+            with self.assertRaises(PlaybackControlReconciliationConflictError):
+                createPlaybackControlReconciliation(**arguments)
+
+        second, second_created = createPlaybackControlReconciliation(
+            "context-1",
+            "alice",
+            1,
+            3,
+            1,
+            2,
+            "terminal_gap",
+            {"positionMs": 130},
+            {"appliedControlVersion": 2},
+            2100,
+        )
+        self.assertTrue(second_created)
+        self.assertEqual(
+            [item["reconciliationControlVersion"]
+             for item in listPlaybackControlReconciliations("context-1", 1)],
+            [2, 3],
+        )
+        self.assertEqual(
+            getPlaybackControlReconciliation("context-1", 1, 2),
+            first,
+        )
+        self.assertEqual(getPlaybackContextState("context-1"), before_context)
+        db.release_database()
+        db.init_database("sqlite:///" + self.db_path)
+        self.assertEqual(
+            listPlaybackControlReconciliations("context-1", 1),
+            [first, second],
+        )
+
+    def test_close_tombstone_read_is_user_scoped_and_does_not_infer_legacy_fields(self):
+        createStrictPlaybackContextState(
+            "closed-context",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            0,
+            "playing",
+        )
+        closed = db.EmoPlaybackContext.get(
+            db.EmoPlaybackContext.playback_context_id == "closed-context"
+        )
+        closed.lifecycle = "closed"
+        closed.close_action = "playback.context.close"
+        closed.close_request_fingerprint = "f" * 64
+        closed.close_expected_epoch = 1
+        closed.close_base_version = 4
+        closed.closed_from_epoch = 1
+        closed.closed_from_version = 4
+        closed.final_epoch = 1
+        closed.final_version = 5
+        closed.final_queue_revision = 2
+        closed.final_control_version = 4
+        closed.close_outcome_json = json.dumps(
+            {"action": "playback.context.close", "status": "closed"}
+        )
+        closed.save()
+
+        tombstone = getPlaybackContextCloseTombstone("closed-context", "alice")
+        self.assertEqual(tombstone["playbackContextId"], "closed-context")
+        self.assertEqual(tombstone["closeAction"], "playback.context.close")
+        self.assertEqual(tombstone["closedFromVersion"], 4)
+        self.assertEqual(tombstone["finalControlVersion"], 4)
+        self.assertEqual(
+            serializePlaybackContextCloseTombstone(closed),
+            tombstone,
+        )
+        self.assertIsNone(
+            getPlaybackContextCloseTombstone("closed-context", "bob")
+        )
+        self.assertIsNone(
+            getPlaybackContextCloseTombstone("active-context", "alice")
+        )
+
+        createStrictPlaybackContextState(
+            "legacy-closed",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            0,
+            "playing",
+        )
+        legacy = db.EmoPlaybackContext.get(
+            db.EmoPlaybackContext.playback_context_id == "legacy-closed"
+        )
+        legacy.lifecycle = "closed"
+        legacy.save()
+        self.assertEqual(
+            getPlaybackContextCloseTombstone("legacy-closed", "alice"),
+            {
+                "playbackContextId": "legacy-closed",
+                "userName": "alice",
+                "lifecycle": "closed",
+            },
+        )
+        closed.close_outcome_json = "[]"
+        closed.save()
+        with self.assertRaises(ValueError):
+            getPlaybackContextCloseTombstone("closed-context", "alice")
+
+    def test_control_mutation_rolls_back_context_when_transaction_creation_fails(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            0,
+            "playing",
+        )
+        before = getPlaybackContextState("context-1")
+        with mock.patch(
+            "supysonic.emo.ws_store._create_playback_control_transaction_record",
+            side_effect=RuntimeError("injected transaction failure"),
+        ):
+            with self.assertRaises(RuntimeError):
+                mutateStrictPlaybackContextControl(
+                    "context-1",
+                    "alice",
+                    "controller-1",
+                    "player.pause",
+                    1,
+                    requesting_client_id="controller-1",
+                    authority_client_id="player-1",
+                    authority_device_session_id="device:player-1",
+                    routed_connection_nonce="authority-nonce-1",
+                    routed_connection_epoch=1,
+                    accepted_at_ms=1000,
+                    execution_timeout_ms=15000,
+                    requesting_device_session_id="device:controller-1",
+                    requesting_connection_nonce="requester-nonce-1",
+                    requesting_connection_epoch=3,
+                )
+        self.assertEqual(getPlaybackContextState("context-1"), before)
+        self.assertEqual(
+            db.EmoPlaybackControlTransaction.select().count(),
+            0,
+        )
 
     def test_strict_playback_update_commits_pending_and_advances_applied_cursor(self):
         createStrictPlaybackContextState(
