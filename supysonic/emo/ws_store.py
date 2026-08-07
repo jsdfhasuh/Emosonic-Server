@@ -264,6 +264,7 @@ _SOURCE_BROADCAST_ALLOWED_MUTATIONS = {
     "createPlaybackControlTransaction",
     "mutateStrictPlaybackContextControl",
     "mutateStrictPlaybackContextQueue",
+    "markPlaybackControlTransactionExecutionEligible",
     "savePlaybackLocalIntent",
     "settlePlaybackControlTransaction",
 }
@@ -996,8 +997,9 @@ def settlePlaybackControlTransaction(
         "errorCode": error_code,
         "dependsOnControlVersion": depends_on_control_version,
         "appliedControlVersion": applied_control_version,
-        "errorMessage": error_message,
     }
+    if error_message is not None:
+        terminal["errorMessage"] = error_message
     terminal_fingerprint = _json_fingerprint(terminal)
     open_connection(reuse=True)
     try:

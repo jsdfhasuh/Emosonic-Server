@@ -11,6 +11,7 @@ from unittest import mock
 from supysonic import db
 from supysonic.emo.ws_store import (
     PlaybackContextAuthorityAmbiguousError,
+    PlaybackContextBroadcastBarrierError,
     PlaybackContextClosedError,
     PlaybackContextEnsureConflictError,
     PlaybackContextIntentConflictError,
@@ -1927,6 +1928,83 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 2000,
             )
 
+    def test_execution_eligibility_allows_active_broadcast_source_fence(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            0,
+            "playing",
+        )
+        self._create_exact_transaction(effective_at_server_ms=1500, execution_timeout_ms=100)
+        db.EmoBroadcastFence.create(
+            resource_key="broadcast-source-fence-1",
+            broadcast_id="broadcast-1",
+            user_name="alice",
+            role="source",
+            phase="nonterminal",
+            playback_context_id="context-1",
+            client_id="player-1",
+            device_session_id="device:player-1",
+        )
+
+        eligible, changed = markPlaybackControlTransactionExecutionEligible(
+            "context-1",
+            1,
+            2,
+            1600,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(eligible["executionEligibleAtMs"], 1600)
+        self.assertEqual(eligible["watchdogDeadlineAtMs"], 3700)
+
+        replay, replay_changed = markPlaybackControlTransactionExecutionEligible(
+            "context-1",
+            1,
+            2,
+            1600,
+        )
+        self.assertFalse(replay_changed)
+        self.assertEqual(replay, eligible)
+
+    def test_execution_eligibility_remains_blocked_by_ordinary_broadcast_fence(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            0,
+            "playing",
+        )
+        self._create_exact_transaction(effective_at_server_ms=1500, execution_timeout_ms=100)
+        db.EmoBroadcastFence.create(
+            resource_key="broadcast-ordinary-fence-1",
+            broadcast_id="broadcast-1",
+            user_name="alice",
+            role="ordinary",
+            phase="nonterminal",
+            playback_context_id="context-1",
+            client_id="player-1",
+            device_session_id="device:player-1",
+        )
+
+        with self.assertRaises(PlaybackContextBroadcastBarrierError):
+            markPlaybackControlTransactionExecutionEligible(
+                "context-1",
+                1,
+                2,
+                1600,
+            )
+
+        transaction = getPlaybackControlTransaction("context-1", 1, 2)
+        self.assertNotIn("executionEligibleAtMs", transaction)
+        self.assertNotIn("watchdogDeadlineAtMs", transaction)
+
     def test_expired_control_query_excludes_nullable_and_terminal_deadlines(self):
         self._create_exact_transaction(command_control_version=2)
         createPlaybackControlTransaction(
@@ -2064,6 +2142,70 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             getPlaybackControlTransaction("context-1", 1, 2),
             terminal,
         )
+
+    def test_legacy_terminal_fingerprint_replays_without_error_message(self):
+        self._create_exact_transaction(command_control_version=2)
+        record = db.EmoPlaybackControlTransaction.get(
+            (db.EmoPlaybackControlTransaction.playback_context_id == "context-1")
+            & (db.EmoPlaybackControlTransaction.epoch == 1)
+            & (db.EmoPlaybackControlTransaction.command_control_version == 2)
+        )
+        old_terminal = {
+            "status": "failed",
+            "errorCode": "execution_unknown",
+            "dependsOnControlVersion": None,
+            "appliedControlVersion": 1,
+        }
+        old_fingerprint = hashlib.sha256(
+            json.dumps(
+                old_terminal,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        record.status = "failed"
+        record.error_code = "execution_unknown"
+        record.depends_on_control_version = None
+        record.applied_control_version = 1
+        record.error_message = None
+        record.terminal_fingerprint = old_fingerprint
+        record.terminal_at_ms = 2000
+        record.save()
+        before = db.EmoPlaybackControlTransaction.get_by_id(record.id)
+
+        replay, changed = settlePlaybackControlTransaction(
+            "context-1",
+            1,
+            2,
+            "failed",
+            2000,
+            error_code="execution_unknown",
+            applied_control_version=1,
+        )
+        self.assertFalse(changed)
+        self.assertEqual(replay["status"], "failed")
+        self.assertEqual(replay["errorCode"], "execution_unknown")
+        self.assertEqual(replay["appliedControlVersion"], 1)
+        self.assertEqual(replay["terminalFingerprint"], old_fingerprint)
+        self.assertNotIn("errorMessage", replay)
+
+        after = db.EmoPlaybackControlTransaction.get_by_id(record.id)
+        self.assertEqual(after.updated_at, before.updated_at)
+        self.assertEqual(after.terminal_fingerprint, old_fingerprint)
+        self.assertIsNone(after.error_message)
+
+        with self.assertRaises(PlaybackControlTransactionConflictError):
+            settlePlaybackControlTransaction(
+                "context-1",
+                1,
+                2,
+                "failed",
+                2000,
+                error_code="execution_unknown",
+                applied_control_version=1,
+                error_message="late diagnostic",
+            )
 
     def test_transaction_serializer_fails_closed_for_malformed_target_json(self):
         record = db.EmoPlaybackControlTransaction.create(
