@@ -25,6 +25,26 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
     def setUp(self):
         self.state = WebSocketState()
 
+    def _register_authenticated_client(
+        self,
+        sid="sid-1",
+        user_name="alice",
+        client_id="player-1",
+        device_session_id="device:player-1",
+    ):
+        self.state.register_session(sid, now=100)
+        self.state.authenticate_session(sid, user_name)
+        self.state.register_client(
+            sid,
+            client_id,
+            {
+                "userName": user_name,
+                "deviceSessionId": device_session_id,
+                "roles": ["player"],
+            },
+            now=100,
+        )
+
     def test_connection_nonce_uses_32_byte_csprng_source(self):
         with mock.patch.object(
             MODULE.secrets,
@@ -238,6 +258,252 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
         self.assertNotEqual(
             first_session["connectionNonce"],
             second_session["connectionNonce"],
+        )
+
+    def test_connection_epoch_is_fixed_for_each_new_physical_session(self):
+        self.state.register_session("sid-register", now=100)
+        tried = self.state.try_register_session(
+            "sid-try",
+            "192.0.2.1",
+            max_unauthenticated=2,
+            now=100,
+        )
+
+        for session in (
+            self.state.get_session("sid-register"),
+            tried,
+        ):
+            self.assertEqual(session["connectionEpoch"], 1)
+            self.assertIs(type(session["connectionEpoch"]), int)
+            self.assertIsNot(session["connectionEpoch"], True)
+        self.assertTrue(tried["connectionNonce"])
+        self.assertNotEqual(
+            self.state.get_session("sid-register")["connectionNonce"],
+            tried["connectionNonce"],
+        )
+
+    def test_current_physical_generation_snapshot_is_exact_and_isolated(self):
+        self._register_authenticated_client()
+
+        snapshot = self.state.get_current_physical_generation(
+            "alice",
+            "player-1",
+            "device:player-1",
+            expected_sid="sid-1",
+        )
+        self.assertEqual(
+            set(snapshot),
+            {
+                "sid",
+                "userName",
+                "clientId",
+                "deviceSessionId",
+                "connectionNonce",
+                "connectionEpoch",
+            },
+        )
+        self.assertEqual(snapshot["sid"], "sid-1")
+        self.assertEqual(snapshot["userName"], "alice")
+        self.assertEqual(snapshot["clientId"], "player-1")
+        self.assertEqual(snapshot["deviceSessionId"], "device:player-1")
+        self.assertEqual(snapshot["connectionEpoch"], 1)
+
+        snapshot["sid"] = "mutated"
+        snapshot["connectionNonce"] = "mutated"
+        snapshot["deviceSessionId"] = "mutated"
+        self.assertEqual(
+            self.state.get_current_physical_generation(
+                "alice",
+                "player-1",
+                "device:player-1",
+            )["sid"],
+            "sid-1",
+        )
+        self.assertEqual(
+            self.state.get_session("sid-1")["connectionNonce"],
+            self.state.get_current_physical_generation(
+                "alice",
+                "player-1",
+                "device:player-1",
+            )["connectionNonce"],
+        )
+
+    def test_current_physical_generation_snapshot_rejects_wrong_identity(self):
+        self._register_authenticated_client()
+
+        self.assertIsNone(
+            self.state.get_current_physical_generation(
+                "bob", "player-1", "device:player-1"
+            )
+        )
+        self.assertIsNone(
+            self.state.get_current_physical_generation(
+                "alice", "other-player", "device:player-1"
+            )
+        )
+        self.assertIsNone(
+            self.state.get_current_physical_generation(
+                "alice", "player-1", "other-device"
+            )
+        )
+        self.assertIsNone(
+            self.state.get_current_physical_generation(
+                "alice",
+                "player-1",
+                "device:player-1",
+                expected_sid="sid-other",
+            )
+        )
+
+    def test_current_physical_generation_rejects_invalid_parameters(self):
+        invalid_snapshot_parameters = (
+            (None, "player-1", "device:player-1"),
+            ("alice", "", "device:player-1"),
+            ("alice", "player-1", None),
+        )
+        for parameters in invalid_snapshot_parameters:
+            with self.subTest(parameters=parameters):
+                with self.assertRaises(ValueError):
+                    self.state.get_current_physical_generation(*parameters)
+        with self.assertRaises(ValueError):
+            self.state.get_current_physical_generation(
+                "alice",
+                "player-1",
+                "device:player-1",
+                expected_sid="",
+            )
+
+    def test_matches_current_physical_generation_requires_all_six_fields(self):
+        self._register_authenticated_client()
+        snapshot = self.state.get_current_physical_generation(
+            "alice",
+            "player-1",
+            "device:player-1",
+        )
+
+        self.assertTrue(
+            self.state.matches_current_physical_generation(
+                snapshot["userName"],
+                snapshot["clientId"],
+                snapshot["deviceSessionId"],
+                snapshot["sid"],
+                snapshot["connectionNonce"],
+                snapshot["connectionEpoch"],
+            )
+        )
+        for field, value in (
+            ("userName", "bob"),
+            ("clientId", "other-player"),
+            ("deviceSessionId", "other-device"),
+            ("sid", "sid-other"),
+            ("connectionNonce", "other-nonce"),
+        ):
+            candidate = dict(snapshot)
+            candidate[field] = value
+            with self.subTest(field=field):
+                self.assertFalse(
+                    self.state.matches_current_physical_generation(
+                        candidate["userName"],
+                        candidate["clientId"],
+                        candidate["deviceSessionId"],
+                        candidate["sid"],
+                        candidate["connectionNonce"],
+                        candidate["connectionEpoch"],
+                    )
+                )
+
+        for invalid_epoch in (0, 2, True, "1", None):
+            with self.subTest(connection_epoch=invalid_epoch):
+                with self.assertRaises(ValueError):
+                    self.state.matches_current_physical_generation(
+                        snapshot["userName"],
+                        snapshot["clientId"],
+                        snapshot["deviceSessionId"],
+                        snapshot["sid"],
+                        snapshot["connectionNonce"],
+                        invalid_epoch,
+                    )
+
+    def test_replacement_invalidates_old_physical_generation(self):
+        self._register_authenticated_client(
+            sid="sid-old",
+            device_session_id="device:player-1",
+        )
+        old_snapshot = self.state.get_current_physical_generation(
+            "alice",
+            "player-1",
+            "device:player-1",
+        )
+
+        self.state.register_session("sid-new", now=101)
+        self.state.authenticate_session("sid-new", "alice")
+        self.state.register_client(
+            "sid-new",
+            "player-1",
+            {
+                "userName": "alice",
+                "deviceSessionId": "device:player-1",
+                "roles": ["player"],
+            },
+            now=101,
+        )
+        new_snapshot = self.state.get_current_physical_generation(
+            "alice",
+            "player-1",
+            "device:player-1",
+        )
+
+        self.assertEqual(new_snapshot["sid"], "sid-new")
+        self.assertNotEqual(
+            old_snapshot["connectionNonce"],
+            new_snapshot["connectionNonce"],
+        )
+        self.assertFalse(
+            self.state.matches_current_physical_generation(
+                old_snapshot["userName"],
+                old_snapshot["clientId"],
+                old_snapshot["deviceSessionId"],
+                old_snapshot["sid"],
+                old_snapshot["connectionNonce"],
+                old_snapshot["connectionEpoch"],
+            )
+        )
+        self.assertTrue(
+            self.state.matches_current_physical_generation(
+                new_snapshot["userName"],
+                new_snapshot["clientId"],
+                new_snapshot["deviceSessionId"],
+                new_snapshot["sid"],
+                new_snapshot["connectionNonce"],
+                new_snapshot["connectionEpoch"],
+            )
+        )
+
+    def test_unregister_invalidates_current_physical_generation(self):
+        self._register_authenticated_client()
+        snapshot = self.state.get_current_physical_generation(
+            "alice",
+            "player-1",
+            "device:player-1",
+        )
+        self.state.unregister_session("sid-1")
+
+        self.assertIsNone(
+            self.state.get_current_physical_generation(
+                "alice",
+                "player-1",
+                "device:player-1",
+            )
+        )
+        self.assertFalse(
+            self.state.matches_current_physical_generation(
+                snapshot["userName"],
+                snapshot["clientId"],
+                snapshot["deviceSessionId"],
+                snapshot["sid"],
+                snapshot["connectionNonce"],
+                snapshot["connectionEpoch"],
+            )
         )
 
     def test_connection_limits_are_checked_atomically(self):

@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Tuple
 
 DEFAULT_CLIENT_STALE_SECONDS = 90
 DEFAULT_FOLLOW_DELAY_MS = 0
+STRICT_CONNECTION_EPOCH = 1
 
 
 def _new_connection_nonce() -> str:
@@ -51,6 +52,12 @@ def _queue_track_id(queue_song_ids, current_index):
     if queue_song_ids and 0 <= current_index < len(queue_song_ids):
         return queue_song_ids[current_index]
     return None
+
+
+def _require_non_empty_generation_string(value, field_name):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("%s must be a non-empty string" % field_name)
+    return value
 
 
 class BroadcastInactiveError(Exception):
@@ -182,6 +189,7 @@ class WebSocketState:
                 "connectedAt": now,
                 "lastSeenAt": now,
                 "connectionNonce": _new_connection_nonce(),
+                "connectionEpoch": STRICT_CONNECTION_EPOCH,
                 "authenticated": False,
                 "userName": None,
                 "clientId": None,
@@ -212,6 +220,7 @@ class WebSocketState:
                 "connectedAt": now,
                 "lastSeenAt": now,
                 "connectionNonce": _new_connection_nonce(),
+                "connectionEpoch": STRICT_CONNECTION_EPOCH,
                 "authenticated": False,
                 "userName": None,
                 "clientId": None,
@@ -310,6 +319,111 @@ class WebSocketState:
                     session_info["userName"] = client_info["userName"]
                     session_info["authenticated"] = True
         return dict(client_info)
+
+    def get_current_physical_generation(
+        self,
+        user_name,
+        client_id,
+        device_session_id,
+        expected_sid=None,
+    ):
+        with self._lock:
+            _require_non_empty_generation_string(user_name, "userName")
+            _require_non_empty_generation_string(client_id, "clientId")
+            _require_non_empty_generation_string(
+                device_session_id,
+                "deviceSessionId",
+            )
+            if expected_sid is not None:
+                _require_non_empty_generation_string(expected_sid, "expectedSid")
+
+            client_key = self._client_key(user_name, client_id)
+            sid = self._client_to_sid.get(client_key)
+            if sid is None or (expected_sid is not None and sid != expected_sid):
+                return None
+            session_info = self._sessions.get(sid)
+            if session_info is None or not session_info.get("authenticated"):
+                return None
+            if (
+                session_info.get("userName") != user_name
+                or session_info.get("clientId") != client_id
+            ):
+                return None
+            client_info = self._clients.get(client_key)
+            if client_info is None:
+                return None
+            if (
+                client_info.get("userName") != user_name
+                or client_info.get("clientId") != client_id
+                or client_info.get("deviceSessionId") != device_session_id
+            ):
+                return None
+            connection_nonce = session_info.get("connectionNonce")
+            connection_epoch = session_info.get("connectionEpoch")
+            if (
+                not isinstance(connection_nonce, str)
+                or not connection_nonce.strip()
+                or type(connection_epoch) is not int
+                or connection_epoch != STRICT_CONNECTION_EPOCH
+            ):
+                return None
+            return {
+                "sid": sid,
+                "userName": user_name,
+                "clientId": client_id,
+                "deviceSessionId": device_session_id,
+                "connectionNonce": connection_nonce,
+                "connectionEpoch": connection_epoch,
+            }
+
+    def matches_current_physical_generation(
+        self,
+        user_name,
+        client_id,
+        device_session_id,
+        sid,
+        connection_nonce,
+        connection_epoch,
+    ):
+        with self._lock:
+            _require_non_empty_generation_string(user_name, "userName")
+            _require_non_empty_generation_string(client_id, "clientId")
+            _require_non_empty_generation_string(
+                device_session_id,
+                "deviceSessionId",
+            )
+            _require_non_empty_generation_string(sid, "sid")
+            _require_non_empty_generation_string(
+                connection_nonce,
+                "connectionNonce",
+            )
+            if (
+                type(connection_epoch) is not int
+                or connection_epoch != STRICT_CONNECTION_EPOCH
+            ):
+                raise ValueError("connectionEpoch must be exactly 1")
+
+            client_key = self._client_key(user_name, client_id)
+            if self._client_to_sid.get(client_key) != sid:
+                return False
+            session_info = self._sessions.get(sid)
+            if session_info is None or not session_info.get("authenticated"):
+                return False
+            if (
+                session_info.get("userName") != user_name
+                or session_info.get("clientId") != client_id
+                or session_info.get("connectionNonce") != connection_nonce
+                or session_info.get("connectionEpoch") != connection_epoch
+            ):
+                return False
+            client_info = self._clients.get(client_key)
+            if client_info is None:
+                return False
+            return (
+                client_info.get("userName") == user_name
+                and client_info.get("clientId") == client_id
+                and client_info.get("deviceSessionId") == device_session_id
+            )
 
     def record_clock_ping(self, sid, now=None):
         now = time.time() if now is None else now

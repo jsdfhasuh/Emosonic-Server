@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from supysonic import db
+from supysonic.emo.ws_state import WebSocketState
 from supysonic.emo.ws_store import (
     PlaybackContextAuthorityAmbiguousError,
     PlaybackContextBroadcastBarrierError,
@@ -3964,3 +3965,322 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 3,
                 2,
             )
+
+    def test_control_mutation_pre_validator_runs_before_canonical_and_transaction_writes(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            25,
+            "playing",
+        )
+        events = []
+        observed = []
+
+        def validator(current):
+            events.append("pre_mutation_validator")
+            observed.append(dict(current))
+            self.assertEqual(current["state"], "playing")
+            self.assertEqual(current["version"], 1)
+            self.assertEqual(current["controlVersion"], 1)
+            self.assertEqual(current["queueRevision"], 1)
+            self.assertEqual(
+                db.EmoPlaybackControlTransaction.select().count(),
+                0,
+            )
+
+        def post_hook(record, result, current):
+            events.append("canonical mutation")
+            self.assertEqual(current["state"], "playing")
+            self.assertEqual(record.state, "paused")
+            self.assertEqual(result["state"], "paused")
+            transaction = db.EmoPlaybackControlTransaction.get_or_none(
+                (
+                    db.EmoPlaybackControlTransaction.playback_context_id
+                    == "context-1"
+                )
+                & (db.EmoPlaybackControlTransaction.epoch == 1)
+                & (
+                    db.EmoPlaybackControlTransaction.command_control_version
+                    == 2
+                )
+            )
+            self.assertIsNotNone(transaction)
+            events.append("transaction creation")
+            events.append("post_mutation_hook")
+            return {"hook": True}
+
+        updated = mutateStrictPlaybackContextControl(
+            "context-1",
+            "alice",
+            "controller-1",
+            "player.pause",
+            1,
+            requesting_client_id="controller-1",
+            authority_client_id="player-1",
+            authority_device_session_id="device:player-1",
+            routed_connection_nonce="authority-nonce-1",
+            accepted_at_ms=1000,
+            execution_timeout_ms=15000,
+            requesting_device_session_id="device:controller-1",
+            requesting_connection_nonce="requester-nonce-1",
+            requesting_connection_epoch=1,
+            pre_mutation_validator=validator,
+            post_mutation_hook=post_hook,
+        )
+
+        self.assertEqual(
+            events,
+            [
+                "pre_mutation_validator",
+                "canonical mutation",
+                "transaction creation",
+                "post_mutation_hook",
+            ],
+        )
+        self.assertEqual(observed[0]["state"], "playing")
+        self.assertEqual(updated["state"], "paused")
+        self.assertEqual(updated["controlVersion"], 2)
+        self.assertEqual(updated["_broadcastMutation"], {"hook": True})
+
+    def test_control_mutation_pre_validator_receives_an_isolated_context_copy(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            25,
+            "playing",
+        )
+
+        def validator(current):
+            current["state"] = "corrupted"
+            current["queueSongIds"].append("unpersisted-song")
+
+        updated = mutateStrictPlaybackContextControl(
+            "context-1",
+            "alice",
+            "controller-1",
+            "player.pause",
+            1,
+            pre_mutation_validator=validator,
+        )
+
+        self.assertEqual(updated["state"], "paused")
+        self.assertEqual(updated["queueSongIds"], ["song-1"])
+        self.assertEqual(getPlaybackContextState("context-1")["state"], "paused")
+        self.assertEqual(
+            getPlaybackContextState("context-1")["queueSongIds"],
+            ["song-1"],
+        )
+
+    def test_control_mutation_pre_validator_failure_rolls_back_everything(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            25,
+            "playing",
+        )
+        before = getPlaybackContextState("context-1")
+        post_hook = mock.Mock()
+
+        class ValidatorFailure(Exception):
+            pass
+
+        def validator(current):
+            self.assertEqual(current["state"], "playing")
+            raise ValidatorFailure("physical generation changed")
+
+        with self.assertRaises(ValidatorFailure) as failure:
+            mutateStrictPlaybackContextControl(
+                "context-1",
+                "alice",
+                "controller-1",
+                "player.pause",
+                1,
+                requesting_client_id="controller-1",
+                authority_client_id="player-1",
+                authority_device_session_id="device:player-1",
+                routed_connection_nonce="authority-nonce-1",
+                accepted_at_ms=1000,
+                execution_timeout_ms=15000,
+                requesting_device_session_id="device:controller-1",
+                requesting_connection_nonce="requester-nonce-1",
+                requesting_connection_epoch=1,
+                pre_mutation_validator=validator,
+                post_mutation_hook=post_hook,
+            )
+
+        self.assertEqual(str(failure.exception), "physical generation changed")
+        self.assertEqual(getPlaybackContextState("context-1"), before)
+        self.assertEqual(
+            db.EmoPlaybackControlTransaction.select().count(),
+            0,
+        )
+        post_hook.assert_not_called()
+
+    def test_control_mutation_static_validation_short_circuits_pre_validator(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1", "song-2"],
+            0,
+            25,
+            "playing",
+        )
+        before = getPlaybackContextState("context-1")
+        validator = mock.Mock()
+
+        with self.assertRaises(PlaybackContextStaleVersionError):
+            mutateStrictPlaybackContextControl(
+                "context-1",
+                "alice",
+                "controller-1",
+                "player.pause",
+                99,
+                pre_mutation_validator=validator,
+            )
+        with self.assertRaises(PlaybackContextStaleVersionError):
+            mutateStrictPlaybackContextControl(
+                "context-1",
+                "alice",
+                "controller-1",
+                "queue.playItem",
+                1,
+                base_queue_revision=99,
+                current_index=1,
+                pre_mutation_validator=validator,
+            )
+
+        validator.assert_not_called()
+        self.assertEqual(getPlaybackContextState("context-1"), before)
+        self.assertEqual(
+            db.EmoPlaybackControlTransaction.select().count(),
+            0,
+        )
+
+    def test_control_mutation_pre_validator_can_match_physical_generation_and_reject_replacement(self):
+        physical_state = WebSocketState()
+        physical_state.register_session("sid-old", now=100)
+        physical_state.authenticate_session("sid-old", "alice")
+        physical_state.register_client(
+            "sid-old",
+            "player-1",
+            {
+                "userName": "alice",
+                "deviceSessionId": "device:player-1",
+                "roles": ["player"],
+            },
+            now=100,
+        )
+        old_generation = physical_state.get_current_physical_generation(
+            "alice",
+            "player-1",
+            "device:player-1",
+        )
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            25,
+            "playing",
+        )
+
+        def matching_validator(current):
+            self.assertTrue(
+                physical_state.matches_current_physical_generation(
+                    old_generation["userName"],
+                    old_generation["clientId"],
+                    old_generation["deviceSessionId"],
+                    old_generation["sid"],
+                    old_generation["connectionNonce"],
+                    old_generation["connectionEpoch"],
+                )
+            )
+            self.assertEqual(current["state"], "playing")
+
+        updated = mutateStrictPlaybackContextControl(
+            "context-1",
+            "alice",
+            "controller-1",
+            "player.pause",
+            1,
+            pre_mutation_validator=matching_validator,
+        )
+        self.assertEqual(updated["state"], "paused")
+
+        physical_state.register_session("sid-new", now=101)
+        physical_state.authenticate_session("sid-new", "alice")
+        physical_state.register_client(
+            "sid-new",
+            "player-1",
+            {
+                "userName": "alice",
+                "deviceSessionId": "device:player-1",
+                "roles": ["player"],
+            },
+            now=101,
+        )
+        before = getPlaybackContextState("context-1")
+
+        class ReplacedGeneration(Exception):
+            pass
+
+        def replaced_validator(current):
+            self.assertFalse(
+                physical_state.matches_current_physical_generation(
+                    old_generation["userName"],
+                    old_generation["clientId"],
+                    old_generation["deviceSessionId"],
+                    old_generation["sid"],
+                    old_generation["connectionNonce"],
+                    old_generation["connectionEpoch"],
+                )
+            )
+            raise ReplacedGeneration("requester generation replaced")
+
+        with self.assertRaises(ReplacedGeneration):
+            mutateStrictPlaybackContextControl(
+                "context-1",
+                "alice",
+                "controller-1",
+                "player.play",
+                before["controlVersion"],
+                pre_mutation_validator=replaced_validator,
+            )
+        self.assertEqual(getPlaybackContextState("context-1"), before)
+
+    def test_control_mutation_without_pre_validator_remains_compatible(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            0,
+            "playing",
+        )
+        updated = mutateStrictPlaybackContextControl(
+            "context-1",
+            "alice",
+            "controller-1",
+            "player.pause",
+            1,
+        )
+        self.assertEqual(updated["state"], "paused")
+        self.assertEqual(updated["controlVersion"], 2)

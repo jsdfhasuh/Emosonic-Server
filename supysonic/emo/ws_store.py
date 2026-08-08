@@ -3507,6 +3507,7 @@ def mutateStrictPlaybackContextControl(
     requesting_connection_nonce=None,
     requesting_connection_epoch=None,
     effective_at_server_ms=None,
+    pre_mutation_validator=None,
 ):
     if requesting_client_id is None and any(
         value is not None
@@ -3600,6 +3601,8 @@ def mutateStrictPlaybackContextControl(
                     requesting_connection_epoch,
                     effective_at_server_ms,
                 )
+            if pre_mutation_validator is not None:
+                pre_mutation_validator(dict(current))
             if current_index is not None:
                 record.current_index = current_index
                 record.track_id = queue_song_ids[current_index]
