@@ -249,6 +249,34 @@ class StrictV2CoreTestCase(unittest.TestCase):
         )
         return self.messages(client)
 
+    def replace_registered_generation(
+        self,
+        client_id,
+        device_session_id=None,
+        sid_suffix="replacement",
+    ):
+        state = get_state()
+        current_sid = state.get_sid_for_client(client_id, user_name="alice")
+        current_client = state.get_client(client_id, user_name="alice")
+        self.assertIsNotNone(current_sid)
+        self.assertIsNotNone(current_client)
+        replacement_sid = "%s-%s-%d" % (
+            client_id,
+            sid_suffix,
+            len(state.list_session_sids()),
+        )
+        state.register_session(replacement_sid, remote_address="test")
+        state.authenticate_session(replacement_sid, "alice")
+        replacement_client = dict(current_client)
+        if device_session_id is not None:
+            replacement_client["deviceSessionId"] = device_session_id
+        state.register_client(
+            replacement_sid,
+            client_id,
+            replacement_client,
+        )
+        return replacement_sid
+
     def test_non_object_envelope_disconnects_without_error(self):
         client = self.connect()
 
@@ -1873,8 +1901,14 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(transaction["status"], "pending")
         self.assertEqual(transaction["requestingClientId"], "controller-control")
         self.assertEqual(
-            transaction["watchdogDeadlineAtMs"] - transaction["acceptedAtMs"],
-            17000,
+            transaction["watchdogDeadlineAtMs"],
+            transaction["executionEligibleAtMs"]
+            + transaction["executionTimeoutMs"]
+            + 2000,
+        )
+        self.assertLess(
+            transaction["acceptedAtMs"],
+            transaction["executionEligibleAtMs"],
         )
         self.messages(controller)
 
@@ -3796,6 +3830,755 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(persisted["controlVersion"], 2)
         self.assertEqual(persisted["queueRevision"], 1)
         self.assertEqual(persisted["epoch"], 1)
+
+    def test_strict_control_persists_exact_requester_and_routed_generations(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-exact",
+            device_session_id="device:controller-exact",
+        )
+
+        with mock.patch.object(socketio, "start_background_task"):
+            response = self.emit_strict(
+                controller,
+                "command",
+                "player.seek",
+                "seek-exact-generation",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                    "positionMs": 42000,
+                },
+            )
+
+        self.assertEqual(
+            [message["action"] for message in response],
+            ["system.ack"],
+        )
+        state = get_state()
+        requester_sid = state.get_sid_for_client(
+            "controller-exact",
+            user_name="alice",
+        )
+        authority_sid = state.get_sid_for_client(
+            "phone-1",
+            user_name="alice",
+        )
+        requester = state.get_current_physical_generation(
+            "alice",
+            "controller-exact",
+            "device:controller-exact",
+            expected_sid=requester_sid,
+        )
+        authority = state.get_current_physical_generation(
+            "alice",
+            "phone-1",
+            "device:phone-1",
+            expected_sid=authority_sid,
+        )
+        transaction = emo_ws.getPlaybackControlTransaction(
+            "context-1",
+            1,
+            2,
+        )
+
+        self.assertEqual(transaction["requestingClientId"], "controller-exact")
+        self.assertEqual(
+            transaction["requestingDeviceSessionId"],
+            requester["deviceSessionId"],
+        )
+        self.assertEqual(
+            transaction["requestingConnectionNonce"],
+            requester["connectionNonce"],
+        )
+        self.assertEqual(transaction["requestingConnectionEpoch"], 1)
+        self.assertEqual(transaction["authorityClientId"], "phone-1")
+        self.assertEqual(
+            transaction["authorityDeviceSessionId"],
+            authority["deviceSessionId"],
+        )
+        self.assertEqual(
+            transaction["routedConnectionNonce"],
+            authority["connectionNonce"],
+        )
+        self.assertEqual(transaction["routedConnectionEpoch"], 1)
+        self.assertNotIn("sid", transaction)
+        self.assertNotIn("effectiveAtServerMs", transaction)
+
+    def test_strict_control_orders_emit_eligibility_watchdog_and_ack(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-order",
+            device_session_id="device:controller-order",
+        )
+        events = []
+        watchdog_transactions = []
+        real_emit = emo_ws._emit_message
+        real_mutate = emo_ws.mutateStrictPlaybackContextControl
+        real_mark = emo_ws.markPlaybackControlTransactionExecutionEligible
+        real_ack = emo_ws._send_ack
+        clock = {"value": 1000}
+
+        def controlled_time():
+            clock["value"] += 10
+            return clock["value"]
+
+        def record_mutate(*args, **kwargs):
+            events.append("mutate")
+            return real_mutate(*args, **kwargs)
+
+        def record_emit(message, *args, **kwargs):
+            if message.get("action") == "player.seek":
+                events.append("emit")
+            return real_emit(message, *args, **kwargs)
+
+        def record_mark(*args, **kwargs):
+            result = real_mark(*args, **kwargs)
+            events.append("eligible")
+            return result
+
+        def record_watchdog(transaction):
+            events.append("watchdog")
+            watchdog_transactions.append(dict(transaction))
+
+        def record_ack(request_id=None, payload=None):
+            if request_id == "seek-order":
+                events.append("ack")
+            return real_ack(request_id, payload)
+
+        with mock.patch.object(
+            emo_ws,
+            "_server_time_ms",
+            side_effect=controlled_time,
+        ), mock.patch.object(
+            emo_ws,
+            "mutateStrictPlaybackContextControl",
+            side_effect=record_mutate,
+        ), mock.patch.object(
+            emo_ws,
+            "_emit_message",
+            side_effect=record_emit,
+        ), mock.patch.object(
+            emo_ws,
+            "markPlaybackControlTransactionExecutionEligible",
+            side_effect=record_mark,
+        ), mock.patch.object(
+            emo_ws,
+            "_start_control_watchdog",
+            side_effect=record_watchdog,
+        ), mock.patch.object(
+            emo_ws,
+            "_send_ack",
+            side_effect=record_ack,
+        ):
+            response = self.emit_strict(
+                controller,
+                "command",
+                "player.seek",
+                "seek-order",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                    "positionMs": 9000,
+                },
+            )
+
+        self.assertEqual([message["action"] for message in response], ["system.ack"])
+        self.assertEqual(
+            events,
+            ["mutate", "emit", "eligible", "watchdog", "ack"],
+        )
+        self.assertEqual(len(watchdog_transactions), 1)
+        transaction = emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        self.assertEqual(
+            watchdog_transactions[0]["executionEligibleAtMs"],
+            transaction["executionEligibleAtMs"],
+        )
+        self.assertEqual(
+            watchdog_transactions[0]["watchdogDeadlineAtMs"],
+            transaction["executionEligibleAtMs"]
+            + transaction["executionTimeoutMs"]
+            + 2000,
+        )
+        self.assertLess(
+            transaction["acceptedAtMs"],
+            transaction["executionEligibleAtMs"],
+        )
+
+    def test_strict_control_requester_replacement_fails_before_mutation(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-requester-replacement",
+            device_session_id="device:controller-requester-replacement",
+        )
+        before = getPlaybackContextState("context-1")
+        real_mutate = emo_ws.mutateStrictPlaybackContextControl
+
+        def replace_requester_before_validator(*args, **kwargs):
+            validator = kwargs["pre_mutation_validator"]
+
+            def replacement_validator(current):
+                self.replace_registered_generation(
+                    "controller-requester-replacement",
+                    sid_suffix="requester-replaced",
+                )
+                return validator(current)
+
+            kwargs["pre_mutation_validator"] = replacement_validator
+            return real_mutate(*args, **kwargs)
+
+        with mock.patch.object(
+            emo_ws,
+            "mutateStrictPlaybackContextControl",
+            side_effect=replace_requester_before_validator,
+        ), mock.patch.object(emo_ws, "_start_control_watchdog") as watchdog:
+            response = self.emit_strict(
+                controller,
+                "command",
+                "player.seek",
+                "seek-requester-replacement",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                    "positionMs": 1000,
+                },
+            )
+
+        self.assertEqual(response[0]["action"], "system.error")
+        self.assertEqual(response[0]["payload"]["code"], "forbidden")
+        self.assertEqual(getPlaybackContextState("context-1"), before)
+        self.assertIsNone(
+            emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        )
+        self.assertFalse(
+            any(
+                message["action"] == "player.seek"
+                for message in self.messages(player)
+            )
+        )
+        watchdog.assert_not_called()
+
+    def test_strict_control_authority_replacement_fails_before_mutation(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-authority-replacement",
+            device_session_id="device:controller-authority-replacement",
+        )
+        before = getPlaybackContextState("context-1")
+        real_mutate = emo_ws.mutateStrictPlaybackContextControl
+
+        def replace_authority_before_validator(*args, **kwargs):
+            validator = kwargs["pre_mutation_validator"]
+
+            def replacement_validator(current):
+                self.replace_registered_generation(
+                    "phone-1",
+                    device_session_id="device:phone-1",
+                    sid_suffix="authority-replaced",
+                )
+                return validator(current)
+
+            kwargs["pre_mutation_validator"] = replacement_validator
+            return real_mutate(*args, **kwargs)
+
+        with mock.patch.object(
+            emo_ws,
+            "mutateStrictPlaybackContextControl",
+            side_effect=replace_authority_before_validator,
+        ), mock.patch.object(emo_ws, "_start_control_watchdog") as watchdog:
+            response = self.emit_strict(
+                controller,
+                "command",
+                "player.seek",
+                "seek-authority-replacement",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                    "positionMs": 1000,
+                },
+            )
+
+        self.assertEqual(response[0]["action"], "system.error")
+        self.assertEqual(response[0]["payload"]["code"], "authority_offline")
+        self.assertEqual(getPlaybackContextState("context-1"), before)
+        self.assertIsNone(
+            emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        )
+        self.assertFalse(
+            any(
+                message["action"] == "player.seek"
+                for message in self.messages(player)
+            )
+        )
+        watchdog.assert_not_called()
+
+    def test_strict_control_authority_replacement_after_commit_is_unknown(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-after-commit",
+            device_session_id="device:controller-after-commit",
+        )
+        state = get_state()
+        real_restore = state.restore_playback_context
+
+        def restore_then_replace(*args, **kwargs):
+            result = real_restore(*args, **kwargs)
+            self.replace_registered_generation(
+                "phone-1",
+                device_session_id="device:phone-1",
+                sid_suffix="authority-after-commit",
+            )
+            return result
+
+        with mock.patch.object(
+            state,
+            "restore_playback_context",
+            side_effect=restore_then_replace,
+        ), mock.patch.object(emo_ws, "_start_control_watchdog") as watchdog:
+            response = self.emit_strict(
+                controller,
+                "command",
+                "player.pause",
+                "pause-authority-after-commit",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                },
+            )
+
+        self.assertEqual(response[0]["action"], "system.error")
+        self.assertEqual(response[0]["payload"]["code"], "authority_offline")
+        persisted = getPlaybackContextState("context-1")
+        self.assertEqual(persisted["controlVersion"], 2)
+        transaction = emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        self.assertEqual(transaction["status"], "failed")
+        self.assertEqual(transaction["errorCode"], "execution_unknown")
+        self.assertEqual(transaction["requestingClientId"], "controller-after-commit")
+        self.assertNotIn("executionEligibleAtMs", transaction)
+        self.assertNotIn("watchdogDeadlineAtMs", transaction)
+        self.assertFalse(
+            any(
+                message["action"] in {"player.pause", "playback.update"}
+                for message in self.messages(player)
+            )
+        )
+        self.assertFalse(
+            any(message["action"] == "system.ack" for message in response)
+        )
+        watchdog.assert_not_called()
+
+    def test_strict_control_emit_failure_settles_exact_transaction_unknown(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-emit-failure",
+            device_session_id="device:controller-emit-failure",
+        )
+        real_emit = emo_ws._emit_message
+
+        def fail_command(message, *args, **kwargs):
+            if message.get("action") == "player.seek":
+                raise RuntimeError("injected command emit failure")
+            return real_emit(message, *args, **kwargs)
+
+        with mock.patch.object(
+            emo_ws,
+            "_emit_message",
+            side_effect=fail_command,
+        ), mock.patch.object(emo_ws, "_start_control_watchdog") as watchdog:
+            response = self.emit_strict(
+                controller,
+                "command",
+                "player.seek",
+                "seek-emit-failure",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                    "positionMs": 1000,
+                },
+            )
+
+        self.assertEqual(response[0]["action"], "system.error")
+        transaction = emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        self.assertEqual(transaction["status"], "failed")
+        self.assertEqual(transaction["errorCode"], "execution_unknown")
+        self.assertEqual(transaction["requestingClientId"], "controller-emit-failure")
+        self.assertNotIn("executionEligibleAtMs", transaction)
+        self.assertNotIn("watchdogDeadlineAtMs", transaction)
+        self.assertFalse(
+            any(
+                message["action"] == "player.seek"
+                for message in self.messages(player)
+            )
+        )
+        self.assertFalse(
+            any(message["action"] == "system.ack" for message in response)
+        )
+        watchdog.assert_not_called()
+
+    def test_strict_control_eligibility_failure_settles_without_retry(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-eligibility-failure",
+            device_session_id="device:controller-eligibility-failure",
+        )
+
+        with mock.patch.object(
+            emo_ws,
+            "markPlaybackControlTransactionExecutionEligible",
+            side_effect=RuntimeError("injected eligibility failure"),
+        ), mock.patch.object(emo_ws, "_start_control_watchdog") as watchdog:
+            response = self.emit_strict(
+                controller,
+                "command",
+                "player.seek",
+                "seek-eligibility-failure",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                    "positionMs": 1000,
+                },
+            )
+
+        self.assertEqual(response[0]["action"], "system.error")
+        transaction = emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        self.assertEqual(transaction["status"], "failed")
+        self.assertEqual(transaction["errorCode"], "execution_unknown")
+        self.assertNotIn("executionEligibleAtMs", transaction)
+        self.assertNotIn("watchdogDeadlineAtMs", transaction)
+        authority_commands = [
+            message
+            for message in self.messages(player)
+            if message["action"] == "player.seek"
+        ]
+        self.assertEqual(len(authority_commands), 1)
+        self.assertFalse(
+            any(message["action"] == "system.ack" for message in response)
+        )
+        watchdog.assert_not_called()
+
+    def test_strict_control_rejects_invalid_requester_or_authority_epoch(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-invalid-epoch",
+            device_session_id="device:controller-invalid-epoch",
+        )
+        state = get_state()
+        real_get_generation = state.get_current_physical_generation
+
+        for client_id, label in (
+            ("controller-invalid-epoch", "requester"),
+            ("phone-1", "authority"),
+        ):
+            for invalid_epoch in (None, 0, True, "1"):
+                with self.subTest(
+                    client_id=client_id,
+                    label=label,
+                    invalid_epoch=repr(invalid_epoch),
+                ):
+                    before = getPlaybackContextState("context-1")
+
+                    def malformed_generation(
+                        user_name,
+                        requested_client_id,
+                        device_session_id,
+                        expected_sid=None,
+                    ):
+                        generation = real_get_generation(
+                            user_name,
+                            requested_client_id,
+                            device_session_id,
+                            expected_sid=expected_sid,
+                        )
+                        if (
+                            generation is not None
+                            and requested_client_id == client_id
+                        ):
+                            generation["connectionEpoch"] = invalid_epoch
+                        return generation
+
+                    with mock.patch.object(
+                        state,
+                        "get_current_physical_generation",
+                        side_effect=malformed_generation,
+                    ):
+                        response = self.emit_strict(
+                            controller,
+                            "command",
+                            "player.pause",
+                            "pause-invalid-epoch-%s-%s"
+                            % (label, repr(invalid_epoch)),
+                            {
+                                "playbackContextId": "context-1",
+                                "baseControlVersion": 1,
+                            },
+                        )
+
+                    self.assertEqual(response[0]["action"], "system.error")
+                    self.assertEqual(getPlaybackContextState("context-1"), before)
+                    self.assertIsNone(
+                        emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+                    )
+                    self.assertFalse(
+                        any(
+                            message["action"] == "player.pause"
+                            for message in self.messages(player)
+                        )
+                    )
+
+    def test_strict_control_rechecks_requester_controller_role_before_mutation(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-role-recheck",
+            device_session_id="device:controller-role-recheck",
+        )
+        before = getPlaybackContextState("context-1")
+        state = get_state()
+        real_mutate = emo_ws.mutateStrictPlaybackContextControl
+
+        def remove_requester_role_before_validator(*args, **kwargs):
+            validator = kwargs["pre_mutation_validator"]
+
+            def changed_role_validator(current):
+                current_client = state.get_client(
+                    "controller-role-recheck",
+                    user_name="alice",
+                )
+                current_client["roles"] = ["player"]
+                state.register_client(
+                    state.get_sid_for_client(
+                        "controller-role-recheck",
+                        user_name="alice",
+                    ),
+                    "controller-role-recheck",
+                    current_client,
+                )
+                return validator(current)
+
+            kwargs["pre_mutation_validator"] = changed_role_validator
+            return real_mutate(*args, **kwargs)
+
+        with mock.patch.object(
+            emo_ws,
+            "mutateStrictPlaybackContextControl",
+            side_effect=remove_requester_role_before_validator,
+        ):
+            response = self.emit_strict(
+                controller,
+                "command",
+                "player.pause",
+                "pause-requester-role-recheck",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                },
+            )
+
+        self.assertEqual(response[0]["action"], "system.error")
+        self.assertEqual(response[0]["payload"]["code"], "forbidden")
+        self.assertEqual(getPlaybackContextState("context-1"), before)
+        self.assertIsNone(
+            emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        )
+
+    def test_strict_control_rechecks_authority_role_before_mutation(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-authority-role",
+            device_session_id="device:controller-authority-role",
+        )
+        before = getPlaybackContextState("context-1")
+        state = get_state()
+        real_mutate = emo_ws.mutateStrictPlaybackContextControl
+
+        def remove_authority_role_before_validator(*args, **kwargs):
+            validator = kwargs["pre_mutation_validator"]
+
+            def changed_role_validator(current):
+                authority_client = state.get_client("phone-1", user_name="alice")
+                authority_client["roles"] = ["controller"]
+                state.register_client(
+                    state.get_sid_for_client("phone-1", user_name="alice"),
+                    "phone-1",
+                    authority_client,
+                )
+                return validator(current)
+
+            kwargs["pre_mutation_validator"] = changed_role_validator
+            return real_mutate(*args, **kwargs)
+
+        with mock.patch.object(
+            emo_ws,
+            "mutateStrictPlaybackContextControl",
+            side_effect=remove_authority_role_before_validator,
+        ):
+            response = self.emit_strict(
+                controller,
+                "command",
+                "player.pause",
+                "pause-authority-role-recheck",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                },
+            )
+
+        self.assertEqual(response[0]["action"], "system.error")
+        self.assertEqual(response[0]["payload"]["code"], "forbidden")
+        self.assertEqual(getPlaybackContextState("context-1"), before)
+        self.assertIsNone(
+            emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        )
+
+    def test_strict_control_rechecks_authority_action_capability_before_mutation(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-capability-recheck",
+            device_session_id="device:controller-capability-recheck",
+        )
+        state = get_state()
+        real_mutate = emo_ws.mutateStrictPlaybackContextControl
+        required_capability = {"value": None}
+
+        def remove_authority_capability_before_validator(*args, **kwargs):
+            validator = kwargs["pre_mutation_validator"]
+
+            def changed_capability_validator(current):
+                authority_client = state.get_client("phone-1", user_name="alice")
+                capabilities = dict(authority_client["capabilities"])
+                capabilities[required_capability["value"]] = False
+                authority_client["capabilities"] = capabilities
+                state.register_client(
+                    state.get_sid_for_client("phone-1", user_name="alice"),
+                    "phone-1",
+                    authority_client,
+                )
+                return validator(current)
+
+            kwargs["pre_mutation_validator"] = changed_capability_validator
+            return real_mutate(*args, **kwargs)
+
+        with mock.patch.object(
+            emo_ws,
+            "mutateStrictPlaybackContextControl",
+            side_effect=remove_authority_capability_before_validator,
+        ):
+            for action, capability, extra in (
+                ("player.play", "canPlay", {}),
+                ("player.pause", "canPause", {}),
+                ("player.seek", "canSeek", {"positionMs": 3000}),
+            ):
+                with self.subTest(action=action):
+                    required_capability["value"] = capability
+                    response = self.emit_strict(
+                        controller,
+                        "command",
+                        action,
+                        "control-capability-recheck-%s" % action,
+                        dict(
+                            {
+                                "playbackContextId": "context-1",
+                                "baseControlVersion": 1,
+                            },
+                            **extra,
+                        ),
+                    )
+                    self.assertEqual(response[0]["action"], "system.error")
+                    self.assertEqual(
+                        response[0]["payload"]["code"],
+                        "capability_required",
+                    )
+                    self.assertIsNone(
+                        emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+                    )
+                    authority_client = state.get_client(
+                        "phone-1",
+                        user_name="alice",
+                    )
+                    capabilities = dict(authority_client["capabilities"])
+                    capabilities[capability] = True
+                    authority_client["capabilities"] = capabilities
+                    state.register_client(
+                        state.get_sid_for_client("phone-1", user_name="alice"),
+                        "phone-1",
+                        authority_client,
+                    )
+
+        self.assertEqual(
+            getPlaybackContextState("context-1")["controlVersion"],
+            1,
+        )
+
+    def test_strict_queue_play_item_persists_exact_generation_and_eligibility(self):
+        player = self.ready_strict_client()
+        self.create_context(player, queue_song_ids=["song-2", "song-1", "song-3"])
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-play-item-exact",
+            device_session_id="device:controller-play-item-exact",
+        )
+        watchdog_transactions = []
+
+        with mock.patch.object(
+            emo_ws,
+            "_start_control_watchdog",
+            side_effect=lambda transaction: watchdog_transactions.append(
+                dict(transaction)
+            ),
+        ):
+            response = self.emit_strict(
+                controller,
+                "command",
+                "queue.playItem",
+                "play-item-exact-generation",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                    "baseQueueRevision": 1,
+                    "queueIndex": 1,
+                },
+            )
+
+        self.assertEqual([message["action"] for message in response], ["system.ack"])
+        transaction = emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        self.assertEqual(transaction["requestingClientId"], "controller-play-item-exact")
+        self.assertEqual(
+            transaction["requestingDeviceSessionId"],
+            "device:controller-play-item-exact",
+        )
+        self.assertEqual(transaction["requestingConnectionEpoch"], 1)
+        self.assertEqual(transaction["authorityClientId"], "phone-1")
+        self.assertEqual(transaction["routedConnectionEpoch"], 1)
+        self.assertEqual(transaction["acceptedTarget"]["queueRevision"], 2)
+        self.assertEqual(getPlaybackContextState("context-1")["queueRevision"], 2)
+        self.assertEqual(len(watchdog_transactions), 1)
+        self.assertEqual(
+            watchdog_transactions[0]["watchdogDeadlineAtMs"],
+            transaction["executionEligibleAtMs"]
+            + transaction["executionTimeoutMs"]
+            + 2000,
+        )
 
     def test_control_does_not_mutate_when_authority_emit_capacity_is_unavailable(self):
         player = self.ready_strict_client()

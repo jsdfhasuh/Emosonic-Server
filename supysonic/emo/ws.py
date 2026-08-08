@@ -124,6 +124,7 @@ from .ws_store import (
     listPendingPlaybackControlTransactions,
     listPendingPlaybackControlTransactionsForAuthorityConnection,
     listPlaybackContexts,
+    markPlaybackControlTransactionExecutionEligible,
     mutateStrictPlaybackContextControl,
     mutateStrictPlaybackContextQueue,
     saveDevicePlaybackState,
@@ -3761,6 +3762,105 @@ def _create_source_prepare(current_user_name, current_client, target_client_id, 
     return prepare
 
 
+def _strict_v2_control_capability(action):
+    return {
+        "player.pause": CAPABILITY_CAN_PAUSE,
+        "player.seek": CAPABILITY_CAN_SEEK,
+    }.get(action, CAPABILITY_CAN_PLAY)
+
+
+def _validate_strict_v2_control_generations(
+    current_user_name,
+    action,
+    current_context,
+    requester_generation,
+    authority_generation,
+):
+    if (
+        current_context.get("authorityClientId")
+        != authority_generation["clientId"]
+        or current_context.get("authorityDeviceSessionId")
+        != authority_generation["deviceSessionId"]
+    ):
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority binding changed"
+        )
+
+    if not state.matches_current_physical_generation(
+        requester_generation["userName"],
+        requester_generation["clientId"],
+        requester_generation["deviceSessionId"],
+        requester_generation["sid"],
+        requester_generation["connectionNonce"],
+        requester_generation["connectionEpoch"],
+    ):
+        raise PermissionError("Requester physical generation changed")
+    requester_client = state.get_client(
+        requester_generation["clientId"],
+        user_name=current_user_name,
+    )
+    if requester_client is None or not _has_role(requester_client, "controller"):
+        raise PermissionError("Playback control requires the controller role")
+
+    if not state.matches_current_physical_generation(
+        authority_generation["userName"],
+        authority_generation["clientId"],
+        authority_generation["deviceSessionId"],
+        authority_generation["sid"],
+        authority_generation["connectionNonce"],
+        authority_generation["connectionEpoch"],
+    ):
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority physical generation changed"
+        )
+    authority_sid = authority_generation["sid"]
+    if not socketio.server.manager.is_connected(
+        authority_sid,
+        namespace="/emo",
+    ):
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority socket is unavailable"
+        )
+    authority_client = state.get_client(
+        authority_generation["clientId"],
+        user_name=current_user_name,
+    )
+    if authority_client is None:
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority is offline"
+        )
+    if not _has_role(authority_client, "player"):
+        raise PermissionError("Playback context authority is not a player")
+    required_capability = _strict_v2_control_capability(action)
+    if not _client_supports(authority_client, required_capability):
+        raise CapabilityRequiredError(
+            "Playback authority lacks %s" % required_capability
+        )
+    return requester_client, authority_client
+
+
+def _settle_strict_control_execution_unknown(
+    playback_context_id,
+    control_transaction,
+    updated_context,
+    authority_client_id,
+):
+    terminal, changed = settlePlaybackControlTransaction(
+        playback_context_id,
+        control_transaction["epoch"],
+        control_transaction["commandControlVersion"],
+        "failed",
+        _server_time_ms(),
+        error_code="execution_unknown",
+        applied_control_version=_last_applied_control_version(
+            updated_context,
+            authority_client_id,
+        ),
+    )
+    if changed:
+        _broadcast_control_settled(terminal, updated_context)
+
+
 def _handle_strict_v2_context_control(
     current_user_name,
     current_client,
@@ -3782,43 +3882,39 @@ def _handle_strict_v2_context_control(
         action,
     )
 
-    authority_client_id = context.get("authorityClientId")
-    authority_client = state.get_client(
-        authority_client_id,
-        user_name=current_user_name,
+    request_sid = request.sid
+    if current_client is None:
+        raise PermissionError("Register the requester device before control")
+    requester_client_id = current_client.get("clientId")
+    requester_device_session_id = current_client.get("deviceSessionId")
+    requester_generation = state.get_current_physical_generation(
+        current_user_name,
+        requester_client_id,
+        requester_device_session_id,
+        expected_sid=request_sid,
     )
-    authority_sid = state.get_sid_for_client(
-        authority_client_id,
-        user_name=current_user_name,
-    )
-    if authority_client is None or authority_sid is None:
-        raise PlaybackAuthorityOfflineError("Playback context authority is offline")
-    if not socketio.server.manager.is_connected(authority_sid, namespace="/emo"):
-        raise PlaybackAuthorityOfflineError("Playback context authority socket is unavailable")
-    if (
-        authority_client.get("deviceSessionId")
-        != context.get("authorityDeviceSessionId")
-    ):
-        raise PlaybackAuthorityOfflineError(
-            "Playback context authority device is not connected"
-        )
-    if not _has_role(authority_client, "player"):
-        raise PlaybackAuthorityOfflineError("Playback context authority is not a player")
-    authority_session = state.get_session(authority_sid) or {}
-    authority_connection_nonce = authority_session.get("connectionNonce")
-    if not isinstance(authority_connection_nonce, str) or not authority_connection_nonce:
-        raise PlaybackAuthorityOfflineError(
-            "Playback context authority connection is unavailable"
-        )
+    if requester_generation is None:
+        raise PermissionError("Requester physical generation is unavailable")
 
-    required_capability = {
-        "player.pause": CAPABILITY_CAN_PAUSE,
-        "player.seek": CAPABILITY_CAN_SEEK,
-    }.get(action, CAPABILITY_CAN_PLAY)
-    if not _client_supports(authority_client, required_capability):
-        raise CapabilityRequiredError(
-            "Playback authority lacks %s" % required_capability
+    authority_client_id = context.get("authorityClientId")
+    authority_device_session_id = context.get("authorityDeviceSessionId")
+    authority_generation = state.get_current_physical_generation(
+        current_user_name,
+        authority_client_id,
+        authority_device_session_id,
+    )
+    if authority_generation is None:
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority is offline"
         )
+    _validate_strict_v2_control_generations(
+        current_user_name,
+        action,
+        context,
+        requester_generation,
+        authority_generation,
+    )
+    authority_sid = authority_generation["sid"]
 
     requested_index = None
     position_ms = payload.get("positionMs")
@@ -3848,23 +3944,65 @@ def _handle_strict_v2_context_control(
             base_queue_revision=payload.get("baseQueueRevision"),
             position_ms=position_ms,
             current_index=requested_index,
-            requesting_client_id=current_client.get("clientId"),
-            authority_client_id=authority_client_id,
-            authority_device_session_id=context.get(
-                "authorityDeviceSessionId"
-            ),
-            routed_connection_nonce=authority_connection_nonce,
-            routed_connection_epoch=authority_session.get(
+            requesting_client_id=requester_generation["clientId"],
+            requesting_device_session_id=requester_generation[
+                "deviceSessionId"
+            ],
+            requesting_connection_nonce=requester_generation[
+                "connectionNonce"
+            ],
+            requesting_connection_epoch=requester_generation[
                 "connectionEpoch"
-            )
-            or 1,
+            ],
+            authority_client_id=authority_client_id,
+            authority_device_session_id=authority_generation[
+                "deviceSessionId"
+            ],
+            routed_connection_nonce=authority_generation["connectionNonce"],
+            routed_connection_epoch=authority_generation["connectionEpoch"],
             accepted_at_ms=accepted_at_ms,
             execution_timeout_ms=execution_timeout_ms,
+            effective_at_server_ms=None,
+            pre_mutation_validator=lambda current: (
+                _validate_strict_v2_control_generations(
+                    current_user_name,
+                    action,
+                    current,
+                    requester_generation,
+                    authority_generation,
+                )
+            ),
         )
         if updated_context is None:
             raise LookupError("Playback context not found")
         control_transaction = updated_context.pop("_controlTransaction")
         state.restore_playback_context(playback_context_id, updated_context)
+
+        if not state.matches_current_physical_generation(
+            authority_generation["userName"],
+            authority_generation["clientId"],
+            authority_generation["deviceSessionId"],
+            authority_generation["sid"],
+            authority_generation["connectionNonce"],
+            authority_generation["connectionEpoch"],
+        ) or not socketio.server.manager.is_connected(
+            authority_generation["sid"],
+            namespace="/emo",
+        ):
+            try:
+                _settle_strict_control_execution_unknown(
+                    playback_context_id,
+                    control_transaction,
+                    updated_context,
+                    authority_client_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Unable to persist authority recheck execution_unknown"
+                )
+            raise PlaybackAuthorityOfflineError(
+                "Playback context authority changed before dispatch"
+            )
 
         source_client_id = current_client.get("clientId")
         if action == "queue.playItem":
@@ -3893,22 +4031,45 @@ def _handle_strict_v2_context_control(
                 emit_reserved=True,
             )
         except Exception:
-            terminal, changed = settlePlaybackControlTransaction(
+            _settle_strict_control_execution_unknown(
                 playback_context_id,
-                control_transaction["epoch"],
-                control_transaction["commandControlVersion"],
-                "failed",
-                _server_time_ms(),
-                error_code="execution_unknown",
-                applied_control_version=_last_applied_control_version(
+                control_transaction,
+                updated_context,
+                authority_client_id,
+            )
+            raise
+        try:
+            execution_eligible_at_ms = _server_time_ms()
+            eligible_transaction, _eligible_changed = (
+                markPlaybackControlTransactionExecutionEligible(
+                    playback_context_id,
+                    control_transaction["epoch"],
+                    control_transaction["commandControlVersion"],
+                    execution_eligible_at_ms,
+                )
+            )
+            if (
+                eligible_transaction is None
+                or eligible_transaction.get("executionEligibleAtMs") is None
+                or eligible_transaction.get("watchdogDeadlineAtMs") is None
+            ):
+                raise RuntimeError(
+                    "Execution eligibility did not return a complete transaction"
+                )
+            _start_control_watchdog(eligible_transaction)
+        except Exception:
+            try:
+                _settle_strict_control_execution_unknown(
+                    playback_context_id,
+                    control_transaction,
                     updated_context,
                     authority_client_id,
-                ),
-            )
-            if changed:
-                _broadcast_control_settled(terminal, updated_context)
+                )
+            except Exception:
+                logger.exception(
+                    "Unable to persist eligibility failure execution_unknown"
+                )
             raise
-        _start_control_watchdog(control_transaction)
     finally:
         strict_v2_safety.release_emit(authority_sid)
     _send_ack(request_id)
