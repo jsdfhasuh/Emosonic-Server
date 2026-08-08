@@ -2555,6 +2555,101 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertTrue(duplicate["sourceOnly"])
         self.assertEqual(duplicate["canonicalUpdate"], committed["canonicalUpdate"])
 
+    def test_ordinary_remote_feedback_requires_execution_eligibility(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            0,
+            "playing",
+        )
+        mutateStrictPlaybackContextControl(
+            "context-1",
+            "alice",
+            "controller-1",
+            "player.pause",
+            1,
+            requesting_client_id="controller-1",
+            requesting_device_session_id="device:controller-1",
+            requesting_connection_nonce="requester-nonce-1",
+            requesting_connection_epoch=3,
+            authority_client_id="player-1",
+            authority_device_session_id="device:player-1",
+            routed_connection_nonce="authority-nonce-1",
+            routed_connection_epoch=1,
+            accepted_at_ms=1000,
+            execution_timeout_ms=15000,
+            effective_at_server_ms=1500,
+        )
+        before_context = getPlaybackContextState("context-1")
+        payload = {
+            "playbackContextId": "context-1",
+            "deviceSessionId": "device:player-1",
+            "origin": "remoteCommand",
+            "executionStatus": "committed",
+            "commandControlVersion": 2,
+            "appliedControlVersion": 2,
+            "state": "paused",
+            "trackId": "song-1",
+            "positionMs": 10,
+            "clientSeq": 1,
+        }
+
+        with self.assertRaisesRegex(
+            PlaybackControlTransactionConflictError,
+            "not execution eligible",
+        ):
+            applyStrictPlaybackUpdate(
+                "context-1",
+                "alice",
+                "player-1",
+                "device:player-1",
+                "authority-nonce-1",
+                payload,
+                2000,
+                require_execution_eligible=True,
+            )
+
+        self.assertEqual(getPlaybackContextState("context-1"), before_context)
+        self.assertIsNone(getDevicePlaybackState("context-1", "player-1"))
+        self.assertEqual(
+            db.EmoPlaybackControlTransaction.select().count(),
+            1,
+        )
+        self.assertEqual(
+            getPlaybackControlTransaction("context-1", 1, 2)["status"],
+            "pending",
+        )
+
+        eligible, changed = markPlaybackControlTransactionExecutionEligible(
+            "context-1",
+            1,
+            2,
+            2000,
+        )
+        self.assertTrue(changed)
+        self.assertIsNotNone(eligible["executionEligibleAtMs"])
+        self.assertIsNotNone(eligible["watchdogDeadlineAtMs"])
+
+        committed = applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "authority-nonce-1",
+            payload,
+            2100,
+            require_execution_eligible=True,
+        )
+        self.assertEqual(committed["canonicalUpdate"]["controlVersion"], 2)
+        self.assertEqual(
+            getPlaybackControlTransaction("context-1", 1, 2)["status"],
+            "committed",
+        )
+
     def test_failed_track_change_cascades_dependency_terminals_in_version_order(self):
         createStrictPlaybackContextState(
             "context-1",

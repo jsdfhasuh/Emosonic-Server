@@ -1513,6 +1513,7 @@ def applyStrictPlaybackUpdate(
     payload,
     server_updated_at_ms,
     post_mutation_hook=None,
+    require_execution_eligible=False,
 ):
     payload = dict(payload)
     payload.setdefault("positionSampledAtServerMs", 0)
@@ -1664,6 +1665,13 @@ def applyStrictPlaybackUpdate(
                 if transaction is None:
                     raise PlaybackControlTransactionConflictError(
                         "Remote control transaction not found"
+                    )
+                if require_execution_eligible and (
+                    transaction.execution_eligible_at_ms is None
+                    or transaction.watchdog_deadline_at_ms is None
+                ):
+                    raise PlaybackControlTransactionConflictError(
+                        "Remote control transaction is not execution eligible"
                     )
                 if last_applied is not None and applied < last_applied:
                     expected_status = (

@@ -3853,9 +3853,8 @@ class StrictV2CoreTestCase(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(
-            [message["action"] for message in response],
-            ["system.ack"],
+        self.assertTrue(
+            any(message["action"] == "system.ack" for message in response)
         )
         state = get_state()
         requester_sid = state.get_sid_for_client(
@@ -4007,6 +4006,264 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertLess(
             transaction["acceptedAtMs"],
             transaction["executionEligibleAtMs"],
+        )
+
+    def _run_immediate_feedback_race(
+        self,
+        execution_status,
+        fail_eligibility=False,
+    ):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-feedback-race",
+            device_session_id="device:controller-feedback-race",
+        )
+        self.emit_strict(
+            controller,
+            "state",
+            "playback.context.subscribe",
+            "subscribe-feedback-race",
+            {"playbackContextId": "context-1"},
+        )
+        self.messages(player)
+        self.messages(controller)
+
+        events = []
+        mark_entered = threading.Event()
+        feedback_started = threading.Event()
+        feedback_finished = threading.Event()
+        feedback_apply_before_mark = []
+        feedback_errors = []
+        feedback_thread = []
+        watchdog_transactions = []
+        real_apply = emo_ws.applyStrictPlaybackUpdate
+        real_emit = emo_ws._emit_message
+        real_mark = emo_ws.markPlaybackControlTransactionExecutionEligible
+        real_mutate = emo_ws.mutateStrictPlaybackContextControl
+        real_ack = emo_ws._send_ack
+
+        feedback_payload = {
+            "playbackContextId": "context-1",
+            "deviceSessionId": "device:phone-1",
+            "origin": "remoteCommand",
+            "executionStatus": execution_status,
+            "commandControlVersion": 2,
+            "appliedControlVersion": (
+                2 if execution_status == "committed" else 1
+            ),
+            "state": "paused" if execution_status == "committed" else "playing",
+            "trackId": "song-2",
+            "positionMs": 1200,
+            "positionSampledAtServerMs": 1,
+            "playbackRate": 1.0,
+            "clientSeq": 1,
+        }
+        if execution_status == "failed":
+            feedback_payload.update(
+                {
+                    "errorCode": "track_load_failed",
+                    "errorMessage": "track load failed",
+                }
+            )
+
+        def send_feedback():
+            feedback_started.set()
+            try:
+                player.emit(
+                    "message",
+                    {
+                        "type": "event",
+                        "action": "playback.update",
+                        "requestId": "feedback-race-%s" % execution_status,
+                        "payload": feedback_payload,
+                    },
+                    namespace="/emo",
+                )
+            except Exception as exc:  # pragma: nocover - asserted below
+                feedback_errors.append(exc)
+            finally:
+                feedback_finished.set()
+
+        def record_mutate(*args, **kwargs):
+            events.append("mutate")
+            return real_mutate(*args, **kwargs)
+
+        def record_emit(message, *args, **kwargs):
+            result = real_emit(message, *args, **kwargs)
+            if message.get("action") == "player.pause":
+                thread = threading.Thread(target=send_feedback)
+                feedback_thread.append(thread)
+                thread.start()
+                self.assertTrue(feedback_started.wait(1))
+                events.append("emit")
+            return result
+
+        def record_apply(*args, **kwargs):
+            if kwargs.get("require_execution_eligible"):
+                feedback_apply_before_mark.append(mark_entered.is_set())
+            return real_apply(*args, **kwargs)
+
+        def record_mark(*args, **kwargs):
+            mark_entered.set()
+            if fail_eligibility:
+                events.append("eligible")
+                raise RuntimeError("injected eligibility failure")
+            result = real_mark(*args, **kwargs)
+            events.append("eligible")
+            return result
+
+        def record_watchdog(transaction):
+            events.append("watchdog")
+            watchdog_transactions.append(dict(transaction))
+
+        def record_ack(request_id=None, payload=None):
+            if request_id == "pause-feedback-race":
+                events.append("ack")
+            return real_ack(request_id, payload)
+
+        with mock.patch.object(
+            emo_ws,
+            "mutateStrictPlaybackContextControl",
+            side_effect=record_mutate,
+        ), mock.patch.object(
+            emo_ws,
+            "_emit_message",
+            side_effect=record_emit,
+        ), mock.patch.object(
+            emo_ws,
+            "applyStrictPlaybackUpdate",
+            side_effect=record_apply,
+        ), mock.patch.object(
+            emo_ws,
+            "markPlaybackControlTransactionExecutionEligible",
+            side_effect=record_mark,
+        ), mock.patch.object(
+            emo_ws,
+            "_start_control_watchdog",
+            side_effect=record_watchdog,
+        ), mock.patch.object(
+            emo_ws,
+            "_send_ack",
+            side_effect=record_ack,
+        ):
+            response = self.emit_strict(
+                controller,
+                "command",
+                "player.pause",
+                "pause-feedback-race",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                },
+            )
+            self.assertEqual(len(feedback_thread), 1)
+            feedback_thread[0].join(2)
+            self.assertFalse(feedback_thread[0].is_alive())
+            self.assertTrue(feedback_finished.is_set())
+            self.assertEqual(feedback_errors, [])
+        self.assertEqual(
+            events,
+            (
+                ["mutate", "emit", "eligible"]
+                if fail_eligibility
+                else ["mutate", "emit", "eligible", "watchdog", "ack"]
+            ),
+        )
+        self.assertEqual(feedback_apply_before_mark, [True])
+        if fail_eligibility:
+            self.assertFalse(
+                any(message["action"] == "system.ack" for message in response)
+            )
+            self.assertTrue(
+                any(
+                    message["action"] == "system.error"
+                    and message["payload"].get("code") == "internal_error"
+                    for message in response
+                )
+            )
+            transaction = emo_ws.getPlaybackControlTransaction(
+                "context-1",
+                1,
+                2,
+            )
+            self.assertEqual(transaction["status"], "failed")
+            self.assertEqual(transaction["errorCode"], "execution_unknown")
+            self.assertNotIn("executionEligibleAtMs", transaction)
+            self.assertNotIn("watchdogDeadlineAtMs", transaction)
+            self.assertEqual(watchdog_transactions, [])
+            self.assertEqual(
+                len(
+                    [
+                        message
+                        for message in self.messages(player)
+                        if message["action"] == "player.pause"
+                    ]
+                ),
+                1,
+            )
+            self.assertIsNone(
+                emo_ws.getDevicePlaybackState("context-1", "phone-1")
+            )
+            return
+
+        self.assertEqual(len(watchdog_transactions), 1)
+        self.assertTrue(
+            any(message["action"] == "system.ack" for message in response)
+        )
+        transaction = emo_ws.getPlaybackControlTransaction(
+            "context-1",
+            1,
+            2,
+        )
+        self.assertEqual(transaction["status"], execution_status)
+        self.assertIsNotNone(transaction["executionEligibleAtMs"])
+        self.assertIsNotNone(transaction["watchdogDeadlineAtMs"])
+        self.assertGreaterEqual(
+            transaction["terminalAtMs"],
+            transaction["executionEligibleAtMs"],
+        )
+        self.assertEqual(
+            transaction["watchdogDeadlineAtMs"],
+            transaction["executionEligibleAtMs"]
+            + transaction["executionTimeoutMs"]
+            + 2000,
+        )
+        self.assertEqual(
+            watchdog_transactions[0]["executionEligibleAtMs"],
+            transaction["executionEligibleAtMs"],
+        )
+        if execution_status == "failed":
+            self.assertEqual(transaction["errorCode"], "track_load_failed")
+            self.assertEqual(transaction["errorMessage"], "track load failed")
+        controller_events = self.messages(controller)
+        self.assertTrue(
+            any(
+                message["action"] == "playback.update"
+                and message["payload"].get("executionStatus")
+                == execution_status
+                for message in controller_events
+            )
+        )
+        self.assertFalse(
+            any(
+                message["action"] == "system.error"
+                and message["payload"].get("code") == "internal_error"
+                for message in controller_events
+            )
+        )
+
+    def test_strict_control_immediate_committed_feedback_waits_for_eligibility(self):
+        self._run_immediate_feedback_race("committed")
+
+    def test_strict_control_immediate_failed_feedback_waits_for_eligibility(self):
+        self._run_immediate_feedback_race("failed")
+
+    def test_strict_control_eligibility_failure_rejects_waiting_feedback(self):
+        self._run_immediate_feedback_race(
+            "committed",
+            fail_eligibility=True,
         )
 
     def test_strict_control_requester_replacement_fails_before_mutation(self):

@@ -174,6 +174,17 @@ _control_watchdog_generation = 0
 _control_watchdog_tokens = {}
 _source_terminal_replay_lock = threading.RLock()
 _source_terminal_replays = {}
+_ordinary_control_dispatch_barriers_guard = threading.Lock()
+_ordinary_control_dispatch_barriers = {}
+
+
+def _ordinary_control_dispatch_barrier(playback_context_id):
+    """Return the process-local live barrier for one ordinary context."""
+    with _ordinary_control_dispatch_barriers_guard:
+        return _ordinary_control_dispatch_barriers.setdefault(
+            playback_context_id,
+            threading.RLock(),
+        )
 
 ALLOWED_PRE_AUTH = {"auth.login"}
 EVENT_CONFIRMED_ACTIONS = {
@@ -3845,18 +3856,19 @@ def _settle_strict_control_execution_unknown(
     updated_context,
     authority_client_id,
 ):
-    terminal, changed = settlePlaybackControlTransaction(
-        playback_context_id,
-        control_transaction["epoch"],
-        control_transaction["commandControlVersion"],
-        "failed",
-        _server_time_ms(),
-        error_code="execution_unknown",
-        applied_control_version=_last_applied_control_version(
-            updated_context,
-            authority_client_id,
-        ),
-    )
+    with _ordinary_control_dispatch_barrier(playback_context_id):
+        terminal, changed = settlePlaybackControlTransaction(
+            playback_context_id,
+            control_transaction["epoch"],
+            control_transaction["commandControlVersion"],
+            "failed",
+            _server_time_ms(),
+            error_code="execution_unknown",
+            applied_control_version=_last_applied_control_version(
+                updated_context,
+                authority_client_id,
+            ),
+        )
     if changed:
         _broadcast_control_settled(terminal, updated_context)
 
@@ -3928,7 +3940,15 @@ def _handle_strict_v2_context_control(
     elif action == "player.play" and position_ms is None:
         position_ms = context.get("positionMs", 0)
 
-    if not strict_v2_safety.reserve_emit(authority_sid):
+    dispatch_barrier = _ordinary_control_dispatch_barrier(playback_context_id)
+    dispatch_barrier.acquire()
+    try:
+        reserved = strict_v2_safety.reserve_emit(authority_sid)
+    except Exception:
+        dispatch_barrier.release()
+        raise
+    if not reserved:
+        dispatch_barrier.release()
         raise PlaybackAuthorityOfflineError(
             "Playback context authority send buffer is unavailable"
         )
@@ -4071,7 +4091,10 @@ def _handle_strict_v2_context_control(
                 )
             raise
     finally:
-        strict_v2_safety.release_emit(authority_sid)
+        try:
+            strict_v2_safety.release_emit(authority_sid)
+        finally:
+            dispatch_barrier.release()
     _send_ack(request_id)
     if action == "queue.playItem":
         _run_post_commit_push(
@@ -7300,36 +7323,39 @@ def _settle_control_transactions_unknown(
         ),
     )
     for pending in ordered:
-        playback_context = getPlaybackContextState(
+        with _ordinary_control_dispatch_barrier(
             pending["playbackContextId"]
-        )
-        applied_control_version = pending.get("appliedControlVersion")
-        if applied_control_version is None:
-            applied_control_version = (
-                _last_applied_control_version(
-                    playback_context,
-                    pending["authorityClientId"],
+        ):
+            playback_context = getPlaybackContextState(
+                pending["playbackContextId"]
+            )
+            applied_control_version = pending.get("appliedControlVersion")
+            if applied_control_version is None:
+                applied_control_version = (
+                    _last_applied_control_version(
+                        playback_context,
+                        pending["authorityClientId"],
+                    )
+                    if playback_context is not None
+                    else 1
                 )
-                if playback_context is not None
-                else 1
-            )
-        try:
-            transaction, changed = settlePlaybackControlTransaction(
-                pending["playbackContextId"],
-                pending["epoch"],
-                pending["commandControlVersion"],
-                "failed",
-                terminal_at_ms,
-                error_code="execution_unknown",
-                applied_control_version=applied_control_version,
-            )
-        except PlaybackControlTransactionConflictError:
-            _cancel_control_watchdog(
-                pending["playbackContextId"],
-                pending["epoch"],
-                pending["commandControlVersion"],
-            )
-            continue
+            try:
+                transaction, changed = settlePlaybackControlTransaction(
+                    pending["playbackContextId"],
+                    pending["epoch"],
+                    pending["commandControlVersion"],
+                    "failed",
+                    terminal_at_ms,
+                    error_code="execution_unknown",
+                    applied_control_version=applied_control_version,
+                )
+            except PlaybackControlTransactionConflictError:
+                _cancel_control_watchdog(
+                    pending["playbackContextId"],
+                    pending["epoch"],
+                    pending["commandControlVersion"],
+                )
+                continue
         _cancel_control_watchdog(
             pending["playbackContextId"],
             pending["epoch"],
@@ -8222,15 +8248,20 @@ def _handle_strict_v2_playback_update(
 
     try:
         if persisted_broadcast is None:
-            result = applyStrictPlaybackUpdate(
-                payload["playbackContextId"],
-                current_user_name,
-                current_client.get("clientId"),
-                payload["deviceSessionId"],
-                connection_nonce,
-                payload,
-                server_time_ms,
-            )
+            with _ordinary_control_dispatch_barrier(
+                payload["playbackContextId"]
+            ):
+                server_time_ms = _server_time_ms()
+                result = applyStrictPlaybackUpdate(
+                    payload["playbackContextId"],
+                    current_user_name,
+                    current_client.get("clientId"),
+                    payload["deviceSessionId"],
+                    connection_nonce,
+                    payload,
+                    server_time_ms,
+                    require_execution_eligible=True,
+                )
         else:
             with broadcastMutationLock(persisted_broadcast["broadcastId"]):
                 result = applyStrictPlaybackUpdate(
