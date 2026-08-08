@@ -4051,12 +4051,17 @@ def _handle_strict_v2_context_control(
                 emit_reserved=True,
             )
         except Exception:
-            _settle_strict_control_execution_unknown(
-                playback_context_id,
-                control_transaction,
-                updated_context,
-                authority_client_id,
-            )
+            try:
+                _settle_strict_control_execution_unknown(
+                    playback_context_id,
+                    control_transaction,
+                    updated_context,
+                    authority_client_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Unable to persist emit failure execution_unknown"
+                )
             raise
         try:
             execution_eligible_at_ms = _server_time_ms()

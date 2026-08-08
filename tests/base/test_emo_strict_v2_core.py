@@ -4484,6 +4484,56 @@ class StrictV2CoreTestCase(unittest.TestCase):
         )
         watchdog.assert_not_called()
 
+    def test_strict_control_emit_failure_preserves_original_exception(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-emit-compensation-failure",
+            device_session_id="device:controller-emit-compensation-failure",
+        )
+
+        class EmitFailure(Exception):
+            pass
+
+        class CompensationFailure(Exception):
+            pass
+
+        real_emit = emo_ws._emit_message
+
+        def fail_command(message, *args, **kwargs):
+            if message.get("action") == "player.seek":
+                raise EmitFailure("injected command emit failure")
+            return real_emit(message, *args, **kwargs)
+
+        with mock.patch.object(
+            emo_ws,
+            "_emit_message",
+            side_effect=fail_command,
+        ), mock.patch.object(
+            emo_ws,
+            "_settle_strict_control_execution_unknown",
+            side_effect=CompensationFailure("injected compensation failure"),
+        ), self.assertLogs("supysonic.emo.ws", level="ERROR") as captured:
+            response = self.emit_strict(
+                controller,
+                "command",
+                "player.seek",
+                "seek-emit-compensation-failure",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                    "positionMs": 1000,
+                },
+            )
+
+        self.assertEqual(response[0]["action"], "system.error")
+        self.assertEqual(response[0]["payload"]["code"], "internal_error")
+        combined = "\n".join(captured.output)
+        self.assertIn("exception_type=EmitFailure", combined)
+        self.assertIn("Unable to persist emit failure execution_unknown", combined)
+        self.assertNotIn("exception_type=CompensationFailure", combined)
+
     def test_strict_control_eligibility_failure_settles_without_retry(self):
         player = self.ready_strict_client()
         self.create_context(player)
