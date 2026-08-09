@@ -469,6 +469,77 @@ class StrictV2CoreTestCase(unittest.TestCase):
             listed_player["capabilities"],
         )
 
+    def test_device_list_volume_state_is_trimmed_by_recipient_negotiation(self):
+        player = self.ready_strict_client(
+            client_id="player-volume-list",
+            device_session_id="device:player-volume-list",
+            capability_overrides={"remoteVolumeControl": True},
+        )
+        allowed = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-volume-allowed",
+            device_session_id="device:controller-volume-allowed",
+            capability_overrides={
+                "canSetVolume": False,
+                "remoteVolumeControl": True,
+            },
+        )
+        denied = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-volume-denied",
+            device_session_id="device:controller-volume-denied",
+            capability_overrides={
+                "canSetVolume": False,
+                "remoteVolumeControl": False,
+            },
+        )
+        for client in (player, allowed, denied):
+            self.messages(client)
+
+        self.emit_strict(
+            player,
+            "event",
+            "device.volume.update",
+            "volume-list-feedback-1",
+            {
+                "deviceSessionId": "device:player-volume-list",
+                "volume": 37,
+                "clientSeq": 1,
+            },
+        )
+        self.messages(allowed)
+        self.messages(denied)
+
+        allowed_list = self.emit_strict(
+            allowed,
+            "state",
+            "device.list",
+            "device-list-volume-allowed-1",
+            {},
+        )[0]
+        denied_list = self.emit_strict(
+            denied,
+            "state",
+            "device.list",
+            "device-list-volume-denied-1",
+            {},
+        )[0]
+        allowed_player = next(
+            device
+            for device in allowed_list["payload"]["devices"]
+            if device["clientId"] == "player-volume-list"
+        )
+        denied_player = next(
+            device
+            for device in denied_list["payload"]["devices"]
+            if device["clientId"] == "player-volume-list"
+        )
+
+        self.assertEqual(allowed_player["volumeState"]["volume"], 37)
+        self.assertNotIn("volumeState", denied_player)
+        self.assertEqual(len(allowed_player["capabilities"]), 10)
+        self.assertEqual(len(denied_player["capabilities"]), 10)
+
     def test_device_volume_requires_extended_capability_and_exact_live_pair(self):
         base_player = self.ready_strict_client(
             client_id="player-1",
@@ -1497,6 +1568,10 @@ class StrictV2CoreTestCase(unittest.TestCase):
         snapshot = response[0]["payload"]
         self.assertEqual(response[0]["action"], "playback.context.ensure")
         self.assertEqual(snapshot["queueSongIds"], ["song-2", "song-1"])
+        self.assertEqual(
+            snapshot["authorityDeviceSessionId"],
+            "device:phone-1",
+        )
         self.assertEqual(snapshot["state"], "playing")
         self.assertEqual(snapshot["positionMs"], 1200)
         for cursor_name in ("epoch", "version", "queueRevision", "controlVersion"):
@@ -1506,6 +1581,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
             {
                 "playbackContextId",
                 "authorityClientId",
+                "authorityDeviceSessionId",
                 "queueSongIds",
                 "currentIndex",
                 "trackId",
@@ -1635,6 +1711,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
         error = response[0]["payload"]
         self.assertEqual(error["code"], "queue_required")
         self.assertEqual(error["playbackContextId"], "context-idle-control")
+        self.assertEqual(error["currentEpoch"], 1)
         self.assertEqual(error["currentControlVersion"], 1)
         self.assertEqual(error["currentQueueRevision"], 1)
         self.assertEqual(error["currentVersion"], 1)
@@ -1754,6 +1831,148 @@ class StrictV2CoreTestCase(unittest.TestCase):
                 and message["payload"]["ready"] is True
                 for message in controller_events
             )
+        )
+
+    def test_core_prepare_does_not_require_handoff_playback_prepare(self):
+        player = self.ready_strict_client(
+            capability_overrides={"playbackPrepare": False},
+        )
+        with mock.patch(
+            "supysonic.emo.ws_store._new_playback_context_id",
+            return_value="context-core-prepare-no-handoff",
+        ):
+            self.emit_strict(
+                player,
+                "command",
+                "playback.context.ensure",
+                "ensure-core-prepare-no-handoff",
+                {
+                    "deviceSessionId": "device:phone-1",
+                    "queueSongIds": [],
+                    "positionMs": 0,
+                    "state": "idle",
+                },
+            )
+        self.messages(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-core-prepare",
+            device_session_id="device:controller-core-prepare",
+        )
+        self.messages(controller)
+
+        with mock.patch.object(socketio, "start_background_task"):
+            response = self.emit_strict(
+                controller,
+                "command",
+                "playback.context.prepare",
+                "core-prepare-no-handoff-1",
+                {
+                    "playbackContextId": "context-core-prepare-no-handoff",
+                    "intentId": "intent-core-prepare-no-handoff",
+                    "baseControlVersion": 1,
+                },
+            )
+
+        self.assertEqual([message["action"] for message in response], ["system.ack"])
+        self.assertEqual(response[0]["payload"]["status"], "preparing")
+        routed = self.messages(player)
+        self.assertEqual(
+            [message["action"] for message in routed],
+            ["playback.context.prepare"],
+        )
+        current_sid = get_state().get_sid_for_client("phone-1", user_name="alice")
+        current_session = get_state().get_session(current_sid)
+        prepare = emo_ws.getPlaybackPrepareTransaction(
+            "context-core-prepare-no-handoff",
+            1,
+            "intent-core-prepare-no-handoff",
+        )
+        self.assertEqual(prepare["authorityClientId"], "phone-1")
+        self.assertEqual(
+            prepare["authorityDeviceSessionId"],
+            "device:phone-1",
+        )
+        self.assertEqual(
+            prepare["routedConnectionNonce"],
+            current_session["connectionNonce"],
+        )
+        self.assertEqual(prepare["routedConnectionEpoch"], 1)
+
+    def test_core_prepare_independence_preserves_current_role_and_can_play_gates(self):
+        player = self.ready_strict_client()
+        with mock.patch(
+            "supysonic.emo.ws_store._new_playback_context_id",
+            return_value="context-core-prepare-gates",
+        ):
+            self.emit_strict(
+                player,
+                "command",
+                "playback.context.ensure",
+                "ensure-core-prepare-gates",
+                {
+                    "deviceSessionId": "device:phone-1",
+                    "queueSongIds": [],
+                    "positionMs": 0,
+                    "state": "idle",
+                },
+            )
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-core-prepare-gates",
+            device_session_id="device:controller-core-prepare-gates",
+        )
+        self.messages(player)
+        self.messages(controller)
+
+        no_play = self.ready_strict_client(
+            client_id="phone-1",
+            device_session_id="device:phone-1",
+            capability_overrides={
+                "playbackPrepare": False,
+                "canPlay": False,
+            },
+        )
+        self.messages(no_play)
+        denied = self.emit_strict(
+            controller,
+            "command",
+            "playback.context.prepare",
+            "core-prepare-no-can-play-1",
+            {
+                "playbackContextId": "context-core-prepare-gates",
+                "intentId": "intent-core-prepare-no-can-play",
+                "baseControlVersion": 1,
+            },
+        )
+        self.assertEqual(denied[0]["payload"]["code"], "capability_required")
+        self.assertEqual(self.messages(no_play), [])
+
+        non_player = self.ready_strict_client(
+            roles=["controller"],
+            client_id="phone-1",
+            device_session_id="device:phone-1",
+            capability_overrides={"playbackPrepare": False},
+        )
+        self.messages(non_player)
+        denied = self.emit_strict(
+            controller,
+            "command",
+            "playback.context.prepare",
+            "core-prepare-non-player-1",
+            {
+                "playbackContextId": "context-core-prepare-gates",
+                "intentId": "intent-core-prepare-non-player",
+                "baseControlVersion": 1,
+            },
+        )
+        self.assertEqual(denied[0]["payload"]["code"], "authority_offline")
+        self.assertEqual(self.messages(non_player), [])
+        self.assertEqual(
+            emo_ws.listActivePlaybackPrepareTransactions(
+                "context-core-prepare-gates"
+            ),
+            [],
         )
 
     def test_context_prepare_on_queue_backed_context_acks_ready_without_route(self):
@@ -3573,7 +3792,10 @@ class StrictV2CoreTestCase(unittest.TestCase):
         client.emit("message", stale, namespace="/emo")
         error = self.messages(client)[0]
         self.assertEqual(error["payload"]["code"], "stale_version")
+        self.assertEqual(error["payload"]["currentEpoch"], 1)
+        self.assertEqual(error["payload"]["currentControlVersion"], 2)
         self.assertEqual(error["payload"]["currentQueueRevision"], 2)
+        self.assertEqual(error["payload"]["currentVersion"], 2)
         after_stale = getPlaybackContextState("context-1")
         self.assertEqual(after_stale, before_stale)
 
@@ -5943,6 +6165,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
                     {
                         "playbackContextId",
                         "authorityClientId",
+                        "authorityDeviceSessionId",
                         "queueSongIds",
                         "currentIndex",
                         "trackId",

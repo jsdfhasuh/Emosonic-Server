@@ -472,9 +472,9 @@ def _serialize_client_info_v2(client, target_client=None):
     if not isinstance(client_capabilities, dict):
         client_capabilities = {}
     target_capabilities = _client_capabilities(target_client)
-    capability_names = list(STRICT_V2_REQUIRED_CAPABILITIES)
-    if CAPABILITY_REMOTE_VOLUME_CONTROL in target_capabilities:
-        capability_names.extend(STRICT_V2_OPTIONAL_CAPABILITIES)
+    capability_names = (
+        STRICT_V2_REQUIRED_CAPABILITIES + STRICT_V2_OPTIONAL_CAPABILITIES
+    )
     capabilities = {
         capability: (
             client_capabilities[capability]
@@ -492,7 +492,7 @@ def _serialize_client_info_v2(client, target_client=None):
     }
     if isinstance(client.get("alias"), str) and client.get("alias"):
         payload["alias"] = client["alias"]
-    if CAPABILITY_REMOTE_VOLUME_CONTROL in target_capabilities:
+    if target_capabilities.get(CAPABILITY_REMOTE_VOLUME_CONTROL) is True:
         volume_state = state.get_device_volume_state(
             client.get("userName"),
             client.get("clientId"),
@@ -969,6 +969,22 @@ def _send_ack(request_id=None, payload=None):
     _emit_message(_build_message("system", "system.ack", payload, requestId=request_id))
 
 
+def _live_context_cursor_fields(playback_context, user_name):
+    if not isinstance(playback_context, dict):
+        return {}
+    if playback_context.get("userName") != user_name:
+        return {}
+    if playback_context.get("lifecycle") != "active":
+        return {}
+    return {
+        "playbackContextId": playback_context.get("playbackContextId"),
+        "currentEpoch": playback_context.get("epoch"),
+        "currentControlVersion": playback_context.get("controlVersion"),
+        "currentQueueRevision": playback_context.get("queueRevision"),
+        "currentVersion": playback_context.get("version"),
+    }
+
+
 def _send_error(code, message, request_id=None, **fields):
     current_client = (
         state.get_client_for_sid(request.sid) if has_request_context() else None
@@ -1316,6 +1332,7 @@ def _build_context_queue_payload_v2(context):
     payload = {
         "playbackContextId": context.get("playbackContextId"),
         "authorityClientId": context.get("authorityClientId"),
+        "authorityDeviceSessionId": context.get("authorityDeviceSessionId"),
         "queueSongIds": list(context.get("queueSongIds") or []),
         "state": context.get("state") or "idle",
         "positionMs": context.get("positionMs", 0),
@@ -7692,38 +7709,27 @@ def _handle_playback_context_prepare(
     _ensure_playback_context_active(context)
 
     authority_client_id = context.get("authorityClientId")
-    authority_sid = state.get_sid_for_client(
+    authority_device_session_id = context.get("authorityDeviceSessionId")
+    authority_generation = state.get_current_physical_generation(
+        current_user_name,
         authority_client_id,
-        user_name=current_user_name,
+        authority_device_session_id,
     )
-    authority_client = state.get_client(
-        authority_client_id,
-        user_name=current_user_name,
-    )
-    if authority_sid is None or authority_client is None:
+    if authority_generation is None:
         raise PlaybackAuthorityOfflineError("Playback context authority is offline")
-    if (
-        authority_client.get("deviceSessionId")
-        != context.get("authorityDeviceSessionId")
-    ):
-        raise PlaybackAuthorityOfflineError(
-            "Playback context authority device is not connected"
-        )
-    if not _has_role(authority_client, "player"):
-        raise PlaybackAuthorityOfflineError("Playback context authority is not a player")
-    if not _client_supports(authority_client, CAPABILITY_PLAYBACK_PREPARE):
-        raise CapabilityRequiredError(
-            "Playback authority lacks playbackPrepare"
-        )
-    if not _client_supports(authority_client, CAPABILITY_CAN_PLAY):
-        raise CapabilityRequiredError("Playback authority lacks canPlay")
-
-    authority_session = state.get_session(authority_sid) or {}
-    routed_nonce = authority_session.get("connectionNonce")
-    if not isinstance(routed_nonce, str) or not routed_nonce:
+    authority_sid = authority_generation["sid"]
+    authority_client = state.get_client_for_sid(authority_sid)
+    if authority_client is None:
+        raise PlaybackAuthorityOfflineError("Playback context authority is offline")
+    if not socketio.server.manager.is_connected(authority_sid, namespace="/emo"):
         raise PlaybackAuthorityOfflineError(
             "Playback context authority connection is unavailable"
         )
+    if not _has_role(authority_client, "player"):
+        raise PlaybackAuthorityOfflineError("Playback context authority is not a player")
+    if not _client_supports(authority_client, CAPABILITY_CAN_PLAY):
+        raise CapabilityRequiredError("Playback authority lacks canPlay")
+
     should_reserve = not context.get("queueSongIds")
     if should_reserve and not strict_v2_safety.reserve_emit(authority_sid):
         raise PlaybackAuthorityOfflineError(
@@ -7738,9 +7744,9 @@ def _handle_playback_context_prepare(
             payload["intentId"],
             current_client.get("clientId"),
             authority_client_id,
-            context.get("authorityDeviceSessionId"),
-            routed_nonce,
-            authority_session.get("connectionEpoch") or 1,
+            authority_generation["deviceSessionId"],
+            authority_generation["connectionNonce"],
+            authority_generation["connectionEpoch"],
             _context_prepare_request_record(payload),
             payload["baseControlVersion"],
             now_ms + CONTEXT_PREPARE_TIMEOUT_MS,
@@ -11299,17 +11305,10 @@ class EmoNamespace(Namespace):
                 _send_error("not_supported", f"Unsupported action: {action}", request_id)
         except PlaybackContextStaleVersionError as exc:
             playback_context = exc.playback_context or {}
-            fields = {
-                "playbackContextId": playback_context.get("playbackContextId"),
-            }
-            if exc.cursor_name == "controlVersion":
-                fields["currentControlVersion"] = playback_context.get(
-                    "controlVersion"
-                )
-            elif exc.cursor_name == "queueRevision":
-                fields["currentQueueRevision"] = playback_context.get(
-                    "queueRevision"
-                )
+            fields = _live_context_cursor_fields(
+                playback_context,
+                current_user_name,
+            )
             _send_error("stale_version", str(exc), request_id, **fields)
         except PlaybackContextRestoreInProgressError as exc:
             playback_context = exc.playback_context or {}
@@ -11317,13 +11316,10 @@ class EmoNamespace(Namespace):
                 "restore_in_progress",
                 str(exc),
                 request_id,
-                playbackContextId=playback_context.get("playbackContextId")
-                or payload.get("playbackContextId"),
-                currentControlVersion=playback_context.get(
-                    "controlVersion"
+                **_live_context_cursor_fields(
+                    playback_context,
+                    current_user_name,
                 ),
-                currentQueueRevision=playback_context.get("queueRevision"),
-                currentVersion=playback_context.get("version"),
             )
         except PlaybackContextClosedError as exc:
             playback_context = exc.playback_context or {}
@@ -11340,10 +11336,10 @@ class EmoNamespace(Namespace):
                 "conflict",
                 str(exc),
                 request_id,
-                playbackContextId=playback_context.get("playbackContextId"),
-                currentControlVersion=playback_context.get("controlVersion"),
-                currentQueueRevision=playback_context.get("queueRevision"),
-                currentVersion=playback_context.get("version"),
+                **_live_context_cursor_fields(
+                    playback_context,
+                    current_user_name,
+                ),
             )
         except PlaybackContextEnsureConflictError as exc:
             playback_context = exc.playback_context or {}
@@ -11351,10 +11347,10 @@ class EmoNamespace(Namespace):
                 "conflict",
                 str(exc),
                 request_id,
-                playbackContextId=playback_context.get("playbackContextId"),
-                currentControlVersion=playback_context.get("controlVersion"),
-                currentQueueRevision=playback_context.get("queueRevision"),
-                currentVersion=playback_context.get("version"),
+                **_live_context_cursor_fields(
+                    playback_context,
+                    current_user_name,
+                ),
             )
         except PlaybackContextQueueRequiredError as exc:
             playback_context = exc.playback_context or {}
@@ -11362,11 +11358,10 @@ class EmoNamespace(Namespace):
                 "queue_required",
                 str(exc),
                 request_id,
-                playbackContextId=playback_context.get("playbackContextId")
-                or payload.get("playbackContextId"),
-                currentControlVersion=playback_context.get("controlVersion"),
-                currentQueueRevision=playback_context.get("queueRevision"),
-                currentVersion=playback_context.get("version"),
+                **_live_context_cursor_fields(
+                    playback_context,
+                    current_user_name,
+                ),
             )
         except (
             PlaybackPrepareAlreadyActiveError,
@@ -11382,11 +11377,10 @@ class EmoNamespace(Namespace):
                 "conflict",
                 str(exc),
                 request_id,
-                playbackContextId=playback_context.get("playbackContextId")
-                or payload.get("playbackContextId"),
-                currentControlVersion=playback_context.get("controlVersion"),
-                currentQueueRevision=playback_context.get("queueRevision"),
-                currentVersion=playback_context.get("version"),
+                **_live_context_cursor_fields(
+                    playback_context,
+                    current_user_name,
+                ),
             )
         except BroadcastFeedbackSequenceConflictError as exc:
             _send_error(
@@ -11410,16 +11404,10 @@ class EmoNamespace(Namespace):
                 "conflict",
                 str(exc),
                 request_id,
-                playbackContextId=playback_context.get(
-                    "playbackContextId"
-                ) or payload.get("playbackContextId"),
-                currentControlVersion=playback_context.get(
-                    "controlVersion"
+                **_live_context_cursor_fields(
+                    playback_context,
+                    current_user_name,
                 ),
-                currentQueueRevision=playback_context.get(
-                    "queueRevision"
-                ),
-                currentVersion=playback_context.get("version"),
             )
         except QueueConflictError as exc:
             event_name = _get_action_event_name(action) or "bad_message"

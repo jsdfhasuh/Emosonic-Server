@@ -1005,6 +1005,7 @@ def _validate_context_snapshot(
     required = {
         "playbackContextId",
         "authorityClientId",
+        "authorityDeviceSessionId",
         "queueSongIds",
         "state",
         "positionMs",
@@ -1020,7 +1021,11 @@ def _validate_context_snapshot(
         required.add("serverUpdatedAtMs")
         optional.remove("serverUpdatedAtMs")
     snapshot = _output_object(value, required, optional, label)
-    for field_name in ("playbackContextId", "authorityClientId"):
+    for field_name in (
+        "playbackContextId",
+        "authorityClientId",
+        "authorityDeviceSessionId",
+    ):
         _output_string(snapshot[field_name], "%s.%s" % (label, field_name))
     queue = _output_string_array(
         snapshot["queueSongIds"],
@@ -1845,6 +1850,7 @@ def _validate_output_error(payload: object) -> str:
         {"action", "code", "message", "retryable"},
         {
             "playbackContextId",
+            "currentEpoch",
             "currentControlVersion",
             "currentQueueRevision",
             "currentVersion",
@@ -1864,6 +1870,7 @@ def _validate_output_error(payload: object) -> str:
     if "playbackContextId" in error:
         _output_string(error["playbackContextId"], "system.error playbackContextId")
     for field_name in (
+        "currentEpoch",
         "currentControlVersion",
         "currentQueueRevision",
         "currentVersion",
@@ -1875,35 +1882,24 @@ def _validate_output_error(payload: object) -> str:
         _output_int(error["retryAfterMs"], "system.error retryAfterMs", 1)
     if code in {"context_closed", "authority_offline"} and "playbackContextId" not in error:
         _output_error("%s requires playbackContextId" % code)
-    if code == "queue_required":
-        required = {
-            "playbackContextId",
-            "currentControlVersion",
-            "currentQueueRevision",
-            "currentVersion",
-        }
-        if not required.issubset(error):
-            _output_error("queue_required requires Context and all canonical cursors")
-    if code == "restore_in_progress":
-        required = {
-            "playbackContextId",
-            "currentControlVersion",
-            "currentQueueRevision",
-            "currentVersion",
-        }
-        if not required.issubset(error):
-            _output_error(
-                "restore_in_progress requires Context and all canonical cursors"
-            )
+    canonical_context_fields = {
+        "playbackContextId",
+        "currentEpoch",
+        "currentControlVersion",
+        "currentQueueRevision",
+        "currentVersion",
+    }
+    context_scoped = code in {
+        "queue_required",
+        "restore_in_progress",
+        "stale_version",
+    } or (code == "conflict" and "playbackContextId" in error)
+    if context_scoped and not canonical_context_fields.issubset(error):
+        _output_error("%s requires Context and all canonical cursors" % code)
     if code == "rate_limited" and "retryAfterMs" not in error:
         _output_error("rate_limited requires retryAfterMs")
     if code == "client_sequence_conflict" and "currentClientSeq" not in error:
         _output_error("client_sequence_conflict requires currentClientSeq")
-    if code == "stale_version" and not any(
-        field_name in error
-        for field_name in ("currentControlVersion", "currentQueueRevision", "currentVersion")
-    ):
-        _output_error("stale_version requires a current cursor")
     return request_action
 
 

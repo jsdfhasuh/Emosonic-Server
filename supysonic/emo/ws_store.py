@@ -3485,6 +3485,9 @@ def serializePlaybackContextV2(playback_context):
     payload = {
         "playbackContextId": playback_context.get("playbackContextId"),
         "authorityClientId": playback_context.get("authorityClientId"),
+        "authorityDeviceSessionId": playback_context.get(
+            "authorityDeviceSessionId"
+        ),
         "queueSongIds": list(playback_context.get("queueSongIds") or []),
         "state": playback_context.get("state") or "idle",
         "positionMs": playback_context.get("positionMs", 0),

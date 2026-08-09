@@ -725,7 +725,10 @@ class StrictV2ContractTestCase(unittest.TestCase):
                     "message": "control cursor is stale",
                     "retryable": False,
                     "playbackContextId": "context-1",
+                    "currentEpoch": 1,
                     "currentControlVersion": 2,
+                    "currentQueueRevision": 1,
+                    "currentVersion": 3,
                 },
                 "seek-1",
             ),
@@ -745,6 +748,7 @@ class StrictV2ContractTestCase(unittest.TestCase):
         context = {
             "playbackContextId": "context-1",
             "authorityClientId": "player-1",
+            "authorityDeviceSessionId": "device:player-1",
             "queueSongIds": ["song-1"],
             "currentIndex": 0,
             "trackId": "song-1",
@@ -803,6 +807,111 @@ class StrictV2ContractTestCase(unittest.TestCase):
         self.assertEqual(validate_strict_output(status), status)
         self.assertEqual(validate_strict_output(feedback), feedback)
 
+    def test_context_snapshot_requires_exact_authority_pair(self):
+        context = {
+            "playbackContextId": "context-1",
+            "authorityClientId": "player-1",
+            "authorityDeviceSessionId": "device:player-1",
+            "queueSongIds": [],
+            "state": "idle",
+            "positionMs": 0,
+            "queueRevision": 1,
+            "controlVersion": 1,
+            "version": 1,
+            "epoch": 1,
+        }
+        message = self._output(
+            "state",
+            "playback.context.ensure",
+            context,
+            "ensure-exact-pair-1",
+        )
+        self.assertEqual(validate_strict_output(message), message)
+
+        invalid_values = (None, "", True, 1)
+        for value in invalid_values:
+            invalid = copy.deepcopy(message)
+            invalid["payload"]["authorityDeviceSessionId"] = value
+            with self.subTest(value=value):
+                with self.assertRaises(StrictOutputValidationError):
+                    validate_strict_output(invalid)
+
+        missing = copy.deepcopy(message)
+        del missing["payload"]["authorityDeviceSessionId"]
+        unknown = copy.deepcopy(message)
+        unknown["payload"]["authoritySid"] = "sid-1"
+        for invalid in (missing, unknown):
+            with self.assertRaises(StrictOutputValidationError):
+                validate_strict_output(invalid)
+
+    def test_live_context_error_requires_all_four_cursors(self):
+        payload = {
+            "action": "player.seek",
+            "code": "stale_version",
+            "message": "control cursor is stale",
+            "retryable": False,
+            "playbackContextId": "context-1",
+            "currentEpoch": 2,
+            "currentControlVersion": 4,
+            "currentQueueRevision": 3,
+            "currentVersion": 5,
+        }
+        message = self._output(
+            "system",
+            "system.error",
+            payload,
+            "seek-stale-1",
+        )
+        self.assertEqual(validate_strict_output(message), message)
+
+        for field_name in (
+            "playbackContextId",
+            "currentEpoch",
+            "currentControlVersion",
+            "currentQueueRevision",
+            "currentVersion",
+        ):
+            invalid = copy.deepcopy(message)
+            del invalid["payload"][field_name]
+            with self.subTest(missing=field_name):
+                with self.assertRaises(StrictOutputValidationError):
+                    validate_strict_output(invalid)
+
+        for value in (0, True, "1", None):
+            invalid = copy.deepcopy(message)
+            invalid["payload"]["currentEpoch"] = value
+            with self.subTest(current_epoch=value):
+                with self.assertRaises(StrictOutputValidationError):
+                    validate_strict_output(invalid)
+
+        unknown = copy.deepcopy(message)
+        unknown["payload"]["currentCursor"] = 5
+        with self.assertRaises(StrictOutputValidationError):
+            validate_strict_output(unknown)
+
+        conflict = copy.deepcopy(message)
+        conflict["payload"]["code"] = "conflict"
+        self.assertEqual(validate_strict_output(conflict), conflict)
+        del conflict["payload"]["currentEpoch"]
+        with self.assertRaises(StrictOutputValidationError):
+            validate_strict_output(conflict)
+
+        fingerprint_conflict = self._output(
+            "system",
+            "system.error",
+            {
+                "action": "player.seek",
+                "code": "conflict",
+                "message": "request fingerprint differs",
+                "retryable": False,
+            },
+            "seek-fingerprint-1",
+        )
+        self.assertEqual(
+            validate_strict_output(fingerprint_conflict),
+            fingerprint_conflict,
+        )
+
     def test_registration_schema_hash_is_optional_and_non_gating(self):
         metadata = {
             "protocolVersion": "2.8.0",
@@ -838,6 +947,7 @@ class StrictV2ContractTestCase(unittest.TestCase):
             {
                 "playbackContextId": "context-1",
                 "authorityClientId": "player-1",
+                "authorityDeviceSessionId": "device:player-1",
                 "queueSongIds": [],
                 "state": "idle",
                 "positionMs": 0,

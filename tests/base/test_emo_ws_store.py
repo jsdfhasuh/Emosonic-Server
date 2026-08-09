@@ -1151,6 +1151,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             {
                 "playbackContextId": "playback:alice:main",
                 "authorityClientId": "phone-1",
+                "authorityDeviceSessionId": "device:phone-1",
                 "originClientId": "phone-1",
                 "queueSongIds": ["song-1", "song-2"],
                 "currentIndex": 1,
@@ -1179,6 +1180,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             {
                 "playbackContextId": "playback:alice:main",
                 "authorityClientId": "phone-1",
+                "authorityDeviceSessionId": "device:phone-1",
                 "originClientId": "phone-1",
                 "queueSongIds": ["song-1"],
                 "currentIndex": 0,
@@ -1692,6 +1694,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             {
                 "playbackContextId": "playback:alice:main",
                 "authorityClientId": "phone-1",
+                "authorityDeviceSessionId": "device:phone-1",
                 "originClientId": "phone-1",
                 "queueSongIds": ["song-1"],
                 "currentIndex": 0,
@@ -1714,6 +1717,10 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertNotIn("logicalVolume", v2_context)
         self.assertEqual(v2_context["playbackContextId"], "playback:alice:main")
         self.assertEqual(v2_context["authorityClientId"], "phone-1")
+        self.assertEqual(
+            v2_context["authorityDeviceSessionId"],
+            "device:phone-1",
+        )
 
     def test_save_and_load_device_playback_state(self):
         saveDevicePlaybackState(

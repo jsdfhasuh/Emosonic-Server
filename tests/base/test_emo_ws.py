@@ -2843,6 +2843,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     context = response["payload"]
     self.assertEqual(context["playbackContextId"], "playback:alice:main")
     self.assertEqual(context["authorityClientId"], "phone-1")
+    self.assertEqual(context["authorityDeviceSessionId"], "root:phone")
     self.assertNotIn("sessionId", context)
     self.assertNotIn("sourceClientId", context)
     self.assertIsNone(getQueueState("playback:alice:main"))
@@ -3054,6 +3055,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     context = response["payload"]["playbackContext"]
     device_state = response["payload"]["deviceStates"][0]
     self.assertEqual(context["playbackContextId"], "playback:alice:main")
+    self.assertEqual(context["authorityDeviceSessionId"], "root:phone")
     self.assertNotIn("sessionId", context)
     self.assertNotIn("sourceClientId", context)
     self.assertEqual(device_state["clientId"], "phone-1")
