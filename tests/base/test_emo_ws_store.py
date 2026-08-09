@@ -4116,9 +4116,591 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             "dependency_failed",
         )
         context = getPlaybackContextState("context-1")
-        self.assertEqual(context["controlVersion"], 3)
+        self.assertEqual(context["controlVersion"], 4)
         self.assertEqual(context["currentIndex"], 0)
         self.assertEqual(context["trackId"], "song-1")
+
+    def test_failed_feedback_reconciles_terminal_gap_inline_once(self):
+        self._create_feedback_dependency_pair()
+        previous_context = getPlaybackContextState("context-1")
+        observed_previous = []
+        payload = {
+            "playbackContextId": "context-1",
+            "deviceSessionId": "device:player-1",
+            "origin": "remoteCommand",
+            "executionStatus": "failed",
+            "commandControlVersion": 2,
+            "appliedControlVersion": 1,
+            "errorCode": "track_load_failed",
+            "errorMessage": "decoder rejected the track",
+            "state": "playing",
+            "trackId": "song-1",
+            "positionMs": 25,
+            "positionSampledAtServerMs": 1590,
+            "playbackRate": 1.25,
+            "clientSeq": 2,
+        }
+
+        result = applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "authority-nonce-1",
+            payload,
+            1600,
+            post_mutation_hook=lambda _record, _result, previous, _device: (
+                observed_previous.append(previous)
+            ),
+            require_execution_eligible=True,
+        )
+
+        self.assertEqual(observed_previous, [previous_context])
+        self.assertEqual(result["canonicalUpdate"]["controlVersion"], 4)
+        self.assertEqual(result["canonicalUpdate"]["appliedControlVersion"], 4)
+        self.assertEqual(result["canonicalUpdate"]["commandControlVersion"], 2)
+        self.assertEqual(result["canonicalUpdate"]["executionStatus"], "failed")
+        self.assertEqual(result["canonicalUpdate"]["errorCode"], "track_load_failed")
+        self.assertEqual(
+            result["canonicalUpdate"]["errorMessage"],
+            "decoder rejected the track",
+        )
+        reconciliation = result["controlReconciliation"]
+        self.assertEqual(reconciliation["reconciliationControlVersion"], 4)
+        self.assertEqual(reconciliation["fromAppliedControlVersion"], 1)
+        self.assertEqual(reconciliation["throughControlVersion"], 3)
+        self.assertEqual(reconciliation["triggerKind"], "remote_failed")
+        self.assertEqual(reconciliation["triggerCommandControlVersion"], 2)
+
+        context = getPlaybackContextState("context-1")
+        device = getDevicePlaybackState("context-1", "player-1")
+        self.assertEqual(context["controlVersion"], 4)
+        self.assertEqual(context["version"], previous_context["version"] + 1)
+        self.assertEqual(context["queueRevision"], 3)
+        self.assertEqual(context["currentIndex"], 0)
+        self.assertEqual(context["trackId"], "song-1")
+        self.assertEqual(context["state"], "playing")
+        self.assertEqual(context["positionMs"], 25)
+        self.assertEqual(device["appliedControlVersion"], 4)
+        self.assertEqual(device["playbackRate"], 1.25)
+        for command_version, error_code in (
+            (2, "track_load_failed"),
+            (3, "dependency_failed"),
+        ):
+            transaction = getPlaybackControlTransaction(
+                "context-1",
+                1,
+                command_version,
+            )
+            self.assertEqual(transaction["status"], "failed")
+            self.assertEqual(transaction["errorCode"], error_code)
+            self.assertEqual(transaction["reconciledByControlVersion"], 4)
+            self.assertIsNotNone(transaction["terminalFingerprint"])
+        self.assertEqual(db.EmoPlaybackControlTransaction.select().count(), 2)
+        self.assertEqual(db.EmoPlaybackControlReconciliation.select().count(), 1)
+
+        duplicate = applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "authority-nonce-1",
+            payload,
+            1700,
+            require_execution_eligible=True,
+        )
+        self.assertTrue(duplicate["sourceOnly"])
+        self.assertEqual(duplicate["canonicalUpdate"], result["canonicalUpdate"])
+        self.assertEqual(getPlaybackContextState("context-1"), context)
+        self.assertEqual(db.EmoPlaybackControlReconciliation.select().count(), 1)
+
+    def test_passive_fact_reconciles_server_unknown_gap(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            100,
+            "playing",
+        )
+        applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "authority-nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 100,
+                "clientSeq": 1,
+            },
+            1000,
+        )
+        mutateStrictPlaybackContextControl(
+            "context-1",
+            "alice",
+            "controller-1",
+            "player.pause",
+            1,
+            requesting_client_id="controller-1",
+            requesting_device_session_id="device:controller-1",
+            requesting_connection_nonce="requester-nonce-1",
+            requesting_connection_epoch=1,
+            authority_client_id="player-1",
+            authority_device_session_id="device:player-1",
+            routed_connection_nonce="authority-nonce-1",
+            routed_connection_epoch=1,
+            accepted_at_ms=1100,
+            execution_timeout_ms=100,
+        )
+        markPlaybackControlTransactionExecutionEligible("context-1", 1, 2, 1200)
+        settlePlaybackControlTransaction(
+            "context-1",
+            1,
+            2,
+            "failed",
+            1300,
+            error_code="execution_unknown",
+            applied_control_version=1,
+        )
+        before = getPlaybackContextState("context-1")
+
+        result = applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "authority-nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 175,
+                "positionSampledAtServerMs": 1390,
+                "playbackRate": 1.5,
+                "clientSeq": 2,
+            },
+            1400,
+        )
+
+        self.assertEqual(result["canonicalUpdate"]["origin"], "passive")
+        self.assertEqual(result["canonicalUpdate"]["controlVersion"], 3)
+        self.assertEqual(result["canonicalUpdate"]["appliedControlVersion"], 3)
+        self.assertEqual(
+            result["controlReconciliation"]["triggerKind"],
+            "passive_terminal_gap",
+        )
+        self.assertEqual(
+            result["controlReconciliation"]["canonicalUpdate"],
+            result["canonicalUpdate"],
+        )
+        after = getPlaybackContextState("context-1")
+        self.assertEqual(after["version"], before["version"] + 1)
+        self.assertEqual(after["controlVersion"], 3)
+        self.assertEqual(after["queueRevision"], before["queueRevision"])
+        self.assertEqual(after["state"], "playing")
+        self.assertEqual(after["positionMs"], 175)
+        self.assertEqual(
+            getDevicePlaybackState("context-1", "player-1")[
+                "appliedControlVersion"
+            ],
+            3,
+        )
+        terminal = getPlaybackControlTransaction("context-1", 1, 2)
+        self.assertEqual(terminal["errorCode"], "execution_unknown")
+        self.assertEqual(terminal["reconciledByControlVersion"], 3)
+
+    def test_failed_feedback_waits_for_all_pending_before_passive_reconciliation(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            100,
+            "playing",
+        )
+        applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 100,
+                "clientSeq": 1,
+            },
+            1000,
+        )
+        for action, base_version, accepted_at_ms in (
+            ("player.pause", 1, 1100),
+            ("player.play", 2, 1200),
+        ):
+            mutateStrictPlaybackContextControl(
+                "context-1",
+                "alice",
+                "controller-1",
+                action,
+                base_version,
+                requesting_client_id="controller-1",
+                requesting_device_session_id="device:controller-1",
+                requesting_connection_nonce="requester-nonce-1",
+                requesting_connection_epoch=1,
+                authority_client_id="player-1",
+                authority_device_session_id="device:player-1",
+                routed_connection_nonce="nonce-1",
+                routed_connection_epoch=1,
+                accepted_at_ms=accepted_at_ms,
+                execution_timeout_ms=100,
+                deterministic_dependency_admission=True,
+            )
+        markPlaybackControlTransactionExecutionEligible("context-1", 1, 2, 1300)
+        markPlaybackControlTransactionExecutionEligible("context-1", 1, 3, 1300)
+
+        failed = applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "remoteCommand",
+                "executionStatus": "failed",
+                "commandControlVersion": 2,
+                "appliedControlVersion": 1,
+                "errorCode": "playback_failed",
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 100,
+                "clientSeq": 2,
+            },
+            1400,
+            require_execution_eligible=True,
+        )
+        self.assertNotIn("controlReconciliation", failed)
+        self.assertEqual(failed["canonicalUpdate"]["controlVersion"], 3)
+        self.assertEqual(failed["canonicalUpdate"]["appliedControlVersion"], 1)
+        self.assertEqual(db.EmoPlaybackControlReconciliation.select().count(), 0)
+        self.assertEqual(
+            getPlaybackControlTransaction("context-1", 1, 3)["status"],
+            "pending",
+        )
+
+        settlePlaybackControlTransaction(
+            "context-1",
+            1,
+            3,
+            "failed",
+            1500,
+            error_code="execution_unknown",
+            applied_control_version=1,
+        )
+        passive = applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 125,
+                "clientSeq": 3,
+            },
+            1600,
+        )
+        self.assertEqual(passive["canonicalUpdate"]["controlVersion"], 4)
+        self.assertEqual(passive["canonicalUpdate"]["appliedControlVersion"], 4)
+        self.assertEqual(db.EmoPlaybackControlReconciliation.select().count(), 1)
+        for command_version in (2, 3):
+            self.assertEqual(
+                getPlaybackControlTransaction(
+                    "context-1",
+                    1,
+                    command_version,
+                )["reconciledByControlVersion"],
+                4,
+            )
+
+    def test_reconciliation_rolls_back_with_post_mutation_failure(self):
+        self._create_feedback_dependency_pair()
+        before_context = getPlaybackContextState("context-1")
+        before_device = getDevicePlaybackState("context-1", "player-1")
+
+        with self.assertRaisesRegex(RuntimeError, "projection failed"):
+            applyStrictPlaybackUpdate(
+                "context-1",
+                "alice",
+                "player-1",
+                "device:player-1",
+                "authority-nonce-1",
+                {
+                    "playbackContextId": "context-1",
+                    "deviceSessionId": "device:player-1",
+                    "origin": "remoteCommand",
+                    "executionStatus": "failed",
+                    "commandControlVersion": 2,
+                    "appliedControlVersion": 1,
+                    "errorCode": "track_load_failed",
+                    "state": "playing",
+                    "trackId": "song-1",
+                    "positionMs": 0,
+                    "clientSeq": 2,
+                },
+                1600,
+                post_mutation_hook=lambda *_args: (_ for _ in ()).throw(
+                    RuntimeError("projection failed")
+                ),
+                require_execution_eligible=True,
+            )
+
+        self.assertEqual(getPlaybackContextState("context-1"), before_context)
+        self.assertEqual(
+            getDevicePlaybackState("context-1", "player-1"),
+            before_device,
+        )
+        self.assertEqual(db.EmoPlaybackControlReconciliation.select().count(), 0)
+        self.assertEqual(
+            getPlaybackControlTransaction("context-1", 1, 2)["status"],
+            "pending",
+        )
+        self.assertEqual(
+            getPlaybackControlTransaction("context-1", 1, 3)["status"],
+            "pending",
+        )
+
+    def test_first_prev_and_last_next_preserve_queue_revision(self):
+        cases = (
+            ("player.prev", 0, "paused", "playing", "song-1"),
+            ("player.next", 1, "playing", "stopped", "song-2"),
+        )
+        for action, index, initial_state, expected_state, track_id in cases:
+            with self.subTest(action=action):
+                context_id = "context-%s" % action
+                createStrictPlaybackContextState(
+                    context_id,
+                    "alice",
+                    "player-1",
+                    "device:player-1",
+                    ["song-1", "song-2"],
+                    index,
+                    500,
+                    initial_state,
+                )
+                before = getPlaybackContextState(context_id)
+                updated = mutateStrictPlaybackContextControl(
+                    context_id,
+                    "alice",
+                    "controller-1",
+                    action,
+                    1,
+                    position_ms=0,
+                )
+
+                self.assertEqual(updated["version"], before["version"] + 1)
+                self.assertEqual(
+                    updated["controlVersion"],
+                    before["controlVersion"] + 1,
+                )
+                self.assertEqual(
+                    updated["queueRevision"],
+                    before["queueRevision"],
+                )
+                self.assertEqual(updated["currentIndex"], index)
+                self.assertEqual(updated["trackId"], track_id)
+                self.assertEqual(updated["state"], expected_state)
+                self.assertEqual(updated["positionMs"], 0)
+                deletePlaybackContext(context_id)
+
+    def test_single_item_natural_terminal_advances_context_version_once(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            100,
+            "playing",
+        )
+        applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 100,
+                "clientSeq": 1,
+            },
+            1000,
+        )
+        before = getPlaybackContextState("context-1")
+        terminal_payload = {
+            "playbackContextId": "context-1",
+            "deviceSessionId": "device:player-1",
+            "origin": "passive",
+            "appliedControlVersion": 1,
+            "state": "stopped",
+            "trackId": "song-1",
+            "positionMs": 0,
+            "positionSampledAtServerMs": 1090,
+            "playbackRate": 1.0,
+            "clientSeq": 2,
+        }
+
+        terminal = applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            terminal_payload,
+            1100,
+        )
+        after = getPlaybackContextState("context-1")
+        self.assertTrue(terminal["naturalTerminal"])
+        self.assertEqual(after["state"], "stopped")
+        self.assertEqual(after["positionMs"], 0)
+        self.assertEqual(after["version"], before["version"] + 1)
+        self.assertEqual(after["epoch"], before["epoch"])
+        self.assertEqual(after["queueRevision"], before["queueRevision"])
+        self.assertEqual(after["controlVersion"], before["controlVersion"])
+
+        duplicate = applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            terminal_payload,
+            1200,
+        )
+        self.assertTrue(duplicate["sourceOnly"])
+        self.assertEqual(getPlaybackContextState("context-1"), after)
+
+        fresh_repeat_payload = dict(terminal_payload)
+        fresh_repeat_payload["clientSeq"] = 3
+        fresh_repeat = applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            fresh_repeat_payload,
+            1300,
+        )
+        self.assertNotIn("naturalTerminal", fresh_repeat)
+        self.assertEqual(getPlaybackContextState("context-1"), after)
+        self.assertEqual(
+            getDevicePlaybackState("context-1", "player-1")["clientSeq"],
+            3,
+        )
+
+    def test_natural_terminal_does_not_advance_context_with_pending_control(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            100,
+            "playing",
+        )
+        applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 100,
+                "clientSeq": 1,
+            },
+            1000,
+        )
+        mutateStrictPlaybackContextControl(
+            "context-1",
+            "alice",
+            "controller-1",
+            "player.seek",
+            1,
+            position_ms=200,
+            requesting_client_id="controller-1",
+            authority_client_id="player-1",
+            authority_device_session_id="device:player-1",
+            routed_connection_nonce="nonce-1",
+            accepted_at_ms=1100,
+            execution_timeout_ms=100,
+        )
+        before = getPlaybackContextState("context-1")
+
+        result = applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "stopped",
+                "trackId": "song-1",
+                "positionMs": 0,
+                "clientSeq": 2,
+            },
+            1200,
+        )
+
+        self.assertNotIn("naturalTerminal", result)
+        self.assertNotIn("controlReconciliation", result)
+        self.assertEqual(getPlaybackContextState("context-1"), before)
+        self.assertEqual(
+            getDevicePlaybackState("context-1", "player-1")["state"],
+            "stopped",
+        )
+        self.assertEqual(
+            getPlaybackControlTransaction("context-1", 1, 2)["status"],
+            "pending",
+        )
 
     def test_local_user_update_allocates_version_and_supersedes_pending(self):
         createStrictPlaybackContextState(
@@ -5180,6 +5762,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             1300,
         )
         reconciled = getPlaybackContextState("context-1")
+        self.assertEqual(reconciled["controlVersion"], 3)
         self.assertEqual(
             getPlaybackControlTransaction("context-1", 1, 2)["status"],
             "failed",
@@ -5197,12 +5780,12 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             position_sampled_at_server_ms=1400,
             connection_nonce="nonce-1",
         )
-        self.assertEqual(advanced["controlVersion"], 3)
+        self.assertEqual(advanced["controlVersion"], 4)
         self.assertEqual(
             getDevicePlaybackState("context-1", "player-1")[
                 "appliedControlVersion"
             ],
-            3,
+            4,
         )
 
     def test_queue_sync_rolls_back_context_and_device_state(self):

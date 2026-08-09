@@ -2015,9 +2015,14 @@ def _validate_playback_update_output(payload: object) -> None:
             if "errorCode" in update or "errorMessage" in update:
                 _output_error("committed playback.update forbids error fields")
         else:
-            if applied_version >= command_version:
+            inline_reconciliation = (
+                command_version < applied_version
+                and applied_version == control_version
+            )
+            if applied_version >= command_version and not inline_reconciliation:
                 _output_error(
-                    "failed appliedControlVersion must be below commandControlVersion"
+                    "failed appliedControlVersion must be below commandControlVersion "
+                    "or equal an inline reconciliation controlVersion"
                 )
             if update.get("errorCode") not in {
                 "playback_failed",

@@ -9017,10 +9017,11 @@ def _handle_strict_v2_playback_update(
                 playback_context,
             ),
         )
-    if payload["origin"] == "localUser" or (
+    context_and_queue_changed = payload["origin"] == "localUser" or (
         payload["origin"] == "remoteCommand"
         and payload["executionStatus"] == "failed"
-    ):
+    ) or result.get("controlReconciliation") is not None
+    if context_and_queue_changed:
         _run_post_commit_push(
             "playback.update",
             request_id,
@@ -9029,6 +9030,15 @@ def _handle_strict_v2_playback_update(
                 playback_context["playbackContextId"],
             ),
         )
+        _run_post_commit_push(
+            "playback.update",
+            request_id,
+            lambda: _broadcast_playback_context_state_v2(
+                current_user_name,
+                playback_context["playbackContextId"],
+            ),
+        )
+    elif result.get("naturalTerminal"):
         _run_post_commit_push(
             "playback.update",
             request_id,

@@ -3685,6 +3685,115 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             before_context,
         )
 
+    def test_last_track_natural_terminal_derives_one_broadcast_pause(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+
+        self.sync_source_queue(
+            authority,
+            ["source-song-1", "source-song-2"],
+            current_index=1,
+            position_ms=500,
+            request_id="natural-terminal-last-index",
+        )
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        before = getPlaybackContextState("context-broadcast-source")
+        self.assertEqual(before["currentIndex"], 1)
+        self.assertEqual(before["trackId"], "source-song-2")
+        self.assertEqual(
+            emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])[
+                "snapshot"
+            ]["broadcastRevision"],
+            2,
+        )
+
+        sampled_at_ms = int(time.time() * 1000)
+        self.update_source_playback(
+            authority,
+            2,
+            sampled_at_ms,
+            state="stopped",
+            trackId="source-song-2",
+            positionMs=0,
+        )
+        source_messages = self.get_messages(authority)
+        participant_messages = self.get_messages(participant)
+        controller_messages = self.get_messages(controller)
+        self.assertTrue(
+            any(
+                message["action"] == "playback.update"
+                for message in source_messages
+            )
+        )
+        participant_pause = self._push(participant_messages, "broadcast.pause")
+        controller_pause = self._push(controller_messages, "broadcast.pause")
+        for pause in (participant_pause, controller_pause):
+            self.assertEqual(pause["payload"]["broadcastRevision"], 3)
+            self.assertEqual(pause["payload"]["state"], "stopped")
+            self.assertEqual(pause["payload"]["currentIndex"], 1)
+            self.assertEqual(pause["payload"]["trackId"], "source-song-2")
+            self.assertEqual(pause["payload"]["positionMs"], 0)
+
+        after = getPlaybackContextState("context-broadcast-source")
+        self.assertEqual(after["version"], before["version"] + 1)
+        self.assertEqual(after["queueRevision"], before["queueRevision"])
+        self.assertEqual(after["controlVersion"], before["controlVersion"])
+        self.assertEqual(after["state"], "stopped")
+        self.assertEqual(after["positionMs"], 0)
+
+        self.update_source_playback(
+            authority,
+            2,
+            sampled_at_ms,
+            state="stopped",
+            trackId="source-song-2",
+            positionMs=0,
+        )
+        self.get_messages(authority)
+        for client in (participant, controller):
+            self.assertFalse(
+                any(
+                    message["action"] == "broadcast.pause"
+                    for message in self.get_messages(client)
+                )
+            )
+
+        self.update_source_playback(
+            authority,
+            3,
+            sampled_at_ms + 1,
+            state="stopped",
+            trackId="source-song-2",
+            positionMs=0,
+        )
+        self.get_messages(authority)
+        for client in (participant, controller):
+            self.assertFalse(
+                any(
+                    message["action"] == "broadcast.pause"
+                    for message in self.get_messages(client)
+                )
+            )
+        self.assertEqual(
+            emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])[
+                "snapshot"
+            ]["broadcastRevision"],
+            3,
+        )
+        self.assertEqual(
+            getPlaybackContextState("context-broadcast-source"),
+            after,
+        )
+
     def test_source_updates_use_deterministic_broadcast_actions(self):
         authority, participant, controller = self.connect_broadcast_devices()
         start_ack = self.get_ack(

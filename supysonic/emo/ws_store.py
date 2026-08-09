@@ -2748,6 +2748,232 @@ def _settle_stale_playback_correction(
     return canonical
 
 
+def _reconcile_terminal_control_gap(
+    record,
+    client_id,
+    device_session_id,
+    origin,
+    payload,
+    applied_control_version,
+    client_seq,
+    server_updated_at_ms,
+    trigger_command_control_version=None,
+):
+    through_control_version = record.control_version
+    if applied_control_version >= through_control_version:
+        return None
+
+    pending_exists = (
+        EmoPlaybackControlTransaction.select()
+        .where(
+            (
+                EmoPlaybackControlTransaction.playback_context_id
+                == record.playback_context_id
+            )
+            & (EmoPlaybackControlTransaction.epoch == record.epoch)
+            & (EmoPlaybackControlTransaction.status == "pending")
+        )
+        .exists()
+    )
+    if pending_exists:
+        return None
+
+    gap_records = list(
+        EmoPlaybackControlTransaction.select()
+        .where(
+            (
+                EmoPlaybackControlTransaction.playback_context_id
+                == record.playback_context_id
+            )
+            & (EmoPlaybackControlTransaction.epoch == record.epoch)
+            & (
+                EmoPlaybackControlTransaction.command_control_version
+                > applied_control_version
+            )
+            & (
+                EmoPlaybackControlTransaction.command_control_version
+                <= through_control_version
+            )
+        )
+        .order_by(EmoPlaybackControlTransaction.command_control_version)
+    )
+    if (
+        not gap_records
+        or any(
+            gap_record.status not in {"committed", "failed", "superseded"}
+            for gap_record in gap_records
+        )
+        or not any(gap_record.status == "failed" for gap_record in gap_records)
+        or any(
+            gap_record.reconciled_by_control_version is not None
+            for gap_record in gap_records
+        )
+    ):
+        return None
+
+    overlapping_reconciliation = (
+        EmoPlaybackControlReconciliation.select()
+        .where(
+            (
+                EmoPlaybackControlReconciliation.playback_context_id
+                == record.playback_context_id
+            )
+            & (EmoPlaybackControlReconciliation.epoch == record.epoch)
+            & (
+                EmoPlaybackControlReconciliation.through_control_version
+                > applied_control_version
+            )
+            & (
+                EmoPlaybackControlReconciliation.through_control_version
+                <= through_control_version
+            )
+        )
+        .exists()
+    )
+    if overlapping_reconciliation:
+        return None
+
+    queue_song_ids = json.loads(record.queue_json)
+    actual_track_id = payload.get("trackId")
+    if (
+        not isinstance(actual_track_id, str)
+        or not actual_track_id
+        or queue_song_ids.count(actual_track_id) != 1
+    ):
+        return None
+    actual_index = queue_song_ids.index(actual_track_id)
+
+    reconciliation_control_version = through_control_version + 1
+    if record.current_index != actual_index:
+        record.queue_revision += 1
+    record.current_index = actual_index
+    record.track_id = actual_track_id
+    record.state = payload["state"]
+    record.position_ms = payload["positionMs"]
+    record.origin_client_id = client_id
+    record.control_version = reconciliation_control_version
+    record.version += 1
+    playback_json = (
+        json.loads(record.playback_json) if record.playback_json else {}
+    )
+    playback_json["positionSampledAtServerMs"] = payload[
+        "positionSampledAtServerMs"
+    ]
+    record.playback_json = json.dumps(playback_json, ensure_ascii=True)
+    record.updated_at = now()
+    record.save()
+
+    canonical = _strict_playback_update_canonical(
+        record,
+        client_id,
+        device_session_id,
+        origin,
+        payload,
+        reconciliation_control_version,
+        client_seq,
+        server_updated_at_ms,
+        command_control_version=trigger_command_control_version,
+    )
+    actual_fact = {
+        "playbackContextId": record.playback_context_id,
+        "sourceClientId": client_id,
+        "deviceSessionId": device_session_id,
+        "origin": origin,
+        "appliedControlVersion": applied_control_version,
+        "state": payload["state"],
+        "trackId": actual_track_id,
+        "positionMs": payload["positionMs"],
+        "positionSampledAtServerMs": payload["positionSampledAtServerMs"],
+        "playbackRate": payload["playbackRate"],
+        "clientSeq": client_seq,
+        "serverUpdatedAtMs": server_updated_at_ms,
+    }
+    for field_name in ("volume", "muted"):
+        if field_name in payload:
+            actual_fact[field_name] = payload[field_name]
+    reconciliation = EmoPlaybackControlReconciliation.create(
+        playback_context_id=record.playback_context_id,
+        user_name=record.user_name,
+        epoch=record.epoch,
+        reconciliation_control_version=reconciliation_control_version,
+        from_applied_control_version=applied_control_version,
+        through_control_version=through_control_version,
+        trigger_kind=(
+            "remote_failed"
+            if trigger_command_control_version is not None
+            else "passive_terminal_gap"
+        ),
+        trigger_command_control_version=trigger_command_control_version,
+        actual_fact_fingerprint=_json_fingerprint(actual_fact),
+        actual_fact_json=_canonical_json(actual_fact),
+        canonical_update_json=_canonical_json(canonical),
+        server_updated_at_ms=server_updated_at_ms,
+        created_at=now(),
+        updated_at=now(),
+    )
+    reconciled_at = now()
+    for gap_record in gap_records:
+        gap_record.reconciled_by_control_version = (
+            reconciliation_control_version
+        )
+        gap_record.updated_at = reconciled_at
+        gap_record.save(
+            only=(
+                EmoPlaybackControlTransaction.reconciled_by_control_version,
+                EmoPlaybackControlTransaction.updated_at,
+            )
+        )
+    return canonical, serializePlaybackControlReconciliation(reconciliation)
+
+
+def _apply_passive_natural_terminal(
+    record,
+    client_id,
+    payload,
+    applied_control_version,
+):
+    queue_song_ids = json.loads(record.queue_json)
+    if (
+        applied_control_version != record.control_version
+        or not queue_song_ids
+        or record.current_index != len(queue_song_ids) - 1
+        or record.track_id != queue_song_ids[-1]
+        or record.state != "playing"
+        or payload["state"] != "stopped"
+        or payload.get("trackId") != queue_song_ids[-1]
+        or payload["positionMs"] != 0
+    ):
+        return False
+    if (
+        EmoPlaybackControlTransaction.select()
+        .where(
+            (
+                EmoPlaybackControlTransaction.playback_context_id
+                == record.playback_context_id
+            )
+            & (EmoPlaybackControlTransaction.epoch == record.epoch)
+            & (EmoPlaybackControlTransaction.status == "pending")
+        )
+        .exists()
+    ):
+        return False
+
+    record.state = "stopped"
+    record.position_ms = 0
+    record.origin_client_id = client_id
+    record.version += 1
+    playback_json = (
+        json.loads(record.playback_json) if record.playback_json else {}
+    )
+    playback_json["positionSampledAtServerMs"] = payload[
+        "positionSampledAtServerMs"
+    ]
+    record.playback_json = json.dumps(playback_json, ensure_ascii=True)
+    record.updated_at = now()
+    record.save()
+    return True
+
+
 @_serialize_strict_playback_context_mutation
 def applyStrictPlaybackUpdate(
     playback_context_id,
@@ -2775,6 +3001,7 @@ def applyStrictPlaybackUpdate(
             if record is None:
                 return None
             current = _playback_context_payload(record)
+            previous_context = dict(current)
             if (
                 record.authority_client_id != client_id
                 or record.authority_device_session_id != device_session_id
@@ -2850,6 +3077,8 @@ def applyStrictPlaybackUpdate(
             dependency_records = []
             eligible_dependency_records = []
             terminal_control_versions = []
+            control_reconciliation = None
+            natural_terminal = False
 
             if origin == "passive":
                 applied = payload["appliedControlVersion"]
@@ -2879,7 +3108,7 @@ def applyStrictPlaybackUpdate(
                     raise PlaybackControlTransactionConflictError(
                         "Passive update cannot advance appliedControlVersion"
                     )
-                canonical = _strict_playback_update_canonical(
+                reconciliation_result = _reconcile_terminal_control_gap(
                     record,
                     client_id,
                     device_session_id,
@@ -2889,6 +3118,25 @@ def applyStrictPlaybackUpdate(
                     incoming_client_seq,
                     server_updated_at_ms,
                 )
+                if reconciliation_result is not None:
+                    canonical, control_reconciliation = reconciliation_result
+                else:
+                    natural_terminal = _apply_passive_natural_terminal(
+                        record,
+                        client_id,
+                        payload,
+                        applied,
+                    )
+                    canonical = _strict_playback_update_canonical(
+                        record,
+                        client_id,
+                        device_session_id,
+                        origin,
+                        payload,
+                        applied,
+                        incoming_client_seq,
+                        server_updated_at_ms,
+                    )
 
             elif origin == "remoteCommand":
                 command_version = payload["commandControlVersion"]
@@ -3018,31 +3266,6 @@ def applyStrictPlaybackUpdate(
                 )
                 terminal_control_versions.append(command_version)
 
-                if terminal_changed and terminal_status == "failed":
-                    queue = json.loads(record.queue_json)
-                    actual_index = (
-                        queue.index(payload["trackId"])
-                        if payload.get("trackId") in queue
-                        else record.current_index
-                    )
-                    snapshot_changed = (
-                        record.state != payload["state"]
-                        or record.position_ms != payload["positionMs"]
-                        or record.current_index != actual_index
-                        or record.track_id != payload.get("trackId")
-                    )
-                    if snapshot_changed:
-                        if record.current_index != actual_index:
-                            record.queue_revision += 1
-                        record.current_index = actual_index
-                        record.track_id = payload.get("trackId")
-                        record.state = payload["state"]
-                        record.position_ms = payload["positionMs"]
-                        record.version += 1
-                        record.updated_at = now()
-                        record.save()
-                        current = _playback_context_payload(record)
-
                 if terminal_changed:
                     (
                         eligible_dependencies,
@@ -3059,17 +3282,33 @@ def applyStrictPlaybackUpdate(
                         for dependency in settled_dependencies
                     )
 
-                canonical = _strict_playback_update_canonical(
-                    record,
-                    client_id,
-                    device_session_id,
-                    origin,
-                    payload,
-                    applied,
-                    incoming_client_seq,
-                    server_updated_at_ms,
-                    command_control_version=command_version,
-                )
+                reconciliation_result = None
+                if terminal_changed and terminal_status == "failed":
+                    reconciliation_result = _reconcile_terminal_control_gap(
+                        record,
+                        client_id,
+                        device_session_id,
+                        origin,
+                        payload,
+                        applied,
+                        incoming_client_seq,
+                        server_updated_at_ms,
+                        trigger_command_control_version=command_version,
+                    )
+                if reconciliation_result is not None:
+                    canonical, control_reconciliation = reconciliation_result
+                else:
+                    canonical = _strict_playback_update_canonical(
+                        record,
+                        client_id,
+                        device_session_id,
+                        origin,
+                        payload,
+                        applied,
+                        incoming_client_seq,
+                        server_updated_at_ms,
+                        command_control_version=command_version,
+                    )
 
             else:
                 if payload["epoch"] != record.epoch:
@@ -3223,11 +3462,15 @@ def applyStrictPlaybackUpdate(
                 "dependencySettlements": dependency_records,
                 "terminalControlVersions": terminal_control_versions,
             }
+            if control_reconciliation is not None:
+                result["controlReconciliation"] = control_reconciliation
+            if natural_terminal:
+                result["naturalTerminal"] = True
             if post_mutation_hook is not None:
                 result["_broadcastMutation"] = post_mutation_hook(
                     record,
                     result,
-                    current,
+                    previous_context,
                     previous_device_state,
                 )
             return result
@@ -4985,17 +5228,18 @@ def mutateStrictPlaybackContextControl(
                 raise PlaybackContextStaleVersionError(current, "queueRevision")
 
             queue_song_ids = json.loads(record.queue_json)
+            previous_current_index = record.current_index
+            terminal_next = False
             if action == "queue.playItem":
                 if current_index is None or current_index >= len(queue_song_ids):
                     raise ValueError("queue.playItem queueIndex is out of bounds")
             elif action == "player.next":
                 current_index = record.current_index + 1
                 if current_index >= len(queue_song_ids):
-                    raise ValueError("player.next queueIndex is out of bounds")
+                    current_index = record.current_index
+                    terminal_next = True
             elif action == "player.prev":
-                if record.current_index <= 0:
-                    raise ValueError("player.prev queueIndex is out of bounds")
-                current_index = record.current_index - 1
+                current_index = max(0, record.current_index - 1)
             if requesting_client_id is not None:
                 _validate_control_transaction_inputs(
                     user_name,
@@ -5019,7 +5263,14 @@ def mutateStrictPlaybackContextControl(
             if current_index is not None:
                 record.current_index = current_index
                 record.track_id = queue_song_ids[current_index]
-            if action in {"player.play", "queue.playItem", "player.next", "player.prev"}:
+            if terminal_next:
+                record.state = "stopped"
+            elif action in {
+                "player.play",
+                "queue.playItem",
+                "player.next",
+                "player.prev",
+            }:
                 record.state = "playing"
             elif action == "player.pause":
                 record.state = "paused"
@@ -5028,7 +5279,10 @@ def mutateStrictPlaybackContextControl(
             record.origin_client_id = updated_by_client_id
             record.version += 1
             record.control_version += 1
-            if action in {"queue.playItem", "player.next", "player.prev"}:
+            if action == "queue.playItem" or (
+                action in {"player.next", "player.prev"}
+                and record.current_index != previous_current_index
+            ):
                 record.queue_revision += 1
             record.updated_at = now()
             record.save()

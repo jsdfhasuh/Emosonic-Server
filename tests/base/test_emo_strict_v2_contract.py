@@ -860,6 +860,49 @@ class StrictV2ContractTestCase(unittest.TestCase):
         self.assertEqual(validate_strict_output(status), status)
         self.assertEqual(validate_strict_output(feedback), feedback)
 
+    def test_failed_output_accepts_only_exact_inline_reconciliation_cursor(self):
+        payload = {
+            "playbackContextId": "context-1",
+            "sourceClientId": "player-1",
+            "deviceSessionId": "device:player-1",
+            "origin": "remoteCommand",
+            "controlVersion": 4,
+            "appliedControlVersion": 4,
+            "executionStatus": "failed",
+            "commandControlVersion": 2,
+            "errorCode": "track_load_failed",
+            "state": "playing",
+            "trackId": "song-1",
+            "positionMs": 25,
+            "positionSampledAtServerMs": 950,
+            "playbackRate": 1.0,
+            "clientSeq": 2,
+            "serverUpdatedAtMs": 1000,
+        }
+        message = self._output("event", "playback.update", payload)
+
+        self.assertEqual(validate_strict_output(message), message)
+
+        for applied_control_version in (2, 3, 5):
+            invalid = copy.deepcopy(message)
+            invalid["payload"]["appliedControlVersion"] = applied_control_version
+            with self.subTest(applied=applied_control_version):
+                with self.assertRaises(StrictOutputValidationError):
+                    validate_strict_output(invalid)
+
+        request = {
+            "type": "event",
+            "action": "playback.update",
+            "requestId": "failed-inline-input-1",
+            "payload": {
+                key: value
+                for key, value in payload.items()
+                if key not in {"sourceClientId", "controlVersion", "serverUpdatedAtMs"}
+            },
+        }
+        with self.assertRaises(StrictRequestValidationError):
+            validate_strict_request(request)
+
     def test_context_snapshot_requires_exact_authority_pair(self):
         context = {
             "playbackContextId": "context-1",

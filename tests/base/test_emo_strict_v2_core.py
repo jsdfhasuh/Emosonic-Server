@@ -3462,12 +3462,17 @@ class StrictV2CoreTestCase(unittest.TestCase):
                 "clientSeq": 2,
             },
         )
-        self.assertTrue(
-            any(
-                message["action"] == "playback.update"
-                and message["payload"]["executionStatus"] == "failed"
-                for message in failed
-            )
+        failed_confirmation = next(
+            message
+            for message in failed
+            if message["action"] == "playback.update"
+            and message["payload"]["executionStatus"] == "failed"
+        )
+        self.assertEqual(failed_confirmation["payload"]["commandControlVersion"], 2)
+        self.assertEqual(failed_confirmation["payload"]["controlVersion"], 5)
+        self.assertEqual(
+            failed_confirmation["payload"]["appliedControlVersion"],
+            5,
         )
         settled = [
             message
@@ -3494,8 +3499,287 @@ class StrictV2CoreTestCase(unittest.TestCase):
             "failed",
         )
         context = getPlaybackContextState("context-1")
-        self.assertEqual(context["controlVersion"], 4)
+        self.assertEqual(context["controlVersion"], 5)
         self.assertEqual(context["trackId"], "song-2")
+        reconciliations = emo_store.listPlaybackControlReconciliations(
+            "context-1",
+            1,
+        )
+        self.assertEqual(len(reconciliations), 1)
+        self.assertEqual(reconciliations[0]["reconciliationControlVersion"], 5)
+        self.assertEqual(reconciliations[0]["throughControlVersion"], 4)
+        self.assertEqual(
+            {
+                emo_ws.getPlaybackControlTransaction(
+                    "context-1",
+                    1,
+                    command_version,
+                )["reconciledByControlVersion"]
+                for command_version in (2, 3, 4)
+            },
+            {5},
+        )
+
+    def test_passive_actual_reconciles_execution_unknown_gap(self):
+        player = self.ready_strict_client()
+        self.create_context(player, queue_song_ids=["song-1"])
+        self.emit_strict(
+            player,
+            "event",
+            "playback.update",
+            "unknown-gap-baseline",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 1200,
+                "clientSeq": 1,
+            },
+        )
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-unknown-gap",
+            device_session_id="device:controller-unknown-gap",
+        )
+        with mock.patch.object(socketio, "start_background_task"):
+            self.emit_strict(
+                controller,
+                "command",
+                "player.pause",
+                "unknown-gap-pause",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                },
+            )
+        self.messages(player)
+        transaction = emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        emo_store.settlePlaybackControlTransaction(
+            "context-1",
+            1,
+            2,
+            "failed",
+            transaction["executionEligibleAtMs"] + 1,
+            error_code="execution_unknown",
+            applied_control_version=1,
+        )
+
+        messages = self.emit_strict(
+            player,
+            "event",
+            "playback.update",
+            "unknown-gap-passive",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 1350,
+                "clientSeq": 2,
+            },
+        )
+
+        confirmation = next(
+            message
+            for message in messages
+            if message["action"] == "playback.update"
+        )
+        self.assertEqual(confirmation["payload"]["origin"], "passive")
+        self.assertEqual(confirmation["payload"]["controlVersion"], 3)
+        self.assertEqual(confirmation["payload"]["appliedControlVersion"], 3)
+        self.assertTrue(
+            any(
+                message["action"] == "playback.context.status"
+                for message in messages
+            )
+        )
+        context = getPlaybackContextState("context-1")
+        self.assertEqual(context["controlVersion"], 3)
+        self.assertEqual(context["state"], "playing")
+        self.assertEqual(context["positionMs"], 1350)
+        terminal = emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        self.assertEqual(terminal["errorCode"], "execution_unknown")
+        self.assertEqual(terminal["reconciledByControlVersion"], 3)
+        self.assertEqual(
+            emo_ws.getDevicePlaybackState("context-1", "phone-1")[
+                "appliedControlVersion"
+            ],
+            3,
+        )
+
+    def test_single_item_prev_and_next_use_no_repeat_boundaries(self):
+        player = self.ready_strict_client()
+        self.create_context(
+            player,
+            queue_song_ids=["song-only"],
+            position_ms=500,
+        )
+        self.emit_strict(
+            player,
+            "event",
+            "playback.update",
+            "single-boundary-baseline",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-only",
+                "positionMs": 500,
+                "clientSeq": 1,
+            },
+        )
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-boundary",
+            device_session_id="device:controller-boundary",
+        )
+
+        with mock.patch.object(socketio, "start_background_task"):
+            prev_messages = self.emit_strict(
+                controller,
+                "command",
+                "player.prev",
+                "single-first-prev",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                },
+            )
+        self.assertTrue(
+            any(message["action"] == "system.ack" for message in prev_messages)
+        )
+        prev_command = next(
+            message
+            for message in self.messages(player)
+            if message["action"] == "player.prev"
+        )
+        self.assertEqual(prev_command["payload"]["controlVersion"], 2)
+        after_prev = getPlaybackContextState("context-1")
+        self.assertEqual(after_prev["currentIndex"], 0)
+        self.assertEqual(after_prev["trackId"], "song-only")
+        self.assertEqual(after_prev["queueRevision"], 1)
+        self.assertEqual(after_prev["state"], "playing")
+        self.assertEqual(after_prev["positionMs"], 0)
+
+        self.emit_strict(
+            player,
+            "event",
+            "playback.update",
+            "single-prev-committed",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "origin": "remoteCommand",
+                "executionStatus": "committed",
+                "commandControlVersion": 2,
+                "appliedControlVersion": 2,
+                "state": "playing",
+                "trackId": "song-only",
+                "positionMs": 0,
+                "clientSeq": 2,
+            },
+        )
+        self.messages(controller)
+
+        with mock.patch.object(socketio, "start_background_task"):
+            next_messages = self.emit_strict(
+                controller,
+                "command",
+                "player.next",
+                "single-last-next",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 2,
+                },
+            )
+        self.assertTrue(
+            any(message["action"] == "system.ack" for message in next_messages)
+        )
+        next_command = next(
+            message
+            for message in self.messages(player)
+            if message["action"] == "player.next"
+        )
+        self.assertEqual(next_command["payload"]["controlVersion"], 3)
+        after_next = getPlaybackContextState("context-1")
+        self.assertEqual(after_next["currentIndex"], 0)
+        self.assertEqual(after_next["trackId"], "song-only")
+        self.assertEqual(after_next["queueRevision"], 1)
+        self.assertEqual(after_next["state"], "stopped")
+        self.assertEqual(after_next["positionMs"], 0)
+
+    def test_last_track_natural_terminal_pushes_context_once(self):
+        player = self.ready_strict_client()
+        self.create_context(player, queue_song_ids=["song-only"])
+        self.emit_strict(
+            player,
+            "event",
+            "playback.update",
+            "natural-terminal-baseline",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-only",
+                "positionMs": 1200,
+                "clientSeq": 1,
+            },
+        )
+        before = getPlaybackContextState("context-1")
+        terminal_payload = {
+            "playbackContextId": "context-1",
+            "deviceSessionId": "device:phone-1",
+            "origin": "passive",
+            "appliedControlVersion": 1,
+            "state": "stopped",
+            "trackId": "song-only",
+            "positionMs": 0,
+            "clientSeq": 2,
+        }
+
+        messages = self.emit_strict(
+            player,
+            "event",
+            "playback.update",
+            "natural-terminal",
+            terminal_payload,
+        )
+        after = getPlaybackContextState("context-1")
+        self.assertEqual(after["version"], before["version"] + 1)
+        self.assertEqual(after["queueRevision"], before["queueRevision"])
+        self.assertEqual(after["controlVersion"], before["controlVersion"])
+        self.assertEqual(after["state"], "stopped")
+        self.assertEqual(
+            sum(
+                message["action"] == "playback.context.status"
+                for message in messages
+            ),
+            1,
+        )
+
+        duplicate = self.emit_strict(
+            player,
+            "event",
+            "playback.update",
+            "natural-terminal-duplicate",
+            terminal_payload,
+        )
+        self.assertEqual(getPlaybackContextState("context-1"), after)
+        self.assertFalse(
+            any(
+                message["action"] == "playback.context.status"
+                for message in duplicate
+            )
+        )
 
     def test_stale_applied_update_returns_passive_correction_only_to_source(self):
         player = self.ready_strict_client()
