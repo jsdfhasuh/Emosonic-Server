@@ -9,7 +9,7 @@ from functools import wraps
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 from uuid import uuid4
 
-from peewee import IntegrityError, SqliteDatabase
+from peewee import IntegrityError, SqliteDatabase, fn
 
 from ..db import (
     EmoBroadcastFence,
@@ -134,6 +134,11 @@ _TRACK_CHANGING_CONTROL_ACTIONS = frozenset(
         "player.prev",
     }
 )
+_TERMINAL_CONTROL_STATUSES = ("committed", "failed", "superseded")
+
+STRICT_CORE_RETENTION_LIMIT = 512
+STRICT_CORE_RETRY_WINDOW_MS = 10 * 60 * 1000
+STRICT_CORE_CLEANUP_BATCH_SIZE = 128
 
 
 class PlaybackControlTransactionSettlementResult(tuple):
@@ -1428,6 +1433,457 @@ def listCoreStartupRecoveries():
         return [serializeCoreStartupRecovery(record) for record in query]
     finally:
         close_connection()
+
+
+def _require_retention_limit(value, field_name):
+    _require_integer(value, field_name, 0)
+    if value > STRICT_CORE_RETENTION_LIMIT:
+        raise ValueError(
+            "%s must not exceed %d" % (field_name, STRICT_CORE_RETENTION_LIMIT)
+        )
+
+
+def _core_retention_event_key(record_kind, record):
+    if record_kind == "control":
+        return (
+            record.terminal_at_ms,
+            record.epoch,
+            record.command_control_version,
+            0,
+            str(record.id),
+        )
+    return (
+        record.server_updated_at_ms,
+        record.epoch,
+        record.reconciliation_control_version,
+        1,
+        str(record.id),
+    )
+
+
+def _recent_core_retention_record_ids(playback_context_id, retention_limit):
+    if retention_limit == 0:
+        return set(), set()
+    controls = list(
+        EmoPlaybackControlTransaction.select(
+            EmoPlaybackControlTransaction.id,
+            EmoPlaybackControlTransaction.terminal_at_ms,
+            EmoPlaybackControlTransaction.epoch,
+            EmoPlaybackControlTransaction.command_control_version,
+        )
+        .where(
+            (EmoPlaybackControlTransaction.playback_context_id
+             == playback_context_id)
+            & (EmoPlaybackControlTransaction.status.in_(_TERMINAL_CONTROL_STATUSES))
+            & (EmoPlaybackControlTransaction.terminal_at_ms.is_null(False))
+        )
+        .order_by(
+            EmoPlaybackControlTransaction.terminal_at_ms.desc(),
+            EmoPlaybackControlTransaction.epoch.desc(),
+            EmoPlaybackControlTransaction.command_control_version.desc(),
+            EmoPlaybackControlTransaction.id.desc(),
+        )
+        .limit(retention_limit)
+    )
+    reconciliations = list(
+        EmoPlaybackControlReconciliation.select(
+            EmoPlaybackControlReconciliation.id,
+            EmoPlaybackControlReconciliation.server_updated_at_ms,
+            EmoPlaybackControlReconciliation.epoch,
+            EmoPlaybackControlReconciliation.reconciliation_control_version,
+        )
+        .where(
+            EmoPlaybackControlReconciliation.playback_context_id
+            == playback_context_id
+        )
+        .order_by(
+            EmoPlaybackControlReconciliation.server_updated_at_ms.desc(),
+            EmoPlaybackControlReconciliation.epoch.desc(),
+            EmoPlaybackControlReconciliation.reconciliation_control_version.desc(),
+            EmoPlaybackControlReconciliation.id.desc(),
+        )
+        .limit(retention_limit)
+    )
+    recent = [
+        (_core_retention_event_key("control", record), "control", record.id)
+        for record in controls
+    ]
+    recent.extend(
+        (
+            _core_retention_event_key("reconciliation", record),
+            "reconciliation",
+            record.id,
+        )
+        for record in reconciliations
+    )
+    recent.sort(key=lambda item: item[0], reverse=True)
+    recent = recent[:retention_limit]
+    return (
+        {record_id for _key, kind, record_id in recent if kind == "control"},
+        {
+            record_id
+            for _key, kind, record_id in recent
+            if kind == "reconciliation"
+        },
+    )
+
+
+def _oldest_unreferenced_terminal_control(
+    playback_context_id,
+    cutoff_at_ms,
+    retained_control_ids,
+):
+    dependent = EmoPlaybackControlTransaction.alias("dependent_control")
+    audit = EmoPlaybackControlReconciliation.alias("control_audit")
+    dependency_reference = fn.EXISTS(
+        dependent.select(dependent.id).where(
+            (dependent.playback_context_id
+             == EmoPlaybackControlTransaction.playback_context_id)
+            & (dependent.epoch == EmoPlaybackControlTransaction.epoch)
+            & (
+                dependent.depends_on_control_version
+                == EmoPlaybackControlTransaction.command_control_version
+            )
+        )
+    )
+    audit_reference = fn.EXISTS(
+        audit.select(audit.id).where(
+            (audit.playback_context_id
+             == EmoPlaybackControlTransaction.playback_context_id)
+            & (audit.epoch == EmoPlaybackControlTransaction.epoch)
+            & (
+                (
+                    audit.trigger_command_control_version
+                    == EmoPlaybackControlTransaction.command_control_version
+                )
+                | (
+                    (
+                        audit.from_applied_control_version
+                        < EmoPlaybackControlTransaction.command_control_version
+                    )
+                    & (
+                        audit.through_control_version
+                        >= EmoPlaybackControlTransaction.command_control_version
+                    )
+                )
+                | (
+                    (
+                        EmoPlaybackControlTransaction.reconciled_by_control_version
+                        .is_null(False)
+                    )
+                    & (
+                        audit.reconciliation_control_version
+                        == EmoPlaybackControlTransaction.reconciled_by_control_version
+                    )
+                )
+            )
+        )
+    )
+    where = (
+        (EmoPlaybackControlTransaction.playback_context_id
+         == playback_context_id)
+        & (EmoPlaybackControlTransaction.status.in_(_TERMINAL_CONTROL_STATUSES))
+        & (EmoPlaybackControlTransaction.terminal_at_ms.is_null(False))
+        & (EmoPlaybackControlTransaction.terminal_at_ms <= cutoff_at_ms)
+        & (EmoPlaybackControlTransaction.terminal_fingerprint.is_null(False))
+        & (EmoPlaybackControlTransaction.terminal_fingerprint != "")
+        & (
+            EmoPlaybackControlTransaction.requesting_device_session_id
+            .is_null(False)
+        )
+        & (EmoPlaybackControlTransaction.requesting_device_session_id != "")
+        & (
+            EmoPlaybackControlTransaction.requesting_connection_nonce
+            .is_null(False)
+        )
+        & (EmoPlaybackControlTransaction.requesting_connection_nonce != "")
+        & (EmoPlaybackControlTransaction.requesting_connection_epoch == 1)
+        & (EmoPlaybackControlTransaction.authority_client_id != "")
+        & (EmoPlaybackControlTransaction.authority_device_session_id != "")
+        & (EmoPlaybackControlTransaction.routed_connection_nonce != "")
+        & (EmoPlaybackControlTransaction.routed_connection_epoch == 1)
+        & ~dependency_reference
+        & ~audit_reference
+    )
+    if retained_control_ids:
+        where &= ~EmoPlaybackControlTransaction.id.in_(retained_control_ids)
+    return (
+        EmoPlaybackControlTransaction.select()
+        .where(where)
+        .order_by(
+            EmoPlaybackControlTransaction.terminal_at_ms,
+            EmoPlaybackControlTransaction.epoch,
+            EmoPlaybackControlTransaction.command_control_version,
+            EmoPlaybackControlTransaction.id,
+        )
+        .first()
+    )
+
+
+def cleanupStrictPlaybackContextRetention(
+    playback_context_id,
+    now_ms,
+    batch_size=STRICT_CORE_CLEANUP_BATCH_SIZE,
+    terminal_retention_limit=STRICT_CORE_RETENTION_LIMIT,
+    local_intent_retention_limit=STRICT_CORE_RETENTION_LIMIT,
+):
+    """Delete only retry-safe Core history for one durable Context."""
+    _require_non_empty_string(playback_context_id, "playbackContextId", 128)
+    _require_integer(now_ms, "nowMs", 0)
+    _require_integer(batch_size, "batchSize", 1)
+    if batch_size > STRICT_CORE_RETENTION_LIMIT:
+        raise ValueError(
+            "batchSize must not exceed %d" % STRICT_CORE_RETENTION_LIMIT
+        )
+    _require_retention_limit(terminal_retention_limit, "terminalRetentionLimit")
+    _require_retention_limit(
+        local_intent_retention_limit,
+        "localIntentRetentionLimit",
+    )
+    cutoff_at_ms = max(0, now_ms - STRICT_CORE_RETRY_WINDOW_MS)
+    cutoff_at = datetime.fromtimestamp(cutoff_at_ms / 1000.0)
+    result = {
+        "playbackContextId": playback_context_id,
+        "cutoffAtMs": cutoff_at_ms,
+        "batchSize": batch_size,
+        "deletedControlTransactions": 0,
+        "deletedReconciliations": 0,
+        "deletedLocalIntents": 0,
+        "deletedTotal": 0,
+        "blockedByFence": False,
+        "closeTombstonePreserved": False,
+    }
+    with _strict_playback_context_lock(playback_context_id):
+        open_connection(reuse=True)
+        try:
+            with _strict_playback_context_transaction():
+                context = EmoPlaybackContext.get_or_none(
+                    EmoPlaybackContext.playback_context_id
+                    == playback_context_id
+                )
+                if context is None:
+                    return result
+                result["closeTombstonePreserved"] = context.lifecycle == "closed"
+                if _broadcast_fences_for_context(playback_context_id):
+                    result["blockedByFence"] = True
+                    return result
+
+                (
+                    retained_control_ids,
+                    retained_reconciliation_ids,
+                ) = _recent_core_retention_record_ids(
+                    playback_context_id,
+                    terminal_retention_limit,
+                )
+
+                reconciliation_where = (
+                    (EmoPlaybackControlReconciliation.playback_context_id
+                     == playback_context_id)
+                    & (
+                        EmoPlaybackControlReconciliation.server_updated_at_ms
+                        <= cutoff_at_ms
+                    )
+                )
+                if retained_reconciliation_ids:
+                    reconciliation_where &= ~(
+                        EmoPlaybackControlReconciliation.id.in_(
+                            retained_reconciliation_ids
+                        )
+                    )
+                reconciliation_ids = [
+                    record.id
+                    for record in (
+                        EmoPlaybackControlReconciliation.select(
+                            EmoPlaybackControlReconciliation.id
+                        )
+                        .where(reconciliation_where)
+                        .order_by(
+                            EmoPlaybackControlReconciliation.server_updated_at_ms,
+                            EmoPlaybackControlReconciliation.epoch,
+                            EmoPlaybackControlReconciliation.reconciliation_control_version,
+                            EmoPlaybackControlReconciliation.id,
+                        )
+                        .limit(batch_size)
+                    )
+                ]
+                if reconciliation_ids:
+                    result["deletedReconciliations"] = (
+                        EmoPlaybackControlReconciliation.delete()
+                        .where(
+                            EmoPlaybackControlReconciliation.id.in_(
+                                reconciliation_ids
+                            )
+                        )
+                        .execute()
+                    )
+
+                while (
+                    result["deletedReconciliations"]
+                    + result["deletedControlTransactions"]
+                    < batch_size
+                ):
+                    candidate = _oldest_unreferenced_terminal_control(
+                        playback_context_id,
+                        cutoff_at_ms,
+                        retained_control_ids,
+                    )
+                    if candidate is None:
+                        break
+                    result["deletedControlTransactions"] += (
+                        EmoPlaybackControlTransaction.delete()
+                        .where(EmoPlaybackControlTransaction.id == candidate.id)
+                        .execute()
+                    )
+
+                remaining = batch_size - (
+                    result["deletedReconciliations"]
+                    + result["deletedControlTransactions"]
+                )
+                if remaining:
+                    retained_intent_ids = {
+                        record.id
+                        for record in (
+                            EmoPlaybackLocalIntent.select(
+                                EmoPlaybackLocalIntent.id
+                            )
+                            .where(
+                                EmoPlaybackLocalIntent.playback_context_id
+                                == playback_context_id
+                            )
+                            .order_by(
+                                EmoPlaybackLocalIntent.created_at.desc(),
+                                EmoPlaybackLocalIntent.epoch.desc(),
+                                EmoPlaybackLocalIntent.control_version.desc(),
+                                EmoPlaybackLocalIntent.id.desc(),
+                            )
+                            .limit(local_intent_retention_limit)
+                        )
+                    }
+                    intent_where = (
+                        (EmoPlaybackLocalIntent.playback_context_id
+                         == playback_context_id)
+                        & (EmoPlaybackLocalIntent.created_at <= cutoff_at)
+                    )
+                    if retained_intent_ids:
+                        intent_where &= ~EmoPlaybackLocalIntent.id.in_(
+                            retained_intent_ids
+                        )
+                    intent_ids = [
+                        record.id
+                        for record in (
+                            EmoPlaybackLocalIntent.select(
+                                EmoPlaybackLocalIntent.id
+                            )
+                            .where(intent_where)
+                            .order_by(
+                                EmoPlaybackLocalIntent.created_at,
+                                EmoPlaybackLocalIntent.epoch,
+                                EmoPlaybackLocalIntent.control_version,
+                                EmoPlaybackLocalIntent.id,
+                            )
+                            .limit(remaining)
+                        )
+                    ]
+                    if intent_ids:
+                        result["deletedLocalIntents"] = (
+                            EmoPlaybackLocalIntent.delete()
+                            .where(EmoPlaybackLocalIntent.id.in_(intent_ids))
+                            .execute()
+                        )
+
+                result["deletedTotal"] = (
+                    result["deletedControlTransactions"]
+                    + result["deletedReconciliations"]
+                    + result["deletedLocalIntents"]
+                )
+                return result
+        finally:
+            close_connection()
+
+
+def cleanupCoreStartupRecoveryRetention(
+    now_ms,
+    batch_size=STRICT_CORE_CLEANUP_BATCH_SIZE,
+    retention_limit=STRICT_CORE_RETENTION_LIMIT,
+):
+    """Bound completed recovery audit history without touching live recovery."""
+    _require_integer(now_ms, "nowMs", 0)
+    _require_integer(batch_size, "batchSize", 1)
+    if batch_size > STRICT_CORE_RETENTION_LIMIT:
+        raise ValueError(
+            "batchSize must not exceed %d" % STRICT_CORE_RETENTION_LIMIT
+        )
+    _require_retention_limit(retention_limit, "retentionLimit")
+    cutoff_at_ms = max(0, now_ms - STRICT_CORE_RETRY_WINDOW_MS)
+    with _core_startup_recovery_lock:
+        open_connection(reuse=True)
+        try:
+            with _strict_playback_context_transaction():
+                retained_ids = {
+                    record.id
+                    for record in (
+                        EmoCoreStartupRecovery.select(EmoCoreStartupRecovery.id)
+                        .where(EmoCoreStartupRecovery.status == "completed")
+                        .order_by(
+                            EmoCoreStartupRecovery.completed_at_ms.desc(),
+                            EmoCoreStartupRecovery.recovery_fingerprint.desc(),
+                            EmoCoreStartupRecovery.id.desc(),
+                        )
+                        .limit(retention_limit)
+                    )
+                }
+                recovered = EmoPlaybackControlTransaction.alias(
+                    "startup_recovered_control"
+                )
+                referenced_terminal = fn.EXISTS(
+                    recovered.select(recovered.id).where(
+                        (
+                            recovered.terminal_at_ms
+                            == EmoCoreStartupRecovery.completed_at_ms
+                        )
+                        & (recovered.status.in_(_TERMINAL_CONTROL_STATUSES))
+                        & (
+                            recovered.error_code.in_(
+                                ("execution_unknown", "dependency_failed")
+                            )
+                        )
+                    )
+                )
+                where = (
+                    (EmoCoreStartupRecovery.status == "completed")
+                    & (EmoCoreStartupRecovery.completed_at_ms <= cutoff_at_ms)
+                    & ~referenced_terminal
+                )
+                if retained_ids:
+                    where &= ~EmoCoreStartupRecovery.id.in_(retained_ids)
+                recovery_ids = [
+                    record.id
+                    for record in (
+                        EmoCoreStartupRecovery.select(EmoCoreStartupRecovery.id)
+                        .where(where)
+                        .order_by(
+                            EmoCoreStartupRecovery.completed_at_ms,
+                            EmoCoreStartupRecovery.recovery_fingerprint,
+                            EmoCoreStartupRecovery.id,
+                        )
+                        .limit(batch_size)
+                    )
+                ]
+                deleted = 0
+                if recovery_ids:
+                    deleted = (
+                        EmoCoreStartupRecovery.delete()
+                        .where(EmoCoreStartupRecovery.id.in_(recovery_ids))
+                        .execute()
+                    )
+                return {
+                    "cutoffAtMs": cutoff_at_ms,
+                    "batchSize": batch_size,
+                    "deletedStartupRecoveries": deleted,
+                    "deletedTotal": deleted,
+                }
+        finally:
+            close_connection()
 
 
 def _startup_recovery_pending_records():

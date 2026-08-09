@@ -47,6 +47,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
         db.EmoPlaybackControlTransaction,
         db.EmoPlaybackControlReconciliation,
         db.EmoCoreStartupRecovery,
+        db.EmoPlaybackLocalIntent,
     )
     CLOSE_FIELDS = (
         "close_action",
@@ -74,6 +75,55 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
     AUTHORITY_INDEX = "idx_emo_control_authority_generation"
     RECONCILIATION_INDEX = "idx_emo_reconcile_gap"
     RECOVERY_INDEX = "idx_emo_core_recovery_status_completed"
+    RETENTION_INDEXES = {
+        "idx_emo_context_close_retention": (
+            "emo_playback_context",
+            ("lifecycle", "closed_at", "playback_context_id"),
+        ),
+        "idx_emo_control_retention": (
+            "emo_playback_control_transaction",
+            (
+                "playback_context_id",
+                "status",
+                "terminal_at_ms",
+                "epoch",
+                "command_control_version",
+            ),
+        ),
+        "idx_emo_control_dependency_ref": (
+            "emo_playback_control_transaction",
+            ("playback_context_id", "epoch", "depends_on_control_version"),
+        ),
+        "idx_emo_control_reconciliation_ref": (
+            "emo_playback_control_transaction",
+            ("playback_context_id", "epoch", "reconciled_by_control_version"),
+        ),
+        "idx_emo_reconcile_retention": (
+            "emo_playback_control_reconciliation",
+            (
+                "playback_context_id",
+                "server_updated_at_ms",
+                "epoch",
+                "reconciliation_control_version",
+            ),
+        ),
+        "idx_emo_reconcile_trigger_ref": (
+            "emo_playback_control_reconciliation",
+            (
+                "playback_context_id",
+                "epoch",
+                "trigger_command_control_version",
+            ),
+        ),
+        "idx_emo_local_intent_retention": (
+            "emo_playback_local_intent",
+            ("playback_context_id", "created_at", "epoch", "control_version"),
+        ),
+        "idx_emo_core_recovery_retention": (
+            "emo_core_startup_recovery",
+            ("status", "completed_at_ms", "recovery_fingerprint"),
+        ),
+    }
 
     @staticmethod
     def _sql_identifier_tokens(sql: str) -> set[str]:
@@ -240,7 +290,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             self._assert_external_r11_transaction_schema()
             self._assert_external_r18_broadcast_schema()
             self._assert_external_core_schema_parity(provider)
-            self.assertEqual(db.Meta["schema_version"].value, "20260809")
+            self.assertEqual(db.Meta["schema_version"].value, "20260810")
             self._record_external_evidence(
                 provider,
                 "clean",
@@ -272,7 +322,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             self._assert_external_r11_transaction_schema()
             self._assert_external_r18_broadcast_schema()
             self._assert_external_core_schema_parity(provider)
-            self.assertEqual(db.Meta["schema_version"].value, "20260809")
+            self.assertEqual(db.Meta["schema_version"].value, "20260810")
             self._record_external_evidence(
                 provider,
                 "upgrade_from_20260708",
@@ -515,6 +565,13 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             "emo_core_startup_recovery",
             ("recovery_fingerprint",),
         )
+        for index_name, (table_name, columns) in self.RETENTION_INDEXES.items():
+            self._assert_external_named_index(
+                provider,
+                table_name,
+                index_name,
+                columns,
+            )
 
     def _assert_sqlite_core_schema_parity(self) -> None:
         for model in self.CORE_MODELS:
@@ -579,6 +636,8 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             index_columns(self.RECOVERY_INDEX),
             ("status", "completed_at_ms"),
         )
+        for index_name, (_table_name, columns) in self.RETENTION_INDEXES.items():
+            self.assertEqual(index_columns(index_name), columns, index_name)
 
         for table_name, unique_columns in (
             (
@@ -626,6 +685,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
         root_id = self._legacy_id(provider, 2)
         dependent_id = self._legacy_id(provider, 3)
         terminal_id = self._legacy_id(provider, 4)
+        local_intent_id = self._legacy_id(provider, 6)
         statements = [
             "CREATE TABLE meta (%s VARCHAR(32) PRIMARY KEY, value VARCHAR(256) NOT NULL)" % key_column,
             "INSERT INTO meta (%s, value) VALUES ('schema_version', '20260728')" % key_column,
@@ -684,6 +744,38 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 UNIQUE(playback_context_id, epoch, command_control_version)
             )
             """ % (id_type, timestamp_type, timestamp_type),
+            """
+            CREATE TABLE emo_playback_local_intent (
+                id %s PRIMARY KEY,
+                playback_context_id VARCHAR(128) NOT NULL,
+                user_name VARCHAR(64) NOT NULL,
+                epoch INTEGER NOT NULL,
+                intent_id VARCHAR(128) NOT NULL,
+                authority_client_id VARCHAR(128) NOT NULL,
+                authority_device_session_id VARCHAR(128) NOT NULL,
+                request_fingerprint VARCHAR(64) NOT NULL,
+                canonical_update_json TEXT NOT NULL,
+                control_version INTEGER NOT NULL,
+                superseded_through_control_version INTEGER NOT NULL,
+                created_at %s NOT NULL,
+                updated_at %s NOT NULL,
+                UNIQUE(playback_context_id, epoch, intent_id)
+            )
+            """ % (id_type, timestamp_type, timestamp_type),
+            """
+            INSERT INTO emo_playback_local_intent (
+                id, playback_context_id, user_name, epoch, intent_id,
+                authority_client_id, authority_device_session_id,
+                request_fingerprint, canonical_update_json, control_version,
+                superseded_through_control_version, created_at, updated_at
+            ) VALUES (
+                '%s', 'context-active', 'alice', 2, 'legacy-intent-1',
+                'player-1', 'device-1',
+                'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                '{"state":"paused"}', 9, 8,
+                '2026-08-07 00:02:30', '2026-08-07 00:02:30'
+            )
+            """ % local_intent_id,
             """
             INSERT INTO emo_playback_context (
                 id, playback_context_id, user_name, authority_client_id,
@@ -816,6 +908,14 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 "SELECT COUNT(*) FROM emo_playback_control_reconciliation"
             ).fetchone()[0],
             0,
+        )
+        self.assertEqual(
+            db.db.execute_sql(
+                "SELECT intent_id, control_version, "
+                "superseded_through_control_version "
+                "FROM emo_playback_local_intent"
+            ).fetchone(),
+            ("legacy-intent-1", 9, 8),
         )
 
     def _assert_large_epoch_round_trip(self) -> None:
@@ -1002,7 +1102,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 },
             )
             self._assert_sqlite_core_schema_parity()
-            self.assertEqual(db.Meta["schema_version"].value, "20260809")
+            self.assertEqual(db.Meta["schema_version"].value, "20260810")
         finally:
             db.release_database()
             os.remove(path)
@@ -1043,6 +1143,9 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 ).read_text("utf-8")
                 startup_recovery_migration = (
                     root / "migration" / provider / "20260809.sql"
+                ).read_text("utf-8")
+                retention_migration = (
+                    root / "migration" / provider / "20260810.sql"
                 ).read_text("utf-8")
                 for field_name in required_fields:
                     self.assertIn(field_name, base_schema)
@@ -1135,6 +1238,13 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                     self.RECOVERY_INDEX,
                     startup_recovery_migration,
                 )
+                for index_name, (_table_name, columns) in (
+                    self.RETENTION_INDEXES.items()
+                ):
+                    self.assertIn(index_name, base_schema)
+                    self.assertIn(index_name, retention_migration)
+                    for column_name in columns:
+                        self.assertIn(column_name, retention_migration)
                 for table_name in (
                     "emo_broadcast",
                     "emo_broadcast_intent_outcome",
@@ -1194,6 +1304,27 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             db.release_database()
             os.remove(path)
 
+    def test_sqlite_retention_indexes_are_executable_query_plans(self):
+        handle, path = tempfile.mkstemp()
+        os.close(handle)
+        try:
+            db.init_database("sqlite:///" + path)
+            for index_name, (table_name, _columns) in (
+                self.RETENTION_INDEXES.items()
+            ):
+                with self.subTest(index=index_name):
+                    plan = db.db.execute_sql(
+                        "EXPLAIN QUERY PLAN SELECT * FROM %s INDEXED BY %s LIMIT 1"
+                        % (table_name, index_name)
+                    ).fetchall()
+                    self.assertIn(
+                        index_name,
+                        " ".join(str(value) for row in plan for value in row),
+                    )
+        finally:
+            db.release_database()
+            os.remove(path)
+
     def _run_20260728_non_empty_upgrade(self, provider: str, database_uri: str) -> None:
         database_available = False
         initialized = False
@@ -1212,7 +1343,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
 
             db.init_database(database_uri)
             initialized = True
-            self.assertEqual(db.Meta["schema_version"].value, "20260809")
+            self.assertEqual(db.Meta["schema_version"].value, "20260810")
             self._assert_20260728_upgrade_rows()
             context_before = db.db.execute_sql(
                 "SELECT playback_context_id, lifecycle, epoch, version, "
@@ -1247,7 +1378,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
 
             db.init_database(database_uri)
             initialized = True
-            self.assertEqual(db.Meta["schema_version"].value, "20260809")
+            self.assertEqual(db.Meta["schema_version"].value, "20260810")
             self._assert_20260728_recovery_rows()
             replay = recoverPendingPlaybackControlsForStartup(1780000040000)
             self.assertFalse(replay["mutated"])

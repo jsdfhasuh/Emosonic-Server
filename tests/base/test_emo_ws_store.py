@@ -1,4 +1,5 @@
 import concurrent.futures
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -7,6 +8,7 @@ import threading
 import time
 import unittest
 from unittest import mock
+from uuid import uuid4
 
 from supysonic import db
 from supysonic.emo import ws_store
@@ -26,6 +28,8 @@ from supysonic.emo.ws_store import (
     PlaybackPrepareTransactionConflictError,
     PlaybackClientSequenceConflictError,
     closeStrictPlaybackContextState,
+    cleanupCoreStartupRecoveryRetention,
+    cleanupStrictPlaybackContextRetention,
     applyStrictPlaybackUpdate,
     completeStrictPlaybackHandoff,
     createPlaybackContextState,
@@ -88,6 +92,8 @@ from supysonic.emo.ws_store import (
 
 
 class EmoWebSocketStoreTestCase(unittest.TestCase):
+    RETENTION_NOW_MS = 1800000000000
+
     def setUp(self):
         handle, self.db_path = tempfile.mkstemp()
         os.close(handle)
@@ -131,6 +137,121 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             deterministic_dependency_admission=(
                 deterministic_dependency_admission
             ),
+        )
+
+    def _create_retention_context(self, playback_context_id="retention-context"):
+        return createStrictPlaybackContextState(
+            playback_context_id,
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            0,
+            "playing",
+        )
+
+    def _retention_control_values(
+        self,
+        command_control_version,
+        terminal_at_ms,
+        playback_context_id="retention-context",
+        status="committed",
+        depends_on_control_version=None,
+        reconciled_by_control_version=None,
+        exact_generation=True,
+    ):
+        created_at_ms = terminal_at_ms or self.RETENTION_NOW_MS
+        return {
+            "id": uuid4(),
+            "playback_context_id": playback_context_id,
+            "user_name": "alice",
+            "epoch": 1,
+            "command_control_version": command_control_version,
+            "requesting_client_id": "controller-1",
+            "requesting_device_session_id": (
+                "device:controller-1" if exact_generation else None
+            ),
+            "requesting_connection_nonce": (
+                "requester-nonce-1" if exact_generation else None
+            ),
+            "requesting_connection_epoch": 1 if exact_generation else None,
+            "authority_client_id": "player-1",
+            "authority_device_session_id": "device:player-1",
+            "routed_connection_nonce": "authority-nonce-1",
+            "routed_connection_epoch": 1,
+            "action": "player.seek",
+            "accepted_target_json": '{"positionMs":100}',
+            "status": status,
+            "depends_on_control_version": depends_on_control_version,
+            "accepted_at_ms": max(0, created_at_ms - 100),
+            "execution_timeout_ms": 15000,
+            "terminal_fingerprint": (
+                hashlib.sha256(
+                    ("%s:%d" % (playback_context_id, command_control_version)).encode(
+                        "utf-8"
+                    )
+                ).hexdigest()
+                if terminal_at_ms is not None
+                else None
+            ),
+            "terminal_at_ms": terminal_at_ms,
+            "reconciled_by_control_version": reconciled_by_control_version,
+            "created_at": datetime.fromtimestamp(created_at_ms / 1000.0),
+            "updated_at": datetime.fromtimestamp(created_at_ms / 1000.0),
+        }
+
+    def _create_retention_control(self, *args, **kwargs):
+        return db.EmoPlaybackControlTransaction.create(
+            **self._retention_control_values(*args, **kwargs)
+        )
+
+    def _create_retention_intent(
+        self,
+        control_version,
+        created_at_ms,
+        playback_context_id="retention-context",
+    ):
+        return db.EmoPlaybackLocalIntent.create(
+            playback_context_id=playback_context_id,
+            user_name="alice",
+            epoch=1,
+            intent_id="intent-%d" % control_version,
+            authority_client_id="player-1",
+            authority_device_session_id="device:player-1",
+            request_fingerprint=("%064d" % control_version)[-64:],
+            canonical_update_json='{"state":"playing"}',
+            control_version=control_version,
+            superseded_through_control_version=control_version - 1,
+            created_at=datetime.fromtimestamp(created_at_ms / 1000.0),
+            updated_at=datetime.fromtimestamp(created_at_ms / 1000.0),
+        )
+
+    def _create_retention_reconciliation(
+        self,
+        reconciliation_control_version,
+        server_updated_at_ms,
+        through_control_version,
+        playback_context_id="retention-context",
+        trigger_command_control_version=None,
+    ):
+        return db.EmoPlaybackControlReconciliation.create(
+            playback_context_id=playback_context_id,
+            user_name="alice",
+            epoch=1,
+            reconciliation_control_version=reconciliation_control_version,
+            from_applied_control_version=0,
+            through_control_version=through_control_version,
+            trigger_kind="terminal_gap",
+            trigger_command_control_version=trigger_command_control_version,
+            actual_fact_fingerprint=(
+                "%064d" % reconciliation_control_version
+            )[-64:],
+            actual_fact_json='{"positionMs":0}',
+            canonical_update_json='{"positionMs":0}',
+            server_updated_at_ms=server_updated_at_ms,
+            created_at=datetime.fromtimestamp(server_updated_at_ms / 1000.0),
+            updated_at=datetime.fromtimestamp(server_updated_at_ms / 1000.0),
         )
 
     def _create_feedback_dependency_pair(self):
@@ -5452,3 +5573,413 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         retry = recoverPendingPlaybackControlsForStartup(2001)
         self.assertTrue(retry["mutated"])
         self.assertEqual(retry["recovery"]["pendingCount"], 3)
+
+    def test_core_retention_enforces_retry_window_boundary(self):
+        self._create_retention_context()
+        cutoff_at_ms = self.RETENTION_NOW_MS - ws_store.STRICT_CORE_RETRY_WINDOW_MS
+        self._create_retention_control(2, cutoff_at_ms)
+        self._create_retention_control(3, cutoff_at_ms + 1)
+        self._create_retention_intent(2, cutoff_at_ms)
+        self._create_retention_intent(3, cutoff_at_ms + 1)
+
+        result = cleanupStrictPlaybackContextRetention(
+            "retention-context",
+            self.RETENTION_NOW_MS,
+            batch_size=10,
+            terminal_retention_limit=0,
+            local_intent_retention_limit=0,
+        )
+
+        self.assertEqual(result["cutoffAtMs"], cutoff_at_ms)
+        self.assertEqual(result["deletedControlTransactions"], 1)
+        self.assertEqual(result["deletedLocalIntents"], 1)
+        self.assertEqual(
+            [
+                record.command_control_version
+                for record in db.EmoPlaybackControlTransaction.select()
+            ],
+            [3],
+        )
+        self.assertEqual(
+            [record.control_version for record in db.EmoPlaybackLocalIntent.select()],
+            [3],
+        )
+
+    def test_core_retention_preserves_latest_512_terminal_records(self):
+        self._create_retention_context()
+        oldest_at_ms = (
+            self.RETENTION_NOW_MS
+            - ws_store.STRICT_CORE_RETRY_WINDOW_MS
+            - 10000
+        )
+        rows = [
+            self._retention_control_values(version, oldest_at_ms + version)
+            for version in range(1, 514)
+        ]
+        with db.db.atomic():
+            db.EmoPlaybackControlTransaction.insert_many(rows).execute()
+
+        result = cleanupStrictPlaybackContextRetention(
+            "retention-context",
+            self.RETENTION_NOW_MS,
+            batch_size=10,
+        )
+
+        self.assertEqual(result["deletedTotal"], 1)
+        remaining_versions = [
+            record.command_control_version
+            for record in db.EmoPlaybackControlTransaction.select().order_by(
+                db.EmoPlaybackControlTransaction.command_control_version
+            )
+        ]
+        self.assertEqual(len(remaining_versions), 512)
+        self.assertEqual(remaining_versions[0], 2)
+        self.assertEqual(remaining_versions[-1], 513)
+
+    def test_reconciliation_counts_toward_combined_terminal_limit(self):
+        self._create_retention_context()
+        old_at_ms = (
+            self.RETENTION_NOW_MS
+            - ws_store.STRICT_CORE_RETRY_WINDOW_MS
+            - 1000
+        )
+        self._create_retention_control(2, old_at_ms)
+        self._create_retention_reconciliation(3, old_at_ms + 100, 1)
+        self._create_retention_control(4, old_at_ms + 200)
+
+        result = cleanupStrictPlaybackContextRetention(
+            "retention-context",
+            self.RETENTION_NOW_MS,
+            batch_size=10,
+            terminal_retention_limit=2,
+            local_intent_retention_limit=0,
+        )
+
+        self.assertEqual(result["deletedControlTransactions"], 1)
+        self.assertEqual(result["deletedReconciliations"], 0)
+        self.assertIsNone(
+            getPlaybackControlTransaction("retention-context", 1, 2)
+        )
+        self.assertIsNotNone(
+            getPlaybackControlReconciliation("retention-context", 1, 3)
+        )
+        self.assertIsNotNone(
+            getPlaybackControlTransaction("retention-context", 1, 4)
+        )
+
+    def test_core_retention_preserves_pending_dependencies_audits_and_legacy(self):
+        self._create_retention_context()
+        old_at_ms = (
+            self.RETENTION_NOW_MS
+            - ws_store.STRICT_CORE_RETRY_WINDOW_MS
+            - 1000
+        )
+        self._create_retention_control(2, old_at_ms)
+        self._create_retention_control(
+            3,
+            None,
+            status="pending",
+            depends_on_control_version=2,
+        )
+        self._create_retention_control(4, old_at_ms + 1)
+        self._create_retention_reconciliation(
+            5,
+            self.RETENTION_NOW_MS - ws_store.STRICT_CORE_RETRY_WINDOW_MS + 1,
+            4,
+            trigger_command_control_version=4,
+        )
+        self._create_retention_control(6, old_at_ms + 2)
+        self._create_retention_control(
+            7,
+            old_at_ms + 3,
+            exact_generation=False,
+        )
+        db.EmoBroadcastFence.create(
+            resource_key="retention-restore-fence",
+            broadcast_id="broadcast-retention",
+            user_name="alice",
+            role="ordinary",
+            phase="restorePending",
+            playback_context_id="retention-context",
+            client_id="player-1",
+            device_session_id="device:player-1",
+        )
+
+        blocked = cleanupStrictPlaybackContextRetention(
+            "retention-context",
+            self.RETENTION_NOW_MS,
+            batch_size=10,
+            terminal_retention_limit=0,
+            local_intent_retention_limit=0,
+        )
+        self.assertTrue(blocked["blockedByFence"])
+        self.assertEqual(blocked["deletedTotal"], 0)
+
+        db.EmoBroadcastFence.delete().execute()
+        result = cleanupStrictPlaybackContextRetention(
+            "retention-context",
+            self.RETENTION_NOW_MS,
+            batch_size=10,
+            terminal_retention_limit=0,
+            local_intent_retention_limit=0,
+        )
+        self.assertEqual(result["deletedControlTransactions"], 1)
+        self.assertIsNone(
+            getPlaybackControlTransaction("retention-context", 1, 6)
+        )
+        for version in (2, 3, 4, 7):
+            self.assertIsNotNone(
+                getPlaybackControlTransaction("retention-context", 1, version)
+            )
+        self.assertIsNotNone(
+            getPlaybackControlReconciliation("retention-context", 1, 5)
+        )
+
+    def test_closed_tombstone_is_preserved_across_bounded_multi_round_cleanup(self):
+        self._create_retention_context()
+        closeStrictPlaybackContextState("retention-context", "alice")
+        closed = db.EmoPlaybackContext.get(
+            db.EmoPlaybackContext.playback_context_id == "retention-context"
+        )
+        closed.close_outcome_json = '{"closed":true}'
+        closed.save()
+        old_at_ms = (
+            self.RETENTION_NOW_MS
+            - ws_store.STRICT_CORE_RETRY_WINDOW_MS
+            - 1000
+        )
+        for version in range(1, 6):
+            self._create_retention_intent(version, old_at_ms + version)
+
+        deleted_per_round = []
+        preserved_per_round = []
+        for _ in range(4):
+            result = cleanupStrictPlaybackContextRetention(
+                "retention-context",
+                self.RETENTION_NOW_MS,
+                batch_size=2,
+                terminal_retention_limit=0,
+                local_intent_retention_limit=0,
+            )
+            deleted_per_round.append(result["deletedTotal"])
+            preserved_per_round.append(result["closeTombstonePreserved"])
+
+        self.assertEqual(deleted_per_round, [2, 2, 1, 0])
+        self.assertEqual(preserved_per_round, [True, True, True, True])
+        tombstone = getPlaybackContextCloseTombstone(
+            "retention-context",
+            "alice",
+        )
+        self.assertEqual(tombstone["closeOutcome"], {"closed": True})
+        self.assertEqual(db.EmoPlaybackContext.select().count(), 1)
+
+    def test_startup_recovery_retention_keeps_live_and_referenced_markers(self):
+        self._create_retention_context()
+        cutoff_at_ms = self.RETENTION_NOW_MS - ws_store.STRICT_CORE_RETRY_WINDOW_MS
+        linked_at_ms = cutoff_at_ms - 400
+        linked_control = self._create_retention_control(
+            2,
+            linked_at_ms,
+            status="failed",
+        )
+        linked_control.error_code = "execution_unknown"
+        linked_control.save()
+
+        def create_marker(name, completed_at_ms, status="completed", pending_count=0):
+            return db.EmoCoreStartupRecovery.create(
+                recovery_fingerprint=hashlib.sha256(name.encode("utf-8")).hexdigest(),
+                status=status,
+                started_at_ms=max(0, completed_at_ms - 1),
+                completed_at_ms=completed_at_ms,
+                pending_count=pending_count,
+                incomplete_generation_count=0,
+                recovered_root_count=pending_count,
+                recovered_dependency_count=0,
+                outcome_fingerprint=hashlib.sha256(
+                    (name + "-outcome").encode("utf-8")
+                ).hexdigest(),
+            )
+
+        linked = create_marker("linked", linked_at_ms, pending_count=1)
+        removable = create_marker("removable", cutoff_at_ms - 300)
+        recent = create_marker("recent", cutoff_at_ms + 1)
+        running = create_marker("running", cutoff_at_ms - 500, status="running")
+
+        first = cleanupCoreStartupRecoveryRetention(
+            self.RETENTION_NOW_MS,
+            batch_size=10,
+            retention_limit=1,
+        )
+        self.assertEqual(first["deletedStartupRecoveries"], 1)
+        self.assertIsNone(
+            db.EmoCoreStartupRecovery.get_or_none(
+                db.EmoCoreStartupRecovery.id == removable.id
+            )
+        )
+        for marker in (linked, recent, running):
+            self.assertIsNotNone(
+                db.EmoCoreStartupRecovery.get_or_none(
+                    db.EmoCoreStartupRecovery.id == marker.id
+                )
+            )
+
+        cleanupStrictPlaybackContextRetention(
+            "retention-context",
+            self.RETENTION_NOW_MS,
+            batch_size=10,
+            terminal_retention_limit=0,
+            local_intent_retention_limit=0,
+        )
+        second = cleanupCoreStartupRecoveryRetention(
+            self.RETENTION_NOW_MS,
+            batch_size=10,
+            retention_limit=1,
+        )
+        self.assertEqual(second["deletedStartupRecoveries"], 1)
+        self.assertIsNone(
+            db.EmoCoreStartupRecovery.get_or_none(
+                db.EmoCoreStartupRecovery.id == linked.id
+            )
+        )
+
+    def test_core_retention_rollback_restores_every_record(self):
+        self._create_retention_context()
+        old_at_ms = (
+            self.RETENTION_NOW_MS
+            - ws_store.STRICT_CORE_RETRY_WINDOW_MS
+            - 1000
+        )
+        self._create_retention_control(
+            2,
+            old_at_ms,
+            reconciled_by_control_version=3,
+        )
+        self._create_retention_reconciliation(
+            3,
+            old_at_ms + 1,
+            2,
+            trigger_command_control_version=2,
+        )
+        self._create_retention_intent(4, old_at_ms + 2)
+
+        with mock.patch.object(
+            db.EmoPlaybackLocalIntent,
+            "delete",
+            side_effect=RuntimeError("injected retention failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "injected retention failure"):
+                cleanupStrictPlaybackContextRetention(
+                    "retention-context",
+                    self.RETENTION_NOW_MS,
+                    batch_size=10,
+                    terminal_retention_limit=0,
+                    local_intent_retention_limit=0,
+                )
+
+        self.assertEqual(db.EmoPlaybackControlTransaction.select().count(), 1)
+        self.assertEqual(db.EmoPlaybackControlReconciliation.select().count(), 1)
+        self.assertEqual(db.EmoPlaybackLocalIntent.select().count(), 1)
+        self.assertEqual(
+            getPlaybackControlTransaction("retention-context", 1, 2)[
+                "reconciledByControlVersion"
+            ],
+            3,
+        )
+
+    def test_core_retention_is_idempotent_and_serializes_concurrent_cleanup(self):
+        self._create_retention_context()
+        old_at_ms = (
+            self.RETENTION_NOW_MS
+            - ws_store.STRICT_CORE_RETRY_WINDOW_MS
+            - 1000
+        )
+        for version in range(1, 6):
+            self._create_retention_intent(version, old_at_ms + version)
+        start = threading.Barrier(2)
+
+        def cleanup(_index):
+            start.wait()
+            return cleanupStrictPlaybackContextRetention(
+                "retention-context",
+                self.RETENTION_NOW_MS,
+                batch_size=10,
+                terminal_retention_limit=0,
+                local_intent_retention_limit=0,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(cleanup, range(2)))
+
+        self.assertEqual(sum(result["deletedTotal"] for result in results), 5)
+        self.assertEqual(
+            sorted(result["deletedTotal"] for result in results),
+            [0, 5],
+        )
+        replay = cleanupStrictPlaybackContextRetention(
+            "retention-context",
+            self.RETENTION_NOW_MS,
+            batch_size=10,
+            terminal_retention_limit=0,
+            local_intent_retention_limit=0,
+        )
+        self.assertEqual(replay["deletedTotal"], 0)
+
+    def test_startup_recovery_and_context_cleanup_share_context_serialization(self):
+        self._create_retention_context()
+        self._create_retention_control(2, None, status="pending")
+        recovery_holds_context = threading.Event()
+        release_recovery = threading.Event()
+        cleanup_started = threading.Event()
+        cleanup_finished = threading.Event()
+        call_guard = threading.Lock()
+        call_count = 0
+        original_pending_records = ws_store._startup_recovery_pending_records
+
+        def blocking_pending_records():
+            nonlocal call_count
+            records = original_pending_records()
+            with call_guard:
+                call_count += 1
+                current_call = call_count
+            if current_call == 2:
+                recovery_holds_context.set()
+                if not release_recovery.wait(5):
+                    raise RuntimeError("retention concurrency test timed out")
+            return records
+
+        def cleanup():
+            cleanup_started.set()
+            try:
+                return cleanupStrictPlaybackContextRetention(
+                    "retention-context",
+                    self.RETENTION_NOW_MS,
+                    batch_size=10,
+                    terminal_retention_limit=0,
+                    local_intent_retention_limit=0,
+                )
+            finally:
+                cleanup_finished.set()
+
+        with mock.patch.object(
+            ws_store,
+            "_startup_recovery_pending_records",
+            side_effect=blocking_pending_records,
+        ):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                recovery_future = executor.submit(
+                    recoverPendingPlaybackControlsForStartup,
+                    self.RETENTION_NOW_MS,
+                )
+                self.assertTrue(recovery_holds_context.wait(2))
+                cleanup_future = executor.submit(cleanup)
+                self.assertTrue(cleanup_started.wait(2))
+                self.assertFalse(cleanup_finished.wait(0.05))
+                release_recovery.set()
+                recovery = recovery_future.result(timeout=5)
+                cleanup_result = cleanup_future.result(timeout=5)
+
+        self.assertTrue(recovery["mutated"])
+        self.assertEqual(cleanup_result["deletedTotal"], 0)
+        transaction = getPlaybackControlTransaction("retention-context", 1, 2)
+        self.assertEqual(transaction["status"], "failed")
+        self.assertEqual(transaction["errorCode"], "execution_unknown")

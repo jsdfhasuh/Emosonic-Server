@@ -101,6 +101,7 @@ class EmoPlaybackContext(_Model):
                 ),
                 False,
             ),
+            (('lifecycle', 'closed_at', 'playback_context_id'), False),
         )
 
 
@@ -199,6 +200,32 @@ class EmoPlaybackControlTransaction(_Model):
                 ),
                 False,
             ),
+            (
+                (
+                    'playback_context_id',
+                    'status',
+                    'terminal_at_ms',
+                    'epoch',
+                    'command_control_version',
+                ),
+                False,
+            ),
+            (
+                (
+                    'playback_context_id',
+                    'epoch',
+                    'depends_on_control_version',
+                ),
+                False,
+            ),
+            (
+                (
+                    'playback_context_id',
+                    'epoch',
+                    'reconciled_by_control_version',
+                ),
+                False,
+            ),
         )
 
 
@@ -237,6 +264,23 @@ class EmoPlaybackControlReconciliation(_Model):
                 ),
                 False,
             ),
+            (
+                (
+                    'playback_context_id',
+                    'server_updated_at_ms',
+                    'epoch',
+                    'reconciliation_control_version',
+                ),
+                False,
+            ),
+            (
+                (
+                    'playback_context_id',
+                    'epoch',
+                    'trigger_command_control_version',
+                ),
+                False,
+            ),
         )
 
 
@@ -255,7 +299,13 @@ class EmoCoreStartupRecovery(_Model):
     updated_at = DateTimeField(default=now)
 
     class Meta:
-        indexes = ((('status', 'completed_at_ms'), False),)
+        indexes = (
+            (('status', 'completed_at_ms'), False),
+            (
+                ('status', 'completed_at_ms', 'recovery_fingerprint'),
+                False,
+            ),
+        )
 
 
 class EmoPlaybackPrepareTransaction(_Model):
@@ -305,7 +355,18 @@ class EmoPlaybackLocalIntent(_Model):
     updated_at = DateTimeField(default=now)
 
     class Meta:
-        indexes = ((('playback_context_id', 'epoch', 'intent_id'), True),)
+        indexes = (
+            (('playback_context_id', 'epoch', 'intent_id'), True),
+            (
+                (
+                    'playback_context_id',
+                    'created_at',
+                    'epoch',
+                    'control_version',
+                ),
+                False,
+            ),
+        )
 
 
 class EmoPlaybackHandoff(_Model):

@@ -347,6 +347,9 @@ ON emo_playback_context (
     authority_device_session_id
 );
 
+CREATE INDEX idx_emo_context_close_retention
+ON emo_playback_context (lifecycle, closed_at, playback_context_id);
+
 CREATE TABLE IF NOT EXISTS emo_device_playback_state (
     id CHAR(32) PRIMARY KEY,
     playback_context_id VARCHAR(128) NOT NULL,
@@ -413,6 +416,16 @@ CREATE TABLE IF NOT EXISTS emo_playback_control_transaction (
     KEY idx_emo_control_authority_generation (
         authority_client_id, authority_device_session_id,
         routed_connection_nonce, routed_connection_epoch, status
+    ),
+    KEY idx_emo_control_retention (
+        playback_context_id, status, terminal_at_ms,
+        epoch, command_control_version
+    ),
+    KEY idx_emo_control_dependency_ref (
+        playback_context_id, epoch, depends_on_control_version
+    ),
+    KEY idx_emo_control_reconciliation_ref (
+        playback_context_id, epoch, reconciled_by_control_version
     )
 ) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
@@ -430,7 +443,10 @@ CREATE TABLE IF NOT EXISTS emo_core_startup_recovery (
     created_at DATETIME NOT NULL,
     updated_at DATETIME NOT NULL,
     UNIQUE KEY uniq_emo_core_recovery_fingerprint (recovery_fingerprint),
-    KEY idx_emo_core_recovery_status_completed (status, completed_at_ms)
+    KEY idx_emo_core_recovery_status_completed (status, completed_at_ms),
+    KEY idx_emo_core_recovery_retention (
+        status, completed_at_ms, recovery_fingerprint
+    )
 ) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS emo_playback_control_reconciliation (
@@ -454,6 +470,13 @@ CREATE TABLE IF NOT EXISTS emo_playback_control_reconciliation (
     ),
     KEY idx_emo_reconcile_gap (
         playback_context_id, epoch, through_control_version
+    ),
+    KEY idx_emo_reconcile_retention (
+        playback_context_id, server_updated_at_ms,
+        epoch, reconciliation_control_version
+    ),
+    KEY idx_emo_reconcile_trigger_ref (
+        playback_context_id, epoch, trigger_command_control_version
     )
 ) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
@@ -502,6 +525,9 @@ CREATE TABLE IF NOT EXISTS emo_playback_local_intent (
     updated_at DATETIME NOT NULL,
     UNIQUE KEY uniq_emo_local_context_epoch_intent (
         playback_context_id, epoch, intent_id
+    ),
+    KEY idx_emo_local_intent_retention (
+        playback_context_id, created_at, epoch, control_version
     )
 ) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
