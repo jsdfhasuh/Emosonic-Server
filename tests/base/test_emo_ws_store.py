@@ -16,9 +16,12 @@ from supysonic.emo.ws_state import WebSocketState
 from supysonic.emo.ws_store import (
     PlaybackContextAuthorityAmbiguousError,
     PlaybackContextBroadcastBarrierError,
+    PlaybackContextCloseConflictError,
+    PlaybackContextCloseInvariantError,
     PlaybackContextClosedError,
     PlaybackContextEnsureConflictError,
     PlaybackContextIntentConflictError,
+    PlaybackContextRestoreInProgressError,
     PlaybackContextStaleVersionError,
     PlaybackControlTransactionConflictError,
     PlaybackControlReconciliationConflictError,
@@ -46,6 +49,7 @@ from supysonic.emo.ws_store import (
     getDevicePlaybackState,
     getDevicePlaybackStates,
     getPlaybackContextState,
+    getPlaybackContextStateForUser,
     getPlaybackContextWithDeviceStates,
     getPlaybackControlTransaction,
     getPlaybackControlReconciliation,
@@ -1356,6 +1360,380 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 0,
                 "stopped",
             )
+
+    def test_safe_close_persists_exact_tombstone_and_replays_after_restart(self):
+        createStrictPlaybackContextState(
+            "safe-close-context",
+            "alice",
+            "phone-1",
+            "device:phone-1",
+            ["song-1"],
+            0,
+            250,
+            "paused",
+        )
+        close_kwargs = {
+            "expected_epoch": 1,
+            "base_version": 1,
+            "requesting_client_id": "phone-1",
+            "requesting_device_session_id": "device:phone-1",
+        }
+
+        closed = closeStrictPlaybackContextState(
+            "safe-close-context",
+            "alice",
+            **close_kwargs,
+        )
+
+        self.assertTrue(closed.mutated)
+        self.assertEqual(closed.close_outcome, {"action": "playback.context.close"})
+        self.assertEqual(closed["lifecycle"], "closed")
+        self.assertEqual(closed["version"], 2)
+        self.assertEqual(
+            closed.affected_authority_pairs,
+            (("alice", "phone-1", "device:phone-1"),),
+        )
+        tombstone = getPlaybackContextCloseTombstone(
+            "safe-close-context",
+            "alice",
+        )
+        self.assertEqual(tombstone["closeAction"], "playback.context.close")
+        self.assertRegex(tombstone["closeRequestFingerprint"], r"^[0-9a-f]{64}$")
+        self.assertEqual(tombstone["closeExpectedEpoch"], 1)
+        self.assertEqual(tombstone["closeBaseVersion"], 1)
+        self.assertEqual(tombstone["closedFromEpoch"], 1)
+        self.assertEqual(tombstone["closedFromVersion"], 1)
+        self.assertEqual(tombstone["finalEpoch"], 1)
+        self.assertEqual(tombstone["finalVersion"], 2)
+        self.assertEqual(tombstone["finalQueueRevision"], 1)
+        self.assertEqual(tombstone["finalControlVersion"], 1)
+        self.assertEqual(
+            tombstone["closeOutcome"],
+            {"action": "playback.context.close"},
+        )
+
+        replay = closeStrictPlaybackContextState(
+            "safe-close-context",
+            "alice",
+            **close_kwargs,
+        )
+        self.assertFalse(replay.mutated)
+        self.assertEqual(replay.close_outcome, closed.close_outcome)
+        self.assertEqual(replay.tombstone, tombstone)
+        self.assertEqual(replay["version"], 2)
+
+        db.release_database()
+        db.init_database("sqlite:///" + self.db_path)
+        restarted_replay = closeStrictPlaybackContextState(
+            "safe-close-context",
+            "alice",
+            **close_kwargs,
+        )
+        self.assertFalse(restarted_replay.mutated)
+        self.assertEqual(restarted_replay.close_outcome, closed.close_outcome)
+        self.assertEqual(restarted_replay.tombstone, tombstone)
+
+    def test_safe_close_mismatch_foreign_and_legacy_rows_fail_closed(self):
+        createStrictPlaybackContextState(
+            "safe-close-mismatch",
+            "alice",
+            "phone-1",
+            "device:phone-1",
+            ["song-1"],
+            0,
+            0,
+            "playing",
+        )
+        closeStrictPlaybackContextState(
+            "safe-close-mismatch",
+            "alice",
+            expected_epoch=1,
+            base_version=1,
+            requesting_client_id="phone-1",
+            requesting_device_session_id="device:phone-1",
+        )
+        for expected_epoch, base_version in ((2, 1), (1, 2)):
+            with self.subTest(
+                expected_epoch=expected_epoch,
+                base_version=base_version,
+            ):
+                with self.assertRaises(PlaybackContextClosedError) as mismatch:
+                    closeStrictPlaybackContextState(
+                        "safe-close-mismatch",
+                        "alice",
+                        expected_epoch=expected_epoch,
+                        base_version=base_version,
+                        requesting_client_id="phone-1",
+                        requesting_device_session_id="device:phone-1",
+                    )
+                self.assertEqual(mismatch.exception.playback_context["epoch"], 1)
+                self.assertEqual(mismatch.exception.playback_context["version"], 2)
+                self.assertEqual(
+                    mismatch.exception.playback_context["queueRevision"],
+                    1,
+                )
+                self.assertEqual(
+                    mismatch.exception.playback_context["controlVersion"],
+                    1,
+                )
+
+        self.assertIsNone(
+            closeStrictPlaybackContextState(
+                "safe-close-mismatch",
+                "bob",
+                expected_epoch=1,
+                base_version=1,
+                requesting_client_id="bob-phone",
+                requesting_device_session_id="device:bob-phone",
+                requester_is_controller=True,
+            )
+        )
+        self.assertIsNone(
+            getPlaybackContextStateForUser("safe-close-mismatch", "bob")
+        )
+
+        createStrictPlaybackContextState(
+            "legacy-close-context",
+            "alice",
+            "phone-1",
+            "device:phone-1",
+            ["song-1"],
+            0,
+            0,
+            "playing",
+        )
+        closeStrictPlaybackContextState("legacy-close-context", "alice")
+        with self.assertRaises(PlaybackContextClosedError):
+            closeStrictPlaybackContextState(
+                "legacy-close-context",
+                "alice",
+                expected_epoch=1,
+                base_version=1,
+                requesting_client_id="phone-1",
+                requesting_device_session_id="device:phone-1",
+            )
+
+    def test_safe_close_rejects_fences_stale_cursors_and_partial_tombstone(self):
+        def create_context(context_id):
+            createStrictPlaybackContextState(
+                context_id,
+                "alice",
+                "phone-1",
+                "device:phone-1",
+                ["song-1"],
+                0,
+                0,
+                "playing",
+            )
+
+        common = {
+            "expected_epoch": 1,
+            "base_version": 1,
+            "requesting_client_id": "controller-1",
+            "requesting_device_session_id": "device:controller-1",
+            "requester_is_controller": True,
+        }
+        create_context("pending-close-context")
+        createPlaybackControlTransaction(
+            "pending-close-context",
+            "alice",
+            1,
+            2,
+            "controller-1",
+            "phone-1",
+            "device:phone-1",
+            "nonce-phone",
+            1,
+            "player.pause",
+            {},
+            1000,
+            5000,
+            requesting_device_session_id="device:controller-1",
+            requesting_connection_nonce="nonce-controller",
+            requesting_connection_epoch=1,
+        )
+        with self.assertRaises(PlaybackContextCloseConflictError):
+            closeStrictPlaybackContextState(
+                "pending-close-context",
+                "alice",
+                **common,
+            )
+        self.assertEqual(
+            getPlaybackContextState("pending-close-context")["lifecycle"],
+            "active",
+        )
+
+        create_context("handoff-close-context")
+        db.EmoPlaybackHandoff.create(
+            handoff_id="handoff-close-fence",
+            playback_context_id="handoff-close-context",
+            user_name="alice",
+            source_client_id="phone-1",
+            target_client_id="phone-2",
+            status="preparing",
+        )
+        with self.assertRaises(PlaybackContextCloseConflictError):
+            closeStrictPlaybackContextState(
+                "handoff-close-context",
+                "alice",
+                **common,
+            )
+        self.assertEqual(
+            getPlaybackHandoff("handoff-close-fence")["status"],
+            "preparing",
+        )
+
+        create_context("validator-close-context")
+
+        class CloseFenceError(Exception):
+            pass
+
+        with self.assertRaises(CloseFenceError):
+            closeStrictPlaybackContextState(
+                "validator-close-context",
+                "alice",
+                pre_close_validator=lambda _current: (_ for _ in ()).throw(
+                    CloseFenceError("follow fence")
+                ),
+                **common,
+            )
+        self.assertEqual(
+            getPlaybackContextState("validator-close-context")["version"],
+            1,
+        )
+
+        create_context("stale-close-context")
+        for overrides in (
+            {"expected_epoch": 2},
+            {"base_version": 2},
+        ):
+            arguments = dict(common)
+            arguments.update(overrides)
+            with self.assertRaises(PlaybackContextStaleVersionError):
+                closeStrictPlaybackContextState(
+                    "stale-close-context",
+                    "alice",
+                    **arguments,
+                )
+        self.assertEqual(
+            getPlaybackContextState("stale-close-context")["version"],
+            1,
+        )
+
+        create_context("partial-close-context")
+        partial = db.EmoPlaybackContext.get(
+            db.EmoPlaybackContext.playback_context_id == "partial-close-context"
+        )
+        partial.close_action = "playback.context.close"
+        partial.save(only=(db.EmoPlaybackContext.close_action,))
+        with self.assertRaises(PlaybackContextCloseInvariantError):
+            closeStrictPlaybackContextState(
+                "partial-close-context",
+                "alice",
+                **common,
+            )
+        self.assertEqual(
+            getPlaybackContextState("partial-close-context")["lifecycle"],
+            "active",
+        )
+
+    def test_safe_close_restore_pending_precedes_stale_cursor_without_writes(self):
+        createStrictPlaybackContextState(
+            "restore-pending-close-context",
+            "alice",
+            "phone-1",
+            "device:phone-1",
+            ["song-1"],
+            0,
+            0,
+            "playing",
+        )
+        db.EmoBroadcastFence.create(
+            resource_key="restore-pending-close-fence",
+            broadcast_id="broadcast-restore-pending-close",
+            user_name="alice",
+            role="ordinary",
+            phase="restorePending",
+            playback_context_id="restore-pending-close-context",
+            client_id="phone-1",
+            device_session_id="device:phone-1",
+        )
+        context_before = getPlaybackContextState(
+            "restore-pending-close-context"
+        )
+        validator = mock.Mock()
+
+        with self.assertRaises(PlaybackContextRestoreInProgressError) as blocked:
+            closeStrictPlaybackContextState(
+                "restore-pending-close-context",
+                "alice",
+                expected_epoch=9,
+                base_version=9,
+                requesting_client_id="controller-1",
+                requesting_device_session_id="device:controller-1",
+                requester_is_controller=True,
+                pre_close_validator=validator,
+            )
+
+        validator.assert_not_called()
+        self.assertEqual(blocked.exception.playback_context, context_before)
+        self.assertEqual(
+            getPlaybackContextState("restore-pending-close-context"),
+            context_before,
+        )
+        self.assertIsNone(
+            getPlaybackContextCloseTombstone(
+                "restore-pending-close-context",
+                "alice",
+            )
+        )
+        self.assertEqual(
+            db.EmoBroadcastFence.select()
+            .where(
+                db.EmoBroadcastFence.resource_key
+                == "restore-pending-close-fence"
+            )
+            .count(),
+            1,
+        )
+
+    def test_safe_close_authorizes_exact_authority_pair_or_controller(self):
+        for context_id in ("pair-close-context", "controller-close-context"):
+            createStrictPlaybackContextState(
+                context_id,
+                "alice",
+                "phone-1",
+                "device:phone-1",
+                ["song-1"],
+                0,
+                0,
+                "playing",
+            )
+
+        with self.assertRaises(PermissionError):
+            closeStrictPlaybackContextState(
+                "pair-close-context",
+                "alice",
+                expected_epoch=1,
+                base_version=1,
+                requesting_client_id="phone-1",
+                requesting_device_session_id="device:replacement",
+            )
+        self.assertEqual(
+            getPlaybackContextState("pair-close-context")["lifecycle"],
+            "active",
+        )
+
+        controller_close = closeStrictPlaybackContextState(
+            "controller-close-context",
+            "alice",
+            expected_epoch=1,
+            base_version=1,
+            requesting_client_id="controller-1",
+            requesting_device_session_id="device:controller-1",
+            requester_is_controller=True,
+        )
+        self.assertTrue(controller_close.mutated)
 
     def test_restart_listing_preserves_active_and_closed_contexts(self):
         createStrictPlaybackContextState(

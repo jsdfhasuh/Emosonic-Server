@@ -85,6 +85,7 @@ from .strict_v2_runtime import (
 from .strict_v2_safety import resolve_allowed_origins, strict_v2_safety
 from .ws_store import (
     PlaybackContextAuthorityAmbiguousError,
+    PlaybackContextCloseConflictError,
     PlaybackContextClosedError,
     PlaybackContextEnsureConflictError,
     PlaybackContextIntentConflictError,
@@ -111,6 +112,7 @@ from .ws_store import (
     getDevicePlaybackStates,
     getDevicePlaybackState,
     getPlaybackContextState,
+    getPlaybackContextStateForUser,
     getPlaybackControlTransaction,
     getPlaybackHandoff,
     getPlaybackHandoffByRequest,
@@ -983,6 +985,32 @@ def _live_context_cursor_fields(playback_context, user_name):
         "currentQueueRevision": playback_context.get("queueRevision"),
         "currentVersion": playback_context.get("version"),
     }
+
+
+def _closed_context_cursor_fields(playback_context, user_name):
+    if not isinstance(playback_context, dict):
+        return {}
+    if playback_context.get("userName") != user_name:
+        return {}
+    fields = {
+        "playbackContextId": playback_context.get("playbackContextId"),
+        "currentEpoch": playback_context.get("finalEpoch", playback_context.get("epoch")),
+        "currentControlVersion": playback_context.get(
+            "finalControlVersion",
+            playback_context.get("controlVersion"),
+        ),
+        "currentQueueRevision": playback_context.get(
+            "finalQueueRevision",
+            playback_context.get("queueRevision"),
+        ),
+        "currentVersion": playback_context.get(
+            "finalVersion",
+            playback_context.get("version"),
+        ),
+    }
+    if any(value is None for value in fields.values()):
+        return {}
+    return fields
 
 
 def _send_error(code, message, request_id=None, **fields):
@@ -2016,7 +2044,10 @@ def _sync_broadcast_playback_context(broadcast):
 
 
 def _restore_broadcast_from_playback_context(user_name, playback_context_id):
-    playback_context = _get_existing_playback_context(playback_context_id)
+    playback_context = _get_existing_playback_context(
+        playback_context_id,
+        user_name,
+    )
     if playback_context is None or playback_context.get("contextType") != "broadcast":
         return None
     _ensure_playback_context_for_user(playback_context, user_name)
@@ -2049,7 +2080,10 @@ def _restore_broadcast_from_playback_context(user_name, playback_context_id):
 def _ensure_broadcast_playback_context_available(user_name, playback_context_id):
     if not playback_context_id:
         return
-    existing_context = _get_existing_playback_context(playback_context_id)
+    existing_context = _get_existing_playback_context(
+        playback_context_id,
+        user_name,
+    )
     if existing_context is None:
         return
     _ensure_playback_context_for_user(existing_context, user_name)
@@ -2419,7 +2453,10 @@ def _strict_broadcast_participant_eligible(client):
 
 
 def _get_strict_broadcast_context(current_user_name, playback_context_id):
-    context = _get_existing_playback_context(playback_context_id)
+    context = _get_existing_playback_context(
+        playback_context_id,
+        current_user_name,
+    )
     if context is None:
         raise LookupError("Playback context not found")
     _ensure_playback_context_for_user(context, current_user_name)
@@ -3948,7 +3985,10 @@ def _handle_strict_v2_context_control(
     request_id,
 ):
     playback_context_id = payload["playbackContextId"]
-    context = _get_existing_playback_context(playback_context_id)
+    context = _get_existing_playback_context(
+        playback_context_id,
+        current_user_name,
+    )
     if context is None:
         raise LookupError("Playback context not found")
     _ensure_playback_context_for_user(context, current_user_name)
@@ -4226,7 +4266,10 @@ def _handle_v2_context_control(current_user_name, current_client, action, payloa
     if not isinstance(playback_context_id, str) or not playback_context_id:
         raise ValueError(f"{action} requires a non-empty playbackContextId")
 
-    context = _get_existing_playback_context(playback_context_id)
+    context = _get_existing_playback_context(
+        playback_context_id,
+        current_user_name,
+    )
     if context is None:
         raise LookupError("Playback context not found")
     _ensure_playback_context_for_user(context, current_user_name)
@@ -6570,7 +6613,10 @@ def _handle_follow_start(current_user_name, current_client, payload, request_id,
         if not isinstance(source_playback_context_id, str) or not source_playback_context_id:
             raise ValueError("follow.start requires a non-empty sourcePlaybackContextId")
 
-        playback_context = _get_existing_playback_context(source_playback_context_id)
+        playback_context = _get_existing_playback_context(
+            source_playback_context_id,
+            current_user_name,
+        )
         if playback_context is None:
             raise LookupError("Playback context not found")
         _ensure_playback_context_for_user(playback_context, current_user_name)
@@ -6968,12 +7014,18 @@ def _get_or_restore_playback_context(playback_context_id):
     )
 
 
-def _get_existing_playback_context(playback_context_id):
+def _get_existing_playback_context(playback_context_id, user_name=None):
     context = state.get_playback_context(playback_context_id)
-    if context is not None:
+    if context is not None and (
+        user_name is None or context.get("userName") == user_name
+    ):
         return context
 
-    persisted_context = getPlaybackContextState(playback_context_id)
+    persisted_context = (
+        getPlaybackContextState(playback_context_id)
+        if user_name is None
+        else getPlaybackContextStateForUser(playback_context_id, user_name)
+    )
     if persisted_context is not None:
         return state.restore_playback_context(playback_context_id, persisted_context)
 
@@ -6983,12 +7035,12 @@ def _get_existing_playback_context(playback_context_id):
 def _ensure_playback_context_for_user(context, user_name):
     context_user_name = context.get("userName")
     if context_user_name is not None and context_user_name != user_name:
-        raise PermissionError("Playback context belongs to another user")
+        raise LookupError("Playback context not found")
 
     authority_client_id = context.get("authorityClientId")
     authority_client = state.get_client(authority_client_id, user_name=user_name)
     if authority_client is not None and authority_client.get("userName") != user_name:
-        raise PermissionError("Playback context authority belongs to another user")
+        raise LookupError("Playback context not found")
 
 
 def _ensure_playback_context_active(context):
@@ -7702,7 +7754,10 @@ def _handle_playback_context_prepare(
     if not _has_role(current_client, "controller"):
         raise PermissionError("Only a controller can prepare a playback context")
     playback_context_id = payload["playbackContextId"]
-    context = _get_existing_playback_context(playback_context_id)
+    context = _get_existing_playback_context(
+        playback_context_id,
+        current_user_name,
+    )
     if context is None:
         raise LookupError("Playback context not found")
     _ensure_playback_context_for_user(context, current_user_name)
@@ -7822,7 +7877,10 @@ def _handle_playback_context_prepared(
     if current_client is None or not _has_role(current_client, "player"):
         raise PermissionError("Only the authority player can settle prepare")
     playback_context_id = payload["playbackContextId"]
-    context = _get_existing_playback_context(playback_context_id)
+    context = _get_existing_playback_context(
+        playback_context_id,
+        current_user_name,
+    )
     if context is None:
         raise LookupError("Playback context not found")
     _ensure_playback_context_for_user(context, current_user_name)
@@ -8022,12 +8080,12 @@ def _handle_playback_context_status(current_user_name, current_client, payload, 
     if not isinstance(playback_context_id, str) or not playback_context_id:
         raise ValueError("playback.context.status requires a non-empty playbackContextId")
 
-    playback_context = _get_existing_playback_context(playback_context_id)
-    if (
-        playback_context is None
-        or playback_context.get("userName") != current_user_name
-    ):
-        raise PermissionError("Playback context access is not allowed")
+    playback_context = _get_existing_playback_context(
+        playback_context_id,
+        current_user_name,
+    )
+    if playback_context is None:
+        raise LookupError("Playback context not found")
     _ensure_playback_context_active(playback_context)
     _send_direct_response(
         "state",
@@ -8052,12 +8110,12 @@ def _handle_playback_context_subscribe(
     if not isinstance(playback_context_id, str) or not playback_context_id:
         raise ValueError("playback.context.subscribe requires a non-empty playbackContextId")
 
-    playback_context = _get_existing_playback_context(playback_context_id)
-    if (
-        playback_context is None
-        or playback_context.get("userName") != current_user_name
-    ):
-        raise PermissionError("Playback context access is not allowed")
+    playback_context = _get_existing_playback_context(
+        playback_context_id,
+        current_user_name,
+    )
+    if playback_context is None:
+        raise LookupError("Playback context not found")
     _ensure_playback_context_active(playback_context)
     state.subscribe_playback_context(sid, playback_context_id)
     _send_ack(request_id)
@@ -8078,9 +8136,11 @@ def _handle_playback_context_unsubscribe(
     if not isinstance(playback_context_id, str) or not playback_context_id:
         raise ValueError("playback.context.unsubscribe requires a non-empty playbackContextId")
 
-    playback_context = _get_existing_playback_context(playback_context_id)
+    playback_context = _get_existing_playback_context(
+        playback_context_id,
+        current_user_name,
+    )
     if playback_context is not None:
-        _ensure_playback_context_for_user(playback_context, current_user_name)
         _ensure_playback_context_active(playback_context)
     state.unsubscribe_playback_context(sid, playback_context_id)
     _send_ack(request_id)
@@ -8094,59 +8154,80 @@ def _handle_playback_context_close(current_user_name, current_client, payload, r
     playback_context_id = _resolve_v2_playback_context_id(payload, strict_v2=True)
     if not isinstance(playback_context_id, str) or not playback_context_id:
         raise ValueError("playback.context.close requires a non-empty playbackContextId")
+    expected_epoch = payload.get("expectedEpoch")
+    base_version = payload.get("baseVersion")
+    if not _is_int(expected_epoch) or expected_epoch < 1:
+        raise ValueError("playback.context.close expectedEpoch must be an integer >= 1")
+    if not _is_int(base_version) or base_version < 1:
+        raise ValueError("playback.context.close baseVersion must be an integer >= 1")
 
-    playback_context = _get_existing_playback_context(playback_context_id)
-    if playback_context is None:
-        raise LookupError("Playback context not found")
-    _ensure_playback_context_for_user(playback_context, current_user_name)
-    if (
-        playback_context.get("authorityClientId") != current_client.get("clientId")
-        and not _has_role(current_client, "controller")
-    ):
-        raise PermissionError("Only playback context authority or a controller can close context")
-
-    active_handoffs = getActivePlaybackHandoffs(playback_context_id)
-    closed_context = closeStrictPlaybackContextState(
+    playback_context = getPlaybackContextStateForUser(
         playback_context_id,
         current_user_name,
     )
+    if playback_context is None:
+        raise LookupError("Playback context not found")
+    requester_is_controller = _has_role(current_client, "controller")
+    requester_is_exact_authority = (
+        playback_context.get("authorityClientId") == current_client.get("clientId")
+        and playback_context.get("authorityDeviceSessionId")
+        == current_client.get("deviceSessionId")
+    )
+    if not requester_is_controller and not requester_is_exact_authority:
+        raise PermissionError(
+            "Only the exact playback authority pair or a controller can close context"
+        )
+
+    def validate_close_fences(current):
+        followers = state.list_followers_for_source(
+            current.get("authorityClientId"),
+        )
+        if any(
+            relationship.get("sourcePlaybackContextId") == playback_context_id
+            for relationship in followers
+        ):
+            raise PlaybackContextCloseConflictError(
+                current,
+                "Playback context has an active Follow relationship",
+            )
+
+    closed_context = closeStrictPlaybackContextState(
+        playback_context_id,
+        current_user_name,
+        expected_epoch=expected_epoch,
+        base_version=base_version,
+        requesting_client_id=current_client.get("clientId"),
+        requesting_device_session_id=current_client.get("deviceSessionId"),
+        requester_is_controller=requester_is_controller,
+        pre_close_validator=validate_close_fences,
+    )
     if closed_context is None:
         raise LookupError("Playback context not found")
-    settled_prepares = _settle_active_context_prepares_for_authority_change(
-        playback_context_id,
-        closed_context.get("controlVersion", 1),
-    )
     state.restore_playback_context(playback_context_id, closed_context)
-    for active_handoff in active_handoffs:
-        handoff = getPlaybackHandoff(active_handoff.get("handoffId"))
-        if handoff is None:
-            continue
-        state.update_playback_handoff(
-            handoff["handoffId"],
-            status=handoff.get("status"),
-            error_code=handoff.get("errorCode"),
-            error_message=handoff.get("errorMessage"),
+    _send_ack(request_id, closed_context.close_outcome)
+    if closed_context.mutated:
+        settled_prepares = _settle_active_context_prepares_for_authority_change(
+            playback_context_id,
+            closed_context.get("controlVersion", 1),
         )
-    _send_ack(request_id)
-    for canonical_result in settled_prepares:
+        for canonical_result in settled_prepares:
+            _run_post_commit_push(
+                "playback.context.close",
+                request_id,
+                lambda result=canonical_result: _broadcast_context_prepared(
+                    current_user_name,
+                    playback_context_id,
+                    result,
+                ),
+            )
         _run_post_commit_push(
             "playback.context.close",
             request_id,
-            lambda result=canonical_result: _broadcast_context_prepared(
+            lambda: _broadcast_playback_context_closed_v2(
                 current_user_name,
                 playback_context_id,
-                result,
             ),
         )
-    _run_post_commit_push(
-        "playback.context.close",
-        request_id,
-        lambda: _broadcast_playback_context_closed_v2(
-            current_user_name,
-            playback_context_id,
-        ),
-    )
-    if closed_context.mutated:
         _run_post_commit_push(
             "playback.context.close",
             request_id,
@@ -8155,8 +8236,7 @@ def _handle_playback_context_close(current_user_name, current_client, payload, r
                 closed_context.affected_authority_pairs,
             ),
         )
-    state.stop_follow_relationships_for_context(playback_context_id)
-    state.clear_playback_context_subscriptions(playback_context_id)
+        state.clear_playback_context_subscriptions(playback_context_id)
     return closed_context
 
 
@@ -8175,7 +8255,10 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
     if not isinstance(device_session_id, str) or not device_session_id:
         raise ValueError("queue.context.sync requires a non-empty deviceSessionId")
 
-    playback_context = _get_existing_playback_context(playback_context_id)
+    playback_context = _get_existing_playback_context(
+        playback_context_id,
+        current_user_name,
+    )
     if playback_context is None:
         raise LookupError("Playback context not found")
     _ensure_playback_context_for_user(playback_context, current_user_name)
@@ -9007,7 +9090,10 @@ def _handle_handoff_start(current_user_name, current_client, payload, request_id
         raise ValueError("playback.handoff.start requires a non-empty playbackContextId")
 
     context = (
-        _get_existing_playback_context(playback_context_id)
+        _get_existing_playback_context(
+            playback_context_id,
+            current_user_name,
+        )
         if use_v2_context
         else _get_or_restore_playback_context(playback_context_id)
     )
@@ -10701,7 +10787,10 @@ class EmoNamespace(Namespace):
                         raise ValueError("playback.update requires a non-empty deviceSessionId")
                     playback_payload["playbackContextId"] = playback_context_id
                     playback_payload["deviceSessionId"] = device_session_id
-                    context = _get_existing_playback_context(playback_context_id)
+                    context = _get_existing_playback_context(
+                        playback_context_id,
+                        current_user_name,
+                    )
                     if context is None:
                         raise LookupError("Playback context not found")
                     _ensure_playback_context_for_user(context, current_user_name)
@@ -11327,8 +11416,20 @@ class EmoNamespace(Namespace):
                 "context_closed",
                 str(exc),
                 request_id,
-                playbackContextId=playback_context.get("playbackContextId")
-                or payload.get("playbackContextId"),
+                **_closed_context_cursor_fields(
+                    playback_context,
+                    current_user_name,
+                ),
+            )
+        except PlaybackContextCloseConflictError as exc:
+            _send_error(
+                "conflict",
+                str(exc),
+                request_id,
+                **_live_context_cursor_fields(
+                    exc.playback_context,
+                    current_user_name,
+                ),
             )
         except PlaybackContextIntentConflictError as exc:
             playback_context = exc.playback_context or {}
@@ -11370,8 +11471,14 @@ class EmoNamespace(Namespace):
             PlaybackControlTransactionConflictError,
             PlaybackLocalIntentConflictError,
         ) as exc:
-            playback_context = getPlaybackContextState(
-                payload.get("playbackContextId")
+            playback_context_id = payload.get("playbackContextId")
+            playback_context = (
+                getPlaybackContextStateForUser(
+                    playback_context_id,
+                    current_user_name,
+                )
+                if isinstance(playback_context_id, str) and playback_context_id
+                else None
             ) or {}
             _send_error(
                 "conflict",

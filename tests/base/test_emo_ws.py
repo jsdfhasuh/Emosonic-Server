@@ -3307,7 +3307,11 @@ class EmoWebSocketTestCase(unittest.TestCase):
         "type": "command",
         "action": "playback.context.close",
         "requestId": "context-close-1",
-        "payload": {"playbackContextId": "playback:alice:main"},
+        "payload": {
+          "playbackContextId": "playback:alice:main",
+          "expectedEpoch": 1,
+          "baseVersion": 1,
+        },
       },
       namespace="/emo",
     )
@@ -4600,7 +4604,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
 
     error = self.get_error(self.get_messages(bob_controller), "cross-user-handoff-1")
-    self.assertEqual(error["payload"]["code"], "forbidden")
+    self.assertEqual(error["payload"]["code"], "not_found")
     self.assertEqual(get_state().get_playback_context("playback:alice:main")["authorityClientId"], "phone-1")
 
   def test_handoff_complete_requires_ready_status(self):

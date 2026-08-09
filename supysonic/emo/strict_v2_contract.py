@@ -81,7 +81,10 @@ ACTION_SCHEMAS = {
         ("playbackContextId", "intentId", "baseControlVersion"),
         ("initialQueueSongIds", "currentIndex", "positionMs"),
     ),
-    "playback.context.close": ActionSchema("command", ("playbackContextId",)),
+    "playback.context.close": ActionSchema(
+        "command",
+        ("playbackContextId", "expectedEpoch", "baseVersion"),
+    ),
     "queue.context.sync": ActionSchema(
         "state",
         (
@@ -238,7 +241,9 @@ _NON_NEGATIVE_INT_FIELDS = {
     "lastAppliedBroadcastRevision",
 }
 _POSITIVE_INT_FIELDS = {
+    "baseVersion",
     "epoch",
+    "expectedEpoch",
     "commandControlVersion",
     "appliedControlVersion",
     "observedControlVersion",
@@ -1890,6 +1895,7 @@ def _validate_output_error(payload: object) -> str:
         "currentVersion",
     }
     context_scoped = code in {
+        "context_closed",
         "queue_required",
         "restore_in_progress",
         "stale_version",

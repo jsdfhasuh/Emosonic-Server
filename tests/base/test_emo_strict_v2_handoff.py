@@ -1199,7 +1199,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
             )
             self.assertEqual(messages[0]["payload"]["status"], "timedOut")
 
-    def test_context_close_fences_late_handoff_complete(self):
+    def test_context_close_conflicts_with_nonterminal_handoff(self):
         source, target, controller = self.connect_handoff_devices()
         start_ack = self.get_ack(
             self.start_handoff(controller),
@@ -1230,59 +1230,38 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
                 "type": "command",
                 "action": "playback.context.close",
                 "requestId": "context-close-during-handoff",
-                "payload": {"playbackContextId": "context-handoff-1"},
-            },
-            namespace="/emo",
-        )
-        close_ack = self.get_ack(
-            self.get_messages(controller),
-            "context-close-during-handoff",
-        )
-        self.assertEqual(
-            close_ack["payload"],
-            {"action": "playback.context.close"},
-        )
-        self.get_messages(source)
-        self.get_messages(target)
-
-        target.emit(
-            "message",
-            {
-                "type": "event",
-                "action": "playback.handoff.complete",
-                "requestId": "handoff-complete-after-close",
                 "payload": {
                     "playbackContextId": "context-handoff-1",
-                    "handoffId": start_ack["payload"]["handoffId"],
-                    "positionMs": 1500,
+                    "expectedEpoch": 1,
+                    "baseVersion": 1,
                 },
             },
             namespace="/emo",
         )
-        complete_messages = self.get_messages(target)
-        error = self.get_error(
-            complete_messages,
-            "handoff-complete-after-close",
+        close_error = self.get_error(
+            self.get_messages(controller),
+            "context-close-during-handoff",
         )
         context = getPlaybackContextState("context-handoff-1")
         handoff = getPlaybackHandoff(start_ack["payload"]["handoffId"])
 
-        self.assertEqual(error["payload"]["code"], "context_closed")
-        self.assertEqual(
-            error["payload"]["playbackContextId"],
-            "context-handoff-1",
-        )
-        self.assertEqual(context["lifecycle"], "closed")
+        self.assertEqual(close_error["payload"]["code"], "conflict")
+        self.assertEqual(close_error["payload"]["playbackContextId"], "context-handoff-1")
+        self.assertEqual(close_error["payload"]["currentEpoch"], 1)
+        self.assertEqual(close_error["payload"]["currentVersion"], 1)
+        self.assertEqual(close_error["payload"]["currentQueueRevision"], 1)
+        self.assertEqual(close_error["payload"]["currentControlVersion"], 1)
+        self.assertEqual(context["lifecycle"], "active")
         self.assertEqual(context["authorityClientId"], "source-1")
-        self.assertEqual(context["version"], 2)
+        self.assertEqual(context["version"], 1)
         self.assertEqual(context["controlVersion"], 1)
-        self.assertEqual(handoff["status"], "failed")
-        self.assertEqual(handoff["errorCode"], "context_closed")
+        self.assertEqual(handoff["status"], "committed")
+        self.assertIsNone(handoff["errorCode"])
         self.assertFalse(
             any(
-                message["action"] == "playback.handoff.status"
-                and message["payload"].get("status") == "completed"
-                for message in complete_messages
+                message["action"] == "playback.context.closed"
+                for message in self.get_messages(source)
+                + self.get_messages(target)
             )
         )
 

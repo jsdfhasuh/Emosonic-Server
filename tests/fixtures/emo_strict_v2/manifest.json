@@ -147,12 +147,12 @@
       "profile": "core",
       "type": "command",
       "contractSection": "5.1/6.4",
-      "payloadSchema": {"closed": true, "required": ["playbackContextId:string"], "optional": []},
+      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "expectedEpoch:int>=1", "baseVersion:int>=1"], "optional": []},
       "settlement": "correlated_ack",
       "serverPushes": ["playback.context.closed", "playback.context.bindings.changed"],
-      "roleCapabilityGate": "current authority or same-user controller",
+      "roleCapabilityGate": "exact current authority pair or same-user controller",
       "cursorMutation": "version +1; terminal tombstone",
-      "errorConditionFields": ["playbackContextId", "currentControlVersion", "currentQueueRevision", "currentVersion", "retryAfterMs"]
+      "errorConditionFields": ["playbackContextId", "currentEpoch", "currentControlVersion", "currentQueueRevision", "currentVersion", "retryAfterMs"]
     },
     "queue.context.sync": {
       "profile": "core",

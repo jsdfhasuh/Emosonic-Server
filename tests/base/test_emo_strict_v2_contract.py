@@ -129,6 +129,15 @@ class StrictV2ContractTestCase(unittest.TestCase):
     def test_rejects_boolean_integer_fields(self):
         cases = (
             (
+                "playback.context.close",
+                {
+                    "playbackContextId": "context-1",
+                    "expectedEpoch": 1,
+                    "baseVersion": 1,
+                },
+                "expectedEpoch",
+            ),
+            (
                 "playback.context.prepare",
                 {
                     "playbackContextId": "context-1",
@@ -176,6 +185,7 @@ class StrictV2ContractTestCase(unittest.TestCase):
             ),
         )
         message_types = {
+            "playback.context.close": "command",
             "playback.context.prepare": "command",
             "queue.playItem": "command",
             "player.seek": "command",
@@ -193,6 +203,33 @@ class StrictV2ContractTestCase(unittest.TestCase):
                 with self.subTest(action=action, field_name=field_name, value=invalid_value):
                     with self.assertRaises(StrictRequestValidationError):
                         validate_strict_request(request)
+
+    def test_validates_safe_context_close_request(self):
+        request = {
+            "type": "command",
+            "action": "playback.context.close",
+            "requestId": "close-1",
+            "payload": {
+                "playbackContextId": "context-1",
+                "expectedEpoch": 1,
+                "baseVersion": 4,
+            },
+        }
+        self.assertEqual(validate_strict_request(request), request)
+
+        for field_name in ("expectedEpoch", "baseVersion"):
+            missing = copy.deepcopy(request)
+            del missing["payload"][field_name]
+            with self.subTest(missing=field_name):
+                with self.assertRaises(StrictRequestValidationError):
+                    validate_strict_request(missing)
+        for field_name in ("expectedEpoch", "baseVersion"):
+            for value in (0, -1, True, "1", None):
+                invalid = copy.deepcopy(request)
+                invalid["payload"][field_name] = value
+                with self.subTest(field_name=field_name, value=value):
+                    with self.assertRaises(StrictRequestValidationError):
+                        validate_strict_request(invalid)
 
     def test_rejects_optional_null_and_requester_spoof_fields(self):
         register = self._register_request()
@@ -731,6 +768,22 @@ class StrictV2ContractTestCase(unittest.TestCase):
                     "currentVersion": 3,
                 },
                 "seek-1",
+            ),
+            self._output(
+                "system",
+                "system.error",
+                {
+                    "action": "playback.context.close",
+                    "code": "context_closed",
+                    "message": "context is closed",
+                    "retryable": False,
+                    "playbackContextId": "context-1",
+                    "currentEpoch": 1,
+                    "currentControlVersion": 3,
+                    "currentQueueRevision": 2,
+                    "currentVersion": 5,
+                },
+                "close-1",
             ),
             self._output(
                 "system",

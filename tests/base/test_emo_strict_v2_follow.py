@@ -253,9 +253,9 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
             controller_error["payload"]["code"],
             "capability_required",
         )
-        self.assertEqual(mismatched_device_error["payload"]["code"], "forbidden")
+        self.assertEqual(mismatched_device_error["payload"]["code"], "not_found")
 
-    def test_disconnect_and_context_close_clear_relationship(self):
+    def test_context_close_is_fenced_and_disconnect_clears_relationship(self):
         owner = self.connect_device(
             "alice",
             "Alic3",
@@ -297,20 +297,45 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
                 "type": "command",
                 "action": "playback.context.close",
                 "requestId": "context-close-source-1",
-                "payload": {"playbackContextId": "context-source-1"},
+                "payload": {
+                    "playbackContextId": "context-source-1",
+                    "expectedEpoch": 1,
+                    "baseVersion": 1,
+                },
             },
             namespace="/emo",
         )
-        self.get_messages(owner)
+        close_messages = self.get_messages(owner)
         follower_messages = self.get_messages(follower)
 
-        self.assertTrue(
+        close_error = self.get_error(
+            close_messages,
+            "context-close-source-1",
+        )
+        self.assertEqual(close_error["payload"]["code"], "conflict")
+        self.assertFalse(
             any(
                 message["action"] == "playback.context.closed"
                 for message in follower_messages
             )
         )
-        self.assertIsNone(get_state().get_follow_relationship("follower-1"))
+        self.assertIsNotNone(
+            get_state().get_follow_relationship("follower-1")
+        )
+
+        follower.emit(
+            "message",
+            {
+                "type": "command",
+                "action": "follow.stop",
+                "requestId": "follow-stop-before-second-source",
+                "payload": {
+                    "sourcePlaybackContextId": "context-source-1",
+                },
+            },
+            namespace="/emo",
+        )
+        self.get_messages(follower)
 
         second_context_owner = self.connect_device(
             "alice",

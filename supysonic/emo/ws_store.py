@@ -85,6 +85,16 @@ class PlaybackContextQueueRequiredError(Exception):
         self.playback_context = playback_context
 
 
+class PlaybackContextCloseConflictError(Exception):
+    def __init__(self, playback_context, message):
+        super().__init__(message)
+        self.playback_context = playback_context
+
+
+class PlaybackContextCloseInvariantError(RuntimeError):
+    pass
+
+
 class PlaybackControlTransactionConflictError(Exception):
     pass
 
@@ -207,6 +217,8 @@ class PlaybackContextCloseResult(dict):
         playback_context: Dict[str, object],
         mutated: bool,
         affected_authority_pairs: Iterable[AuthorityPair],
+        close_outcome: Optional[Dict[str, object]] = None,
+        tombstone: Optional[Dict[str, object]] = None,
     ) -> None:
         super().__init__(playback_context)
         self.mutated = bool(mutated)
@@ -214,6 +226,10 @@ class PlaybackContextCloseResult(dict):
             affected_authority_pairs
         )
         self.canonical_context = dict(playback_context)
+        self.close_outcome = (
+            None if close_outcome is None else dict(close_outcome)
+        )
+        self.tombstone = None if tombstone is None else dict(tombstone)
 
 
 class PlaybackHandoffCompleteResult(tuple):
@@ -355,6 +371,7 @@ def _raise_broadcast_fence(
 def _require_broadcast_context_mutation_allowed(
     playback_context_id,
     mutation_name,
+    restore_in_progress=False,
 ):
     fences = _broadcast_fences_for_context(playback_context_id)
     ordinary = next(
@@ -362,7 +379,11 @@ def _require_broadcast_context_mutation_allowed(
         None,
     )
     if ordinary is not None:
-        _raise_broadcast_fence(ordinary, playback_context_id)
+        _raise_broadcast_fence(
+            ordinary,
+            playback_context_id,
+            restore_in_progress=restore_in_progress,
+        )
     source = next(
         (fence for fence in fences if fence.role == "source"),
         None,
@@ -371,7 +392,11 @@ def _require_broadcast_context_mutation_allowed(
         source is not None
         and mutation_name not in _SOURCE_BROADCAST_ALLOWED_MUTATIONS
     ):
-        _raise_broadcast_fence(source, playback_context_id)
+        _raise_broadcast_fence(
+            source,
+            playback_context_id,
+            restore_in_progress=restore_in_progress,
+        )
 
 
 @contextmanager
@@ -399,6 +424,39 @@ def _serialize_strict_playback_context_mutation(function):
             finally:
                 close_connection()
             return function(playback_context_id, *args, **kwargs)
+
+    return serialized
+
+
+def _serialize_strict_playback_context_close(function):
+    @wraps(function)
+    def serialized(playback_context_id, user_name=None, *args, **kwargs):
+        with _strict_playback_context_lock(playback_context_id):
+            open_connection(reuse=True)
+            try:
+                if user_name is None:
+                    _require_broadcast_context_mutation_allowed(
+                        playback_context_id,
+                        function.__name__,
+                        restore_in_progress=True,
+                    )
+                else:
+                    visible_record = EmoPlaybackContext.get_or_none(
+                        (
+                            EmoPlaybackContext.playback_context_id
+                            == playback_context_id
+                        )
+                        & (EmoPlaybackContext.user_name == user_name)
+                    )
+                    if visible_record is not None:
+                        _require_broadcast_context_mutation_allowed(
+                            playback_context_id,
+                            function.__name__,
+                            restore_in_progress=True,
+                        )
+            finally:
+                close_connection()
+            return function(playback_context_id, user_name, *args, **kwargs)
 
     return serialized
 
@@ -2449,6 +2507,71 @@ def serializePlaybackContextCloseTombstone(record):
     return payload
 
 
+_PLAYBACK_CONTEXT_CLOSE_TOMBSTONE_FIELDS = (
+    "close_action",
+    "close_request_fingerprint",
+    "close_expected_epoch",
+    "close_base_version",
+    "closed_from_epoch",
+    "closed_from_version",
+    "final_epoch",
+    "final_version",
+    "final_queue_revision",
+    "final_control_version",
+    "close_outcome_json",
+)
+
+
+def _has_playback_context_close_tombstone_data(record):
+    return any(
+        getattr(record, field_name) is not None
+        for field_name in _PLAYBACK_CONTEXT_CLOSE_TOMBSTONE_FIELDS
+    )
+
+
+def _has_complete_playback_context_close_tombstone(record):
+    return all(
+        getattr(record, field_name) is not None
+        for field_name in _PLAYBACK_CONTEXT_CLOSE_TOMBSTONE_FIELDS
+    )
+
+
+def _closed_playback_context_payload(record):
+    payload = _playback_context_payload(record)
+    final_fields = {
+        "epoch": record.final_epoch,
+        "version": record.final_version,
+        "queueRevision": record.final_queue_revision,
+        "controlVersion": record.final_control_version,
+    }
+    payload.update(
+        {
+            field_name: value
+            for field_name, value in final_fields.items()
+            if value is not None
+        }
+    )
+    return payload
+
+
+def _playback_context_close_fingerprint(
+    playback_context_id,
+    expected_epoch,
+    base_version,
+    close_action,
+):
+    return _json_fingerprint(
+        {
+            "action": close_action,
+            "payload": {
+                "playbackContextId": playback_context_id,
+                "expectedEpoch": expected_epoch,
+                "baseVersion": base_version,
+            },
+        }
+    )
+
+
 def getPlaybackContextCloseTombstone(playback_context_id, user_name):
     _require_non_empty_string(playback_context_id, "playbackContextId", 128)
     _require_non_empty_string(user_name, "userName", 64)
@@ -3820,6 +3943,20 @@ def getPlaybackContextState(playback_context_id):
         close_connection()
 
 
+def getPlaybackContextStateForUser(playback_context_id, user_name):
+    _require_non_empty_string(playback_context_id, "playbackContextId", 128)
+    _require_non_empty_string(user_name, "userName", 64)
+    open_connection(reuse=True)
+    try:
+        record = EmoPlaybackContext.get_or_none(
+            (EmoPlaybackContext.playback_context_id == playback_context_id)
+            & (EmoPlaybackContext.user_name == user_name)
+        )
+        return None if record is None else _playback_context_payload(record)
+    finally:
+        close_connection()
+
+
 def playbackContextCreationFingerprint(
     user_name,
     authority_client_id,
@@ -4258,67 +4395,233 @@ def createStrictPlaybackContextState(
         close_connection()
 
 
-@_serialize_strict_playback_context_mutation
+@_serialize_strict_playback_context_close
 def closeStrictPlaybackContextState(
     playback_context_id,
     user_name,
+    expected_epoch=None,
+    base_version=None,
+    requesting_client_id=None,
+    requesting_device_session_id=None,
+    requester_is_controller=False,
+    pre_close_validator=None,
+    close_action="playback.context.close",
+    close_outcome=None,
 ) -> Optional[PlaybackContextCloseResult]:
+    _require_non_empty_string(playback_context_id, "playbackContextId", 128)
+    _require_non_empty_string(user_name, "userName", 64)
+    safe_close = expected_epoch is not None or base_version is not None
+    if safe_close:
+        _require_integer(expected_epoch, "expectedEpoch", 1)
+        _require_integer(base_version, "baseVersion", 1)
+        _require_non_empty_string(requesting_client_id, "requestingClientId", 128)
+        _require_non_empty_string(
+            requesting_device_session_id,
+            "requestingDeviceSessionId",
+            128,
+        )
+        if type(requester_is_controller) is not bool:
+            raise ValueError("requesterIsController must be a boolean")
+        _require_non_empty_string(close_action, "closeAction", 64)
+        if close_action != "playback.context.close":
+            raise ValueError("closeAction is not a strict Context close action")
+        if close_outcome is None:
+            close_outcome = {"action": close_action}
+        if close_outcome != {"action": close_action}:
+            raise ValueError("closeOutcome must be the canonical close ACK payload")
+        request_fingerprint = _playback_context_close_fingerprint(
+            playback_context_id,
+            expected_epoch,
+            base_version,
+            close_action,
+        )
+    else:
+        if expected_epoch is not None or base_version is not None:
+            raise ValueError("expectedEpoch and baseVersion must appear together")
+        request_fingerprint = None
+
     open_connection(reuse=True)
     try:
         initial_record = EmoPlaybackContext.get_or_none(
-            EmoPlaybackContext.playback_context_id == playback_context_id
+            (EmoPlaybackContext.playback_context_id == playback_context_id)
+            & (EmoPlaybackContext.user_name == user_name)
         )
         if initial_record is None:
             return None
-        if initial_record.user_name != user_name:
-            raise PermissionError("Playback context belongs to another user")
         authority_pair = _record_authority_pair(initial_record)
         with _strict_authority_pair_transaction((authority_pair,)):
             record = EmoPlaybackContext.get_or_none(
-                EmoPlaybackContext.playback_context_id == playback_context_id
+                (EmoPlaybackContext.playback_context_id == playback_context_id)
+                & (EmoPlaybackContext.user_name == user_name)
             )
             if record is None:
                 return None
-            if record.user_name != user_name:
-                raise PermissionError("Playback context belongs to another user")
-            mutated = record.lifecycle != "closed"
-            if mutated:
-                closed_at = now()
-                record.lifecycle = "closed"
-                record.closed_at = closed_at
-                record.version = max(1, record.version) + 1
-                record.updated_at = closed_at
-                record.save(
-                    only=(
-                        EmoPlaybackContext.lifecycle,
-                        EmoPlaybackContext.closed_at,
-                        EmoPlaybackContext.version,
-                        EmoPlaybackContext.updated_at,
-                    )
+
+            if safe_close and not requester_is_controller and (
+                record.authority_client_id != requesting_client_id
+                or record.authority_device_session_id
+                != requesting_device_session_id
+            ):
+                raise PermissionError(
+                    "Only the exact playback authority pair or a controller can close context"
                 )
-                (
-                    EmoPlaybackHandoff.update(
-                        status="failed",
-                        error_code="context_closed",
-                        error_message="Playback context is closed",
-                        updated_at=closed_at,
+
+            if record.lifecycle == "closed":
+                closed_context = _closed_playback_context_payload(record)
+                if not safe_close:
+                    return PlaybackContextCloseResult(
+                        closed_context,
+                        False,
+                        (),
                     )
+                if not _has_complete_playback_context_close_tombstone(record):
+                    raise PlaybackContextClosedError(closed_context)
+                tombstone_matches = (
+                    record.close_action == close_action
+                    and record.close_request_fingerprint == request_fingerprint
+                    and record.close_expected_epoch == expected_epoch
+                    and record.close_base_version == base_version
+                    and record.closed_from_epoch == expected_epoch
+                    and record.closed_from_version == base_version
+                )
+                if not tombstone_matches:
+                    raise PlaybackContextClosedError(closed_context)
+                persisted_outcome = _load_json_object(
+                    record.close_outcome_json,
+                    required=True,
+                )
+                return PlaybackContextCloseResult(
+                    closed_context,
+                    False,
+                    (),
+                    close_outcome=persisted_outcome,
+                    tombstone=serializePlaybackContextCloseTombstone(record),
+                )
+
+            if record.lifecycle != "active":
+                raise PlaybackContextCloseInvariantError(
+                    "Playback context has an invalid lifecycle"
+                )
+            if _has_playback_context_close_tombstone_data(record):
+                raise PlaybackContextCloseInvariantError(
+                    "Active playback context already contains close tombstone data"
+                )
+
+            current = _playback_context_payload(record)
+            if safe_close:
+                if pre_close_validator is not None:
+                    pre_close_validator(dict(current))
+                has_pending_control = (
+                    EmoPlaybackControlTransaction.select()
                     .where(
                         (
-                            EmoPlaybackHandoff.playback_context_id
+                            EmoPlaybackControlTransaction.playback_context_id
                             == playback_context_id
                         )
+                        & (EmoPlaybackControlTransaction.status == "pending")
+                    )
+                    .exists()
+                )
+                if has_pending_control:
+                    raise PlaybackContextCloseConflictError(
+                        current,
+                        "Playback context has a pending control transaction",
+                    )
+                has_nonterminal_handoff = (
+                    EmoPlaybackHandoff.select()
+                    .where(
+                        (EmoPlaybackHandoff.playback_context_id == playback_context_id)
                         & EmoPlaybackHandoff.status.in_(
                             ("preparing", "ready", "committed", "committing")
                         )
                     )
-                    .execute()
+                    .exists()
                 )
+                if has_nonterminal_handoff:
+                    raise PlaybackContextCloseConflictError(
+                        current,
+                        "Playback context has a nonterminal Handoff",
+                    )
+                if expected_epoch != record.epoch:
+                    raise PlaybackContextStaleVersionError(current, "epoch")
+                if base_version != record.version:
+                    raise PlaybackContextStaleVersionError(current, "version")
+
+            mutated = record.lifecycle != "closed"
+            if mutated:
+                closed_at = now()
+                closed_from_epoch = record.epoch
+                closed_from_version = record.version
+                record.lifecycle = "closed"
+                record.closed_at = closed_at
+                record.version = max(1, record.version) + 1
+                record.updated_at = closed_at
+                fields = [
+                    EmoPlaybackContext.lifecycle,
+                    EmoPlaybackContext.closed_at,
+                    EmoPlaybackContext.version,
+                    EmoPlaybackContext.updated_at,
+                ]
+                if safe_close:
+                    record.close_action = close_action
+                    record.close_request_fingerprint = request_fingerprint
+                    record.close_expected_epoch = expected_epoch
+                    record.close_base_version = base_version
+                    record.closed_from_epoch = closed_from_epoch
+                    record.closed_from_version = closed_from_version
+                    record.final_epoch = record.epoch
+                    record.final_version = record.version
+                    record.final_queue_revision = record.queue_revision
+                    record.final_control_version = record.control_version
+                    record.close_outcome_json = _canonical_json(close_outcome)
+                    fields.extend(
+                        (
+                            EmoPlaybackContext.close_action,
+                            EmoPlaybackContext.close_request_fingerprint,
+                            EmoPlaybackContext.close_expected_epoch,
+                            EmoPlaybackContext.close_base_version,
+                            EmoPlaybackContext.closed_from_epoch,
+                            EmoPlaybackContext.closed_from_version,
+                            EmoPlaybackContext.final_epoch,
+                            EmoPlaybackContext.final_version,
+                            EmoPlaybackContext.final_queue_revision,
+                            EmoPlaybackContext.final_control_version,
+                            EmoPlaybackContext.close_outcome_json,
+                        )
+                    )
+                record.save(
+                    only=tuple(fields)
+                )
+                if not safe_close:
+                    (
+                        EmoPlaybackHandoff.update(
+                            status="failed",
+                            error_code="context_closed",
+                            error_message="Playback context is closed",
+                            updated_at=closed_at,
+                        )
+                        .where(
+                            (
+                                EmoPlaybackHandoff.playback_context_id
+                                == playback_context_id
+                            )
+                            & EmoPlaybackHandoff.status.in_(
+                                ("preparing", "ready", "committed", "committing")
+                            )
+                        )
+                        .execute()
+                    )
             playback_context = _playback_context_payload(record)
             return PlaybackContextCloseResult(
                 playback_context,
                 mutated,
                 (authority_pair,) if mutated else (),
+                close_outcome=close_outcome if safe_close else None,
+                tombstone=(
+                    serializePlaybackContextCloseTombstone(record)
+                    if safe_close
+                    else None
+                ),
             )
     finally:
         close_connection()
@@ -4326,12 +4629,11 @@ def closeStrictPlaybackContextState(
 
 def _getStrictPlaybackContextRecord(playback_context_id, user_name):
     record = EmoPlaybackContext.get_or_none(
-        EmoPlaybackContext.playback_context_id == playback_context_id
+        (EmoPlaybackContext.playback_context_id == playback_context_id)
+        & (EmoPlaybackContext.user_name == user_name)
     )
     if record is None:
         return None
-    if record.user_name != user_name:
-        raise PermissionError("Playback context belongs to another user")
     if record.lifecycle == "closed":
         raise PlaybackContextClosedError(_playback_context_payload(record))
     return record

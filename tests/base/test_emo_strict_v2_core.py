@@ -3262,7 +3262,11 @@ class StrictV2CoreTestCase(unittest.TestCase):
             "command",
             "playback.context.close",
             "context-close-bindings",
-            {"playbackContextId": "context-1"},
+            {
+                "playbackContextId": "context-1",
+                "expectedEpoch": 1,
+                "baseVersion": 1,
+            },
         )
         self.assertEqual(
             len(
@@ -3288,7 +3292,11 @@ class StrictV2CoreTestCase(unittest.TestCase):
             "command",
             "playback.context.close",
             "context-close-bindings-repeat",
-            {"playbackContextId": "context-1"},
+            {
+                "playbackContextId": "context-1",
+                "expectedEpoch": 1,
+                "baseVersion": 1,
+            },
         )
         self.assertFalse(
             any(
@@ -3700,13 +3708,49 @@ class StrictV2CoreTestCase(unittest.TestCase):
     def test_closed_context_is_a_terminal_tombstone(self):
         client = self.ready_strict_client()
         self.create_context(client)
+
+        stale = self.emit_strict(
+            client,
+            "command",
+            "playback.context.close",
+            "context-close-stale",
+            {
+                "playbackContextId": "context-1",
+                "expectedEpoch": 1,
+                "baseVersion": 2,
+            },
+        )
+        self.assertEqual(stale[0]["payload"]["code"], "stale_version")
+        self.assertEqual(
+            {
+                field: stale[0]["payload"][field]
+                for field in (
+                    "currentEpoch",
+                    "currentVersion",
+                    "currentQueueRevision",
+                    "currentControlVersion",
+                )
+            },
+            {
+                "currentEpoch": 1,
+                "currentVersion": 1,
+                "currentQueueRevision": 1,
+                "currentControlVersion": 1,
+            },
+        )
+        self.assertEqual(getPlaybackContextState("context-1")["version"], 1)
+
         client.emit(
             "message",
             {
                 "type": "command",
                 "action": "playback.context.close",
                 "requestId": "context-close-1",
-                "payload": {"playbackContextId": "context-1"},
+                "payload": {
+                    "playbackContextId": "context-1",
+                    "expectedEpoch": 1,
+                    "baseVersion": 1,
+                },
             },
             namespace="/emo",
         )
@@ -3720,7 +3764,77 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(persisted["state"], "playing")
         self.assertEqual(persisted["version"], 2)
 
+        exact_replay = self.emit_strict(
+            client,
+            "command",
+            "playback.context.close",
+            "context-close-exact-replay",
+            {
+                "playbackContextId": "context-1",
+                "expectedEpoch": 1,
+                "baseVersion": 1,
+            },
+        )
+        self.assertEqual(
+            [message["action"] for message in exact_replay],
+            ["system.ack"],
+        )
+        self.assertEqual(exact_replay[0]["payload"], closed_messages[0]["payload"])
+        self.assertEqual(getPlaybackContextState("context-1")["version"], 2)
+
         get_state()._playback_contexts.clear()
+        restart_replay = self.emit_strict(
+            client,
+            "command",
+            "playback.context.close",
+            "context-close-restart-replay",
+            {
+                "playbackContextId": "context-1",
+                "expectedEpoch": 1,
+                "baseVersion": 1,
+            },
+        )
+        self.assertEqual(
+            [message["action"] for message in restart_replay],
+            ["system.ack"],
+        )
+        self.assertEqual(restart_replay[0]["payload"], closed_messages[0]["payload"])
+
+        mismatched_replay = self.emit_strict(
+            client,
+            "command",
+            "playback.context.close",
+            "context-close-mismatch",
+            {
+                "playbackContextId": "context-1",
+                "expectedEpoch": 1,
+                "baseVersion": 2,
+            },
+        )
+        self.assertEqual(
+            [message["action"] for message in mismatched_replay],
+            ["system.error"],
+        )
+        self.assertEqual(mismatched_replay[0]["payload"]["code"], "context_closed")
+        self.assertEqual(
+            {
+                field: mismatched_replay[0]["payload"][field]
+                for field in (
+                    "currentEpoch",
+                    "currentVersion",
+                    "currentQueueRevision",
+                    "currentControlVersion",
+                )
+            },
+            {
+                "currentEpoch": 1,
+                "currentVersion": 2,
+                "currentQueueRevision": 1,
+                "currentControlVersion": 1,
+            },
+        )
+        self.assertEqual(getPlaybackContextState("context-1")["version"], 2)
+
         recreate = self.create_context(client, request_id="context-recreate-1")
         self.assertEqual(recreate[0]["payload"]["code"], "context_closed")
         client.emit(
@@ -6362,7 +6476,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(offline_error["payload"]["code"], "authority_offline")
         self.assertEqual(getPlaybackContextState("context-1")["version"], 1)
 
-    def test_cross_user_status_and_subscribe_are_forbidden(self):
+    def test_cross_user_status_and_subscribe_are_concealed_as_not_found(self):
         owner = self.ready_strict_client()
         self.create_context(owner)
         other = self.connect()
@@ -6393,12 +6507,151 @@ class StrictV2CoreTestCase(unittest.TestCase):
                     self.assertEqual(len(response), 1)
                     self.assertEqual(
                         response[0]["payload"]["code"],
-                        "forbidden",
+                        "not_found",
                     )
                     error_payloads.append(response[0]["payload"])
                 self.assertEqual(error_payloads[0], error_payloads[1])
 
-    def test_context_close_notifies_and_stops_followers(self):
+    def test_foreign_and_missing_context_mutations_are_identically_concealed(self):
+        owner = self.ready_strict_client()
+        self.create_context(owner)
+        other = self.connect()
+        self.authenticate(other, "bob", "B0b", "auth-bob-mutations")
+        with self.enable_all_profiles():
+            self.register(
+                other,
+                "register-bob-mutations",
+                self.strict_registration_payload(
+                    roles=["player", "controller"],
+                    client_id="bob-phone",
+                    device_session_id="device:bob-phone",
+                ),
+            )
+        self.messages(other)
+
+        context_before = getPlaybackContextState("context-1")
+        device_before = emo_ws.getDevicePlaybackState(
+            "context-1",
+            "bob-phone",
+        )
+        pending_before = emo_store.listPendingPlaybackControlTransactions(
+            "context-1",
+            1,
+        )
+        cases = (
+            (
+                "command",
+                "player.seek",
+                {
+                    "baseControlVersion": 1,
+                    "positionMs": 2500,
+                },
+            ),
+            (
+                "command",
+                "playback.context.prepare",
+                {
+                    "intentId": "concealed-prepare",
+                    "baseControlVersion": 1,
+                },
+            ),
+            (
+                "event",
+                "playback.context.prepared",
+                {
+                    "deviceSessionId": "device:bob-phone",
+                    "intentId": "concealed-prepared",
+                    "ready": True,
+                },
+            ),
+            (
+                "state",
+                "queue.context.sync",
+                {
+                    "deviceSessionId": "device:bob-phone",
+                    "queueSongIds": ["song-1"],
+                    "currentIndex": 0,
+                    "positionMs": 0,
+                    "baseQueueRevision": 1,
+                },
+            ),
+            (
+                "event",
+                "playback.update",
+                {
+                    "deviceSessionId": "device:bob-phone",
+                    "origin": "passive",
+                    "appliedControlVersion": 1,
+                    "state": "playing",
+                    "positionMs": 10,
+                    "clientSeq": 1,
+                    "trackId": "song-1",
+                },
+            ),
+            (
+                "command",
+                "playback.context.close",
+                {
+                    "expectedEpoch": 1,
+                    "baseVersion": 1,
+                },
+            ),
+        )
+
+        for message_type, action, action_payload in cases:
+            with self.subTest(action=action):
+                error_payloads = []
+                for scope, playback_context_id in (
+                    ("foreign", "context-1"),
+                    ("missing", "missing-context"),
+                ):
+                    response = self.emit_strict(
+                        other,
+                        message_type,
+                        action,
+                        "concealed-%s-%s" % (action, scope),
+                        dict(
+                            action_payload,
+                            playbackContextId=playback_context_id,
+                        ),
+                    )
+                    self.assertEqual(
+                        [message["action"] for message in response],
+                        ["system.error"],
+                    )
+                    self.assertEqual(response[0]["payload"]["code"], "not_found")
+                    error_payloads.append(response[0]["payload"])
+                self.assertEqual(error_payloads[0], error_payloads[1])
+
+        self.assertEqual(getPlaybackContextState("context-1"), context_before)
+        self.assertEqual(
+            emo_ws.getDevicePlaybackState("context-1", "bob-phone"),
+            device_before,
+        )
+        self.assertEqual(
+            emo_store.listPendingPlaybackControlTransactions(
+                "context-1",
+                1,
+            ),
+            pending_before,
+        )
+        self.assertIsNone(
+            emo_ws.getPlaybackPrepareTransaction(
+                "context-1",
+                1,
+                "concealed-prepare",
+            )
+        )
+        self.assertIsNone(
+            emo_ws.getPlaybackPrepareTransaction(
+                "context-1",
+                1,
+                "concealed-prepared",
+            )
+        )
+        self.assertEqual(self.messages(owner), [])
+
+    def test_context_close_rejects_active_follow_fence_without_side_effects(self):
         owner = self.ready_strict_client()
         self.create_context(owner)
         follower = self.ready_strict_client(
@@ -6419,18 +6672,50 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(relationship["sourcePlaybackContextId"], "context-1")
         self.messages(owner)
 
-        self.emit_strict(
+        close_messages = self.emit_strict(
             owner,
             "command",
             "playback.context.close",
             "context-close-followers",
-            {"playbackContextId": "context-1"},
+            {
+                "playbackContextId": "context-1",
+                "expectedEpoch": 1,
+                "baseVersion": 1,
+            },
         )
         follower_messages = self.messages(follower)
-        self.assertTrue(
-            any(message["action"] == "playback.context.closed" for message in follower_messages)
+        self.assertEqual(
+            [message["action"] for message in close_messages],
+            ["system.error"],
         )
-        self.assertIsNone(get_state().get_follow_relationship("follower-1"))
+        self.assertEqual(close_messages[0]["payload"]["code"], "conflict")
+        self.assertEqual(
+            {
+                field: close_messages[0]["payload"][field]
+                for field in (
+                    "currentEpoch",
+                    "currentVersion",
+                    "currentQueueRevision",
+                    "currentControlVersion",
+                )
+            },
+            {
+                "currentEpoch": 1,
+                "currentVersion": 1,
+                "currentQueueRevision": 1,
+                "currentControlVersion": 1,
+            },
+        )
+        self.assertFalse(
+            any(
+                message["action"] == "playback.context.closed"
+                for message in follower_messages
+            )
+        )
+        self.assertIsNotNone(get_state().get_follow_relationship("follower-1"))
+        context = getPlaybackContextState("context-1")
+        self.assertEqual(context["lifecycle"], "active")
+        self.assertEqual(context["version"], 1)
 
     def test_queue_sync_commits_before_emit_and_recovers_after_push_failure(self):
         client = self.ready_strict_client()
