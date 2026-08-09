@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from supysonic import db
+from supysonic.emo import ws_store
 from supysonic.emo.ws_state import WebSocketState
 from supysonic.emo.ws_store import (
     PlaybackContextAuthorityAmbiguousError,
@@ -104,6 +105,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         accepted_at_ms=1000,
         execution_timeout_ms=15000,
         action="player.next",
+        deterministic_dependency_admission=False,
     ):
         return createPlaybackControlTransaction(
             "context-1",
@@ -123,7 +125,83 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             requesting_connection_nonce=requesting_connection_nonce,
             requesting_connection_epoch=requesting_connection_epoch,
             effective_at_server_ms=effective_at_server_ms,
+            deterministic_dependency_admission=(
+                deterministic_dependency_admission
+            ),
         )
+
+    def _create_feedback_dependency_pair(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1", "song-2", "song-3"],
+            0,
+            0,
+            "playing",
+        )
+        applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "authority-nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 0,
+                "clientSeq": 1,
+            },
+            1000,
+        )
+        first = mutateStrictPlaybackContextControl(
+            "context-1",
+            "alice",
+            "controller-1",
+            "player.next",
+            1,
+            requesting_client_id="controller-1",
+            requesting_device_session_id="device:controller-1",
+            requesting_connection_nonce="requester-nonce-1",
+            requesting_connection_epoch=1,
+            authority_client_id="player-1",
+            authority_device_session_id="device:player-1",
+            routed_connection_nonce="authority-nonce-1",
+            routed_connection_epoch=1,
+            accepted_at_ms=1100,
+            execution_timeout_ms=100,
+            deterministic_dependency_admission=True,
+        )
+        second = mutateStrictPlaybackContextControl(
+            "context-1",
+            "alice",
+            "controller-1",
+            "player.pause",
+            first["controlVersion"],
+            requesting_client_id="controller-1",
+            requesting_device_session_id="device:controller-1",
+            requesting_connection_nonce="requester-nonce-1",
+            requesting_connection_epoch=1,
+            authority_client_id="player-1",
+            authority_device_session_id="device:player-1",
+            routed_connection_nonce="authority-nonce-1",
+            routed_connection_epoch=1,
+            accepted_at_ms=1200,
+            execution_timeout_ms=100,
+            deterministic_dependency_admission=True,
+        )
+        markPlaybackControlTransactionExecutionEligible(
+            "context-1",
+            1,
+            2,
+            1500,
+        )
+        return first, second
 
     def test_save_and_load_queue_state(self):
         saveQueueState(
@@ -1970,6 +2048,676 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 2000,
             )
 
+    def test_deterministic_dependency_admission_uses_latest_pending_track_change(self):
+        transactions = []
+        for version, action in (
+            (2, "player.pause"),
+            (3, "player.seek"),
+            (4, "player.next"),
+            (5, "player.play"),
+            (6, "queue.playItem"),
+            (7, "player.pause"),
+        ):
+            transaction, created = self._create_exact_transaction(
+                command_control_version=version,
+                action=action,
+                effective_at_server_ms=None,
+                deterministic_dependency_admission=True,
+            )
+            self.assertTrue(created)
+            transactions.append(transaction)
+
+        self.assertNotIn("dependsOnControlVersion", transactions[0])
+        self.assertNotIn("dependsOnControlVersion", transactions[1])
+        self.assertNotIn("dependsOnControlVersion", transactions[2])
+        self.assertEqual(transactions[3]["dependsOnControlVersion"], 4)
+        self.assertEqual(transactions[4]["dependsOnControlVersion"], 4)
+        self.assertEqual(transactions[5]["dependsOnControlVersion"], 6)
+
+        with self.assertRaises(ValueError):
+            self._create_exact_transaction(
+                command_control_version=8,
+                deterministic_dependency_admission="yes",
+            )
+        with self.assertRaises(ValueError):
+            self._create_exact_transaction(
+                command_control_version=8,
+                action="broadcast.play",
+                deterministic_dependency_admission=True,
+            )
+        self.assertEqual(
+            db.EmoPlaybackControlTransaction.select().count(),
+            6,
+        )
+
+        replay, created = self._create_exact_transaction(
+            command_control_version=2,
+            action="player.pause",
+            effective_at_server_ms=None,
+            deterministic_dependency_admission=True,
+        )
+        self.assertFalse(created)
+        self.assertNotIn("dependsOnControlVersion", replay)
+
+    def test_dependency_success_establishes_direct_eligibility_atomically(self):
+        self._create_exact_transaction(
+            command_control_version=2,
+            action="player.next",
+            effective_at_server_ms=None,
+            execution_timeout_ms=100,
+            deterministic_dependency_admission=True,
+        )
+        dependent, _created = self._create_exact_transaction(
+            command_control_version=3,
+            action="player.next",
+            effective_at_server_ms=4000,
+            execution_timeout_ms=100,
+            deterministic_dependency_admission=True,
+        )
+        transitive, _created = self._create_exact_transaction(
+            command_control_version=4,
+            action="player.pause",
+            effective_at_server_ms=None,
+            execution_timeout_ms=100,
+            deterministic_dependency_admission=True,
+        )
+        self.assertEqual(dependent["dependsOnControlVersion"], 2)
+        self.assertEqual(transitive["dependsOnControlVersion"], 3)
+
+        markPlaybackControlTransactionExecutionEligible(
+            "context-1",
+            1,
+            2,
+            1500,
+        )
+        first_result = settlePlaybackControlTransaction(
+            "context-1",
+            1,
+            2,
+            "committed",
+            3000,
+            applied_control_version=2,
+        )
+
+        self.assertTrue(first_result.mutated)
+        self.assertEqual(
+            [
+                item["commandControlVersion"]
+                for item in first_result.execution_eligible_transactions
+            ],
+            [3],
+        )
+        dependent = getPlaybackControlTransaction("context-1", 1, 3)
+        self.assertEqual(dependent["executionEligibleAtMs"], 4000)
+        self.assertEqual(dependent["watchdogDeadlineAtMs"], 6100)
+        self.assertNotIn(
+            "executionEligibleAtMs",
+            getPlaybackControlTransaction("context-1", 1, 4),
+        )
+
+        second_result = settlePlaybackControlTransaction(
+            "context-1",
+            1,
+            3,
+            "committed",
+            4500,
+            applied_control_version=3,
+        )
+        self.assertEqual(
+            [
+                item["commandControlVersion"]
+                for item in second_result.execution_eligible_transactions
+            ],
+            [4],
+        )
+        transitive = getPlaybackControlTransaction("context-1", 1, 4)
+        self.assertEqual(transitive["executionEligibleAtMs"], 4500)
+        self.assertEqual(transitive["watchdogDeadlineAtMs"], 6600)
+
+        replay = settlePlaybackControlTransaction(
+            "context-1",
+            1,
+            3,
+            "committed",
+            4500,
+            applied_control_version=3,
+        )
+        self.assertFalse(replay.mutated)
+        self.assertEqual(replay.execution_eligible_transactions, ())
+        self.assertEqual(replay.dependency_settlements, ())
+
+    def test_dependency_wait_does_not_consume_execution_timeout(self):
+        self._create_exact_transaction(
+            command_control_version=2,
+            action="player.next",
+            effective_at_server_ms=None,
+            execution_timeout_ms=10,
+            deterministic_dependency_admission=True,
+        )
+        self._create_exact_transaction(
+            command_control_version=3,
+            action="player.pause",
+            effective_at_server_ms=None,
+            execution_timeout_ms=10,
+            deterministic_dependency_admission=True,
+        )
+        markPlaybackControlTransactionExecutionEligible(
+            "context-1",
+            1,
+            2,
+            1000,
+        )
+
+        with self.assertRaisesRegex(
+            PlaybackControlTransactionConflictError,
+            "dependency is not committed",
+        ):
+            markPlaybackControlTransactionExecutionEligible(
+                "context-1",
+                1,
+                3,
+                1000,
+            )
+        dependent = getPlaybackControlTransaction("context-1", 1, 3)
+        self.assertNotIn("executionEligibleAtMs", dependent)
+        self.assertNotIn("watchdogDeadlineAtMs", dependent)
+        self.assertEqual(
+            [
+                item["commandControlVersion"]
+                for item in listExpiredPlaybackControlTransactions(1000000)
+            ],
+            [2],
+        )
+
+    def test_dependency_failure_cascades_direct_edges_in_version_order(self):
+        for version, action in (
+            (2, "player.next"),
+            (3, "player.next"),
+            (4, "player.pause"),
+            (5, "player.seek"),
+            (6, "queue.playItem"),
+            (7, "player.play"),
+        ):
+            self._create_exact_transaction(
+                command_control_version=version,
+                action=action,
+                effective_at_server_ms=None,
+                execution_timeout_ms=100,
+                deterministic_dependency_admission=True,
+            )
+        markPlaybackControlTransactionExecutionEligible(
+            "context-1",
+            1,
+            2,
+            1500,
+        )
+
+        result = settlePlaybackControlTransaction(
+            "context-1",
+            1,
+            2,
+            "failed",
+            3000,
+            error_code="track_load_failed",
+            applied_control_version=1,
+        )
+
+        self.assertEqual(
+            [
+                item["commandControlVersion"]
+                for item in result.dependency_settlements
+            ],
+            [3, 4, 5, 6, 7],
+        )
+        expected_direct_dependencies = {
+            3: 2,
+            4: 3,
+            5: 3,
+            6: 3,
+            7: 6,
+        }
+        for version, dependency_version in expected_direct_dependencies.items():
+            transaction = getPlaybackControlTransaction(
+                "context-1",
+                1,
+                version,
+            )
+            self.assertEqual(transaction["status"], "failed")
+            self.assertEqual(transaction["errorCode"], "dependency_failed")
+            self.assertEqual(
+                transaction["dependsOnControlVersion"],
+                dependency_version,
+            )
+            self.assertEqual(transaction["terminalAtMs"], 3000)
+            self.assertNotIn("executionEligibleAtMs", transaction)
+            self.assertNotIn("watchdogDeadlineAtMs", transaction)
+
+        replay = settlePlaybackControlTransaction(
+            "context-1",
+            1,
+            2,
+            "failed",
+            3000,
+            error_code="track_load_failed",
+            applied_control_version=1,
+        )
+        self.assertFalse(replay.mutated)
+        self.assertEqual(replay.dependency_settlements, ())
+        direct_replay = settlePlaybackControlTransaction(
+            "context-1",
+            1,
+            3,
+            "failed",
+            3000,
+            error_code="dependency_failed",
+            depends_on_control_version=2,
+            applied_control_version=1,
+        )
+        self.assertFalse(direct_replay.mutated)
+
+    def test_execution_unknown_cascades_dependency_failed_without_deadlines(self):
+        self._create_exact_transaction(
+            command_control_version=2,
+            action="player.next",
+            effective_at_server_ms=None,
+            deterministic_dependency_admission=True,
+        )
+        self._create_exact_transaction(
+            command_control_version=3,
+            action="player.pause",
+            effective_at_server_ms=None,
+            deterministic_dependency_admission=True,
+        )
+
+        result = settlePlaybackControlTransaction(
+            "context-1",
+            1,
+            2,
+            "failed",
+            3000,
+            error_code="execution_unknown",
+            applied_control_version=1,
+        )
+
+        self.assertEqual(result.transaction["errorCode"], "execution_unknown")
+        self.assertEqual(len(result.dependency_settlements), 1)
+        dependent = result.dependency_settlements[0]
+        self.assertEqual(dependent["errorCode"], "dependency_failed")
+        self.assertEqual(dependent["dependsOnControlVersion"], 2)
+        self.assertNotIn("executionEligibleAtMs", dependent)
+        self.assertNotIn("watchdogDeadlineAtMs", dependent)
+
+    def test_dependency_supersede_cascades_direct_edges(self):
+        for version, action in (
+            (2, "player.next"),
+            (3, "queue.playItem"),
+            (4, "player.pause"),
+        ):
+            self._create_exact_transaction(
+                command_control_version=version,
+                action=action,
+                effective_at_server_ms=None,
+                deterministic_dependency_admission=True,
+            )
+
+        result = settlePlaybackControlTransaction(
+            "context-1",
+            1,
+            2,
+            "superseded",
+            3000,
+            applied_control_version=4,
+        )
+
+        self.assertEqual(result.transaction["status"], "superseded")
+        self.assertEqual(
+            [
+                item["commandControlVersion"]
+                for item in result.dependency_settlements
+            ],
+            [3, 4],
+        )
+        for version, dependency_version in ((3, 2), (4, 3)):
+            dependent = getPlaybackControlTransaction(
+                "context-1",
+                1,
+                version,
+            )
+            self.assertEqual(dependent["status"], "failed")
+            self.assertEqual(dependent["errorCode"], "dependency_failed")
+            self.assertEqual(
+                dependent["dependsOnControlVersion"],
+                dependency_version,
+            )
+
+    def test_dependency_graph_survives_restart_and_resumes_store_transition(self):
+        for version, action in (
+            (2, "player.next"),
+            (3, "player.next"),
+            (4, "player.pause"),
+        ):
+            self._create_exact_transaction(
+                command_control_version=version,
+                action=action,
+                effective_at_server_ms=None,
+                execution_timeout_ms=100,
+                deterministic_dependency_admission=True,
+            )
+        markPlaybackControlTransactionExecutionEligible(
+            "context-1",
+            1,
+            2,
+            1500,
+        )
+
+        db.release_database()
+        db.init_database("sqlite:///" + self.db_path)
+        self.assertEqual(
+            getPlaybackControlTransaction("context-1", 1, 3)[
+                "dependsOnControlVersion"
+            ],
+            2,
+        )
+        self.assertEqual(
+            getPlaybackControlTransaction("context-1", 1, 4)[
+                "dependsOnControlVersion"
+            ],
+            3,
+        )
+
+        result = settlePlaybackControlTransaction(
+            "context-1",
+            1,
+            2,
+            "committed",
+            3000,
+            applied_control_version=2,
+        )
+        self.assertEqual(
+            [
+                item["commandControlVersion"]
+                for item in result.execution_eligible_transactions
+            ],
+            [3],
+        )
+        self.assertNotIn(
+            "executionEligibleAtMs",
+            getPlaybackControlTransaction("context-1", 1, 4),
+        )
+
+    def test_dependency_transition_rollback_has_no_partial_terminal_or_eligibility(self):
+        self._create_exact_transaction(
+            command_control_version=2,
+            action="player.next",
+            effective_at_server_ms=None,
+            deterministic_dependency_admission=True,
+        )
+        self._create_exact_transaction(
+            command_control_version=3,
+            action="player.pause",
+            effective_at_server_ms=None,
+            deterministic_dependency_admission=True,
+        )
+        markPlaybackControlTransactionExecutionEligible(
+            "context-1",
+            1,
+            2,
+            1500,
+        )
+
+        with mock.patch(
+            "supysonic.emo.ws_store."
+            "_mark_control_transaction_record_execution_eligible",
+            side_effect=RuntimeError("injected dependency transition failure"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "injected dependency transition failure",
+            ):
+                settlePlaybackControlTransaction(
+                    "context-1",
+                    1,
+                    2,
+                    "committed",
+                    3000,
+                    applied_control_version=2,
+                )
+
+        root = getPlaybackControlTransaction("context-1", 1, 2)
+        dependent = getPlaybackControlTransaction("context-1", 1, 3)
+        self.assertEqual(root["status"], "pending")
+        self.assertNotIn("terminalAtMs", root)
+        self.assertEqual(dependent["status"], "pending")
+        self.assertNotIn("executionEligibleAtMs", dependent)
+        self.assertNotIn("watchdogDeadlineAtMs", dependent)
+
+    def test_dependency_cascade_rollback_has_no_partial_terminal(self):
+        for version, action in (
+            (2, "player.next"),
+            (3, "player.next"),
+            (4, "player.pause"),
+        ):
+            self._create_exact_transaction(
+                command_control_version=version,
+                action=action,
+                effective_at_server_ms=None,
+                deterministic_dependency_admission=True,
+            )
+
+        original_settle = ws_store._settle_playback_control_transaction_record
+        cascaded_versions = []
+
+        def fail_during_second_cascade(record, *args, **kwargs):
+            if kwargs.get("error_code") == "dependency_failed":
+                cascaded_versions.append(record.command_control_version)
+                if len(cascaded_versions) == 2:
+                    raise RuntimeError("injected cascade failure")
+            return original_settle(record, *args, **kwargs)
+
+        with mock.patch(
+            "supysonic.emo.ws_store."
+            "_settle_playback_control_transaction_record",
+            side_effect=fail_during_second_cascade,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "injected cascade failure"):
+                settlePlaybackControlTransaction(
+                    "context-1",
+                    1,
+                    2,
+                    "failed",
+                    3000,
+                    error_code="execution_unknown",
+                    applied_control_version=1,
+                )
+
+        self.assertEqual(cascaded_versions, [3, 4])
+        for version in (2, 3, 4):
+            transaction = getPlaybackControlTransaction(
+                "context-1",
+                1,
+                version,
+            )
+            self.assertEqual(transaction["status"], "pending")
+            self.assertNotIn("terminalAtMs", transaction)
+
+    def test_concurrent_dependency_terminal_has_one_durable_winner(self):
+        self._create_exact_transaction(
+            command_control_version=2,
+            action="player.next",
+            effective_at_server_ms=None,
+            deterministic_dependency_admission=True,
+        )
+        self._create_exact_transaction(
+            command_control_version=3,
+            action="player.pause",
+            effective_at_server_ms=None,
+            deterministic_dependency_admission=True,
+        )
+        markPlaybackControlTransactionExecutionEligible(
+            "context-1",
+            1,
+            2,
+            1500,
+        )
+        start = threading.Barrier(2)
+
+        def settle(status, error_code, applied_control_version):
+            start.wait()
+            try:
+                result = settlePlaybackControlTransaction(
+                    "context-1",
+                    1,
+                    2,
+                    status,
+                    3000,
+                    error_code=error_code,
+                    applied_control_version=applied_control_version,
+                )
+                return "won", result.transaction["status"]
+            except PlaybackControlTransactionConflictError:
+                return "conflict", None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(
+                executor.map(
+                    lambda arguments: settle(*arguments),
+                    (
+                        ("committed", None, 2),
+                        ("failed", "execution_unknown", 1),
+                    ),
+                )
+            )
+
+        self.assertEqual([outcome[0] for outcome in outcomes].count("won"), 1)
+        self.assertEqual(
+            [outcome[0] for outcome in outcomes].count("conflict"),
+            1,
+        )
+        root = getPlaybackControlTransaction("context-1", 1, 2)
+        dependent = getPlaybackControlTransaction("context-1", 1, 3)
+        if root["status"] == "committed":
+            self.assertEqual(dependent["status"], "pending")
+            self.assertEqual(dependent["executionEligibleAtMs"], 3000)
+        else:
+            self.assertEqual(root["errorCode"], "execution_unknown")
+            self.assertEqual(dependent["status"], "failed")
+            self.assertEqual(dependent["errorCode"], "dependency_failed")
+
+    def test_store_feedback_commit_releases_only_direct_dependency(self):
+        _first, second = self._create_feedback_dependency_pair()
+        self.assertEqual(
+            second["_controlTransaction"]["dependsOnControlVersion"],
+            2,
+        )
+
+        result = applyStrictPlaybackUpdate(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            "authority-nonce-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "origin": "remoteCommand",
+                "executionStatus": "committed",
+                "commandControlVersion": 2,
+                "appliedControlVersion": 2,
+                "state": "playing",
+                "trackId": "song-2",
+                "positionMs": 0,
+                "clientSeq": 2,
+            },
+            3000,
+            require_execution_eligible=True,
+        )
+
+        self.assertEqual(result["dependencySettlements"], [])
+        self.assertEqual(
+            [
+                item["commandControlVersion"]
+                for item in result["executionEligibleTransactions"]
+            ],
+            [3],
+        )
+        dependent = getPlaybackControlTransaction("context-1", 1, 3)
+        self.assertEqual(dependent["status"], "pending")
+        self.assertEqual(dependent["executionEligibleAtMs"], 3000)
+        self.assertEqual(dependent["watchdogDeadlineAtMs"], 5100)
+
+    def test_feedback_and_server_unknown_have_one_dependency_outcome(self):
+        self._create_feedback_dependency_pair()
+        start = threading.Barrier(2)
+
+        def apply_feedback():
+            start.wait()
+            try:
+                applyStrictPlaybackUpdate(
+                    "context-1",
+                    "alice",
+                    "player-1",
+                    "device:player-1",
+                    "authority-nonce-1",
+                    {
+                        "playbackContextId": "context-1",
+                        "deviceSessionId": "device:player-1",
+                        "origin": "remoteCommand",
+                        "executionStatus": "committed",
+                        "commandControlVersion": 2,
+                        "appliedControlVersion": 2,
+                        "state": "playing",
+                        "trackId": "song-2",
+                        "positionMs": 0,
+                        "clientSeq": 2,
+                    },
+                    3000,
+                    require_execution_eligible=True,
+                )
+                return "feedback"
+            except PlaybackControlTransactionConflictError:
+                return "conflict"
+
+        def settle_unknown():
+            start.wait()
+            try:
+                settlePlaybackControlTransaction(
+                    "context-1",
+                    1,
+                    2,
+                    "failed",
+                    3000,
+                    error_code="execution_unknown",
+                    applied_control_version=1,
+                )
+                return "unknown"
+            except PlaybackControlTransactionConflictError:
+                return "conflict"
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = [
+                executor.submit(apply_feedback),
+                executor.submit(settle_unknown),
+            ]
+            outcomes = [future.result() for future in outcomes]
+
+        self.assertEqual(outcomes.count("conflict"), 1)
+        root = getPlaybackControlTransaction("context-1", 1, 2)
+        dependent = getPlaybackControlTransaction("context-1", 1, 3)
+        device_state = getDevicePlaybackState("context-1", "player-1")
+        if root["status"] == "committed":
+            self.assertIn("feedback", outcomes)
+            self.assertEqual(dependent["status"], "pending")
+            self.assertEqual(dependent["executionEligibleAtMs"], 3000)
+            self.assertEqual(device_state["clientSeq"], 2)
+            self.assertEqual(device_state["appliedControlVersion"], 2)
+        else:
+            self.assertIn("unknown", outcomes)
+            self.assertEqual(root["errorCode"], "execution_unknown")
+            self.assertEqual(dependent["status"], "failed")
+            self.assertEqual(dependent["errorCode"], "dependency_failed")
+            self.assertEqual(device_state["clientSeq"], 1)
+            self.assertEqual(device_state["appliedControlVersion"], 1)
+
     def test_execution_eligibility_allows_active_broadcast_source_fence(self):
         createStrictPlaybackContextState(
             "context-1",
@@ -2248,6 +2996,62 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 applied_control_version=1,
                 error_message="late diagnostic",
             )
+
+    def test_legacy_dependency_terminal_fingerprint_replays_unchanged(self):
+        self._create_exact_transaction(
+            command_control_version=2,
+            action="player.next",
+            effective_at_server_ms=None,
+            deterministic_dependency_admission=True,
+        )
+        self._create_exact_transaction(
+            command_control_version=3,
+            action="player.pause",
+            effective_at_server_ms=None,
+            deterministic_dependency_admission=True,
+        )
+        record = db.EmoPlaybackControlTransaction.get(
+            (db.EmoPlaybackControlTransaction.playback_context_id == "context-1")
+            & (db.EmoPlaybackControlTransaction.epoch == 1)
+            & (db.EmoPlaybackControlTransaction.command_control_version == 3)
+        )
+        old_terminal = {
+            "status": "failed",
+            "errorCode": "dependency_failed",
+            "dependsOnControlVersion": 2,
+            "appliedControlVersion": 1,
+        }
+        old_fingerprint = hashlib.sha256(
+            json.dumps(
+                old_terminal,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        record.status = "failed"
+        record.error_code = "dependency_failed"
+        record.applied_control_version = 1
+        record.terminal_fingerprint = old_fingerprint
+        record.terminal_at_ms = 2000
+        record.save()
+
+        replay = settlePlaybackControlTransaction(
+            "context-1",
+            1,
+            3,
+            "failed",
+            2000,
+            error_code="dependency_failed",
+            applied_control_version=1,
+        )
+
+        self.assertFalse(replay.mutated)
+        self.assertEqual(replay.transaction["dependsOnControlVersion"], 2)
+        self.assertEqual(replay.transaction["terminalFingerprint"], old_fingerprint)
+        persisted = db.EmoPlaybackControlTransaction.get_by_id(record.id)
+        self.assertEqual(persisted.terminal_fingerprint, old_fingerprint)
+        self.assertIsNone(persisted.error_message)
 
     def test_transaction_serializer_fails_closed_for_malformed_target_json(self):
         record = db.EmoPlaybackControlTransaction.create(

@@ -1,4 +1,5 @@
 import hashlib
+import heapq
 import json
 import threading
 import time
@@ -114,6 +115,42 @@ class PlaybackClientSequenceConflictError(Exception):
 
 
 AuthorityPair = Tuple[str, str, str]
+
+_ORDINARY_CONTROL_ACTIONS = frozenset(
+    {
+        "queue.playItem",
+        "player.play",
+        "player.pause",
+        "player.seek",
+        "player.next",
+        "player.prev",
+    }
+)
+_TRACK_CHANGING_CONTROL_ACTIONS = frozenset(
+    {
+        "queue.playItem",
+        "player.next",
+        "player.prev",
+    }
+)
+
+
+class PlaybackControlTransactionSettlementResult(tuple):
+    def __new__(
+        cls,
+        transaction: Optional[Dict[str, object]],
+        mutated: bool,
+        execution_eligible_transactions: Iterable[Dict[str, object]] = (),
+        dependency_settlements: Iterable[Dict[str, object]] = (),
+    ):
+        result = super().__new__(cls, (transaction, bool(mutated)))
+        result.transaction = transaction
+        result.mutated = bool(mutated)
+        result.execution_eligible_transactions = tuple(
+            execution_eligible_transactions
+        )
+        result.dependency_settlements = tuple(dependency_settlements)
+        return result
 
 
 def _distinct_authority_pairs(
@@ -637,6 +674,35 @@ def serializePlaybackControlTransaction(record):
     return payload
 
 
+def _pending_track_changing_dependency_record(
+    playback_context_id,
+    epoch,
+    command_control_version,
+):
+    return (
+        EmoPlaybackControlTransaction.select()
+        .where(
+            (
+                EmoPlaybackControlTransaction.playback_context_id
+                == playback_context_id
+            )
+            & (EmoPlaybackControlTransaction.epoch == epoch)
+            & (EmoPlaybackControlTransaction.status == "pending")
+            & (
+                EmoPlaybackControlTransaction.command_control_version
+                < command_control_version
+            )
+            & (
+                EmoPlaybackControlTransaction.action.in_(
+                    tuple(sorted(_TRACK_CHANGING_CONTROL_ACTIONS))
+                )
+            )
+        )
+        .order_by(EmoPlaybackControlTransaction.command_control_version.desc())
+        .first()
+    )
+
+
 def _create_playback_control_transaction_record(
     playback_context_id,
     user_name,
@@ -655,7 +721,17 @@ def _create_playback_control_transaction_record(
     requesting_connection_nonce=None,
     requesting_connection_epoch=None,
     effective_at_server_ms=None,
+    deterministic_dependency_admission=False,
 ):
+    if type(deterministic_dependency_admission) is not bool:
+        raise ValueError("deterministicDependencyAdmission must be a boolean")
+    if (
+        deterministic_dependency_admission
+        and action not in _ORDINARY_CONTROL_ACTIONS
+    ):
+        raise ValueError(
+            "Deterministic dependency admission requires an ordinary control action"
+        )
     _validate_control_transaction_inputs(
         user_name,
         epoch,
@@ -721,6 +797,13 @@ def _create_playback_control_transaction_record(
             )
         return existing, False
 
+    dependency_record = None
+    if deterministic_dependency_admission:
+        dependency_record = _pending_track_changing_dependency_record(
+            playback_context_id,
+            epoch,
+            command_control_version,
+        )
     watchdog_deadline_at_ms = None
     if requesting_device_session_id is None:
         watchdog_deadline_at_ms = accepted_at_ms + execution_timeout_ms + 2000
@@ -744,6 +827,11 @@ def _create_playback_control_transaction_record(
         execution_timeout_ms=execution_timeout_ms,
         watchdog_deadline_at_ms=watchdog_deadline_at_ms,
         effective_at_server_ms=effective_at_server_ms,
+        depends_on_control_version=(
+            dependency_record.command_control_version
+            if dependency_record is not None
+            else None
+        ),
     )
     return record, True
 
@@ -767,6 +855,7 @@ def createPlaybackControlTransaction(
     requesting_connection_nonce=None,
     requesting_connection_epoch=None,
     effective_at_server_ms=None,
+    deterministic_dependency_admission=False,
 ):
     open_connection(reuse=True)
     try:
@@ -789,6 +878,9 @@ def createPlaybackControlTransaction(
                 requesting_connection_nonce=requesting_connection_nonce,
                 requesting_connection_epoch=requesting_connection_epoch,
                 effective_at_server_ms=effective_at_server_ms,
+                deterministic_dependency_admission=(
+                    deterministic_dependency_admission
+                ),
             )
             return serializePlaybackControlTransaction(record), created
     finally:
@@ -926,6 +1018,273 @@ def listExpiredPlaybackControlTransactions(deadline_at_ms):
         close_connection()
 
 
+def _control_transaction_record(
+    playback_context_id,
+    epoch,
+    command_control_version,
+):
+    return EmoPlaybackControlTransaction.get_or_none(
+        (
+            EmoPlaybackControlTransaction.playback_context_id
+            == playback_context_id
+        )
+        & (EmoPlaybackControlTransaction.epoch == epoch)
+        & (
+            EmoPlaybackControlTransaction.command_control_version
+            == command_control_version
+        )
+    )
+
+
+def _mark_control_transaction_record_execution_eligible(
+    record,
+    execution_eligible_at_ms,
+):
+    if record.status != "pending":
+        raise PlaybackControlTransactionConflictError(
+            "Terminal control transaction cannot become eligible"
+        )
+    if record.depends_on_control_version is not None:
+        dependency = _control_transaction_record(
+            record.playback_context_id,
+            record.epoch,
+            record.depends_on_control_version,
+        )
+        if dependency is None:
+            raise PlaybackControlTransactionConflictError(
+                "Control transaction dependency is missing"
+            )
+        if dependency.status != "committed" or dependency.terminal_at_ms is None:
+            raise PlaybackControlTransactionConflictError(
+                "Control transaction dependency is not committed"
+            )
+        required_eligible_at_ms = dependency.terminal_at_ms
+        if record.effective_at_server_ms is not None:
+            required_eligible_at_ms = max(
+                required_eligible_at_ms,
+                record.effective_at_server_ms,
+            )
+        if execution_eligible_at_ms != required_eligible_at_ms:
+            raise ValueError(
+                "executionEligibleAtMs does not match dependency eligibility"
+            )
+    elif (
+        record.effective_at_server_ms is not None
+        and execution_eligible_at_ms < record.effective_at_server_ms
+    ):
+        raise ValueError("executionEligibleAtMs precedes effectiveAtServerMs")
+    if record.execution_eligible_at_ms is not None:
+        if record.execution_eligible_at_ms != execution_eligible_at_ms:
+            raise PlaybackControlTransactionConflictError(
+                "Execution eligibility conflicts"
+            )
+        return serializePlaybackControlTransaction(record), False
+    record.execution_eligible_at_ms = execution_eligible_at_ms
+    record.watchdog_deadline_at_ms = (
+        execution_eligible_at_ms + record.execution_timeout_ms + 2000
+    )
+    record.updated_at = now()
+    record.save(
+        only=(
+            EmoPlaybackControlTransaction.execution_eligible_at_ms,
+            EmoPlaybackControlTransaction.watchdog_deadline_at_ms,
+            EmoPlaybackControlTransaction.updated_at,
+        )
+    )
+    return serializePlaybackControlTransaction(record), True
+
+
+def _settle_playback_control_transaction_record(
+    record,
+    status,
+    terminal_at_ms,
+    error_code=None,
+    depends_on_control_version=None,
+    applied_control_version=None,
+    error_message=None,
+    terminal_identity=None,
+):
+    persisted_dependency = record.depends_on_control_version
+    if depends_on_control_version is not None:
+        _require_integer(
+            depends_on_control_version,
+            "dependsOnControlVersion",
+            1,
+        )
+        if depends_on_control_version >= record.command_control_version:
+            raise ValueError(
+                "dependsOnControlVersion must precede commandControlVersion"
+            )
+        if (
+            persisted_dependency is not None
+            and persisted_dependency != depends_on_control_version
+        ):
+            raise PlaybackControlTransactionConflictError(
+                "Control transaction direct dependency conflicts"
+            )
+        persisted_dependency = depends_on_control_version
+
+    if terminal_identity is None:
+        terminal_identity = {
+            "status": status,
+            "errorCode": error_code,
+            "dependsOnControlVersion": persisted_dependency,
+            "appliedControlVersion": applied_control_version,
+        }
+        if error_message is not None:
+            terminal_identity["errorMessage"] = error_message
+    terminal_fingerprint = _json_fingerprint(terminal_identity)
+    if record.status != "pending":
+        if record.terminal_fingerprint != terminal_fingerprint:
+            raise PlaybackControlTransactionConflictError(
+                "Control transaction terminal conflict"
+            )
+        return record, False
+
+    _require_terminal_time_after_eligibility(record, terminal_at_ms)
+    updated = (
+        EmoPlaybackControlTransaction.update(
+            status=status,
+            error_code=error_code,
+            error_message=error_message,
+            depends_on_control_version=persisted_dependency,
+            applied_control_version=applied_control_version,
+            terminal_fingerprint=terminal_fingerprint,
+            terminal_at_ms=terminal_at_ms,
+            updated_at=now(),
+        )
+        .where(
+            (EmoPlaybackControlTransaction.id == record.id)
+            & (EmoPlaybackControlTransaction.status == "pending")
+        )
+        .execute()
+    )
+    if updated != 1:
+        raise PlaybackControlTransactionConflictError(
+            "Control transaction changed concurrently"
+        )
+    return EmoPlaybackControlTransaction.get_by_id(record.id), True
+
+
+def _pending_direct_control_dependents(record):
+    return list(
+        EmoPlaybackControlTransaction.select()
+        .where(
+            (
+                EmoPlaybackControlTransaction.playback_context_id
+                == record.playback_context_id
+            )
+            & (EmoPlaybackControlTransaction.epoch == record.epoch)
+            & (EmoPlaybackControlTransaction.status == "pending")
+            & (
+                EmoPlaybackControlTransaction.depends_on_control_version
+                == record.command_control_version
+            )
+        )
+        .order_by(EmoPlaybackControlTransaction.command_control_version)
+    )
+
+
+def _legacy_pending_control_dependents(record):
+    if record.action not in _TRACK_CHANGING_CONTROL_ACTIONS:
+        return []
+    return list(
+        EmoPlaybackControlTransaction.select()
+        .where(
+            (
+                EmoPlaybackControlTransaction.playback_context_id
+                == record.playback_context_id
+            )
+            & (EmoPlaybackControlTransaction.epoch == record.epoch)
+            & (EmoPlaybackControlTransaction.status == "pending")
+            & (
+                EmoPlaybackControlTransaction.command_control_version
+                > record.command_control_version
+            )
+            & (
+                EmoPlaybackControlTransaction.depends_on_control_version.is_null(
+                    True
+                )
+            )
+        )
+        .order_by(EmoPlaybackControlTransaction.command_control_version)
+    )
+
+
+def _resolve_playback_control_dependency_outcome(
+    record,
+    terminal_at_ms,
+    allow_legacy_track_change_fallback=False,
+):
+    eligible_transactions = []
+    dependency_settlements = []
+    direct_dependents = _pending_direct_control_dependents(record)
+
+    if record.status == "committed":
+        for dependent in direct_dependents:
+            eligible_at_ms = terminal_at_ms
+            if dependent.effective_at_server_ms is not None:
+                eligible_at_ms = max(
+                    eligible_at_ms,
+                    dependent.effective_at_server_ms,
+                )
+            eligible, changed = _mark_control_transaction_record_execution_eligible(
+                dependent,
+                eligible_at_ms,
+            )
+            if changed:
+                eligible_transactions.append(eligible)
+        return eligible_transactions, dependency_settlements
+
+    if record.status not in {"failed", "superseded"}:
+        return eligible_transactions, dependency_settlements
+
+    if not direct_dependents and allow_legacy_track_change_fallback:
+        direct_dependents = _legacy_pending_control_dependents(record)
+
+    pending = []
+    for dependent in direct_dependents:
+        heapq.heappush(
+            pending,
+            (
+                dependent.command_control_version,
+                record.command_control_version,
+                dependent,
+            ),
+        )
+    while pending:
+        _command_version, direct_dependency_version, dependent = heapq.heappop(
+            pending
+        )
+        dependent, changed = _settle_playback_control_transaction_record(
+            dependent,
+            "failed",
+            terminal_at_ms,
+            error_code="dependency_failed",
+            depends_on_control_version=direct_dependency_version,
+            applied_control_version=record.applied_control_version,
+        )
+        if not changed:
+            continue
+        dependency_settlements.append(
+            serializePlaybackControlTransaction(dependent)
+        )
+        for child in _pending_direct_control_dependents(dependent):
+            heapq.heappush(
+                pending,
+                (
+                    child.command_control_version,
+                    dependent.command_control_version,
+                    child,
+                ),
+            )
+
+    dependency_settlements.sort(
+        key=lambda transaction: transaction["commandControlVersion"]
+    )
+    return eligible_transactions, dependency_settlements
+
+
 @_serialize_strict_playback_context_mutation
 def markPlaybackControlTransactionExecutionEligible(
     playback_context_id,
@@ -939,46 +1298,17 @@ def markPlaybackControlTransactionExecutionEligible(
     open_connection(reuse=True)
     try:
         with _strict_playback_context_transaction():
-            record = EmoPlaybackControlTransaction.get_or_none(
-                (EmoPlaybackControlTransaction.playback_context_id == playback_context_id)
-                & (EmoPlaybackControlTransaction.epoch == epoch)
-                & (
-                    EmoPlaybackControlTransaction.command_control_version
-                    == command_control_version
-                )
+            record = _control_transaction_record(
+                playback_context_id,
+                epoch,
+                command_control_version,
             )
             if record is None:
                 return None, False
-            if record.status != "pending":
-                raise PlaybackControlTransactionConflictError(
-                    "Terminal control transaction cannot become eligible"
-                )
-            if (
-                record.effective_at_server_ms is not None
-                and execution_eligible_at_ms < record.effective_at_server_ms
-            ):
-                raise ValueError(
-                    "executionEligibleAtMs precedes effectiveAtServerMs"
-                )
-            if record.execution_eligible_at_ms is not None:
-                if record.execution_eligible_at_ms != execution_eligible_at_ms:
-                    raise PlaybackControlTransactionConflictError(
-                        "Execution eligibility conflicts"
-                    )
-                return serializePlaybackControlTransaction(record), False
-            record.execution_eligible_at_ms = execution_eligible_at_ms
-            record.watchdog_deadline_at_ms = (
-                execution_eligible_at_ms + record.execution_timeout_ms + 2000
+            return _mark_control_transaction_record_execution_eligible(
+                record,
+                execution_eligible_at_ms,
             )
-            record.updated_at = now()
-            record.save(
-                only=(
-                    EmoPlaybackControlTransaction.execution_eligible_at_ms,
-                    EmoPlaybackControlTransaction.watchdog_deadline_at_ms,
-                    EmoPlaybackControlTransaction.updated_at,
-                )
-            )
-            return serializePlaybackControlTransaction(record), True
     finally:
         close_connection()
 
@@ -1002,58 +1332,41 @@ def settlePlaybackControlTransaction(
         raise ValueError("errorMessage must be a string")
     if status != "failed" and error_message is not None:
         raise ValueError("Only failed transactions may contain errorMessage")
-    terminal = {
-        "status": status,
-        "errorCode": error_code,
-        "dependsOnControlVersion": depends_on_control_version,
-        "appliedControlVersion": applied_control_version,
-    }
-    if error_message is not None:
-        terminal["errorMessage"] = error_message
-    terminal_fingerprint = _json_fingerprint(terminal)
     open_connection(reuse=True)
     try:
         with _strict_playback_context_transaction():
-            record = EmoPlaybackControlTransaction.get_or_none(
-                (EmoPlaybackControlTransaction.playback_context_id == playback_context_id)
-                & (EmoPlaybackControlTransaction.epoch == epoch)
-                & (
-                    EmoPlaybackControlTransaction.command_control_version
-                    == command_control_version
-                )
+            record = _control_transaction_record(
+                playback_context_id,
+                epoch,
+                command_control_version,
             )
             if record is None:
-                return None, False
-            if record.status != "pending":
-                if record.terminal_fingerprint != terminal_fingerprint:
-                    raise PlaybackControlTransactionConflictError(
-                        "Control transaction terminal conflict"
-                    )
-                return serializePlaybackControlTransaction(record), False
-            _require_terminal_time_after_eligibility(record, terminal_at_ms)
-            updated = (
-                EmoPlaybackControlTransaction.update(
-                    status=status,
-                    error_code=error_code,
-                    error_message=error_message,
-                    depends_on_control_version=depends_on_control_version,
-                    applied_control_version=applied_control_version,
-                    terminal_fingerprint=terminal_fingerprint,
-                    terminal_at_ms=terminal_at_ms,
-                    updated_at=now(),
-                )
-                .where(
-                    (EmoPlaybackControlTransaction.id == record.id)
-                    & (EmoPlaybackControlTransaction.status == "pending")
-                )
-                .execute()
+                return PlaybackControlTransactionSettlementResult(None, False)
+            record, changed = _settle_playback_control_transaction_record(
+                record,
+                status,
+                terminal_at_ms,
+                error_code=error_code,
+                depends_on_control_version=depends_on_control_version,
+                applied_control_version=applied_control_version,
+                error_message=error_message,
             )
-            if updated != 1:
-                raise PlaybackControlTransactionConflictError(
-                    "Control transaction changed concurrently"
+            eligible_transactions = []
+            dependency_settlements = []
+            if changed:
+                (
+                    eligible_transactions,
+                    dependency_settlements,
+                ) = _resolve_playback_control_dependency_outcome(
+                    record,
+                    terminal_at_ms,
                 )
-            record = EmoPlaybackControlTransaction.get_by_id(record.id)
-            return serializePlaybackControlTransaction(record), True
+            return PlaybackControlTransactionSettlementResult(
+                serializePlaybackControlTransaction(record),
+                changed,
+                eligible_transactions,
+                dependency_settlements,
+            )
     finally:
         close_connection()
 
@@ -1614,6 +1927,7 @@ def applyStrictPlaybackUpdate(
             )
             origin = payload["origin"]
             dependency_records = []
+            eligible_dependency_records = []
             terminal_control_versions = []
 
             if origin == "passive":
@@ -1770,105 +2084,59 @@ def applyStrictPlaybackUpdate(
                     "trackId": payload.get("trackId"),
                     "positionMs": payload["positionMs"],
                 }
-                terminal_fingerprint = _json_fingerprint(terminal_identity)
-                if transaction.status != "pending":
-                    if transaction.terminal_fingerprint != terminal_fingerprint:
-                        raise PlaybackControlTransactionConflictError(
-                            "Remote control terminal conflict"
-                        )
-                    terminal_control_versions.append(command_version)
-                else:
-                    transaction.status = terminal_status
-                    transaction.error_code = terminal_error
-                    transaction.error_message = terminal_error_message
-                    transaction.applied_control_version = applied
-                    transaction.terminal_fingerprint = terminal_fingerprint
-                    transaction.terminal_at_ms = server_updated_at_ms
-                    transaction.updated_at = now()
-                    transaction.save()
-                    terminal_control_versions.append(command_version)
+                transaction, terminal_changed = (
+                    _settle_playback_control_transaction_record(
+                        transaction,
+                        terminal_status,
+                        server_updated_at_ms,
+                        error_code=terminal_error,
+                        applied_control_version=applied,
+                        error_message=terminal_error_message,
+                        terminal_identity=terminal_identity,
+                    )
+                )
+                terminal_control_versions.append(command_version)
 
-                    if terminal_status == "failed":
-                        queue = json.loads(record.queue_json)
-                        actual_index = (
-                            queue.index(payload["trackId"])
-                            if payload.get("trackId") in queue
-                            else record.current_index
-                        )
-                        snapshot_changed = (
-                            record.state != payload["state"]
-                            or record.position_ms != payload["positionMs"]
-                            or record.current_index != actual_index
-                            or record.track_id != payload.get("trackId")
-                        )
-                        if snapshot_changed:
-                            if record.current_index != actual_index:
-                                record.queue_revision += 1
-                            record.current_index = actual_index
-                            record.track_id = payload.get("trackId")
-                            record.state = payload["state"]
-                            record.position_ms = payload["positionMs"]
-                            record.version += 1
-                            record.updated_at = now()
-                            record.save()
-                            current = _playback_context_payload(record)
+                if terminal_changed and terminal_status == "failed":
+                    queue = json.loads(record.queue_json)
+                    actual_index = (
+                        queue.index(payload["trackId"])
+                        if payload.get("trackId") in queue
+                        else record.current_index
+                    )
+                    snapshot_changed = (
+                        record.state != payload["state"]
+                        or record.position_ms != payload["positionMs"]
+                        or record.current_index != actual_index
+                        or record.track_id != payload.get("trackId")
+                    )
+                    if snapshot_changed:
+                        if record.current_index != actual_index:
+                            record.queue_revision += 1
+                        record.current_index = actual_index
+                        record.track_id = payload.get("trackId")
+                        record.state = payload["state"]
+                        record.position_ms = payload["positionMs"]
+                        record.version += 1
+                        record.updated_at = now()
+                        record.save()
+                        current = _playback_context_payload(record)
 
-                        if transaction.action in {
-                            "queue.playItem",
-                            "player.next",
-                            "player.prev",
-                        }:
-                            dependent_query = (
-                                EmoPlaybackControlTransaction.select()
-                                .where(
-                                    (
-                                        EmoPlaybackControlTransaction.playback_context_id
-                                        == playback_context_id
-                                    )
-                                    & (
-                                        EmoPlaybackControlTransaction.epoch
-                                        == record.epoch
-                                    )
-                                    & (
-                                        EmoPlaybackControlTransaction.status
-                                        == "pending"
-                                    )
-                                    & (
-                                        EmoPlaybackControlTransaction.command_control_version
-                                        > command_version
-                                    )
-                                )
-                                .order_by(
-                                    EmoPlaybackControlTransaction.command_control_version
-                                )
-                            )
-                            for dependent in dependent_query:
-                                _require_terminal_time_after_eligibility(
-                                    dependent,
-                                    server_updated_at_ms,
-                                )
-                                dependent.status = "failed"
-                                dependent.error_code = "dependency_failed"
-                                dependent.depends_on_control_version = command_version
-                                dependent.applied_control_version = applied
-                                dependent.terminal_fingerprint = _json_fingerprint(
-                                    {
-                                        "status": "failed",
-                                        "errorCode": "dependency_failed",
-                                        "errorMessage": None,
-                                        "dependsOnControlVersion": command_version,
-                                        "appliedControlVersion": applied,
-                                    }
-                                )
-                                dependent.terminal_at_ms = server_updated_at_ms
-                                dependent.updated_at = now()
-                                dependent.save()
-                                dependency_records.append(
-                                    serializePlaybackControlTransaction(dependent)
-                                )
-                                terminal_control_versions.append(
-                                    dependent.command_control_version
-                                )
+                if terminal_changed:
+                    (
+                        eligible_dependencies,
+                        settled_dependencies,
+                    ) = _resolve_playback_control_dependency_outcome(
+                        transaction,
+                        server_updated_at_ms,
+                        allow_legacy_track_change_fallback=True,
+                    )
+                    eligible_dependency_records.extend(eligible_dependencies)
+                    dependency_records.extend(settled_dependencies)
+                    terminal_control_versions.extend(
+                        dependency["commandControlVersion"]
+                        for dependency in settled_dependencies
+                    )
 
                 canonical = _strict_playback_update_canonical(
                     record,
@@ -2030,6 +2298,7 @@ def applyStrictPlaybackUpdate(
                 "canonicalUpdate": canonical,
                 "created": True,
                 "sourceOnly": False,
+                "executionEligibleTransactions": eligible_dependency_records,
                 "dependencySettlements": dependency_records,
                 "terminalControlVersions": terminal_control_versions,
             }
@@ -3539,7 +3808,17 @@ def mutateStrictPlaybackContextControl(
     requesting_connection_epoch=None,
     effective_at_server_ms=None,
     pre_mutation_validator=None,
+    deterministic_dependency_admission=False,
 ):
+    if type(deterministic_dependency_admission) is not bool:
+        raise ValueError("deterministicDependencyAdmission must be a boolean")
+    if (
+        deterministic_dependency_admission
+        and action not in _ORDINARY_CONTROL_ACTIONS
+    ):
+        raise ValueError(
+            "Deterministic dependency admission requires an ordinary control action"
+        )
     if requesting_client_id is None and any(
         value is not None
         for value in (
@@ -3686,6 +3965,9 @@ def mutateStrictPlaybackContextControl(
                     requesting_connection_nonce=requesting_connection_nonce,
                     requesting_connection_epoch=requesting_connection_epoch,
                     effective_at_server_ms=effective_at_server_ms,
+                    deterministic_dependency_admission=(
+                        deterministic_dependency_admission
+                    ),
                 )
                 result["_controlTransaction"] = (
                     serializePlaybackControlTransaction(transaction_record)
