@@ -455,6 +455,16 @@ def _json_fingerprint(value):
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _require_terminal_time_after_eligibility(record, terminal_at_ms):
+    if (
+        record.execution_eligible_at_ms is not None
+        and terminal_at_ms < record.execution_eligible_at_ms
+    ):
+        raise PlaybackControlTransactionConflictError(
+            "terminalAtMs precedes executionEligibleAtMs"
+        )
+
+
 def _load_json_object(value, required=False):
     if value is None:
         if required:
@@ -1020,6 +1030,7 @@ def settlePlaybackControlTransaction(
                         "Control transaction terminal conflict"
                     )
                 return serializePlaybackControlTransaction(record), False
+            _require_terminal_time_after_eligibility(record, terminal_at_ms)
             updated = (
                 EmoPlaybackControlTransaction.update(
                     status=status,
@@ -1666,6 +1677,10 @@ def applyStrictPlaybackUpdate(
                     raise PlaybackControlTransactionConflictError(
                         "Remote control transaction not found"
                     )
+                _require_terminal_time_after_eligibility(
+                    transaction,
+                    server_updated_at_ms,
+                )
                 if require_execution_eligible and (
                     transaction.execution_eligible_at_ms is None
                     or transaction.watchdog_deadline_at_ms is None
@@ -1828,6 +1843,10 @@ def applyStrictPlaybackUpdate(
                                 )
                             )
                             for dependent in dependent_query:
+                                _require_terminal_time_after_eligibility(
+                                    dependent,
+                                    server_updated_at_ms,
+                                )
                                 dependent.status = "failed"
                                 dependent.error_code = "dependency_failed"
                                 dependent.depends_on_control_version = command_version
@@ -1946,6 +1965,10 @@ def applyStrictPlaybackUpdate(
                     )
                 )
                 for pending in pending_query:
+                    _require_terminal_time_after_eligibility(
+                        pending,
+                        server_updated_at_ms,
+                    )
                     pending.status = "superseded"
                     pending.applied_control_version = applied
                     pending.terminal_fingerprint = _json_fingerprint(

@@ -653,6 +653,70 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
         self.assertIsNone(self.state.get_sid_for_client("player-1"))
         self.assertIsNone(self.state.get_client_for_sid("sid-1"))
 
+    def test_stale_prune_waits_for_generation_lifecycle_lock(self):
+        self._register_authenticated_client()
+        self.state._clients[("alice", "player-1")]["lastSeenAt"] = 1
+
+        prune_started = threading.Event()
+        prune_finished = threading.Event()
+
+        def prune():
+            prune_started.set()
+            self.state.prune_stale_clients(stale_after_seconds=5, now=10)
+            prune_finished.set()
+
+        thread = threading.Thread(target=prune)
+        with MODULE.strictPhysicalGenerationLockSet(
+            (("alice", "player-1"),)
+        ):
+            thread.start()
+            self.assertTrue(prune_started.wait(1))
+            self.assertFalse(prune_finished.is_set())
+            self.assertIsNotNone(
+                self.state.get_current_physical_generation(
+                    "alice",
+                    "player-1",
+                    "device:player-1",
+                )
+            )
+
+        thread.join(1)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(prune_finished.is_set())
+        self.assertIsNone(
+            self.state.get_current_physical_generation(
+                "alice",
+                "player-1",
+                "device:player-1",
+            )
+        )
+
+    def test_different_generation_keys_can_progress_in_parallel(self):
+        for client_id in ("player-1", "player-2"):
+            self._register_authenticated_client(client_id=client_id)
+
+        entered = threading.Barrier(2)
+        finished = []
+
+        def hold(client_id):
+            with MODULE.strictPhysicalGenerationLockSet(
+                (("alice", client_id),)
+            ):
+                entered.wait(1)
+                finished.append(client_id)
+
+        threads = [
+            threading.Thread(target=hold, args=(client_id,))
+            for client_id in ("player-1", "player-2")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(1)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(set(finished), {"player-1", "player-2"})
+
     def test_queue_and_playback_state_are_stored_per_session(self):
         queue_state = self.state.update_queue(
             "sess-1", ["songId1", "songId2"], current_index=1, position_ms=3200

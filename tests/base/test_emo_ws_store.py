@@ -1686,6 +1686,13 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             getPlaybackControlTransaction("context-1", 1, 2),
             transaction,
         )
+
+        db.release_database()
+        db.init_database("sqlite:///" + self.db_path)
+        self.assertEqual(
+            getPlaybackControlTransaction("context-1", 1, 2),
+            transaction,
+        )
         self.assertEqual(listExpiredPlaybackControlTransactions(17999), [])
         self.assertEqual(
             [item["commandControlVersion"] for item in listPendingPlaybackControlTransactions("context-1", 1)],
@@ -1772,12 +1779,46 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             transaction,
         )
 
-        db.release_database()
-        db.init_database("sqlite:///" + self.db_path)
-        self.assertEqual(
-            getPlaybackControlTransaction("context-1", 1, 2),
-            transaction,
+    def test_terminal_time_cannot_precede_execution_eligibility(self):
+        transaction, created = self._create_exact_transaction(
+            effective_at_server_ms=None,
+            accepted_at_ms=1000,
         )
+        self.assertTrue(created)
+        eligible, changed = markPlaybackControlTransactionExecutionEligible(
+            "context-1",
+            1,
+            2,
+            1600,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(eligible["executionEligibleAtMs"], 1600)
+
+        with self.assertRaises(PlaybackControlTransactionConflictError):
+            settlePlaybackControlTransaction(
+                "context-1",
+                1,
+                2,
+                "failed",
+                1599,
+                error_code="execution_unknown",
+            )
+
+        pending = getPlaybackControlTransaction("context-1", 1, 2)
+        self.assertEqual(pending["status"], "pending")
+        self.assertEqual(pending["executionEligibleAtMs"], 1600)
+        self.assertNotIn("terminalAtMs", pending)
+
+        terminal, changed = settlePlaybackControlTransaction(
+            "context-1",
+            1,
+            2,
+            "failed",
+            1600,
+            error_code="execution_unknown",
+        )
+        self.assertTrue(changed)
+        self.assertEqual(terminal["terminalAtMs"], 1600)
 
     def test_control_transaction_requester_generation_is_all_or_none(self):
         invalid_inputs = (

@@ -4,10 +4,12 @@ import shutil
 import tempfile
 import threading
 import unittest
+from contextlib import contextmanager
 from unittest import mock
 
 from supysonic.db import release_database
 from supysonic.emo import ws as emo_ws
+from supysonic.emo import ws_store as emo_store
 from supysonic.emo.strict_v2_acceptance import (
     FAULT_DIRECTORY_ENV,
     arm_binding_emit_failure,
@@ -276,6 +278,30 @@ class StrictV2CoreTestCase(unittest.TestCase):
             replacement_client,
         )
         return replacement_sid
+
+    def authenticated_unregistered_client(self, client_id):
+        client = self.connect()
+        self.authenticate(client, request_id="auth-unregistered-%s" % client_id)
+        return client
+
+    def register_real_replacement(
+        self,
+        client,
+        request_id,
+        client_id,
+        device_session_id,
+        roles=None,
+    ):
+        with self.enable_all_profiles():
+            return self.register(
+                client,
+                request_id,
+                self.strict_registration_payload(
+                    roles=roles or ["player"],
+                    client_id=client_id,
+                    device_session_id=device_session_id,
+                ),
+            )
 
     def test_non_object_envelope_disconnects_without_error(self):
         client = self.connect()
@@ -4265,6 +4291,806 @@ class StrictV2CoreTestCase(unittest.TestCase):
             "committed",
             fail_eligibility=True,
         )
+
+    def test_real_authority_replacement_first_rejects_old_generation(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-real-replacement-first",
+            device_session_id="device:controller-real-replacement-first",
+        )
+        self.messages(player)
+        self.messages(controller)
+
+        replacement = self.authenticated_unregistered_client(
+            "phone-1-replacement-first"
+        )
+        self.register_real_replacement(
+            replacement,
+            "register-authority-replacement-first",
+            "phone-1",
+            "device:phone-1-replacement",
+        )
+        self.messages(replacement)
+
+        before = getPlaybackContextState("context-1")
+        with mock.patch.object(emo_ws, "_start_control_watchdog") as watchdog:
+            response = self.emit_strict(
+                controller,
+                "command",
+                "player.seek",
+                "seek-authority-replacement-first",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                    "positionMs": 1000,
+                },
+            )
+
+        self.assertEqual(response[0]["payload"]["code"], "authority_offline")
+        self.assertEqual(getPlaybackContextState("context-1"), before)
+        self.assertIsNone(
+            emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        )
+        self.assertFalse(
+            any(
+                message["action"] == "player.seek"
+                for message in self.messages(replacement)
+            )
+        )
+        self.assertFalse(
+            any(message["action"] == "system.ack" for message in response)
+        )
+        watchdog.assert_not_called()
+
+    def test_real_authority_replacement_waits_until_control_dispatch_finishes(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-real-control-first",
+            device_session_id="device:controller-real-control-first",
+        )
+        self.messages(player)
+        self.messages(controller)
+        replacement = self.authenticated_unregistered_client(
+            "phone-1-control-first"
+        )
+        old_authority_sid = get_state().get_sid_for_client(
+            "phone-1",
+            user_name="alice",
+        )
+
+        replacement_trying = threading.Event()
+        replacement_entered = threading.Event()
+        dispatch_window = threading.Event()
+        control_result = []
+        control_errors = []
+        replacement_errors = []
+        watchdog_transactions = []
+        authority_commands = []
+        real_lifecycle = emo_ws.strictPhysicalGenerationLockSet
+        real_emit = emo_ws._emit_message
+        replacement_thread = None
+
+        def observed_lifecycle(keys):
+            @contextmanager
+            def observed():
+                is_replacement = threading.current_thread() is replacement_thread
+                if is_replacement:
+                    replacement_trying.set()
+                with real_lifecycle(keys):
+                    if is_replacement:
+                        replacement_entered.set()
+                    yield
+
+            return observed()
+
+        def register_replacement():
+            try:
+                self.register_real_replacement(
+                    replacement,
+                    "register-authority-control-first",
+                    "phone-1",
+                    "device:phone-1-control-first",
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                replacement_errors.append(exc)
+
+        replacement_thread = threading.Thread(target=register_replacement)
+
+        def emit_and_hold(message, *args, **kwargs):
+            result = real_emit(message, *args, **kwargs)
+            if message.get("action") == "player.seek":
+                authority_commands.append((message, args[0] if args else None))
+                replacement_thread.start()
+                if not replacement_trying.wait(1):
+                    raise RuntimeError("replacement did not reach lifecycle lock")
+                if not dispatch_window.wait(2):
+                    raise RuntimeError("dispatch test window was not released")
+            return result
+
+        def run_control():
+            try:
+                control_result.extend(
+                    self.emit_strict(
+                        controller,
+                        "command",
+                        "player.seek",
+                        "seek-authority-control-first",
+                        {
+                            "playbackContextId": "context-1",
+                            "baseControlVersion": 1,
+                            "positionMs": 2000,
+                        },
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                control_errors.append(exc)
+
+        control_thread = threading.Thread(target=run_control)
+        with mock.patch.object(
+            emo_ws,
+            "strictPhysicalGenerationLockSet",
+            side_effect=observed_lifecycle,
+        ), mock.patch.object(
+            emo_ws,
+            "_emit_message",
+            side_effect=emit_and_hold,
+        ), mock.patch.object(
+            emo_ws,
+            "_start_control_watchdog",
+            side_effect=lambda transaction: watchdog_transactions.append(
+                dict(transaction)
+            ),
+        ):
+            control_thread.start()
+            self.assertTrue(replacement_trying.wait(2))
+            self.assertFalse(replacement_entered.is_set())
+            dispatch_window.set()
+            control_thread.join(2)
+            replacement_thread.join(2)
+
+        self.assertFalse(control_thread.is_alive())
+        self.assertFalse(replacement_thread.is_alive())
+        self.assertEqual(control_errors, [])
+        self.assertEqual(replacement_errors, [])
+        self.assertTrue(replacement_entered.is_set())
+        self.assertEqual(
+            len(
+                [
+                    message
+                    for message in self.messages(replacement)
+                    if message["action"] == "player.seek"
+                ]
+            ),
+            0,
+        )
+        self.assertEqual(
+            len(
+                [
+                    message
+                    for message, target_sid in authority_commands
+                    if message["action"] == "player.seek"
+                    and target_sid == old_authority_sid
+                ]
+            ),
+            1,
+        )
+        self.assertTrue(
+            any(message["action"] == "system.ack" for message in control_result)
+        )
+        self.assertEqual(len(watchdog_transactions), 1)
+        transaction = emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        self.assertEqual(transaction["status"], "failed")
+        self.assertEqual(transaction["errorCode"], "execution_unknown")
+        self.assertIsNotNone(transaction["executionEligibleAtMs"])
+        self.assertGreaterEqual(
+            transaction["terminalAtMs"],
+            transaction["executionEligibleAtMs"],
+        )
+
+    def test_real_replacement_attempt_after_final_recheck_cannot_precede_emit(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-final-recheck-race",
+            device_session_id="device:controller-final-recheck-race",
+        )
+        self.messages(player)
+        self.messages(controller)
+        old_authority_sid = get_state().get_sid_for_client(
+            "phone-1",
+            user_name="alice",
+        )
+        replacement = self.authenticated_unregistered_client(
+            "phone-1-final-recheck"
+        )
+
+        replacement_trying = threading.Event()
+        replacement_entered = threading.Event()
+        restore_ready = threading.Event()
+        allow_restore = threading.Event()
+        control_result = []
+        control_errors = []
+        replacement_errors = []
+        authority_commands = []
+        real_lifecycle = emo_ws.strictPhysicalGenerationLockSet
+        real_emit = emo_ws._emit_message
+        real_restore = get_state().restore_playback_context
+        replacement_thread = None
+
+        def observed_lifecycle(keys):
+            @contextmanager
+            def observed():
+                is_replacement = threading.current_thread() is replacement_thread
+                if is_replacement:
+                    replacement_trying.set()
+                with real_lifecycle(keys):
+                    if is_replacement:
+                        replacement_entered.set()
+                    yield
+
+            return observed()
+
+        def register_replacement():
+            try:
+                self.register_real_replacement(
+                    replacement,
+                    "register-authority-final-recheck",
+                    "phone-1",
+                    "device:phone-1-final-recheck",
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                replacement_errors.append(exc)
+
+        replacement_thread = threading.Thread(target=register_replacement)
+
+        def observe_emit(message, *args, **kwargs):
+            if message.get("action") == "player.pause":
+                authority_commands.append((message, args[0] if args else None))
+            return real_emit(message, *args, **kwargs)
+
+        def restore_then_start(*args, **kwargs):
+            result = real_restore(*args, **kwargs)
+            replacement_thread.start()
+            if not replacement_trying.wait(1):
+                raise RuntimeError("replacement did not reach final-check race")
+            restore_ready.set()
+            if not allow_restore.wait(2):
+                raise RuntimeError("final-check race was not released")
+            return result
+
+        def run_control():
+            try:
+                control_result.extend(
+                    self.emit_strict(
+                        controller,
+                        "command",
+                        "player.pause",
+                        "pause-final-recheck-race",
+                        {
+                            "playbackContextId": "context-1",
+                            "baseControlVersion": 1,
+                        },
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                control_errors.append(exc)
+
+        control_thread = threading.Thread(target=run_control)
+        with mock.patch.object(
+            emo_ws,
+            "strictPhysicalGenerationLockSet",
+            side_effect=observed_lifecycle,
+        ), mock.patch.object(
+            get_state(),
+            "restore_playback_context",
+            side_effect=restore_then_start,
+        ), mock.patch.object(
+            emo_ws,
+            "_emit_message",
+            side_effect=observe_emit,
+        ), mock.patch.object(emo_ws, "_start_control_watchdog"):
+            control_thread.start()
+            self.assertTrue(restore_ready.wait(2))
+            self.assertFalse(replacement_entered.is_set())
+            allow_restore.set()
+            control_thread.join(2)
+            replacement_thread.join(2)
+
+        self.assertFalse(control_thread.is_alive())
+        self.assertFalse(replacement_thread.is_alive())
+        self.assertEqual(control_errors, [])
+        self.assertEqual(replacement_errors, [])
+        self.assertTrue(replacement_entered.is_set())
+        self.assertTrue(
+            any(message["action"] == "system.ack" for message in control_result)
+        )
+        self.assertEqual(
+            len(
+                [
+                    message
+                    for message in self.messages(replacement)
+                    if message["action"] == "player.pause"
+                ]
+            ),
+            0,
+        )
+        self.assertEqual(
+            len(
+                [
+                    message
+                    for message, target_sid in authority_commands
+                    if message["action"] == "player.pause"
+                    and target_sid == old_authority_sid
+                ]
+            ),
+            1,
+        )
+        transaction = emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        self.assertEqual(transaction["status"], "failed")
+        self.assertEqual(transaction["errorCode"], "execution_unknown")
+        self.assertIsNotNone(transaction["executionEligibleAtMs"])
+
+    def test_real_authority_disconnect_waits_until_control_dispatch_finishes(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-disconnect-control-first",
+            device_session_id="device:controller-disconnect-control-first",
+        )
+        self.messages(player)
+        self.messages(controller)
+        old_authority_sid = get_state().get_sid_for_client(
+            "phone-1",
+            user_name="alice",
+        )
+
+        disconnect_trying = threading.Event()
+        disconnect_entered = threading.Event()
+        dispatch_window = threading.Event()
+        disconnect_finished = threading.Event()
+        disconnect_errors = []
+        control_result = []
+        control_errors = []
+        authority_commands = []
+        real_lifecycle = emo_ws.strictPhysicalGenerationLockSet
+        real_emit = emo_ws._emit_message
+        disconnect_thread = None
+
+        def observed_lifecycle(keys):
+            @contextmanager
+            def observed():
+                is_disconnect = threading.current_thread() is disconnect_thread
+                if is_disconnect:
+                    disconnect_trying.set()
+                with real_lifecycle(keys):
+                    if is_disconnect:
+                        disconnect_entered.set()
+                    yield
+
+            return observed()
+
+        def disconnect_authority():
+            try:
+                player.disconnect(namespace="/emo")
+            except BaseException as exc:  # pragma: no cover - asserted below
+                disconnect_errors.append(exc)
+            finally:
+                disconnect_finished.set()
+
+        disconnect_thread = threading.Thread(target=disconnect_authority)
+
+        def emit_and_hold(message, *args, **kwargs):
+            if message.get("action") == "player.seek":
+                authority_commands.append((message, args[0] if args else None))
+            result = real_emit(message, *args, **kwargs)
+            if message.get("action") == "player.seek":
+                disconnect_thread.start()
+                if not disconnect_trying.wait(1):
+                    raise RuntimeError("disconnect did not reach lifecycle lock")
+                if not dispatch_window.wait(2):
+                    raise RuntimeError("disconnect test window was not released")
+            return result
+
+        def run_control():
+            try:
+                control_result.extend(
+                    self.emit_strict(
+                        controller,
+                        "command",
+                        "player.seek",
+                        "seek-authority-disconnect-race",
+                        {
+                            "playbackContextId": "context-1",
+                            "baseControlVersion": 1,
+                            "positionMs": 3000,
+                        },
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                control_errors.append(exc)
+
+        control_thread = threading.Thread(target=run_control)
+        with mock.patch.object(
+            emo_ws,
+            "strictPhysicalGenerationLockSet",
+            side_effect=observed_lifecycle,
+        ), mock.patch.object(
+            emo_ws,
+            "_emit_message",
+            side_effect=emit_and_hold,
+        ), mock.patch.object(emo_ws, "_start_control_watchdog"):
+            control_thread.start()
+            self.assertTrue(disconnect_trying.wait(2))
+            self.assertFalse(disconnect_entered.is_set())
+            dispatch_window.set()
+            control_thread.join(2)
+            disconnect_thread.join(2)
+
+        self.assertFalse(control_thread.is_alive())
+        self.assertFalse(disconnect_thread.is_alive())
+        self.assertTrue(disconnect_finished.is_set())
+        self.assertEqual(control_errors, [])
+        self.assertEqual(disconnect_errors, [])
+        self.assertTrue(disconnect_entered.is_set())
+        self.assertTrue(
+            any(message["action"] == "system.ack" for message in control_result)
+        )
+        self.assertEqual(
+            len(
+                [
+                    message
+                    for message, target_sid in authority_commands
+                    if message["action"] == "player.seek"
+                    and target_sid == old_authority_sid
+                ]
+            ),
+            1,
+        )
+        transaction = emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        self.assertEqual(transaction["status"], "failed")
+        self.assertEqual(transaction["errorCode"], "execution_unknown")
+        self.assertIsNotNone(transaction["executionEligibleAtMs"])
+        self.assertIsNone(get_state().get_sid_for_client("phone-1", "alice"))
+
+    def test_real_authority_disconnect_first_rejects_control_without_mutation(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-disconnect-first",
+            device_session_id="device:controller-disconnect-first",
+        )
+        player.disconnect(namespace="/emo")
+        before = getPlaybackContextState("context-1")
+
+        response = self.emit_strict(
+            controller,
+            "command",
+            "player.pause",
+            "pause-authority-disconnect-first",
+            {
+                "playbackContextId": "context-1",
+                "baseControlVersion": 1,
+            },
+        )
+
+        self.assertEqual(response[0]["payload"]["code"], "authority_offline")
+        self.assertEqual(getPlaybackContextState("context-1"), before)
+        self.assertIsNone(
+            emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        )
+        self.assertFalse(
+            any(message["action"] == "system.ack" for message in response)
+        )
+
+    def test_real_requester_replacement_first_rejects_old_generation(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-requester-replacement-first",
+            device_session_id="device:controller-requester-replacement-first",
+        )
+        self.messages(player)
+        self.messages(controller)
+        before = getPlaybackContextState("context-1")
+
+        self.replace_registered_generation(
+            "controller-requester-replacement-first",
+            device_session_id="device:controller-requester-replacement-new",
+            sid_suffix="requester-first",
+        )
+        response = self.emit_strict(
+            controller,
+            "command",
+            "player.seek",
+            "seek-requester-replacement-first",
+            {
+                "playbackContextId": "context-1",
+                "baseControlVersion": 1,
+                "positionMs": 1000,
+            },
+        )
+
+        self.assertEqual(response[0]["action"], "system.error")
+        self.assertEqual(response[0]["payload"]["code"], "unauthorized")
+        self.assertEqual(getPlaybackContextState("context-1"), before)
+        self.assertIsNone(
+            emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        )
+        self.assertFalse(
+            any(
+                message["action"] == "player.seek"
+                for message in self.messages(player)
+            )
+        )
+
+    def test_real_requester_replacement_waits_until_control_dispatch_finishes(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-requester-control-first",
+            device_session_id="device:controller-requester-control-first",
+        )
+        self.messages(player)
+        self.messages(controller)
+        old_generation = get_state().get_current_physical_generation(
+            "alice",
+            "controller-requester-control-first",
+            "device:controller-requester-control-first",
+        )
+        replacement = self.authenticated_unregistered_client(
+            "controller-requester-control-first-new"
+        )
+
+        replacement_trying = threading.Event()
+        replacement_entered = threading.Event()
+        replacement_before_ack = threading.Event()
+        dispatch_window = threading.Event()
+        control_result = []
+        control_errors = []
+        replacement_errors = []
+        watchdog_transactions = []
+        ack_sent = threading.Event()
+        real_lifecycle = emo_ws.strictPhysicalGenerationLockSet
+        real_emit = emo_ws._emit_message
+        replacement_thread = None
+
+        def observed_lifecycle(keys):
+            @contextmanager
+            def observed():
+                is_replacement = threading.current_thread() is replacement_thread
+                if is_replacement:
+                    replacement_trying.set()
+                with real_lifecycle(keys):
+                    if is_replacement:
+                        if not ack_sent.is_set():
+                            replacement_before_ack.set()
+                        replacement_entered.set()
+                    yield
+
+            return observed()
+
+        def register_replacement():
+            try:
+                self.register_real_replacement(
+                    replacement,
+                    "register-requester-control-first",
+                    "controller-requester-control-first",
+                    "device:controller-requester-control-first-new",
+                    roles=["controller"],
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                replacement_errors.append(exc)
+
+        replacement_thread = threading.Thread(target=register_replacement)
+
+        def emit_and_hold(message, *args, **kwargs):
+            result = real_emit(message, *args, **kwargs)
+            if (
+                message.get("action") == "system.ack"
+                and message.get("requestId") == "seek-requester-control-first"
+            ):
+                ack_sent.set()
+            if message.get("action") == "player.seek":
+                replacement_thread.start()
+                if not replacement_trying.wait(1):
+                    raise RuntimeError("requester replacement did not reach lock")
+                if not dispatch_window.wait(2):
+                    raise RuntimeError("requester dispatch window was not released")
+            return result
+
+        def run_control():
+            try:
+                controller.emit(
+                    "message",
+                    {
+                        "type": "command",
+                        "action": "player.seek",
+                        "requestId": "seek-requester-control-first",
+                        "payload": {
+                            "playbackContextId": "context-1",
+                            "baseControlVersion": 1,
+                            "positionMs": 2000,
+                        },
+                    },
+                    namespace="/emo",
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                control_errors.append(exc)
+
+        control_thread = threading.Thread(target=run_control)
+        with mock.patch.object(
+            emo_ws,
+            "strictPhysicalGenerationLockSet",
+            side_effect=observed_lifecycle,
+        ), mock.patch.object(
+            emo_ws,
+            "_emit_message",
+            side_effect=emit_and_hold,
+        ), mock.patch.object(
+            emo_ws,
+            "_start_control_watchdog",
+            side_effect=lambda transaction: watchdog_transactions.append(
+                dict(transaction)
+            ),
+        ):
+            control_thread.start()
+            self.assertTrue(replacement_trying.wait(2))
+            self.assertFalse(replacement_entered.is_set())
+            dispatch_window.set()
+            control_thread.join(2)
+            replacement_thread.join(2)
+
+        self.assertFalse(control_thread.is_alive())
+        self.assertFalse(replacement_thread.is_alive())
+        self.assertEqual(control_errors, [])
+        self.assertEqual(replacement_errors, [])
+        self.assertTrue(replacement_entered.is_set())
+        self.assertFalse(replacement_before_ack.is_set())
+        self.assertTrue(ack_sent.is_set())
+        self.assertEqual(
+            len(
+                [
+                    message
+                    for message in self.messages(player)
+                    if message["action"] == "player.seek"
+                ]
+            ),
+            1,
+        )
+        transaction = emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        self.assertEqual(transaction["requestingDeviceSessionId"], old_generation["deviceSessionId"])
+        self.assertEqual(
+            transaction["requestingConnectionNonce"],
+            old_generation["connectionNonce"],
+        )
+        self.assertEqual(transaction["requestingConnectionEpoch"], 1)
+        self.assertIsNotNone(transaction["executionEligibleAtMs"])
+        self.assertEqual(len(watchdog_transactions), 1)
+
+    def test_strict_control_emit_holds_only_generation_and_dispatch_locks(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"],
+            client_id="controller-lock-boundary",
+            device_session_id="device:controller-lock-boundary",
+        )
+        self.messages(player)
+        self.messages(controller)
+        active = {
+            "generation": 0,
+            "context": 0,
+            "pair": 0,
+            "database": 0,
+        }
+        observations = []
+        real_lifecycle = emo_ws.strictPhysicalGenerationLockSet
+        real_context_lock = emo_store._strict_playback_context_lock
+        real_pair_transaction = emo_store._strict_authority_pair_transaction
+        real_database_transaction = emo_store._strict_playback_context_transaction
+        real_emit = emo_ws._emit_message
+
+        def observed_lifecycle(keys):
+            @contextmanager
+            def observed():
+                with real_lifecycle(keys):
+                    active["generation"] += 1
+                    try:
+                        yield
+                    finally:
+                        active["generation"] -= 1
+
+            return observed()
+
+        def observed_context_lock(*args, **kwargs):
+            @contextmanager
+            def observed():
+                active["context"] += 1
+                try:
+                    with real_context_lock(*args, **kwargs):
+                        yield
+                finally:
+                    active["context"] -= 1
+
+            return observed()
+
+        def observed_pair_transaction(*args, **kwargs):
+            @contextmanager
+            def observed():
+                active["pair"] += 1
+                try:
+                    with real_pair_transaction(*args, **kwargs):
+                        yield
+                finally:
+                    active["pair"] -= 1
+
+            return observed()
+
+        def observed_database_transaction(*args, **kwargs):
+            @contextmanager
+            def observed():
+                active["database"] += 1
+                try:
+                    with real_database_transaction(*args, **kwargs):
+                        yield
+                finally:
+                    active["database"] -= 1
+
+            return observed()
+
+        def record_emit(message, *args, **kwargs):
+            if message.get("action") == "player.seek":
+                observations.append(dict(active))
+            return real_emit(message, *args, **kwargs)
+
+        with mock.patch.object(
+            emo_ws,
+            "strictPhysicalGenerationLockSet",
+            side_effect=observed_lifecycle,
+        ), mock.patch.object(
+            emo_ws,
+            "_emit_message",
+            side_effect=record_emit,
+        ), mock.patch.object(
+            emo_store,
+            "_strict_playback_context_lock",
+            side_effect=observed_context_lock,
+        ), mock.patch.object(
+            emo_store,
+            "_strict_authority_pair_transaction",
+            side_effect=observed_pair_transaction,
+        ), mock.patch.object(
+            emo_store,
+            "_strict_playback_context_transaction",
+            side_effect=observed_database_transaction,
+        ), mock.patch.object(emo_ws, "_start_control_watchdog"):
+            response = self.emit_strict(
+                controller,
+                "command",
+                "player.seek",
+                "seek-lock-boundary",
+                {
+                    "playbackContextId": "context-1",
+                    "baseControlVersion": 1,
+                    "positionMs": 3000,
+                },
+            )
+
+        self.assertEqual([message["action"] for message in response], ["system.ack"])
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["generation"], 1)
+        self.assertEqual(observations[0]["context"], 0)
+        self.assertEqual(observations[0]["pair"], 0)
+        self.assertEqual(observations[0]["database"], 0)
 
     def test_strict_control_requester_replacement_fails_before_mutation(self):
         player = self.ready_strict_client()

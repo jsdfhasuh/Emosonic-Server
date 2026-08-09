@@ -1,7 +1,8 @@
 import secrets
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from contextlib import contextmanager
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 
 DEFAULT_CLIENT_STALE_SECONDS = 90
@@ -58,6 +59,50 @@ def _require_non_empty_generation_string(value, field_name):
     if not isinstance(value, str) or not value.strip():
         raise ValueError("%s must be a non-empty string" % field_name)
     return value
+
+
+_physical_generation_lifecycle_locks = {}
+_physical_generation_lifecycle_locks_guard = threading.Lock()
+
+
+@contextmanager
+def strictPhysicalGenerationLockSet(
+    generation_keys: Iterable[Tuple[str, str]],
+) -> Iterator[None]:
+    """Serialize live replacement and dispatch for stable client keys."""
+    normalized_keys = []
+    for generation_key in generation_keys:
+        if (
+            not isinstance(generation_key, tuple)
+            or len(generation_key) != 2
+        ):
+            raise ValueError("Physical generation key must be a pair")
+        user_name = _require_non_empty_generation_string(
+            generation_key[0],
+            "userName",
+        )
+        client_id = _require_non_empty_generation_string(
+            generation_key[1],
+            "clientId",
+        )
+        normalized_keys.append((user_name, client_id))
+    normalized_keys = sorted(set(normalized_keys))
+    locks = []
+    with _physical_generation_lifecycle_locks_guard:
+        for generation_key in normalized_keys:
+            locks.append(
+                _physical_generation_lifecycle_locks.setdefault(
+                    generation_key,
+                    threading.RLock(),
+                )
+            )
+    for lifecycle_lock in locks:
+        lifecycle_lock.acquire()
+    try:
+        yield
+    finally:
+        for lifecycle_lock in reversed(locks):
+            lifecycle_lock.release()
 
 
 class BroadcastInactiveError(Exception):
@@ -294,30 +339,31 @@ class WebSocketState:
         client_info["clientId"] = client_id
         client_info["connectedAt"] = now
         client_info["lastSeenAt"] = now
-        with self._lock:
-            client_key = self._client_key(client_info.get("userName"), client_id)
-            previous_sid = self._client_to_sid.get(client_key)
-            if previous_sid is not None and previous_sid != sid:
-                previous_client = self._clients.get(client_key) or {}
-                self._clear_device_volume_state_locked(
-                    client_info.get("userName"),
-                    client_id,
-                    previous_client.get("deviceSessionId"),
-                )
-                previous_session = self._sessions.get(previous_sid)
-                if previous_session is not None:
-                    previous_session["clientId"] = None
-            self._clients[client_key] = client_info
-            self._client_to_sid[client_key] = sid
-            session_info = self._sessions.get(sid)
-            if session_info is not None:
-                session_info["clientId"] = client_id
-                session_info["lastSeenAt"] = now
-                session_info["clockPingCount"] = 0
-                session_info["lastClockPingAtMs"] = None
-                if client_info.get("userName"):
-                    session_info["userName"] = client_info["userName"]
-                    session_info["authenticated"] = True
+        client_key = self._client_key(client_info.get("userName"), client_id)
+        with strictPhysicalGenerationLockSet((client_key,)):
+            with self._lock:
+                previous_sid = self._client_to_sid.get(client_key)
+                if previous_sid is not None and previous_sid != sid:
+                    previous_client = self._clients.get(client_key) or {}
+                    self._clear_device_volume_state_locked(
+                        client_info.get("userName"),
+                        client_id,
+                        previous_client.get("deviceSessionId"),
+                    )
+                    previous_session = self._sessions.get(previous_sid)
+                    if previous_session is not None:
+                        previous_session["clientId"] = None
+                self._clients[client_key] = client_info
+                self._client_to_sid[client_key] = sid
+                session_info = self._sessions.get(sid)
+                if session_info is not None:
+                    session_info["clientId"] = client_id
+                    session_info["lastSeenAt"] = now
+                    session_info["clockPingCount"] = 0
+                    session_info["lastClockPingAtMs"] = None
+                    if client_info.get("userName"):
+                        session_info["userName"] = client_info["userName"]
+                        session_info["authenticated"] = True
         return dict(client_info)
 
     def get_current_physical_generation(
@@ -479,55 +525,108 @@ class WebSocketState:
             return []
 
         now = time.time() if now is None else now
-        removed = []
         with self._lock:
-            for client_key, client_info in list(self._clients.items()):
-                client_id = client_info.get("clientId")
-                last_seen_at = client_info.get("lastSeenAt") or client_info.get("connectedAt")
-                if last_seen_at is None or now - last_seen_at <= stale_after_seconds:
-                    continue
-
-                sid = self._client_to_sid.get(client_key)
-                if sid is not None:
-                    session_info = self._sessions.get(sid)
-                    if session_info is not None and session_info.get("clientId") == client_id:
-                        session_info["clientId"] = None
-                self._client_to_sid.pop(client_key, None)
-                removed_client = self._clients.pop(client_key)
-                self._clear_device_volume_state_locked(
-                    removed_client.get("userName"),
-                    client_id,
-                    removed_client.get("deviceSessionId"),
+            stale_keys = []
+            for client_key, client_info in self._clients.items():
+                last_seen_at = client_info.get("lastSeenAt") or client_info.get(
+                    "connectedAt"
                 )
-                self._mark_broadcast_participant_offline_locked(client_id, now=now)
-                self._deactivate_follow_relationships_for_client_locked(client_id, now=now)
-                removed.append(removed_client)
-            return [dict(client) for client in removed]
+                if (
+                    last_seen_at is not None
+                    and now - last_seen_at > stale_after_seconds
+                ):
+                    stale_keys.append(client_key)
+
+        removed = []
+        with strictPhysicalGenerationLockSet(stale_keys):
+            with self._lock:
+                for client_key in stale_keys:
+                    client_info = self._clients.get(client_key)
+                    if client_info is None:
+                        continue
+                    last_seen_at = client_info.get("lastSeenAt") or client_info.get(
+                        "connectedAt"
+                    )
+                    if (
+                        last_seen_at is None
+                        or now - last_seen_at <= stale_after_seconds
+                    ):
+                        continue
+
+                    client_id = client_info.get("clientId")
+                    sid = self._client_to_sid.get(client_key)
+                    if sid is not None:
+                        session_info = self._sessions.get(sid)
+                        if (
+                            session_info is not None
+                            and session_info.get("clientId") == client_id
+                        ):
+                            session_info["clientId"] = None
+                    self._client_to_sid.pop(client_key, None)
+                    removed_client = self._clients.pop(client_key)
+                    self._clear_device_volume_state_locked(
+                        removed_client.get("userName"),
+                        client_id,
+                        removed_client.get("deviceSessionId"),
+                    )
+                    self._mark_broadcast_participant_offline_locked(
+                        client_id,
+                        now=now,
+                    )
+                    self._deactivate_follow_relationships_for_client_locked(
+                        client_id,
+                        now=now,
+                    )
+                    removed.append(removed_client)
+                return [dict(client) for client in removed]
 
     def unregister_session(self, sid):
         with self._lock:
-            session_info = self._sessions.pop(sid, None)
-            if session_info is None:
-                return None, None
-            self._session_subscriptions.pop(sid, None)
-            self._playback_context_subscriptions.pop(sid, None)
-            client_id = session_info.get("clientId")
-            client_info = None
-            if client_id:
-                client_key = self._client_key(session_info.get("userName"), client_id)
-                current_sid = self._client_to_sid.get(client_key)
-                if current_sid == sid:
-                    self._client_to_sid.pop(client_key, None)
-                    client_info = self._clients.pop(client_key, None)
-                    if client_info is not None:
-                        self._clear_device_volume_state_locked(
-                            client_info.get("userName"),
-                            client_id,
-                            client_info.get("deviceSessionId"),
+            observed_session = self._sessions.get(sid)
+            observed_client_id = (
+                None
+                if observed_session is None
+                else observed_session.get("clientId")
+            )
+            observed_key = (
+                self._client_key(
+                    observed_session.get("userName"),
+                    observed_client_id,
+                )
+                if observed_session is not None and observed_client_id
+                else None
+            )
+
+        lifecycle_keys = () if observed_key is None else (observed_key,)
+        with strictPhysicalGenerationLockSet(lifecycle_keys):
+            with self._lock:
+                session_info = self._sessions.pop(sid, None)
+                if session_info is None:
+                    return None, None
+                self._session_subscriptions.pop(sid, None)
+                self._playback_context_subscriptions.pop(sid, None)
+                client_id = session_info.get("clientId")
+                client_info = None
+                if client_id:
+                    client_key = self._client_key(
+                        session_info.get("userName"),
+                        client_id,
+                    )
+                    current_sid = self._client_to_sid.get(client_key)
+                    if current_sid == sid:
+                        self._client_to_sid.pop(client_key, None)
+                        client_info = self._clients.pop(client_key, None)
+                        if client_info is not None:
+                            self._clear_device_volume_state_locked(
+                                client_info.get("userName"),
+                                client_id,
+                                client_info.get("deviceSessionId"),
+                            )
+                        self._mark_broadcast_participant_offline_locked(client_id)
+                        self._deactivate_follow_relationships_for_client_locked(
+                            client_id
                         )
-                    self._mark_broadcast_participant_offline_locked(client_id)
-                    self._deactivate_follow_relationships_for_client_locked(client_id)
-            return session_info, client_info
+                return session_info, client_info
 
     def get_client(self, client_id, user_name=None):
         with self._lock:
