@@ -7,7 +7,9 @@ from unittest import mock
 from jsonschema import Draft202012Validator
 
 from supysonic.db import release_database
+from supysonic.emo import ws as emo_ws
 from supysonic.emo.strict_v2_contract import validate_strict_output
+from supysonic.emo.strict_v2_safety import strict_v2_safety
 from supysonic.emo.protocol_metadata import (
   get_strict_v2_metadata,
   get_strict_v2_registration_descriptor,
@@ -162,6 +164,149 @@ class EmoWebSocketTestCase(unittest.TestCase):
         f"server_build_commit={'b' * 40}",
       ],
     )
+
+  def test_socketio_startup_recovery_precedes_profile_restore_and_watchdog(self):
+    events = []
+
+    def record(name, result=None):
+      def callback(*_args, **_kwargs):
+        events.append(name)
+        return result
+
+      return callback
+
+    self.app.config["WEBAPP"]["emo_strict_watchdog_sweep_in_tests"] = True
+    with mock.patch.object(
+      strict_v2_safety,
+      "configure",
+      side_effect=record("configure"),
+    ), mock.patch.object(
+      strict_v2_safety,
+      "begin_startup_recovery",
+      side_effect=record("gate-begin"),
+    ), mock.patch.object(
+      strict_v2_safety,
+      "complete_startup_recovery",
+      side_effect=record("gate-complete"),
+    ), mock.patch.object(
+      strict_v2_safety,
+      "fail_startup_recovery",
+      side_effect=record("gate-fail"),
+    ), mock.patch.object(
+      socketio,
+      "init_app",
+      side_effect=record("socketio-init"),
+    ), mock.patch.object(
+      emo_ws.strict_request_cache,
+      "clear_all",
+      side_effect=record("request-cache"),
+    ), mock.patch.object(
+      emo_ws,
+      "_reset_control_watchdog_runtime",
+      side_effect=record("watchdog-reset", 9),
+    ), mock.patch.object(
+      emo_ws,
+      "recoverPendingPlaybackControlsForStartup",
+      side_effect=record(
+        "core-recovery",
+        {"recoveredTransactions": [], "mutated": False},
+      ),
+    ), mock.patch.object(
+      emo_ws.state,
+      "restore_strict_playback_contexts",
+      side_effect=record("context-restore"),
+    ), mock.patch.object(
+      emo_ws,
+      "listPlaybackContexts",
+      return_value=[],
+    ), mock.patch.object(
+      emo_ws,
+      "failActivePlaybackHandoffsForRestart",
+      side_effect=record("handoff-recovery", []),
+    ), mock.patch.object(
+      emo_ws.state,
+      "stop_active_broadcasts_for_restart",
+      side_effect=record("memory-broadcast-recovery", []),
+    ), mock.patch.object(
+      emo_ws,
+      "stopNonterminalBroadcastsForRestart",
+      side_effect=record("durable-broadcast-recovery", []),
+    ), mock.patch.object(
+      emo_ws,
+      "get_strict_v2_metadata",
+      side_effect=record(
+        "metadata",
+        {
+          "protocolVersion": "2.8.0",
+          "schemaHash": "a" * 64,
+          "serverBuildCommit": "b" * 40,
+        },
+      ),
+    ), mock.patch.object(
+      socketio,
+      "start_background_task",
+      side_effect=record("watchdog-start"),
+    ):
+      init_socketio(self.app)
+
+    self.assertEqual(
+      events,
+      [
+        "configure",
+        "gate-begin",
+        "socketio-init",
+        "request-cache",
+        "watchdog-reset",
+        "core-recovery",
+        "context-restore",
+        "handoff-recovery",
+        "memory-broadcast-recovery",
+        "durable-broadcast-recovery",
+        "metadata",
+        "watchdog-start",
+        "gate-complete",
+      ],
+    )
+
+  def test_socketio_startup_recovery_failure_blocks_later_recovery_and_watchdog(self):
+    strict_v2_safety.configure(self.app.config["WEBAPP"])
+    try:
+      with mock.patch.object(socketio, "init_app"), mock.patch.object(
+        emo_ws,
+        "recoverPendingPlaybackControlsForStartup",
+        side_effect=RuntimeError("injected Core recovery failure"),
+      ), mock.patch.object(
+        emo_ws.state,
+        "restore_strict_playback_contexts",
+      ) as restore_contexts, mock.patch.object(
+        emo_ws,
+        "failActivePlaybackHandoffsForRestart",
+      ) as recover_handoffs, mock.patch.object(
+        emo_ws.state,
+        "stop_active_broadcasts_for_restart",
+      ) as recover_memory_broadcasts, mock.patch.object(
+        emo_ws,
+        "stopNonterminalBroadcastsForRestart",
+      ) as recover_durable_broadcasts, mock.patch.object(
+        socketio,
+        "start_background_task",
+      ) as start_watchdog:
+        with self.assertRaisesRegex(
+          RuntimeError,
+          "injected Core recovery failure",
+        ):
+          init_socketio(self.app)
+
+      self.assertEqual(strict_v2_safety.startup_recovery_state(), "failed")
+      self.assertFalse(strict_v2_safety.accepts_connections())
+      self.assertFalse(strict_v2_safety.begin_request())
+      restore_contexts.assert_not_called()
+      recover_handoffs.assert_not_called()
+      recover_memory_broadcasts.assert_not_called()
+      recover_durable_broadcasts.assert_not_called()
+      start_watchdog.assert_not_called()
+    finally:
+      strict_v2_safety.configure(self.app.config["WEBAPP"])
 
   def register_device(self, client, request_id, payload):
     payload = dict(payload)

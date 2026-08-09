@@ -381,6 +381,42 @@ class StrictV2SafetyTestCase(unittest.TestCase):
         thread.join(1)
         self.assertEqual(result, [True])
 
+    def test_startup_recovery_gate_rejects_connections_and_requests_until_ready(self):
+        safety = StrictV2Safety()
+        safety.configure({})
+
+        safety.begin_startup_recovery()
+
+        self.assertEqual(safety.startup_recovery_state(), "running")
+        self.assertFalse(safety.startup_recovery_complete())
+        self.assertFalse(safety.accepts_connections())
+        self.assertFalse(safety.begin_request())
+
+        safety.complete_startup_recovery()
+
+        self.assertEqual(safety.startup_recovery_state(), "ready")
+        self.assertTrue(safety.startup_recovery_complete())
+        self.assertTrue(safety.accepts_connections())
+        self.assertTrue(safety.begin_request())
+        safety.finish_request()
+
+    def test_failed_startup_recovery_remains_fail_closed(self):
+        safety = StrictV2Safety()
+        safety.configure({})
+        safety.begin_startup_recovery()
+
+        safety.fail_startup_recovery()
+
+        self.assertEqual(safety.startup_recovery_state(), "failed")
+        self.assertFalse(safety.startup_recovery_complete())
+        self.assertFalse(safety.accepts_connections())
+        self.assertFalse(safety.begin_request())
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "startup recovery is not running",
+        ):
+            safety.complete_startup_recovery()
+
     def test_graceful_shutdown_timeout_reports_incomplete_drain(self):
         safety = StrictV2Safety()
         safety.configure({})

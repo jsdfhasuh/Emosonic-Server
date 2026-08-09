@@ -25,6 +25,7 @@ from .db_layer.emo import (
     EmoBroadcastRevision,
     EmoBroadcastTerminalRecovery,
     EmoDevicePlaybackState,
+    EmoCoreStartupRecovery,
     EmoLocalQueue,
     EmoPlaybackControlTransaction,
     EmoPlaybackContext,

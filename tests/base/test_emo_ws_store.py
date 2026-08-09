@@ -45,6 +45,7 @@ from supysonic.emo.ws_store import (
     getPlaybackContextWithDeviceStates,
     getPlaybackControlTransaction,
     getPlaybackControlReconciliation,
+    getCoreStartupRecovery,
     getPlaybackContextCloseTombstone,
     getPlaybackHandoff,
     getPlaybackHandoffByRequest,
@@ -55,6 +56,7 @@ from supysonic.emo.ws_store import (
     getQueueState,
     listActivePlaybackContextBindings,
     listAllPendingPlaybackControlTransactions,
+    listCoreStartupRecoveries,
     listExpiredPlaybackControlTransactions,
     listPlaybackControlReconciliations,
     listExpiredPlaybackPrepareTransactions,
@@ -64,6 +66,7 @@ from supysonic.emo.ws_store import (
     listPlaybackContexts,
     mutateStrictPlaybackContextControl,
     mutateStrictPlaybackContextQueue,
+    recoverPendingPlaybackControlsForStartup,
     saveDevicePlaybackState,
     savePlaybackContextState,
     savePlaybackHandoff,
@@ -202,6 +205,31 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             1500,
         )
         return first, second
+
+    def _create_startup_recovery_chain(self):
+        transactions = []
+        for version, action in (
+            (2, "player.next"),
+            (3, "queue.playItem"),
+            (4, "player.pause"),
+        ):
+            transaction, created = self._create_exact_transaction(
+                command_control_version=version,
+                requesting_connection_epoch=1,
+                action=action,
+                effective_at_server_ms=None,
+                execution_timeout_ms=100,
+                deterministic_dependency_admission=True,
+            )
+            self.assertTrue(created)
+            transactions.append(transaction)
+        markPlaybackControlTransactionExecutionEligible(
+            "context-1",
+            1,
+            2,
+            1500,
+        )
+        return transactions
 
     def test_save_and_load_queue_state(self):
         saveQueueState(
@@ -5224,3 +5252,203 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         )
         self.assertEqual(updated["state"], "paused")
         self.assertEqual(updated["controlVersion"], 2)
+
+    def test_startup_recovery_terminalizes_roots_and_dependency_chains_atomically(self):
+        createStrictPlaybackContextState(
+            "context-1",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1", "song-2", "song-3"],
+            0,
+            250,
+            "playing",
+        )
+        saveDevicePlaybackState(
+            "context-1",
+            "device:player-1",
+            "alice",
+            "player-1",
+            {
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 250,
+                "epoch": 1,
+                "appliedControlVersion": 1,
+                "clientSeq": 7,
+            },
+            is_authority=True,
+        )
+        self._create_startup_recovery_chain()
+        createPlaybackControlTransaction(
+            "context-legacy",
+            "alice",
+            1,
+            2,
+            "legacy-controller",
+            "legacy-player",
+            "device:legacy-player",
+            "legacy-routed-nonce",
+            1,
+            "player.pause",
+            {"state": "paused"},
+            1200,
+            100,
+        )
+        createPlaybackControlTransaction(
+            "context-terminal",
+            "alice",
+            1,
+            2,
+            "terminal-controller",
+            "terminal-player",
+            "device:terminal-player",
+            "terminal-routed-nonce",
+            1,
+            "player.pause",
+            {"state": "paused"},
+            1000,
+            100,
+            requesting_device_session_id="device:terminal-controller",
+            requesting_connection_nonce="terminal-requester-nonce",
+            requesting_connection_epoch=1,
+        )
+        markPlaybackControlTransactionExecutionEligible(
+            "context-terminal",
+            1,
+            2,
+            1600,
+        )
+        terminal_before = settlePlaybackControlTransaction(
+            "context-terminal",
+            1,
+            2,
+            "committed",
+            1700,
+            applied_control_version=2,
+        ).transaction
+        context_before = getPlaybackContextState("context-1")
+        device_before = getDevicePlaybackState("context-1", "player-1")
+
+        with mock.patch.object(
+            ws_store,
+            "_mark_control_transaction_record_execution_eligible",
+            wraps=ws_store._mark_control_transaction_record_execution_eligible,
+        ) as mark_eligible:
+            result = recoverPendingPlaybackControlsForStartup(2000)
+
+        mark_eligible.assert_not_called()
+        self.assertTrue(result["mutated"])
+        self.assertEqual(
+            [
+                (item["playbackContextId"], item["commandControlVersion"])
+                for item in result["recoveredTransactions"]
+            ],
+            [
+                ("context-1", 2),
+                ("context-1", 3),
+                ("context-1", 4),
+                ("context-legacy", 2),
+            ],
+        )
+        root = getPlaybackControlTransaction("context-1", 1, 2)
+        first_dependent = getPlaybackControlTransaction("context-1", 1, 3)
+        second_dependent = getPlaybackControlTransaction("context-1", 1, 4)
+        legacy = getPlaybackControlTransaction("context-legacy", 1, 2)
+        self.assertEqual((root["status"], root["errorCode"]), ("failed", "execution_unknown"))
+        self.assertGreaterEqual(root["terminalAtMs"], root["executionEligibleAtMs"])
+        self.assertEqual(
+            (
+                first_dependent["status"],
+                first_dependent["errorCode"],
+                first_dependent["dependsOnControlVersion"],
+            ),
+            ("failed", "dependency_failed", 2),
+        )
+        self.assertEqual(
+            (
+                second_dependent["status"],
+                second_dependent["errorCode"],
+                second_dependent["dependsOnControlVersion"],
+            ),
+            ("failed", "dependency_failed", 3),
+        )
+        for dependent in (first_dependent, second_dependent):
+            self.assertNotIn("executionEligibleAtMs", dependent)
+            self.assertNotIn("watchdogDeadlineAtMs", dependent)
+        self.assertEqual(
+            (legacy["status"], legacy["errorCode"]),
+            ("failed", "execution_unknown"),
+        )
+        self.assertNotIn("requestingDeviceSessionId", legacy)
+        self.assertEqual(
+            getPlaybackControlTransaction("context-terminal", 1, 2),
+            terminal_before,
+        )
+        self.assertEqual(getPlaybackContextState("context-1"), context_before)
+        self.assertEqual(getDevicePlaybackState("context-1", "player-1"), device_before)
+        recovery = result["recovery"]
+        self.assertEqual(recovery["status"], "completed")
+        self.assertEqual(recovery["pendingCount"], 4)
+        self.assertEqual(recovery["incompleteGenerationCount"], 1)
+        self.assertEqual(recovery["recoveredRootCount"], 2)
+        self.assertEqual(recovery["recoveredDependencyCount"], 2)
+        self.assertEqual(
+            getCoreStartupRecovery(recovery["recoveryFingerprint"]),
+            recovery,
+        )
+
+    def test_startup_recovery_is_repeatable_and_concurrent_calls_mutate_once(self):
+        self._create_startup_recovery_chain()
+        start = threading.Barrier(2)
+
+        def recover(started_at_ms):
+            start.wait()
+            return recoverPendingPlaybackControlsForStartup(started_at_ms)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(recover, (2000, 2001)))
+
+        self.assertEqual(sum(result["mutated"] for result in results), 1)
+        self.assertEqual(
+            [
+                getPlaybackControlTransaction("context-1", 1, version)["errorCode"]
+                for version in (2, 3, 4)
+            ],
+            ["execution_unknown", "dependency_failed", "dependency_failed"],
+        )
+        marker_count = len(listCoreStartupRecoveries())
+        self.assertEqual(marker_count, 2)
+        replay = recoverPendingPlaybackControlsForStartup(3000)
+        self.assertFalse(replay["mutated"])
+        self.assertEqual(replay["recoveredTransactions"], [])
+        self.assertEqual(len(listCoreStartupRecoveries()), marker_count)
+
+    def test_startup_recovery_marker_failure_rolls_back_every_terminal(self):
+        self._create_startup_recovery_chain()
+        before = {
+            version: getPlaybackControlTransaction("context-1", 1, version)
+            for version in (2, 3, 4)
+        }
+
+        with mock.patch.object(
+            db.EmoCoreStartupRecovery,
+            "create",
+            side_effect=RuntimeError("injected recovery marker failure"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "injected recovery marker failure",
+            ):
+                recoverPendingPlaybackControlsForStartup(2000)
+
+        self.assertEqual(listCoreStartupRecoveries(), [])
+        for version in (2, 3, 4):
+            self.assertEqual(
+                getPlaybackControlTransaction("context-1", 1, version),
+                before[version],
+            )
+
+        retry = recoverPendingPlaybackControlsForStartup(2001)
+        self.assertTrue(retry["mutated"])
+        self.assertEqual(retry["recovery"]["pendingCount"], 3)

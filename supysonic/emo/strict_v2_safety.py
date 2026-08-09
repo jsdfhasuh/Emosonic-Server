@@ -103,6 +103,7 @@ class StrictV2Safety:
         self._max_pending_emits = 100
         self._shutting_down = False
         self._active_requests = 0
+        self._startup_recovery_state = "ready"
 
     def configure(
         self,
@@ -132,8 +133,33 @@ class StrictV2Safety:
             )
             self._shutting_down = False
             self._active_requests = 0
+            self._startup_recovery_state = "ready"
             if time_fn is not None:
                 self._time_fn = time_fn
+
+    def begin_startup_recovery(self) -> None:
+        with self._condition:
+            self._startup_recovery_state = "running"
+
+    def complete_startup_recovery(self) -> None:
+        with self._condition:
+            if self._startup_recovery_state != "running":
+                raise RuntimeError("strict-v2 startup recovery is not running")
+            self._startup_recovery_state = "ready"
+            self._condition.notify_all()
+
+    def fail_startup_recovery(self) -> None:
+        with self._condition:
+            self._startup_recovery_state = "failed"
+            self._condition.notify_all()
+
+    def startup_recovery_state(self) -> str:
+        with self._lock:
+            return self._startup_recovery_state
+
+    def startup_recovery_complete(self) -> bool:
+        with self._lock:
+            return self._startup_recovery_state == "ready"
 
     def limit(self, name: str) -> int:
         with self._lock:
@@ -141,11 +167,17 @@ class StrictV2Safety:
 
     def accepts_connections(self) -> bool:
         with self._lock:
-            return not self._shutting_down
+            return bool(
+                not self._shutting_down
+                and self._startup_recovery_state == "ready"
+            )
 
     def begin_request(self) -> bool:
         with self._condition:
-            if self._shutting_down:
+            if (
+                self._shutting_down
+                or self._startup_recovery_state != "ready"
+            ):
                 return False
             self._active_requests += 1
             return True

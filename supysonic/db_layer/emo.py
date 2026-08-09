@@ -240,6 +240,24 @@ class EmoPlaybackControlReconciliation(_Model):
         )
 
 
+class EmoCoreStartupRecovery(_Model):
+    id = PrimaryKeyField()
+    recovery_fingerprint = CharField(64, unique=True)
+    status = CharField(16, default="completed")
+    started_at_ms = BigIntegerField()
+    completed_at_ms = BigIntegerField()
+    pending_count = IntegerField(default=0)
+    incomplete_generation_count = IntegerField(default=0)
+    recovered_root_count = IntegerField(default=0)
+    recovered_dependency_count = IntegerField(default=0)
+    outcome_fingerprint = CharField(64)
+    created_at = DateTimeField(default=now)
+    updated_at = DateTimeField(default=now)
+
+    class Meta:
+        indexes = ((('status', 'completed_at_ms'), False),)
+
+
 class EmoPlaybackPrepareTransaction(_Model):
     id = PrimaryKeyField()
     playback_context_id = CharField(128)

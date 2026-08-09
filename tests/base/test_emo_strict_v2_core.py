@@ -1416,6 +1416,57 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(response[0]["action"], "system.error")
         self.assertEqual(response[0]["payload"]["code"], "internal_error")
 
+    def test_startup_recovery_gate_rejects_connections_and_strict_requests(self):
+        client = self.ready_strict_client()
+        strict_v2_safety.begin_startup_recovery()
+        try:
+            rejected_connection = self.connect()
+            self.assertFalse(rejected_connection.is_connected("/emo"))
+
+            response = self.emit_strict(
+                client,
+                "system",
+                "system.ping",
+                "ping-during-startup-recovery",
+                {},
+            )
+            self.assertEqual(len(response), 1)
+            self.assertEqual(response[0]["action"], "system.error")
+            self.assertEqual(
+                response[0]["payload"]["code"],
+                "internal_error",
+            )
+        finally:
+            strict_v2_safety.complete_startup_recovery()
+
+    def test_strict_registration_fails_closed_while_recovery_is_incomplete(self):
+        client = self.connect()
+        self.authenticate(client)
+        strict_v2_safety.begin_startup_recovery()
+        try:
+            with self.enable_all_profiles(), mock.patch.object(
+                strict_v2_safety,
+                "begin_request",
+                return_value=True,
+            ):
+                response = self.register(
+                    client,
+                    "register-during-startup-recovery",
+                    self.strict_registration_payload(),
+                )
+            self.assertEqual(len(response), 1)
+            self.assertEqual(response[0]["action"], "system.error")
+            self.assertEqual(response[0]["payload"]["code"], "not_supported")
+            self.assertIn("startup recovery", response[0]["payload"]["message"])
+            self.assertIsNone(
+                get_state().get_sid_for_client(
+                    "phone-1",
+                    user_name="alice",
+                )
+            )
+        finally:
+            strict_v2_safety.complete_startup_recovery()
+
     def test_internal_error_log_is_diagnostic_but_does_not_include_exception_text(self):
         client = self.ready_strict_client()
         exception_text = "password=Alic3 path=/private/music.db"

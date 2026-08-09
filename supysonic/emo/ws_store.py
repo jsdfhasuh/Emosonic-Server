@@ -13,6 +13,7 @@ from peewee import IntegrityError, SqliteDatabase
 
 from ..db import (
     EmoBroadcastFence,
+    EmoCoreStartupRecovery,
     EmoDevicePlaybackState,
     EmoLocalQueue,
     EmoPlaybackControlTransaction,
@@ -246,6 +247,7 @@ _strict_authority_pair_locks = {}
 _strict_authority_pair_locks_guard = threading.Lock()
 _strict_stable_client_locks = {}
 _strict_stable_client_locks_guard = threading.Lock()
+_core_startup_recovery_lock = threading.RLock()
 
 
 @contextmanager
@@ -1154,7 +1156,15 @@ def _settle_playback_control_transaction_record(
             updated_at=now(),
         )
         .where(
-            (EmoPlaybackControlTransaction.id == record.id)
+            (
+                EmoPlaybackControlTransaction.playback_context_id
+                == record.playback_context_id
+            )
+            & (EmoPlaybackControlTransaction.epoch == record.epoch)
+            & (
+                EmoPlaybackControlTransaction.command_control_version
+                == record.command_control_version
+            )
             & (EmoPlaybackControlTransaction.status == "pending")
         )
         .execute()
@@ -1163,7 +1173,11 @@ def _settle_playback_control_transaction_record(
         raise PlaybackControlTransactionConflictError(
             "Control transaction changed concurrently"
         )
-    return EmoPlaybackControlTransaction.get_by_id(record.id), True
+    return _control_transaction_record(
+        record.playback_context_id,
+        record.epoch,
+        record.command_control_version,
+    ), True
 
 
 def _pending_direct_control_dependents(record):
@@ -1369,6 +1383,334 @@ def settlePlaybackControlTransaction(
             )
     finally:
         close_connection()
+
+
+def serializeCoreStartupRecovery(record):
+    if record is None:
+        return None
+    return {
+        "recoveryFingerprint": record.recovery_fingerprint,
+        "status": record.status,
+        "startedAtMs": record.started_at_ms,
+        "completedAtMs": record.completed_at_ms,
+        "pendingCount": record.pending_count,
+        "incompleteGenerationCount": record.incomplete_generation_count,
+        "recoveredRootCount": record.recovered_root_count,
+        "recoveredDependencyCount": record.recovered_dependency_count,
+        "outcomeFingerprint": record.outcome_fingerprint,
+    }
+
+
+def getCoreStartupRecovery(recovery_fingerprint):
+    _require_non_empty_string(
+        recovery_fingerprint,
+        "recoveryFingerprint",
+        64,
+    )
+    open_connection(reuse=True)
+    try:
+        record = EmoCoreStartupRecovery.get_or_none(
+            EmoCoreStartupRecovery.recovery_fingerprint
+            == recovery_fingerprint
+        )
+        return serializeCoreStartupRecovery(record)
+    finally:
+        close_connection()
+
+
+def listCoreStartupRecoveries():
+    open_connection(reuse=True)
+    try:
+        query = EmoCoreStartupRecovery.select().order_by(
+            EmoCoreStartupRecovery.completed_at_ms,
+            EmoCoreStartupRecovery.recovery_fingerprint,
+        )
+        return [serializeCoreStartupRecovery(record) for record in query]
+    finally:
+        close_connection()
+
+
+def _startup_recovery_pending_records():
+    return list(
+        EmoPlaybackControlTransaction.select()
+        .where(EmoPlaybackControlTransaction.status == "pending")
+        .order_by(
+            EmoPlaybackControlTransaction.playback_context_id,
+            EmoPlaybackControlTransaction.epoch,
+            EmoPlaybackControlTransaction.command_control_version,
+        )
+    )
+
+
+def _startup_recovery_generation_is_complete(record):
+    string_values = (
+        record.requesting_client_id,
+        record.requesting_device_session_id,
+        record.requesting_connection_nonce,
+        record.authority_client_id,
+        record.authority_device_session_id,
+        record.routed_connection_nonce,
+    )
+    return bool(
+        all(isinstance(value, str) and value.strip() for value in string_values)
+        and type(record.requesting_connection_epoch) is int
+        and record.requesting_connection_epoch == 1
+        and type(record.routed_connection_epoch) is int
+        and record.routed_connection_epoch == 1
+    )
+
+
+def _startup_recovery_batch_identity(records):
+    return [
+        {
+            "playbackContextId": record.playback_context_id,
+            "userName": record.user_name,
+            "epoch": record.epoch,
+            "commandControlVersion": record.command_control_version,
+            "requestingClientId": record.requesting_client_id,
+            "requestingDeviceSessionId": record.requesting_device_session_id,
+            "requestingConnectionNonce": record.requesting_connection_nonce,
+            "requestingConnectionEpoch": record.requesting_connection_epoch,
+            "authorityClientId": record.authority_client_id,
+            "authorityDeviceSessionId": record.authority_device_session_id,
+            "routedConnectionNonce": record.routed_connection_nonce,
+            "routedConnectionEpoch": record.routed_connection_epoch,
+            "action": record.action,
+            "dependsOnControlVersion": record.depends_on_control_version,
+            "executionEligibleAtMs": record.execution_eligible_at_ms,
+            "watchdogDeadlineAtMs": record.watchdog_deadline_at_ms,
+        }
+        for record in records
+    ]
+
+
+def _startup_recovery_terminal_identity(record):
+    return {
+        "playbackContextId": record.playback_context_id,
+        "epoch": record.epoch,
+        "commandControlVersion": record.command_control_version,
+        "status": record.status,
+        "errorCode": record.error_code,
+        "dependsOnControlVersion": record.depends_on_control_version,
+        "appliedControlVersion": record.applied_control_version,
+        "terminalAtMs": record.terminal_at_ms,
+    }
+
+
+def recoverPendingPlaybackControlsForStartup(started_at_ms):
+    """Atomically terminalize every control that survived a server restart."""
+    _require_integer(started_at_ms, "startedAtMs", 0)
+    with _core_startup_recovery_lock:
+        while True:
+            open_connection(reuse=True)
+            try:
+                context_ids = {
+                    record.playback_context_id
+                    for record in _startup_recovery_pending_records()
+                }
+            finally:
+                close_connection()
+
+            retry_with_more_locks = False
+            with _strict_playback_context_lock_set(context_ids):
+                open_connection(reuse=True)
+                try:
+                    with _strict_playback_context_transaction():
+                        records = _startup_recovery_pending_records()
+                        current_context_ids = {
+                            record.playback_context_id for record in records
+                        }
+                        if not current_context_ids.issubset(context_ids):
+                            retry_with_more_locks = True
+                            continue
+
+                        recovery_fingerprint = _json_fingerprint(
+                            _startup_recovery_batch_identity(records)
+                        )
+                        existing = EmoCoreStartupRecovery.get_or_none(
+                            EmoCoreStartupRecovery.recovery_fingerprint
+                            == recovery_fingerprint
+                        )
+                        if existing is not None:
+                            if records:
+                                raise PlaybackControlTransactionConflictError(
+                                    "Completed startup recovery still has pending controls"
+                                )
+                            return {
+                                "recovery": serializeCoreStartupRecovery(existing),
+                                "recoveredTransactions": [],
+                                "mutated": False,
+                            }
+
+                        terminal_at_ms = max(
+                            started_at_ms,
+                            int(time.time() * 1000),
+                            max(
+                                (
+                                    record.execution_eligible_at_ms or 0
+                                    for record in records
+                                ),
+                                default=0,
+                            ),
+                        )
+                        initial_pending_count = len(records)
+                        incomplete_generation_count = sum(
+                            not _startup_recovery_generation_is_complete(record)
+                            for record in records
+                        )
+                        recovered = []
+                        recovered_root_count = 0
+                        recovered_dependency_count = 0
+
+                        pending_keys = {
+                            (
+                                record.playback_context_id,
+                                record.epoch,
+                                record.command_control_version,
+                            )
+                            for record in records
+                        }
+                        roots = [
+                            record
+                            for record in records
+                            if record.depends_on_control_version is None
+                            or (
+                                record.playback_context_id,
+                                record.epoch,
+                                record.depends_on_control_version,
+                            )
+                            not in pending_keys
+                        ]
+
+                        for initial_record in roots:
+                            record = _control_transaction_record(
+                                initial_record.playback_context_id,
+                                initial_record.epoch,
+                                initial_record.command_control_version,
+                            )
+                            if record is None or record.status != "pending":
+                                continue
+                            dependency = None
+                            if record.depends_on_control_version is not None:
+                                dependency = _control_transaction_record(
+                                    record.playback_context_id,
+                                    record.epoch,
+                                    record.depends_on_control_version,
+                                )
+                            dependency_failed = bool(
+                                record.depends_on_control_version is not None
+                                and (
+                                    dependency is None
+                                    or dependency.status != "committed"
+                                )
+                            )
+                            error_code = (
+                                "dependency_failed"
+                                if dependency_failed
+                                else "execution_unknown"
+                            )
+                            applied_control_version = (
+                                None
+                                if dependency is None
+                                else dependency.applied_control_version
+                            )
+                            record, changed = _settle_playback_control_transaction_record(
+                                record,
+                                "failed",
+                                terminal_at_ms,
+                                error_code=error_code,
+                                depends_on_control_version=(
+                                    record.depends_on_control_version
+                                    if dependency_failed
+                                    else None
+                                ),
+                                applied_control_version=applied_control_version,
+                            )
+                            if not changed:
+                                continue
+                            recovered_root_count += 1
+                            if dependency_failed:
+                                recovered_dependency_count += 1
+                            recovered.append(record)
+                            (
+                                _eligible,
+                                dependency_settlements,
+                            ) = _resolve_playback_control_dependency_outcome(
+                                record,
+                                terminal_at_ms,
+                            )
+                            recovered_dependency_count += len(
+                                dependency_settlements
+                            )
+                            for settlement in dependency_settlements:
+                                recovered_record = _control_transaction_record(
+                                    settlement["playbackContextId"],
+                                    settlement["epoch"],
+                                    settlement["commandControlVersion"],
+                                )
+                                if recovered_record is not None:
+                                    recovered.append(recovered_record)
+
+                        for initial_record in records:
+                            record = _control_transaction_record(
+                                initial_record.playback_context_id,
+                                initial_record.epoch,
+                                initial_record.command_control_version,
+                            )
+                            if record is None or record.status != "pending":
+                                continue
+                            record, changed = _settle_playback_control_transaction_record(
+                                record,
+                                "failed",
+                                terminal_at_ms,
+                                error_code="execution_unknown",
+                            )
+                            if changed:
+                                recovered_root_count += 1
+                                recovered.append(record)
+
+                        recovered.sort(
+                            key=lambda record: (
+                                record.playback_context_id,
+                                record.epoch,
+                                record.command_control_version,
+                            )
+                        )
+                        outcome_fingerprint = _json_fingerprint(
+                            [
+                                _startup_recovery_terminal_identity(record)
+                                for record in recovered
+                            ]
+                        )
+                        marker = EmoCoreStartupRecovery.create(
+                            recovery_fingerprint=recovery_fingerprint,
+                            status="completed",
+                            started_at_ms=started_at_ms,
+                            completed_at_ms=terminal_at_ms,
+                            pending_count=initial_pending_count,
+                            incomplete_generation_count=(
+                                incomplete_generation_count
+                            ),
+                            recovered_root_count=recovered_root_count,
+                            recovered_dependency_count=(
+                                recovered_dependency_count
+                            ),
+                            outcome_fingerprint=outcome_fingerprint,
+                        )
+                        return {
+                            "recovery": serializeCoreStartupRecovery(marker),
+                            "recoveredTransactions": [
+                                serializePlaybackControlTransaction(record)
+                                for record in recovered
+                            ],
+                            "mutated": bool(recovered),
+                        }
+                finally:
+                    close_connection()
+            if not retry_with_more_locks:
+                raise PlaybackControlTransactionConflictError(
+                    "Startup recovery lock set changed unexpectedly"
+                )
 
 
 def serializePlaybackControlReconciliation(record):

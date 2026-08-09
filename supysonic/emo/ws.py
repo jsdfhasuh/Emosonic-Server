@@ -128,6 +128,7 @@ from .ws_store import (
     markPlaybackControlTransactionExecutionEligible,
     mutateStrictPlaybackContextControl,
     mutateStrictPlaybackContextQueue,
+    recoverPendingPlaybackControlsForStartup,
     saveDevicePlaybackState,
     saveLocalQueueState,
     savePlaybackContextState,
@@ -541,63 +542,69 @@ def init_socketio(app):
         webapp_config,
         development=development,
     )
-    socketio.init_app(
-        app,
-        path="/emo/ws",
-        cors_allowed_origins=allowed_origins,
-        max_http_buffer_size=256 * 1024,
-        ping_interval=webapp_config.get("emo_socketio_ping_interval", 25),
-        ping_timeout=webapp_config.get("emo_socketio_ping_timeout", 20),
-    )
     strict_v2_safety.configure(webapp_config)
-    strict_request_cache.clear_all()
-    watchdog_generation = _reset_control_watchdog_runtime()
-    state.restore_strict_playback_contexts(listPlaybackContexts())
-    recovered_controls = _settle_control_transactions_unknown(
-        listAllPendingPlaybackControlTransactions(),
-        emit=False,
-    )
-    if recovered_controls:
+    strict_v2_safety.begin_startup_recovery()
+    try:
+        socketio.init_app(
+            app,
+            path="/emo/ws",
+            cors_allowed_origins=allowed_origins,
+            max_http_buffer_size=256 * 1024,
+            ping_interval=webapp_config.get("emo_socketio_ping_interval", 25),
+            ping_timeout=webapp_config.get("emo_socketio_ping_timeout", 20),
+        )
+        strict_request_cache.clear_all()
+        watchdog_generation = _reset_control_watchdog_runtime()
+        recovery_result = recoverPendingPlaybackControlsForStartup(
+            _server_time_ms()
+        )
+        recovered_controls = recovery_result["recoveredTransactions"]
+        if recovered_controls:
+            logger.warning(
+                "Recovered %d pending strict playback controls after restart",
+                len(recovered_controls),
+            )
+        state.restore_strict_playback_contexts(listPlaybackContexts())
+        failed_handoffs = failActivePlaybackHandoffsForRestart()
+        if failed_handoffs:
+            logger.warning(
+                "Marked %d active Emo handoffs failed after restart",
+                len(failed_handoffs),
+            )
+        stopped_broadcasts = state.stop_active_broadcasts_for_restart()
+        if stopped_broadcasts:
+            logger.warning(
+                "Marked %d active strict Emo broadcasts stopped after restart",
+                len(stopped_broadcasts),
+            )
+        stopped_persistent_broadcasts = stopNonterminalBroadcastsForRestart()
+        if stopped_persistent_broadcasts:
+            logger.warning(
+                "Marked %d persistent strict Emo broadcasts stopped after restart",
+                len(stopped_persistent_broadcasts),
+            )
+        metadata = get_strict_v2_metadata()
         logger.warning(
-            "Marked %d pending strict playback controls execution_unknown after restart",
-            len(recovered_controls),
+            format_log_event(
+                "emo",
+                "strict_v2_registration_metadata",
+                protocol_version=metadata["protocolVersion"],
+                schema_hash=metadata["schemaHash"],
+                server_build_commit=metadata["serverBuildCommit"],
+            )
         )
-    failed_handoffs = failActivePlaybackHandoffsForRestart()
-    if failed_handoffs:
-        logger.warning(
-            "Marked %d active Emo handoffs failed after restart",
-            len(failed_handoffs),
-        )
-    stopped_broadcasts = state.stop_active_broadcasts_for_restart()
-    if stopped_broadcasts:
-        logger.warning(
-            "Marked %d active strict Emo broadcasts stopped after restart",
-            len(stopped_broadcasts),
-        )
-    stopped_persistent_broadcasts = stopNonterminalBroadcastsForRestart()
-    if stopped_persistent_broadcasts:
-        logger.warning(
-            "Marked %d persistent strict Emo broadcasts stopped after restart",
-            len(stopped_persistent_broadcasts),
-        )
-    metadata = get_strict_v2_metadata()
-    logger.warning(
-        format_log_event(
-            "emo",
-            "strict_v2_registration_metadata",
-            protocol_version=metadata["protocolVersion"],
-            schema_hash=metadata["schemaHash"],
-            server_build_commit=metadata["serverBuildCommit"],
-        )
-    )
-    if not app.testing or webapp_config.get(
-        "emo_strict_watchdog_sweep_in_tests",
-        False,
-    ):
-        socketio.start_background_task(
-            _control_watchdog_sweep_later,
-            watchdog_generation,
-        )
+        if not app.testing or webapp_config.get(
+            "emo_strict_watchdog_sweep_in_tests",
+            False,
+        ):
+            socketio.start_background_task(
+                _control_watchdog_sweep_later,
+                watchdog_generation,
+            )
+        strict_v2_safety.complete_startup_recovery()
+    except Exception:
+        strict_v2_safety.fail_startup_recovery()
+        raise
     return socketio
 
 
@@ -1676,6 +1683,10 @@ def _register_device(sid, user_name, payload):
         and capabilities.get(CAPABILITY_PLAYBACK_CONTEXT_V2) is True
     )
     if strict_v2:
+        if not strict_v2_safety.startup_recovery_complete():
+            raise CoreProfileNotReady(
+                "strict-v2 Core startup recovery is not complete"
+            )
         if not roles or len(roles) > 2 or len(set(roles)) != len(roles):
             raise ValueError("strict-v2 roles must contain distinct player/controller values")
         if not all(role in {"player", "controller"} for role in roles):
