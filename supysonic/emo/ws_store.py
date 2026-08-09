@@ -5048,6 +5048,8 @@ def mutateStrictPlaybackContextControl(
                 }:
                     accepted_target["queueIndex"] = record.current_index
                     accepted_target["queueRevision"] = record.queue_revision
+                if action == "queue.playItem":
+                    accepted_target["queueSongIds"] = list(queue_song_ids)
                 if accepted_target_extra:
                     accepted_target.update(dict(accepted_target_extra))
                 transaction_record, _created = _create_playback_control_transaction_record(

@@ -1045,6 +1045,7 @@ class StrictV2ContractTestCase(unittest.TestCase):
                 "controlVersion": 3,
                 "appliedControlVersion": 1,
                 "requestingClientId": "controller-1",
+                "requestingDeviceSessionId": "device:controller-1",
                 "serverUpdatedAtMs": 1000,
             },
         )
@@ -1060,6 +1061,43 @@ class StrictV2ContractTestCase(unittest.TestCase):
 
         invalid = copy.deepcopy(settled)
         invalid["payload"]["errorCode"] = "execution_unknown"
+        with self.assertRaises(StrictOutputValidationError):
+            validate_strict_output(invalid)
+
+    def test_validates_dependent_routed_control_outputs(self):
+        seek = self._output(
+            "command",
+            "player.seek",
+            {
+                "playbackContextId": "context-1",
+                "controlVersion": 3,
+                "sourceClientId": "controller-1",
+                "executionTimeoutMs": 15000,
+                "dependsOnControlVersion": 2,
+                "positionMs": 1200,
+            },
+        )
+        play_item = self._output(
+            "command",
+            "queue.playItem",
+            {
+                "playbackContextId": "context-1",
+                "queueSongIds": ["song-1", "song-2"],
+                "queueIndex": 1,
+                "queueRevision": 2,
+                "controlVersion": 4,
+                "sourceClientId": "controller-1",
+                "executionTimeoutMs": 15000,
+                "dependsOnControlVersion": 3,
+            },
+        )
+
+        for message in (seek, play_item):
+            with self.subTest(action=message["action"]):
+                self.assertEqual(validate_strict_output(message), message)
+
+        invalid = copy.deepcopy(seek)
+        invalid["payload"]["dependsOnControlVersion"] = 3
         with self.assertRaises(StrictOutputValidationError):
             validate_strict_output(invalid)
 

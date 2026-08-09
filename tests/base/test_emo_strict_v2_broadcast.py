@@ -2928,6 +2928,276 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             accepted_target["effectiveAtServerMs"],
             ordinary["payload"]["effectiveAtServerMs"],
         )
+        serialized = emo_ws.getPlaybackControlTransaction(
+            "context-broadcast-source",
+            context["epoch"],
+            context["controlVersion"],
+        )
+        state = get_state()
+        requester_generation = state.get_current_physical_generation(
+            "alice",
+            "controller-1",
+            "device:controller-1",
+        )
+        authority_generation = state.get_current_physical_generation(
+            "alice",
+            "authority-1",
+            "device:authority-1",
+        )
+        self.assertEqual(
+            (
+                serialized["requestingClientId"],
+                serialized["requestingDeviceSessionId"],
+                serialized["requestingConnectionNonce"],
+                serialized["requestingConnectionEpoch"],
+            ),
+            (
+                requester_generation["clientId"],
+                requester_generation["deviceSessionId"],
+                requester_generation["connectionNonce"],
+                requester_generation["connectionEpoch"],
+            ),
+        )
+        self.assertEqual(
+            (
+                serialized["authorityClientId"],
+                serialized["authorityDeviceSessionId"],
+                serialized["routedConnectionNonce"],
+                serialized["routedConnectionEpoch"],
+            ),
+            (
+                authority_generation["clientId"],
+                authority_generation["deviceSessionId"],
+                authority_generation["connectionNonce"],
+                authority_generation["connectionEpoch"],
+            ),
+        )
+        self.assertEqual(
+            serialized["effectiveAtServerMs"],
+            source_command["payload"]["effectiveAtServerMs"],
+        )
+        self.assertGreaterEqual(
+            serialized["executionEligibleAtMs"],
+            serialized["effectiveAtServerMs"],
+        )
+        self.assertEqual(
+            serialized["watchdogDeadlineAtMs"],
+            serialized["executionEligibleAtMs"]
+            + serialized["executionTimeoutMs"]
+            + 2000,
+        )
+
+    def test_broadcast_source_dependency_enqueues_once_then_activates(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        context = getPlaybackContextState("context-broadcast-source")
+        state = get_state()
+        requester_generation = state.get_current_physical_generation(
+            "alice",
+            "controller-1",
+            "device:controller-1",
+        )
+        authority_generation = state.get_current_physical_generation(
+            "alice",
+            "authority-1",
+            "device:authority-1",
+        )
+        createPlaybackControlTransaction(
+            "context-broadcast-source",
+            "alice",
+            context["epoch"],
+            context["controlVersion"],
+            requester_generation["clientId"],
+            authority_generation["clientId"],
+            authority_generation["deviceSessionId"],
+            authority_generation["connectionNonce"],
+            authority_generation["connectionEpoch"],
+            "player.next",
+            {
+                "state": "playing",
+                "trackId": "source-song-2",
+                "positionMs": 0,
+                "queueIndex": 1,
+            },
+            int(time.time() * 1000),
+            15000,
+            requesting_device_session_id=requester_generation[
+                "deviceSessionId"
+            ],
+            requesting_connection_nonce=requester_generation[
+                "connectionNonce"
+            ],
+            requesting_connection_epoch=requester_generation[
+                "connectionEpoch"
+            ],
+        )
+
+        with mock.patch.object(emo_ws, "_start_control_watchdog") as watchdog:
+            controller.emit(
+                "message",
+                {
+                    "type": "command",
+                    "action": "broadcast.pause",
+                    "requestId": "broadcast-pause-dependent-1",
+                    "payload": {
+                        "playbackContextId": "context-broadcast-source",
+                        "broadcastId": start_ack["broadcastId"],
+                        "baseControlVersion": 1,
+                    },
+                },
+                namespace="/emo",
+            )
+            controller_messages = self.get_messages(controller)
+            self.get_ack(
+                controller_messages,
+                "broadcast-pause-dependent-1",
+            )
+            source_commands = [
+                message
+                for message in self.get_messages(authority)
+                if message["action"] == "player.pause"
+            ]
+            self.assertEqual(len(source_commands), 1)
+            self.assertEqual(
+                source_commands[0]["payload"]["dependsOnControlVersion"],
+                1,
+            )
+            dependent = emo_ws.getPlaybackControlTransaction(
+                "context-broadcast-source",
+                context["epoch"],
+                2,
+            )
+            self.assertNotIn("executionEligibleAtMs", dependent)
+            self.assertNotIn("watchdogDeadlineAtMs", dependent)
+            watchdog.assert_not_called()
+
+            terminal_at_ms = dependent["effectiveAtServerMs"] + 1500
+            settlement = settlePlaybackControlTransaction(
+                "context-broadcast-source",
+                context["epoch"],
+                1,
+                "committed",
+                terminal_at_ms,
+                applied_control_version=1,
+            )
+            self.assertEqual(
+                len(settlement.execution_eligible_transactions),
+                1,
+            )
+            with mock.patch.object(emo_ws, "_emit_message") as emit:
+                activated = emo_ws._activate_execution_eligible_control_transaction(
+                    settlement.execution_eligible_transactions[0],
+                    getPlaybackContextState("context-broadcast-source"),
+                )
+            self.assertTrue(activated)
+            emit.assert_not_called()
+
+        eligible = emo_ws.getPlaybackControlTransaction(
+            "context-broadcast-source",
+            context["epoch"],
+            2,
+        )
+        self.assertEqual(eligible["executionEligibleAtMs"], terminal_at_ms)
+        self.assertGreater(
+            eligible["executionEligibleAtMs"]
+            - eligible["effectiveAtServerMs"],
+            1000,
+        )
+        self.assertEqual(
+            eligible["watchdogDeadlineAtMs"],
+            eligible["executionEligibleAtMs"]
+            + eligible["executionTimeoutMs"]
+            + 2000,
+        )
+        watchdog.assert_called_once()
+
+    def test_broadcast_source_effective_at_miss_uses_remote_failed_feedback(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        controller.emit(
+            "message",
+            {
+                "type": "command",
+                "action": "broadcast.pause",
+                "requestId": "broadcast-pause-late-source-1",
+                "payload": {
+                    "playbackContextId": "context-broadcast-source",
+                    "broadcastId": start_ack["broadcastId"],
+                    "baseControlVersion": 1,
+                },
+            },
+            namespace="/emo",
+        )
+        self.get_ack(
+            self.get_messages(controller),
+            "broadcast-pause-late-source-1",
+        )
+        source_command = self._push(
+            self.get_messages(authority),
+            "player.pause",
+        )
+        self.get_messages(participant)
+        self.get_messages(controller)
+        late_at_ms = source_command["payload"]["effectiveAtServerMs"] + 1001
+
+        with mock.patch.object(
+            emo_ws,
+            "_server_time_ms",
+            return_value=late_at_ms,
+        ):
+            self.update_source_playback(
+                authority,
+                2,
+                late_at_ms,
+                origin="remoteCommand",
+                executionStatus="failed",
+                commandControlVersion=2,
+                appliedControlVersion=1,
+                errorCode="effective_at_missed",
+                state="playing",
+                trackId="source-song-1",
+                positionMs=1000,
+            )
+
+        transaction = emo_ws.getPlaybackControlTransaction(
+            "context-broadcast-source",
+            1,
+            2,
+        )
+        self.assertEqual(transaction["status"], "failed")
+        self.assertEqual(transaction["errorCode"], "effective_at_missed")
+        self.assertGreater(
+            late_at_ms - transaction["effectiveAtServerMs"],
+            1000,
+        )
+        all_messages = []
+        for client in (authority, participant, controller):
+            all_messages.extend(self.get_messages(client))
+        self.assertTrue(
+            any(message["action"] == "playback.update" for message in all_messages)
+        )
+        self.assertFalse(
+            any(
+                message["action"] == "playback.control.settled"
+                for message in all_messages
+            )
+        )
 
     def test_broadcast_play_item_advances_source_and_broadcast_cursors_once(self):
         authority, participant, controller = self.connect_broadcast_devices()
@@ -3536,20 +3806,25 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         self._push(self.get_messages(participant), "broadcast.pause")
         for client in (authority, participant, controller):
             self.get_messages(client)
-        sampled_at_ms = int(time.time() * 1000)
+        sampled_at_ms = source_command["payload"]["effectiveAtServerMs"]
 
-        self.update_source_playback(
-            authority,
-            2,
-            sampled_at_ms,
-            origin="remoteCommand",
-            executionStatus="committed",
-            commandControlVersion=2,
-            appliedControlVersion=2,
-            state="paused",
-            trackId="source-song-1",
-            positionMs=source_command["payload"]["positionMs"],
-        )
+        with mock.patch.object(
+            emo_ws,
+            "_server_time_ms",
+            return_value=sampled_at_ms,
+        ):
+            self.update_source_playback(
+                authority,
+                2,
+                sampled_at_ms,
+                origin="remoteCommand",
+                executionStatus="committed",
+                commandControlVersion=2,
+                appliedControlVersion=2,
+                state="paused",
+                trackId="source-song-1",
+                positionMs=source_command["payload"]["positionMs"],
+            )
 
         transaction = db.EmoPlaybackControlTransaction.get(
             db.EmoPlaybackControlTransaction.command_control_version == 2

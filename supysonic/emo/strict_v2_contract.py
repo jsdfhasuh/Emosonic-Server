@@ -2075,12 +2075,17 @@ def _validate_control_settled_output(payload: object) -> None:
             "controlVersion",
             "appliedControlVersion",
             "requestingClientId",
+            "requestingDeviceSessionId",
             "serverUpdatedAtMs",
         },
         {"dependsOnControlVersion", "errorMessage"},
         "playback.control.settled payload",
     )
-    for field_name in ("playbackContextId", "requestingClientId"):
+    for field_name in (
+        "playbackContextId",
+        "requestingClientId",
+        "requestingDeviceSessionId",
+    ):
         _output_string(settled[field_name], "playback.control.settled %s" % field_name)
     if settled["status"] != "failed":
         _output_error("playback.control.settled status must be failed")
@@ -2398,7 +2403,11 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
                 "sourceClientId",
                 "executionTimeoutMs",
             }
-            optional = {"effectiveAtServerMs", "serverTimeMs"}
+            optional = {
+                "dependsOnControlVersion",
+                "effectiveAtServerMs",
+                "serverTimeMs",
+            }
             if action in {"player.play", "player.pause"}:
                 optional.add("positionMs")
             if action == "player.seek":
@@ -2415,6 +2424,17 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
             )
         if "positionMs" in control:
             _output_int(control["positionMs"], "%s positionMs" % action)
+        if "dependsOnControlVersion" in control:
+            dependency = _output_int(
+                control["dependsOnControlVersion"],
+                "%s dependsOnControlVersion" % action,
+                1,
+            )
+            if dependency >= control["controlVersion"]:
+                _output_error(
+                    "%s dependsOnControlVersion must be below controlVersion"
+                    % action
+                )
         if not handoff_commit and (
             "effectiveAtServerMs" in control or "serverTimeMs" in control
         ):
@@ -2444,7 +2464,11 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
                 "sourceClientId",
                 "executionTimeoutMs",
             },
-            {"effectiveAtServerMs", "serverTimeMs"},
+            {
+                "dependsOnControlVersion",
+                "effectiveAtServerMs",
+                "serverTimeMs",
+            },
             "queue.playItem payload",
         )
         _output_string(control["playbackContextId"], "queue.playItem playbackContextId")
@@ -2464,6 +2488,16 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
             1,
         )
         _output_string(control["sourceClientId"], "queue.playItem sourceClientId")
+        if "dependsOnControlVersion" in control:
+            dependency = _output_int(
+                control["dependsOnControlVersion"],
+                "queue.playItem dependsOnControlVersion",
+                1,
+            )
+            if dependency >= control["controlVersion"]:
+                _output_error(
+                    "queue.playItem dependsOnControlVersion must be below controlVersion"
+                )
         if "effectiveAtServerMs" in control or "serverTimeMs" in control:
             if not {"effectiveAtServerMs", "serverTimeMs"}.issubset(control):
                 _output_error("queue.playItem timing fields must appear together")

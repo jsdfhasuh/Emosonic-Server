@@ -3941,6 +3941,89 @@ def _validate_strict_v2_control_generations(
     return requester_client, authority_client
 
 
+def _strict_control_command_payload(transaction):
+    accepted_target = transaction.get("acceptedTarget")
+    if not isinstance(accepted_target, dict):
+        raise RuntimeError("Control transaction accepted target is unavailable")
+    action = transaction["action"]
+    payload = {
+        "playbackContextId": transaction["playbackContextId"],
+        "controlVersion": transaction["commandControlVersion"],
+        "sourceClientId": transaction["requestingClientId"],
+        "executionTimeoutMs": transaction["executionTimeoutMs"],
+    }
+    dependency = transaction.get("dependsOnControlVersion")
+    if dependency is not None:
+        payload["dependsOnControlVersion"] = dependency
+    effective_at_server_ms = transaction.get("effectiveAtServerMs")
+    if effective_at_server_ms is not None:
+        server_time_ms = accepted_target.get("serverTimeMs")
+        if type(server_time_ms) is not int or server_time_ms < 0:
+            raise RuntimeError(
+                "Effective-at control transaction server time is unavailable"
+            )
+        payload["effectiveAtServerMs"] = effective_at_server_ms
+        payload["serverTimeMs"] = server_time_ms
+
+    if action == "queue.playItem":
+        queue_song_ids = accepted_target.get("queueSongIds")
+        if (
+            not isinstance(queue_song_ids, list)
+            or not queue_song_ids
+            or not all(isinstance(song_id, str) and song_id for song_id in queue_song_ids)
+        ):
+            raise RuntimeError(
+                "queue.playItem accepted queue snapshot is unavailable"
+            )
+        payload.update(
+            {
+                "queueSongIds": list(queue_song_ids),
+                "queueIndex": accepted_target["queueIndex"],
+                "queueRevision": accepted_target["queueRevision"],
+            }
+        )
+    elif action in {"player.play", "player.pause", "player.seek"}:
+        payload["positionMs"] = accepted_target["positionMs"]
+    return payload
+
+
+def _current_routed_control_generation(transaction):
+    try:
+        generation = state.get_current_physical_generation(
+            transaction["userName"],
+            transaction["authorityClientId"],
+            transaction["authorityDeviceSessionId"],
+        )
+    except (KeyError, ValueError):
+        return None
+    if generation is None or (
+        generation.get("connectionNonce")
+        != transaction.get("routedConnectionNonce")
+        or generation.get("connectionEpoch")
+        != transaction.get("routedConnectionEpoch")
+    ):
+        return None
+    if not socketio.server.manager.is_connected(
+        generation["sid"],
+        namespace="/emo",
+    ):
+        return None
+    authority_client = state.get_client(
+        transaction["authorityClientId"],
+        user_name=transaction["userName"],
+    )
+    if (
+        authority_client is None
+        or not _has_role(authority_client, "player")
+        or not _client_supports(
+            authority_client,
+            _strict_v2_control_capability(transaction["action"]),
+        )
+    ):
+        return None
+    return generation
+
+
 def _settle_strict_control_execution_unknown(
     playback_context_id,
     control_transaction,
@@ -3961,20 +4044,117 @@ def _settle_strict_control_execution_unknown(
         )
         if execution_eligible_at_ms is not None:
             terminal_at_ms = max(terminal_at_ms, execution_eligible_at_ms)
-        terminal, changed = settlePlaybackControlTransaction(
+        applied_control_version = (
+            persisted_transaction.get("appliedControlVersion")
+            if persisted_transaction is not None
+            and persisted_transaction.get("status") != "pending"
+            else _last_applied_control_version(
+                updated_context,
+                authority_client_id,
+            )
+        )
+        settlement = settlePlaybackControlTransaction(
             playback_context_id,
             control_transaction["epoch"],
             control_transaction["commandControlVersion"],
             "failed",
             terminal_at_ms,
             error_code="execution_unknown",
-            applied_control_version=_last_applied_control_version(
-                updated_context,
-                authority_client_id,
-            ),
+            applied_control_version=applied_control_version,
         )
-    if changed:
-        _broadcast_control_settled(terminal, updated_context)
+    if settlement.transaction is not None:
+        settlement_context = (
+            updated_context
+            if settlement.mutated
+            else getPlaybackContextState(playback_context_id)
+        )
+        if settlement_context is not None:
+            _broadcast_control_settled(
+                settlement.transaction,
+                settlement_context,
+            )
+    if settlement.mutated:
+        for dependent in settlement.dependency_settlements:
+            _cancel_control_watchdog(
+                dependent["playbackContextId"],
+                dependent["epoch"],
+                dependent["commandControlVersion"],
+            )
+            _broadcast_control_settled(dependent, updated_context)
+    return settlement
+
+
+def _activate_execution_eligible_control_transaction(
+    transaction,
+    playback_context,
+):
+    persisted = getPlaybackControlTransaction(
+        transaction["playbackContextId"],
+        transaction["epoch"],
+        transaction["commandControlVersion"],
+    )
+    if persisted is None or persisted.get("status") != "pending":
+        return False
+    if (
+        persisted.get("executionEligibleAtMs") is None
+        or persisted.get("watchdogDeadlineAtMs") is None
+    ):
+        logger.error(
+            "Eligible control transaction is missing its execution lease "
+            "context=%s version=%s",
+            persisted["playbackContextId"],
+            persisted["commandControlVersion"],
+        )
+        try:
+            _settle_strict_control_execution_unknown(
+                persisted["playbackContextId"],
+                persisted,
+                playback_context,
+                persisted["authorityClientId"],
+            )
+        except Exception:
+            logger.exception(
+                "Unable to settle incomplete eligible control transaction"
+            )
+        return False
+
+    authority_generation = _current_routed_control_generation(persisted)
+    if authority_generation is None:
+        try:
+            _settle_strict_control_execution_unknown(
+                persisted["playbackContextId"],
+                persisted,
+                playback_context,
+                persisted["authorityClientId"],
+            )
+        except Exception:
+            logger.exception(
+                "Unable to settle unroutable eligible control transaction"
+            )
+        return False
+
+    try:
+        _start_control_watchdog(persisted)
+    except Exception:
+        try:
+            _settle_strict_control_execution_unknown(
+                persisted["playbackContextId"],
+                persisted,
+                playback_context,
+                persisted["authorityClientId"],
+            )
+        except Exception:
+            logger.exception(
+                "Unable to settle eligible control watchdog failure"
+            )
+        logger.exception(
+            "Failed to schedule dependency-eligible control watchdog "
+            "context=%s version=%s",
+            persisted["playbackContextId"],
+            persisted["commandControlVersion"],
+        )
+        return False
+    return True
 
 
 def _handle_strict_v2_context_control(
@@ -4116,6 +4296,7 @@ def _handle_strict_v2_context_control(
                         authority_generation,
                     )
                 ),
+                deterministic_dependency_admission=True,
             )
             if updated_context is None:
                 raise LookupError("Playback context not found")
@@ -4148,29 +4329,13 @@ def _handle_strict_v2_context_control(
                     "Playback context authority changed before dispatch"
                 )
 
-            source_client_id = current_client.get("clientId")
-            if action == "queue.playItem":
-                outgoing_payload = {
-                    "playbackContextId": playback_context_id,
-                    "queueSongIds": list(updated_context["queueSongIds"]),
-                    "queueIndex": updated_context["currentIndex"],
-                    "queueRevision": updated_context["queueRevision"],
-                    "controlVersion": updated_context["controlVersion"],
-                    "sourceClientId": source_client_id,
-                    "executionTimeoutMs": execution_timeout_ms,
-                }
-            else:
-                outgoing_payload = {
-                    "playbackContextId": playback_context_id,
-                    "controlVersion": updated_context["controlVersion"],
-                    "sourceClientId": source_client_id,
-                    "executionTimeoutMs": execution_timeout_ms,
-                }
-                if action in {"player.play", "player.pause", "player.seek"}:
-                    outgoing_payload["positionMs"] = updated_context["positionMs"]
             try:
                 _emit_message(
-                    _build_message("command", action, outgoing_payload),
+                    _build_message(
+                        "command",
+                        action,
+                        _strict_control_command_payload(control_transaction),
+                    ),
                     authority_sid,
                     emit_reserved=True,
                 )
@@ -4187,38 +4352,46 @@ def _handle_strict_v2_context_control(
                         "Unable to persist emit failure execution_unknown"
                     )
                 raise
-            try:
-                execution_eligible_at_ms = _server_time_ms()
-                eligible_transaction, _eligible_changed = (
-                    markPlaybackControlTransactionExecutionEligible(
-                        playback_context_id,
-                        control_transaction["epoch"],
-                        control_transaction["commandControlVersion"],
-                        execution_eligible_at_ms,
-                    )
-                )
-                if (
-                    eligible_transaction is None
-                    or eligible_transaction.get("executionEligibleAtMs") is None
-                    or eligible_transaction.get("watchdogDeadlineAtMs") is None
-                ):
-                    raise RuntimeError(
-                        "Execution eligibility did not return a complete transaction"
-                    )
-                _start_control_watchdog(eligible_transaction)
-            except Exception:
+            if control_transaction.get("dependsOnControlVersion") is None:
                 try:
-                    _settle_strict_control_execution_unknown(
-                        playback_context_id,
-                        control_transaction,
-                        updated_context,
-                        authority_client_id,
+                    execution_eligible_at_ms = _server_time_ms()
+                    eligible_transaction, _eligible_changed = (
+                        markPlaybackControlTransactionExecutionEligible(
+                            playback_context_id,
+                            control_transaction["epoch"],
+                            control_transaction["commandControlVersion"],
+                            execution_eligible_at_ms,
+                        )
                     )
+                    if (
+                        eligible_transaction is None
+                        or eligible_transaction.get("executionEligibleAtMs") is None
+                        or eligible_transaction.get("watchdogDeadlineAtMs") is None
+                    ):
+                        raise RuntimeError(
+                            "Execution eligibility did not return a complete transaction"
+                        )
+                    _start_control_watchdog(eligible_transaction)
                 except Exception:
-                    logger.exception(
-                        "Unable to persist eligibility failure execution_unknown"
-                    )
-                raise
+                    try:
+                        _settle_strict_control_execution_unknown(
+                            playback_context_id,
+                            control_transaction,
+                            updated_context,
+                            authority_client_id,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Unable to persist eligibility failure execution_unknown"
+                        )
+                    raise
+            elif (
+                control_transaction.get("executionEligibleAtMs") is not None
+                or control_transaction.get("watchdogDeadlineAtMs") is not None
+            ):
+                raise RuntimeError(
+                    "Dependent control transaction became eligible before its dependency"
+                )
         finally:
             try:
                 if reserved:
@@ -5792,6 +5965,81 @@ def _project_r18_control_position(
     return position_ms, playback_rate
 
 
+def _validate_r18_broadcast_control_generations(
+    user_name,
+    action,
+    current_context,
+    broadcast_snapshot,
+    requester_generation,
+    authority_generation,
+):
+    if (
+        current_context.get("authorityClientId")
+        != authority_generation["clientId"]
+        or current_context.get("authorityDeviceSessionId")
+        != authority_generation["deviceSessionId"]
+    ):
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority changed before dispatch"
+        )
+    if not state.matches_current_physical_generation(
+        requester_generation["userName"],
+        requester_generation["clientId"],
+        requester_generation["deviceSessionId"],
+        requester_generation["sid"],
+        requester_generation["connectionNonce"],
+        requester_generation["connectionEpoch"],
+    ):
+        raise PermissionError("Broadcast requester physical generation changed")
+    if not state.matches_current_physical_generation(
+        authority_generation["userName"],
+        authority_generation["clientId"],
+        authority_generation["deviceSessionId"],
+        authority_generation["sid"],
+        authority_generation["connectionNonce"],
+        authority_generation["connectionEpoch"],
+    ) or not socketio.server.manager.is_connected(
+        authority_generation["sid"],
+        namespace="/emo",
+    ):
+        raise PlaybackAuthorityOfflineError(
+            "Broadcast authority physical generation changed"
+        )
+    requester = state.get_client(
+        requester_generation["clientId"],
+        user_name=user_name,
+    )
+    authority = state.get_client(
+        authority_generation["clientId"],
+        user_name=user_name,
+    )
+    requester_is_owner = (
+        requester_generation["clientId"]
+        == broadcast_snapshot.get("ownerClientId")
+        and requester is not None
+        and _has_role(requester, "controller")
+    )
+    requester_is_source = (
+        requester_generation["clientId"]
+        == broadcast_snapshot.get("authorityClientId")
+        and requester_generation["deviceSessionId"]
+        == broadcast_snapshot.get("authorityDeviceSessionId")
+        and requester is not None
+        and _has_role(requester, "player")
+    )
+    if not requester_is_owner and not requester_is_source:
+        raise PermissionError("Broadcast control is not allowed")
+    if authority is None or not _strict_broadcast_participant_eligible(authority):
+        raise CapabilityRequiredError(
+            "Playback context authority lacks Broadcast playback capabilities"
+        )
+    required_capability = _strict_v2_control_capability(action)
+    if not _client_supports(authority, required_capability):
+        raise CapabilityRequiredError(
+            "Playback context authority lacks %s" % required_capability
+        )
+
+
 def _handle_r18_broadcast_control(
     current_user_name: str,
     current_client: Dict[str, object],
@@ -5828,146 +6076,246 @@ def _handle_r18_broadcast_control(
         )
     except EffectiveAtEligibilityError as exc:
         raise BroadcastConflictError(str(exc)) from exc
-    authority_sid = state.get_sid_for_client(
-        authority["clientId"],
-        user_name=current_user_name,
-    )
-    authority_session = state.get_session(authority_sid) or {}
-    authority_nonce = authority_session.get("connectionNonce")
-    if not isinstance(authority_nonce, str) or not authority_nonce:
-        raise PlaybackAuthorityOfflineError(
-            "Playback context authority connection is unavailable"
-        )
-    source_device_state = getDevicePlaybackState(
-        snapshot["playbackContextId"],
-        authority["clientId"],
-    )
-    server_time_ms = _server_time_ms()
-    effective_at_server_ms = server_time_ms + 250
-    position_ms, playback_rate = _project_r18_control_position(
-        snapshot,
-        playback_context,
-        source_device_state,
-        effective_at_server_ms,
-        server_time_ms,
-    )
-    requested_index = None
-    if source_action == "player.seek":
-        position_ms = payload["positionMs"]
-    elif source_action == "queue.playItem":
-        requested_index = payload["queueIndex"]
-        position_ms = 0
-    execution_timeout_ms = _get_control_execution_timeout_ms()
-    if not strict_v2_safety.reserve_emit(authority_sid):
-        raise PlaybackAuthorityOfflineError(
-            "Playback context authority send buffer is unavailable"
-        )
-    try:
-        def projection_hook(_record, result, _previous):
-            return _commit_r18_broadcast_projection(
-                persisted,
-                result,
-                broadcast_action,
-                result["positionMs"],
-                result["state"],
-                playback_rate,
-                server_time_ms,
-                effective_at_server_ms,
-            )
-
-        try:
-            with broadcastMutationLock(persisted["broadcastId"]):
-                updated_context = mutateStrictPlaybackContextControl(
-                    snapshot["playbackContextId"],
-                    current_user_name,
-                    current_client.get("clientId"),
-                    source_action,
-                    payload["baseControlVersion"],
-                    base_queue_revision=payload.get("baseQueueRevision"),
-                    position_ms=position_ms,
-                    current_index=requested_index,
-                    requesting_client_id=current_client.get("clientId"),
-                    authority_client_id=authority["clientId"],
-                    authority_device_session_id=authority[
-                        "deviceSessionId"
-                    ],
-                    routed_connection_nonce=authority_nonce,
-                    routed_connection_epoch=authority_session.get(
-                        "connectionEpoch"
-                    )
-                    or 1,
-                    accepted_at_ms=server_time_ms,
-                    execution_timeout_ms=execution_timeout_ms,
-                    accepted_target_extra={
-                        "effectiveAtServerMs": effective_at_server_ms,
-                        "serverTimeMs": server_time_ms,
-                    },
-                    post_mutation_hook=projection_hook,
+    lifecycle_keys = tuple(
+        sorted(
+            set(
+                key
+                for key in (
+                    _physical_generation_key(
+                        current_user_name,
+                        current_client.get("clientId"),
+                    ),
+                    _physical_generation_key(
+                        current_user_name,
+                        authority["clientId"],
+                    ),
                 )
-        except (
-            BroadcastNotFoundError,
-            BroadcastResourceConflictError,
-            BroadcastRevisionConflictError,
-        ) as exc:
-            raise BroadcastConflictError(str(exc)) from exc
-        if updated_context is None:
-            raise LookupError("Playback context not found")
-        control_transaction = updated_context.pop("_controlTransaction")
-        broadcast_mutation = updated_context.pop("_broadcastMutation")
-        state.restore_playback_context(
-            snapshot["playbackContextId"],
-            updated_context,
+                if key is not None
+            )
         )
-        source_client_id = current_client.get("clientId")
-        if source_action == "queue.playItem":
-            outgoing_payload = {
-                "playbackContextId": snapshot["playbackContextId"],
-                "queueSongIds": list(updated_context["queueSongIds"]),
-                "queueIndex": updated_context["currentIndex"],
-                "queueRevision": updated_context["queueRevision"],
-                "controlVersion": updated_context["controlVersion"],
-                "sourceClientId": source_client_id,
-                "executionTimeoutMs": execution_timeout_ms,
-                "effectiveAtServerMs": effective_at_server_ms,
-                "serverTimeMs": server_time_ms,
-            }
-        else:
-            outgoing_payload = {
-                "playbackContextId": snapshot["playbackContextId"],
-                "controlVersion": updated_context["controlVersion"],
-                "sourceClientId": source_client_id,
-                "executionTimeoutMs": execution_timeout_ms,
-                "effectiveAtServerMs": effective_at_server_ms,
-                "serverTimeMs": server_time_ms,
-            }
-            if source_action in {"player.play", "player.pause", "player.seek"}:
-                outgoing_payload["positionMs"] = updated_context["positionMs"]
+    )
+    broadcast_mutation = None
+    with strictPhysicalGenerationLockSet(lifecycle_keys):
+        requester_generation = state.get_current_physical_generation(
+            current_user_name,
+            current_client.get("clientId"),
+            current_client.get("deviceSessionId"),
+            expected_sid=request.sid,
+        )
+        authority_generation = state.get_current_physical_generation(
+            current_user_name,
+            authority["clientId"],
+            authority["deviceSessionId"],
+        )
+        if requester_generation is None:
+            raise PermissionError(
+                "Broadcast requester physical generation is unavailable"
+            )
+        if authority_generation is None:
+            raise PlaybackAuthorityOfflineError(
+                "Playback context authority connection is unavailable"
+            )
+        _validate_r18_broadcast_control_generations(
+            current_user_name,
+            source_action,
+            playback_context,
+            snapshot,
+            requester_generation,
+            authority_generation,
+        )
+        authority_sid = authority_generation["sid"]
+        dispatch_barrier = _ordinary_control_dispatch_barrier(
+            snapshot["playbackContextId"]
+        )
+        dispatch_barrier.acquire()
+        reserved = False
         try:
-            _emit_message(
-                _build_message("command", source_action, outgoing_payload),
-                authority_sid,
-                emit_reserved=True,
-            )
-        except Exception:
-            terminal, changed = settlePlaybackControlTransaction(
+            reserved = strict_v2_safety.reserve_emit(authority_sid)
+            if not reserved:
+                raise PlaybackAuthorityOfflineError(
+                    "Playback context authority send buffer is unavailable"
+                )
+            source_device_state = getDevicePlaybackState(
                 snapshot["playbackContextId"],
-                control_transaction["epoch"],
-                control_transaction["commandControlVersion"],
-                "failed",
-                _server_time_ms(),
-                error_code="execution_unknown",
-                applied_control_version=_last_applied_control_version(
-                    updated_context,
-                    authority["clientId"],
-                ),
+                authority["clientId"],
             )
-            if changed:
-                _broadcast_control_settled(terminal, updated_context)
-            raise
-        _start_control_watchdog(control_transaction)
-        _emit_r18_broadcast_projection(broadcast_mutation)
-    finally:
-        strict_v2_safety.release_emit(authority_sid)
+            server_time_ms = _server_time_ms()
+            effective_at_server_ms = server_time_ms + 250
+            position_ms, playback_rate = _project_r18_control_position(
+                snapshot,
+                playback_context,
+                source_device_state,
+                effective_at_server_ms,
+                server_time_ms,
+            )
+            requested_index = None
+            if source_action == "player.seek":
+                position_ms = payload["positionMs"]
+            elif source_action == "queue.playItem":
+                requested_index = payload["queueIndex"]
+                position_ms = 0
+            execution_timeout_ms = _get_control_execution_timeout_ms()
+
+            def projection_hook(_record, result, _previous):
+                return _commit_r18_broadcast_projection(
+                    persisted,
+                    result,
+                    broadcast_action,
+                    result["positionMs"],
+                    result["state"],
+                    playback_rate,
+                    server_time_ms,
+                    effective_at_server_ms,
+                )
+
+            try:
+                with broadcastMutationLock(persisted["broadcastId"]):
+                    updated_context = mutateStrictPlaybackContextControl(
+                        snapshot["playbackContextId"],
+                        current_user_name,
+                        requester_generation["clientId"],
+                        source_action,
+                        payload["baseControlVersion"],
+                        base_queue_revision=payload.get("baseQueueRevision"),
+                        position_ms=position_ms,
+                        current_index=requested_index,
+                        requesting_client_id=requester_generation["clientId"],
+                        requesting_device_session_id=requester_generation[
+                            "deviceSessionId"
+                        ],
+                        requesting_connection_nonce=requester_generation[
+                            "connectionNonce"
+                        ],
+                        requesting_connection_epoch=requester_generation[
+                            "connectionEpoch"
+                        ],
+                        authority_client_id=authority_generation["clientId"],
+                        authority_device_session_id=authority_generation[
+                            "deviceSessionId"
+                        ],
+                        routed_connection_nonce=authority_generation[
+                            "connectionNonce"
+                        ],
+                        routed_connection_epoch=authority_generation[
+                            "connectionEpoch"
+                        ],
+                        accepted_at_ms=server_time_ms,
+                        execution_timeout_ms=execution_timeout_ms,
+                        effective_at_server_ms=effective_at_server_ms,
+                        accepted_target_extra={
+                            "effectiveAtServerMs": effective_at_server_ms,
+                            "serverTimeMs": server_time_ms,
+                        },
+                        pre_mutation_validator=lambda current: (
+                            _validate_r18_broadcast_control_generations(
+                                current_user_name,
+                                source_action,
+                                current,
+                                snapshot,
+                                requester_generation,
+                                authority_generation,
+                            )
+                        ),
+                        post_mutation_hook=projection_hook,
+                        deterministic_dependency_admission=True,
+                    )
+            except (
+                BroadcastNotFoundError,
+                BroadcastResourceConflictError,
+                BroadcastRevisionConflictError,
+            ) as exc:
+                raise BroadcastConflictError(str(exc)) from exc
+            if updated_context is None:
+                raise LookupError("Playback context not found")
+            control_transaction = updated_context.pop("_controlTransaction")
+            broadcast_mutation = updated_context.pop("_broadcastMutation")
+            state.restore_playback_context(
+                snapshot["playbackContextId"],
+                updated_context,
+            )
+            try:
+                _validate_r18_broadcast_control_generations(
+                    current_user_name,
+                    source_action,
+                    updated_context,
+                    snapshot,
+                    requester_generation,
+                    authority_generation,
+                )
+                _emit_message(
+                    _build_message(
+                        "command",
+                        source_action,
+                        _strict_control_command_payload(control_transaction),
+                    ),
+                    authority_sid,
+                    emit_reserved=True,
+                )
+            except Exception:
+                try:
+                    _settle_strict_control_execution_unknown(
+                        snapshot["playbackContextId"],
+                        control_transaction,
+                        updated_context,
+                        authority_generation["clientId"],
+                    )
+                except Exception:
+                    logger.exception(
+                        "Unable to persist Broadcast source dispatch failure"
+                    )
+                raise
+            if control_transaction.get("dependsOnControlVersion") is None:
+                try:
+                    eligible_at_ms = max(
+                        _server_time_ms(),
+                        effective_at_server_ms,
+                    )
+                    eligible_transaction, _changed = (
+                        markPlaybackControlTransactionExecutionEligible(
+                            snapshot["playbackContextId"],
+                            control_transaction["epoch"],
+                            control_transaction["commandControlVersion"],
+                            eligible_at_ms,
+                        )
+                    )
+                    if (
+                        eligible_transaction is None
+                        or eligible_transaction.get("executionEligibleAtMs")
+                        is None
+                        or eligible_transaction.get("watchdogDeadlineAtMs")
+                        is None
+                    ):
+                        raise RuntimeError(
+                            "Broadcast source eligibility is incomplete"
+                        )
+                    _start_control_watchdog(eligible_transaction)
+                except Exception:
+                    try:
+                        _settle_strict_control_execution_unknown(
+                            snapshot["playbackContextId"],
+                            control_transaction,
+                            updated_context,
+                            authority_generation["clientId"],
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Unable to persist Broadcast source eligibility failure"
+                        )
+                    raise
+            elif (
+                control_transaction.get("executionEligibleAtMs") is not None
+                or control_transaction.get("watchdogDeadlineAtMs") is not None
+            ):
+                raise RuntimeError(
+                    "Dependent Broadcast source control became eligible early"
+                )
+            _emit_r18_broadcast_projection(broadcast_mutation)
+        finally:
+            try:
+                if reserved:
+                    strict_v2_safety.release_emit(authority_sid)
+            finally:
+                dispatch_barrier.release()
     _send_ack(request_id)
     if source_action == "queue.playItem":
         _run_post_commit_push(
@@ -7459,6 +7807,7 @@ def _settle_control_transactions_unknown(
     lifecycle_locked: bool = False,
 ) -> List[Dict[str, object]]:
     settled = []
+    settled_for_emit = []
     ordered = sorted(
         transactions,
         key=lambda item: (
@@ -7523,7 +7872,7 @@ def _settle_control_transactions_unknown(
                         eligible_at_ms,
                     )
                 try:
-                    transaction, changed = settlePlaybackControlTransaction(
+                    settlement = settlePlaybackControlTransaction(
                         pending["playbackContextId"],
                         pending["epoch"],
                         pending["commandControlVersion"],
@@ -7532,6 +7881,7 @@ def _settle_control_transactions_unknown(
                         error_code="execution_unknown",
                         applied_control_version=applied_control_version,
                     )
+                    transaction, changed = settlement
                 except PlaybackControlTransactionConflictError:
                     _cancel_control_watchdog(
                         pending["playbackContextId"],
@@ -7547,8 +7897,16 @@ def _settle_control_transactions_unknown(
         if not changed:
             continue
         settled.append((transaction, playback_context))
+        settled_for_emit.append((transaction, playback_context))
+        for dependent in settlement.dependency_settlements:
+            _cancel_control_watchdog(
+                dependent["playbackContextId"],
+                dependent["epoch"],
+                dependent["commandControlVersion"],
+            )
+            settled_for_emit.append((dependent, playback_context))
     if emit:
-        for transaction, playback_context in settled:
+        for transaction, playback_context in settled_for_emit:
             if playback_context is not None:
                 _broadcast_control_settled(transaction, playback_context)
     return [transaction for transaction, _playback_context in settled]
@@ -7620,13 +7978,62 @@ def _control_watchdog_sweep_later(generation: int) -> None:
             logger.exception("Strict Broadcast terminal compaction failed")
 
 
+def _matching_control_generation_sid(
+    transaction,
+    client_field,
+    device_field,
+    nonce_field,
+    epoch_field,
+):
+    user_name = transaction.get("userName")
+    client_id = transaction.get(client_field)
+    device_session_id = transaction.get(device_field)
+    nonce = transaction.get(nonce_field)
+    connection_epoch = transaction.get(epoch_field)
+    if not all(
+        isinstance(value, str) and value
+        for value in (user_name, client_id, device_session_id, nonce)
+    ) or type(connection_epoch) is not int or connection_epoch != 1:
+        return None
+    generation = state.get_current_physical_generation(
+        user_name,
+        client_id,
+        device_session_id,
+    )
+    if generation is None or (
+        generation["connectionNonce"] != nonce
+        or generation["connectionEpoch"] != connection_epoch
+    ):
+        return None
+    if not socketio.server.manager.is_connected(
+        generation["sid"],
+        namespace="/emo",
+    ):
+        return None
+    return generation["sid"]
+
+
 def _control_settled_payload(transaction, playback_context):
+    error_code = transaction.get("errorCode")
+    if error_code not in {"dependency_failed", "execution_unknown"}:
+        raise ValueError("Control transaction has no server-only settlement")
+    for field_name in (
+        "playbackContextId",
+        "requestingClientId",
+        "requestingDeviceSessionId",
+    ):
+        if not isinstance(transaction.get(field_name), str) or not transaction[
+            field_name
+        ]:
+            raise ValueError(
+                "Control transaction is missing wire settlement identity"
+            )
     payload = {
         "playbackContextId": transaction["playbackContextId"],
         "epoch": transaction["epoch"],
         "commandControlVersion": transaction["commandControlVersion"],
         "status": "failed",
-        "errorCode": transaction["errorCode"],
+        "errorCode": error_code,
         "controlVersion": playback_context["controlVersion"],
         "appliedControlVersion": transaction.get("appliedControlVersion")
         or _last_applied_control_version(
@@ -7634,48 +8041,73 @@ def _control_settled_payload(transaction, playback_context):
             transaction["authorityClientId"],
         ),
         "requestingClientId": transaction["requestingClientId"],
+        "requestingDeviceSessionId": transaction[
+            "requestingDeviceSessionId"
+        ],
         "serverUpdatedAtMs": transaction["terminalAtMs"],
     }
-    if transaction.get("dependsOnControlVersion") is not None:
+    if error_code == "dependency_failed":
+        if transaction.get("dependsOnControlVersion") is None:
+            raise ValueError(
+                "Dependency settlement is missing its direct dependency"
+            )
         payload["dependsOnControlVersion"] = transaction[
             "dependsOnControlVersion"
         ]
+    error_message = transaction.get("errorMessage")
+    if isinstance(error_message, str) and error_message:
+        payload["errorMessage"] = error_message
     return payload
 
 
 def _broadcast_control_settled(transaction, playback_context):
-    payload = _control_settled_payload(transaction, playback_context)
-    message = _build_message("event", "playback.control.settled", payload)
-    target_sids = set(
-        state.list_playback_context_subscribers(
-            transaction["playbackContextId"],
-            user_name=transaction["userName"],
+    try:
+        payload = _control_settled_payload(transaction, playback_context)
+    except (KeyError, TypeError, ValueError):
+        logger.warning(
+            "Skipping invalid playback.control.settled context=%s version=%s",
+            transaction.get("playbackContextId"),
+            transaction.get("commandControlVersion"),
         )
-    )
-    authority_sid = state.get_sid_for_client(
-        transaction["authorityClientId"],
-        user_name=transaction["userName"],
-    )
-    if authority_sid is not None:
-        authority_client = state.get_client_for_sid(authority_sid) or {}
-        authority_session = state.get_session(authority_sid) or {}
-        if (
-            authority_client.get("deviceSessionId")
-            == transaction["authorityDeviceSessionId"]
-            and authority_session.get("connectionNonce")
-            == transaction["routedConnectionNonce"]
-        ):
-            target_sids.add(authority_sid)
-    for target_sid in sorted(target_sids):
-        try:
-            _emit_message(message, target_sid)
-        except Exception:
-            logger.exception(
-                "Failed to emit playback.control.settled context=%s version=%s sid=%s",
+        return False
+    message = _build_message("event", "playback.control.settled", payload)
+    with strictPhysicalGenerationLockSet(_control_lifecycle_keys(transaction)):
+        target_sids = set(
+            state.list_playback_context_subscribers(
                 transaction["playbackContextId"],
-                transaction["commandControlVersion"],
-                target_sid,
+                user_name=transaction["userName"],
             )
+        )
+        requester_sid = _matching_control_generation_sid(
+            transaction,
+            "requestingClientId",
+            "requestingDeviceSessionId",
+            "requestingConnectionNonce",
+            "requestingConnectionEpoch",
+        )
+        if requester_sid is not None:
+            target_sids.add(requester_sid)
+        authority_sid = _matching_control_generation_sid(
+            transaction,
+            "authorityClientId",
+            "authorityDeviceSessionId",
+            "routedConnectionNonce",
+            "routedConnectionEpoch",
+        )
+        if authority_sid is not None:
+            target_sids.add(authority_sid)
+        for target_sid in sorted(target_sids):
+            try:
+                _emit_message(message, target_sid)
+            except Exception:
+                logger.exception(
+                    "Failed to emit playback.control.settled "
+                    "context=%s version=%s sid=%s",
+                    transaction["playbackContextId"],
+                    transaction["commandControlVersion"],
+                    target_sid,
+                )
+    return True
 
 
 def _expire_control_transaction_later(
@@ -8457,45 +8889,45 @@ def _handle_strict_v2_playback_update(
         )
 
     try:
-        if persisted_broadcast is None:
-            lifecycle_key = _physical_generation_key(
+        lifecycle_key = _physical_generation_key(
+            current_user_name,
+            authority_client_id,
+        )
+        if lifecycle_key is None:
+            raise PermissionError(
+                "Playback update physical generation is unavailable"
+            )
+        with strictPhysicalGenerationLockSet((lifecycle_key,)):
+            authority_generation = state.get_current_physical_generation(
                 current_user_name,
                 authority_client_id,
+                authority_device_session_id,
+                expected_sid=request.sid,
             )
-            if lifecycle_key is None:
+            if authority_generation is None:
                 raise PermissionError(
                     "Playback update physical generation is unavailable"
                 )
-            with strictPhysicalGenerationLockSet((lifecycle_key,)):
-                authority_generation = state.get_current_physical_generation(
-                    current_user_name,
-                    authority_client_id,
-                    authority_device_session_id,
-                    expected_sid=request.sid,
+            connection_nonce = authority_generation["connectionNonce"]
+            if not state.matches_current_physical_generation(
+                authority_generation["userName"],
+                authority_generation["clientId"],
+                authority_generation["deviceSessionId"],
+                authority_generation["sid"],
+                authority_generation["connectionNonce"],
+                authority_generation["connectionEpoch"],
+            ) or not socketio.server.manager.is_connected(
+                authority_generation["sid"],
+                namespace="/emo",
+            ):
+                raise PermissionError(
+                    "Playback update physical generation changed"
                 )
-                if authority_generation is None:
-                    raise PermissionError(
-                        "Playback update physical generation is unavailable"
-                    )
-                connection_nonce = authority_generation["connectionNonce"]
-                if not state.matches_current_physical_generation(
-                    authority_generation["userName"],
-                    authority_generation["clientId"],
-                    authority_generation["deviceSessionId"],
-                    authority_generation["sid"],
-                    authority_generation["connectionNonce"],
-                    authority_generation["connectionEpoch"],
-                ) or not socketio.server.manager.is_connected(
-                    authority_generation["sid"],
-                    namespace="/emo",
-                ):
-                    raise PermissionError(
-                        "Playback update physical generation changed"
-                    )
-                with _ordinary_control_dispatch_barrier(
-                    payload["playbackContextId"]
-                ):
-                    server_time_ms = _server_time_ms()
+            with _ordinary_control_dispatch_barrier(
+                payload["playbackContextId"]
+            ):
+                server_time_ms = _server_time_ms()
+                if persisted_broadcast is None:
                     result = applyStrictPlaybackUpdate(
                         payload["playbackContextId"],
                         current_user_name,
@@ -8506,18 +8938,30 @@ def _handle_strict_v2_playback_update(
                         server_time_ms,
                         require_execution_eligible=True,
                     )
-        else:
-            with broadcastMutationLock(persisted_broadcast["broadcastId"]):
-                result = applyStrictPlaybackUpdate(
-                    payload["playbackContextId"],
-                    current_user_name,
-                    current_client.get("clientId"),
-                    payload["deviceSessionId"],
-                    connection_nonce,
-                    payload,
-                    server_time_ms,
-                    post_mutation_hook=projection_hook,
-                )
+                else:
+                    with broadcastMutationLock(
+                        persisted_broadcast["broadcastId"]
+                    ):
+                        result = applyStrictPlaybackUpdate(
+                            payload["playbackContextId"],
+                            current_user_name,
+                            current_client.get("clientId"),
+                            payload["deviceSessionId"],
+                            connection_nonce,
+                            payload,
+                            server_time_ms,
+                            post_mutation_hook=projection_hook,
+                            require_execution_eligible=True,
+                        )
+                if result is not None:
+                    for eligible_transaction in result.get(
+                        "executionEligibleTransactions",
+                        (),
+                    ):
+                        _activate_execution_eligible_control_transaction(
+                            eligible_transaction,
+                            result["playbackContext"],
+                        )
     except (
         BroadcastNotFoundError,
         BroadcastResourceConflictError,
