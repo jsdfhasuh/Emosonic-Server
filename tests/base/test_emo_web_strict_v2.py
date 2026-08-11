@@ -20,6 +20,7 @@ from supysonic.emo.ws_state import get_state
 from supysonic.emo.ws_store import (
     closeStrictPlaybackContextState,
     createStrictPlaybackContextState,
+    getDevicePlaybackState,
     getPlaybackContextState,
 )
 from supysonic.managers.user import UserManager
@@ -249,6 +250,31 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
             if message.get("requestId") == request_message["requestId"]
         )
         return response["payload"]
+
+    def report_web_context(self, player, context_id, device_session_id, client_seq=1):
+        context = getPlaybackContextState(context_id)
+        player.emit(
+            "message",
+            {
+                "type": "event",
+                "action": "playback.update",
+                "requestId": "fact-%s" % context_id,
+                "payload": {
+                    "playbackContextId": context_id,
+                    "deviceSessionId": device_session_id,
+                    "origin": "passive",
+                    "appliedControlVersion": context["controlVersion"],
+                    "state": context["state"],
+                    "trackId": context["trackId"],
+                    "positionMs": context["positionMs"],
+                    "positionSampledAtServerMs": int(time.time() * 1000),
+                    "playbackRate": 1.0,
+                    "clientSeq": client_seq,
+                },
+            },
+            namespace="/emo",
+        )
+        return self.messages(player)
 
     @staticmethod
     def assert_no_session_fields(value):
@@ -965,7 +991,9 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
     def test_exact_web_follow_is_started_by_follower_player(self):
         self.login()
         source = self.register_web_player(
-            "web-player-source", "web-player-device:source"
+            "web-player-source",
+            "web-player-device:source",
+            effective_at_playback=True,
         )
         self.create_web_context(
             source,
@@ -977,6 +1005,26 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
             "web-player-device:follower",
             supports_follow=True,
             effective_at_playback=True,
+        )
+        self.create_web_context(
+            follower,
+            context_id="ctx-suspended",
+            device_session_id="web-player-device:follower",
+        )
+        self.report_web_context(
+            source,
+            "ctx-source",
+            "web-player-device:source",
+        )
+        self.report_web_context(
+            follower,
+            "ctx-suspended",
+            "web-player-device:follower",
+        )
+        suspended_before = getPlaybackContextState("ctx-suspended")
+        suspended_device_before = getDevicePlaybackState(
+            "ctx-suspended",
+            "web-player-follower",
         )
         self.messages(source)
 
@@ -992,7 +1040,46 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
             for message in start_messages
             if message.get("requestId") == start["requestId"]
         )
-        self.assertEqual(start_ack["payload"], {"action": "follow.start"})
+        self.assertEqual(start_ack["payload"]["action"], "follow.start")
+        self.assertEqual(start_ack["payload"]["status"], "active")
+        self.assertEqual(
+            start_ack["payload"]["suspendedPlaybackContextId"],
+            "ctx-suspended",
+        )
+        self.assertEqual(
+            {
+                "suspendedAuthorityClientId": start_ack["payload"][
+                    "suspendedAuthorityClientId"
+                ],
+                "suspendedAuthorityDeviceSessionId": start_ack["payload"][
+                    "suspendedAuthorityDeviceSessionId"
+                ],
+                "suspendedEpoch": start_ack["payload"]["suspendedEpoch"],
+                "suspendedVersion": start_ack["payload"]["suspendedVersion"],
+                "suspendedQueueRevision": start_ack["payload"][
+                    "suspendedQueueRevision"
+                ],
+                "suspendedControlVersion": start_ack["payload"][
+                    "suspendedControlVersion"
+                ],
+                "suspendedAppliedControlVersion": start_ack["payload"][
+                    "suspendedAppliedControlVersion"
+                ],
+            },
+            {
+                "suspendedAuthorityClientId": suspended_before["authorityClientId"],
+                "suspendedAuthorityDeviceSessionId": suspended_before[
+                    "authorityDeviceSessionId"
+                ],
+                "suspendedEpoch": suspended_before["epoch"],
+                "suspendedVersion": suspended_before["version"],
+                "suspendedQueueRevision": suspended_before["queueRevision"],
+                "suspendedControlVersion": suspended_before["controlVersion"],
+                "suspendedAppliedControlVersion": suspended_device_before[
+                    "appliedControlVersion"
+                ],
+            },
+        )
         relationship = get_state().get_follow_relationship("web-player-follower")
         self.assertEqual(relationship["sourcePlaybackContextId"], "ctx-source")
 

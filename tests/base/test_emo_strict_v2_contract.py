@@ -1532,6 +1532,54 @@ class StrictV2ContractTestCase(unittest.TestCase):
         with self.assertRaises(StrictOutputValidationError):
             validate_strict_output(untimed_active_resync)
 
+    def test_validates_follow_start_frozen_baseline_ack(self):
+        ack = self._output(
+            "system",
+            "system.ack",
+            {
+                "action": "follow.start",
+                "status": "active",
+                "sourcePlaybackContextId": "context-source",
+                "suspendedPlaybackContextId": "context-suspended",
+                "suspendedAuthorityClientId": "follower-1",
+                "suspendedAuthorityDeviceSessionId": "device:follower-1",
+                "suspendedEpoch": 1,
+                "suspendedVersion": 9,
+                "suspendedQueueRevision": 7,
+                "suspendedControlVersion": 11,
+                "suspendedAppliedControlVersion": 11,
+            },
+            "follow-start-1",
+        )
+
+        self.assertEqual(validate_strict_output(ack), ack)
+        for field_name in (
+            "status",
+            "sourcePlaybackContextId",
+            "suspendedPlaybackContextId",
+            "suspendedAuthorityClientId",
+            "suspendedAuthorityDeviceSessionId",
+            "suspendedEpoch",
+            "suspendedVersion",
+            "suspendedQueueRevision",
+            "suspendedControlVersion",
+            "suspendedAppliedControlVersion",
+        ):
+            with self.subTest(field_name=field_name):
+                invalid = copy.deepcopy(ack)
+                del invalid["payload"][field_name]
+                with self.assertRaises(StrictOutputValidationError):
+                    validate_strict_output(invalid)
+
+        unsettled = copy.deepcopy(ack)
+        unsettled["payload"]["suspendedAppliedControlVersion"] = 10
+        with self.assertRaises(StrictOutputValidationError):
+            validate_strict_output(unsettled)
+        extra = copy.deepcopy(ack)
+        extra["payload"]["connectionNonce"] = "forbidden"
+        with self.assertRaises(StrictOutputValidationError):
+            validate_strict_output(extra)
+
     def test_validates_broadcast_feedback_confirmation_output(self):
         applied = self._output(
             "event",

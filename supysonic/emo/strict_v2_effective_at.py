@@ -174,10 +174,25 @@ def validateBroadcastSourceState(
             "source_track_mismatch",
             "Source actual track does not match the canonical queue item",
         )
-    if require_playing and device_state.get("state") != "playing":
+    source_state = device_state.get("state")
+    if require_playing and source_state != "playing":
         raise EffectiveAtEligibilityError(
             "source_not_playing",
             "Broadcast source must currently be playing",
+        )
+    if not require_playing and source_state == "idle":
+        raise EffectiveAtEligibilityError(
+            "queue_required",
+            "Follow source requires a canonical non-empty queue",
+        )
+    if not require_playing and source_state not in {
+        "playing",
+        "paused",
+        "stopped",
+    }:
+        raise EffectiveAtEligibilityError(
+            "source_state_invalid",
+            "Follow source state is invalid",
         )
     playback_rate = device_state.get("playbackRate")
     if (
@@ -214,18 +229,24 @@ def validateBroadcastSourceState(
     if (
         sampled_age_ms < -MAX_EFFECTIVE_AT_SAMPLE_FUTURE_MS
         or received_age_ms < 0
-        or sampled_age_ms > MAX_PLAYING_STATE_AGE_MS
-        or received_age_ms > MAX_PLAYING_STATE_AGE_MS
     ):
         raise EffectiveAtEligibilityError(
             "source_state_stale",
             "Source sample and receive times must both be fresh",
         )
+    if source_state == "playing" and (
+        sampled_age_ms > MAX_PLAYING_STATE_AGE_MS
+        or received_age_ms > MAX_PLAYING_STATE_AGE_MS
+    ):
+        raise EffectiveAtEligibilityError(
+            "source_state_stale",
+            "Playing source sample and receive times must both be fresh",
+        )
     return {
         "queueSongIds": list(queue_song_ids),
         "currentIndex": current_index,
         "trackId": track_id,
-        "state": device_state.get("state"),
+        "state": source_state,
         "positionMs": position_ms,
         "positionSampledAtServerMs": sampled_at_ms,
         "serverUpdatedAtMs": received_at_ms,

@@ -7756,11 +7756,60 @@ class StrictV2CoreTestCase(unittest.TestCase):
     def test_context_close_rejects_active_follow_fence_without_side_effects(self):
         owner = self.ready_strict_client()
         self.create_context(owner)
+        self.emit_strict(
+            owner,
+            "event",
+            "playback.update",
+            "follow-source-fact-1",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "stopped",
+                "positionMs": 1200,
+                "clientSeq": 1,
+                "trackId": "song-2",
+            },
+        )
         follower = self.ready_strict_client(
             client_id="follower-1",
             device_session_id="device:follower-1",
         )
+        with mock.patch(
+            "supysonic.emo.ws_store._new_playback_context_id",
+            return_value="context-follower-1",
+        ):
+            self.emit_strict(
+                follower,
+                "command",
+                "playback.context.ensure",
+                "follow-suspended-context-1",
+                {
+                    "deviceSessionId": "device:follower-1",
+                    "queueSongIds": ["song-follower"],
+                    "currentIndex": 0,
+                    "positionMs": 0,
+                    "state": "stopped",
+                },
+            )
         self.emit_strict(
+            follower,
+            "event",
+            "playback.update",
+            "follow-suspended-fact-1",
+            {
+                "playbackContextId": "context-follower-1",
+                "deviceSessionId": "device:follower-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "stopped",
+                "positionMs": 0,
+                "clientSeq": 1,
+                "trackId": "song-follower",
+            },
+        )
+        follow_messages = self.emit_strict(
             follower,
             "command",
             "follow.start",
@@ -7769,6 +7818,10 @@ class StrictV2CoreTestCase(unittest.TestCase):
                 "sourcePlaybackContextId": "context-1",
                 "deviceSessionId": "device:follower-1",
             },
+        )
+        self.assertEqual(
+            [message["action"] for message in follow_messages],
+            ["system.ack"],
         )
         relationship = get_state().get_follow_relationship("follower-1")
         self.assertEqual(relationship["sourcePlaybackContextId"], "context-1")

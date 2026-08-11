@@ -144,6 +144,38 @@ class StrictV2EffectiveAtTestCase(unittest.TestCase):
                 self.assertEqual(anchor["sourceControlVersion"], 7)
                 self.assertEqual(anchor["trackId"], "song-1")
 
+    def test_follow_source_paused_and_stopped_skip_playing_freshness(self):
+        for state_name in ("paused", "stopped"):
+            with self.subTest(state_name=state_name):
+                device_state = self._device_state()
+                device_state.update(
+                    {
+                        "state": state_name,
+                        "positionSampledAtServerMs": 1000,
+                        "serverUpdatedAtMs": 1000,
+                    }
+                )
+
+                anchor = validateBroadcastSourceState(
+                    self._context(),
+                    device_state,
+                    now_ms=10000,
+                    require_playing=False,
+                )
+
+                self.assertEqual(anchor["state"], state_name)
+
+        idle = self._device_state()
+        idle["state"] = "idle"
+        with self.assertRaises(EffectiveAtEligibilityError) as conflict:
+            validateBroadcastSourceState(
+                self._context(),
+                idle,
+                now_ms=10000,
+                require_playing=False,
+            )
+        self.assertEqual(conflict.exception.reason, "queue_required")
+
     def test_source_rejects_future_sample_unsettled_track_and_rate(self):
         cases = (
             ("positionSampledAtServerMs", 10051, "clock_unsynchronized"),

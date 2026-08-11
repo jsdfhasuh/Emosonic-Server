@@ -52,6 +52,8 @@ class EmoFollowStoreTestCase(unittest.TestCase):
         os.remove(self.db_path)
 
     def _create_context(self, context_id, client_id, device_session_id):
+        client_prefix, client_number = client_id.rsplit("-", 1)
+        connection_nonce = "%s-nonce-%s" % (client_prefix, client_number)
         createStrictPlaybackContextState(
             context_id,
             "alice",
@@ -77,6 +79,7 @@ class EmoFollowStoreTestCase(unittest.TestCase):
                 "serverUpdatedAtMs": 1000,
                 "positionSampledAtServerMs": 1000,
                 "playbackRate": 1.0,
+                "_connectionNonce": connection_nonce,
             },
             is_authority=True,
         )
@@ -173,6 +176,14 @@ class EmoFollowStoreTestCase(unittest.TestCase):
 
         self.assertTrue(created)
         self.assertEqual(len(validator_inputs), 1)
+        self.assertEqual(
+            validator_inputs[0][1]["connectionNonce"],
+            "source-nonce-1",
+        )
+        self.assertEqual(
+            validator_inputs[0][3]["connectionNonce"],
+            "follower-nonce-1",
+        )
         self.assertEqual(lease["phase"], "active")
         self.assertEqual(lease["followerClientId"], "follower-1")
         self.assertEqual(
@@ -248,6 +259,24 @@ class EmoFollowStoreTestCase(unittest.TestCase):
                 "context-suspended",
             )
         )
+
+    def test_create_rejects_stale_source_or_suspended_fact_generation(self):
+        for context_id, client_id, nonce_field in (
+            ("context-source", "source-1", "source_connection_nonce"),
+            (
+                "context-suspended",
+                "follower-1",
+                "suspended_connection_nonce",
+            ),
+        ):
+            with self.subTest(context_id=context_id):
+                with self.assertRaises(FollowSafetyLeaseConflictError) as conflict:
+                    self._create_lease(**{nonce_field: "replacement-nonce"})
+                self.assertEqual(
+                    conflict.exception.playback_context_id,
+                    context_id,
+                )
+                self.assertEqual(db.EmoFollowSafetyLease.select().count(), 0)
 
     def test_durable_start_replay_precedes_live_context_validation(self):
         first, created = self._create_lease()
@@ -460,6 +489,35 @@ class EmoFollowStoreTestCase(unittest.TestCase):
             self._create_lease()
 
         self.assertEqual(db.EmoFollowSafetyLease.select().count(), 0)
+
+    def test_broadcast_source_can_also_source_follow(self):
+        self._create_context(
+            "context-ordinary",
+            "ordinary-1",
+            "device:ordinary-1",
+        )
+        snapshot, participant = self._broadcast_values()
+        snapshot["participants"] = ["ordinary-1"]
+        participant.update(
+            {
+                "clientId": "ordinary-1",
+                "deviceSessionId": "device:ordinary-1",
+                "suspendedPlaybackContextId": "context-ordinary",
+            }
+        )
+        createBroadcastState(
+            snapshot,
+            [participant],
+            "broadcast-source-follow-fingerprint",
+            {"broadcastId": "broadcast-1"},
+        )
+
+        lease, created = self._create_lease()
+
+        self.assertTrue(created)
+        self.assertEqual(lease["sourcePlaybackContextId"], "context-source")
+        self.assertEqual(db.EmoBroadcast.select().count(), 1)
+        self.assertEqual(db.EmoFollowSafetyLease.select().count(), 1)
 
     def test_handoff_and_follow_creation_have_one_linear_pair_order(self):
         self._make_suspended_context_idle()

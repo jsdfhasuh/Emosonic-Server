@@ -583,6 +583,54 @@ class EmoWebSocketTestCase(unittest.TestCase):
       request_id,
     )
 
+  def report_strict_playback_context(
+    self,
+    client,
+    request_id,
+    playback_context_id,
+    device_session_id,
+    state=None,
+    position_ms=None,
+    playback_rate=1.0,
+    client_seq=1,
+    sampled_at_server_ms=None,
+  ):
+    playback_context = getPlaybackContextState(playback_context_id)
+    self.assertIsNotNone(playback_context)
+    state = playback_context["state"] if state is None else state
+    position_ms = (
+      playback_context["positionMs"] if position_ms is None else position_ms
+    )
+    sampled_at_server_ms = (
+      emo_ws._server_time_ms()
+      if sampled_at_server_ms is None
+      else sampled_at_server_ms
+    )
+    payload = {
+      "playbackContextId": playback_context_id,
+      "deviceSessionId": device_session_id,
+      "origin": "passive",
+      "appliedControlVersion": playback_context["controlVersion"],
+      "state": state,
+      "positionMs": position_ms,
+      "positionSampledAtServerMs": sampled_at_server_ms,
+      "playbackRate": playback_rate,
+      "clientSeq": client_seq,
+    }
+    if playback_context.get("trackId") is not None:
+      payload["trackId"] = playback_context["trackId"]
+    client.emit(
+      "message",
+      {
+        "type": "event",
+        "action": "playback.update",
+        "requestId": request_id,
+        "payload": payload,
+      },
+      namespace="/emo",
+    )
+    return self.get_messages(client)
+
   def test_build_message_stamps_server_time_without_mutating_payload(self):
     payload = {"serverUpdatedAtMs": 1000, "positionMs": 10}
 
@@ -7421,7 +7469,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertEqual(error["payload"]["code"], "follow_control_forbidden")
     self.assertFalse(any(message["action"] == "player.seek" for message in phone_messages))
 
-  def test_v2_follow_start_subscribes_playback_context_without_source_online(self):
+  def test_v2_follow_start_rejects_offline_source_without_side_effects(self):
     phone = self.connect_device(
       "alice",
       "Alic3",
@@ -7454,6 +7502,29 @@ class EmoWebSocketTestCase(unittest.TestCase):
       queue_song_ids=["song-source"],
       position_ms=12000,
     )
+    self.ensure_playback_context(
+      laptop,
+      "v2-follow-suspended-create-1",
+      playback_context_id="playback:alice:laptop",
+      device_session_id="root:laptop",
+      queue_song_ids=["song-laptop"],
+      state="stopped",
+    )
+    self.report_strict_playback_context(
+      phone,
+      "v2-follow-source-fact-1",
+      "playback:alice:main",
+      "root:phone",
+      state="stopped",
+      position_ms=12000,
+    )
+    self.report_strict_playback_context(
+      laptop,
+      "v2-follow-suspended-fact-1",
+      "playback:alice:laptop",
+      "root:laptop",
+      state="stopped",
+    )
     self.get_messages(laptop)
 
     phone.disconnect(namespace="/emo")
@@ -7474,51 +7545,15 @@ class EmoWebSocketTestCase(unittest.TestCase):
       namespace="/emo",
     )
 
-    follow_ack = self.get_ack(self.get_messages(laptop), "v2-follow-start-1")
-    self.assertEqual(follow_ack["payload"], {"action": "follow.start"})
-    relationship = get_state().get_follow_relationship("laptop-1")
-    self.assertEqual(relationship["sourcePlaybackContextId"], "playback:alice:main")
-    self.assertEqual(relationship["sourceClientId"], "phone-1")
-    self.assertIsNone(relationship["sourceSessionId"])
-    laptop.emit(
-      "message",
-      {
-        "type": "state",
-        "action": "playback.context.status",
-        "requestId": "v2-follow-status-1",
-        "payload": {"playbackContextId": "playback:alice:main"},
-      },
-      namespace="/emo",
-    )
-    snapshot = self.get_direct_response(
+    follow_error = self.get_error(
       self.get_messages(laptop),
-      "playback.context.status",
-      "v2-follow-status-1",
+      "v2-follow-start-1",
     )
-    playback_context = snapshot["payload"]["playbackContext"]
-    self.assertEqual(playback_context["playbackContextId"], "playback:alice:main")
-    self.assertEqual(playback_context["queueSongIds"], ["song-source"])
-    self.assertNotIn("sessionId", playback_context)
+    self.assertEqual(follow_error["payload"]["code"], "authority_offline")
     self.assertEqual(
-      get_state().get_follow_relationship("laptop-1")["sourcePlaybackContextId"],
+      follow_error["payload"]["playbackContextId"],
       "playback:alice:main",
     )
-
-    laptop.emit(
-      "message",
-      {
-        "type": "command",
-        "action": "follow.stop",
-        "requestId": "v2-follow-stop-1",
-        "payload": {
-          "sourcePlaybackContextId": "playback:alice:main",
-        },
-      },
-      namespace="/emo",
-    )
-
-    stop_ack = self.get_ack(self.get_messages(laptop), "v2-follow-stop-1")
-    self.assertEqual(stop_ack["payload"], {"action": "follow.stop"})
     self.assertIsNone(get_state().get_follow_relationship("laptop-1"))
 
   def test_v2_follow_participant_cannot_report_context_feedback(self):
@@ -7553,6 +7588,29 @@ class EmoWebSocketTestCase(unittest.TestCase):
       "v2-follow-feedback-context-create-1",
       queue_song_ids=["song-source"],
       position_ms=12000,
+    )
+    self.ensure_playback_context(
+      laptop,
+      "v2-follow-feedback-suspended-create-1",
+      playback_context_id="playback:alice:laptop",
+      device_session_id="root:laptop",
+      queue_song_ids=["song-laptop"],
+      state="stopped",
+    )
+    self.report_strict_playback_context(
+      phone,
+      "v2-follow-feedback-source-fact-1",
+      "playback:alice:main",
+      "root:phone",
+      state="stopped",
+      position_ms=12000,
+    )
+    self.report_strict_playback_context(
+      laptop,
+      "v2-follow-feedback-suspended-fact-1",
+      "playback:alice:laptop",
+      "root:laptop",
+      state="stopped",
     )
     self.get_messages(phone)
     self.get_messages(laptop)
@@ -7633,6 +7691,28 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.get_messages(phone)
     self.get_messages(laptop)
     self.ensure_playback_context(phone, "v2-follow-control-context-create-1")
+    self.ensure_playback_context(
+      laptop,
+      "v2-follow-control-suspended-create-1",
+      playback_context_id="playback:alice:laptop",
+      device_session_id="root:laptop",
+      queue_song_ids=["song-laptop"],
+      state="stopped",
+    )
+    self.report_strict_playback_context(
+      phone,
+      "v2-follow-control-source-fact-1",
+      "playback:alice:main",
+      "root:phone",
+      state="stopped",
+    )
+    self.report_strict_playback_context(
+      laptop,
+      "v2-follow-control-suspended-fact-1",
+      "playback:alice:laptop",
+      "root:laptop",
+      state="stopped",
+    )
     self.get_messages(phone)
     self.get_messages(laptop)
 

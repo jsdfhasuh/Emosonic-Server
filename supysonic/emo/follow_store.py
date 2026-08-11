@@ -33,7 +33,13 @@ class FollowSafetyLeaseError(Exception):
 
 
 class FollowSafetyLeaseConflictError(FollowSafetyLeaseError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        playback_context_id: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.playback_context_id = playback_context_id
 
 
 class FollowSafetyLeaseLimitError(FollowSafetyLeaseError):
@@ -168,6 +174,8 @@ def _device_payload(record: EmoDevicePlaybackState) -> Dict[str, object]:
         "contextEpoch": record.context_epoch,
         "appliedControlVersion": record.applied_control_version,
         "clientSeq": record.client_seq,
+        "isAuthority": bool(record.is_authority),
+        "connectionNonce": playback.get("_connectionNonce"),
         "serverUpdatedAtMs": playback.get(
             "serverUpdatedAtMs",
             int(record.updated_at.timestamp() * 1000),
@@ -333,7 +341,8 @@ def _require_follow_profile_resources_available(
     )
     if source_is_suspended is not None:
         raise FollowSafetyLeaseConflictError(
-            "Follow source Context is occupied by another Follow"
+            "Follow source Context is occupied by another Follow",
+            source_playback_context_id,
         )
 
     active_prepare = EmoPlaybackPrepareTransaction.get_or_none(
@@ -346,7 +355,8 @@ def _require_follow_profile_resources_available(
     )
     if active_prepare is not None:
         raise FollowSafetyLeaseConflictError(
-            "Follow suspended Context has an active prepare"
+            "Follow suspended Context has an active prepare",
+            suspended_playback_context_id,
         )
 
     active_handoffs = EmoPlaybackHandoff.select().where(
@@ -385,7 +395,8 @@ def _require_follow_profile_resources_available(
         )
         if occupies_suspended_context:
             raise FollowSafetyLeaseConflictError(
-                "Follow suspended Context has an active Handoff"
+                "Follow suspended Context has an active Handoff",
+                suspended_playback_context_id,
             )
 
     broadcast_fence = EmoBroadcastFence.get_or_none(
@@ -406,7 +417,8 @@ def _require_follow_profile_resources_available(
     )
     if broadcast_fence is not None:
         raise FollowSafetyLeaseConflictError(
-            "Follow suspended Context has a Broadcast fence"
+            "Follow suspended Context has a Broadcast fence",
+            suspended_playback_context_id,
         )
 
     source_ordinary_fence = EmoBroadcastFence.get_or_none(
@@ -419,7 +431,8 @@ def _require_follow_profile_resources_available(
     )
     if source_ordinary_fence is not None:
         raise FollowSafetyLeaseConflictError(
-            "Follow source Context is a Broadcast ordinary participant"
+            "Follow source Context is a Broadcast ordinary participant",
+            source_playback_context_id,
         )
 
 
@@ -506,7 +519,8 @@ def createFollowSafetyLease(
     _require_integer(server_time_ms, "serverTimeMs")
     if source_playback_context_id == suspended_playback_context_id:
         raise FollowSafetyLeaseConflictError(
-            "Follow source and suspended Context must differ"
+            "Follow source and suspended Context must differ",
+            source_playback_context_id,
         )
 
     context_ids = (
@@ -558,7 +572,8 @@ def createFollowSafetyLease(
                     ):
                         return serializeFollowSafetyLease(existing), False
                     raise FollowSafetyLeaseConflictError(
-                        "Follower already has another Follow safety lease"
+                        "Follower already has another Follow safety lease",
+                        existing.suspended_playback_context_id,
                     )
 
                 source_record = EmoPlaybackContext.get_or_none(
@@ -571,12 +586,18 @@ def createFollowSafetyLease(
                 )
                 if source_record is None or suspended_record is None:
                     raise FollowSafetyLeaseConflictError(
-                        "Follow Context is unavailable"
+                        "Follow Context is unavailable",
+                        (
+                            source_playback_context_id
+                            if source_record is None
+                            else suspended_playback_context_id
+                        ),
                     )
                 for record in (source_record, suspended_record):
                     if record.user_name != user_name or record.lifecycle != "active":
                         raise FollowSafetyLeaseConflictError(
-                            "Follow Context is unavailable"
+                            "Follow Context is unavailable",
+                            record.playback_context_id,
                         )
                 if (
                     source_record.authority_client_id
@@ -585,7 +606,8 @@ def createFollowSafetyLease(
                     != source_authority_device_session_id
                 ):
                     raise FollowSafetyLeaseConflictError(
-                        "Follow source authority changed"
+                        "Follow source authority changed",
+                        source_playback_context_id,
                     )
                 if (
                     suspended_record.authority_client_id
@@ -597,7 +619,8 @@ def createFollowSafetyLease(
                     != follower_device_session_id
                 ):
                     raise FollowSafetyLeaseConflictError(
-                        "Follow suspended authority changed"
+                        "Follow suspended authority changed",
+                        suspended_playback_context_id,
                     )
 
                 _require_follow_profile_resources_available(
@@ -631,17 +654,35 @@ def createFollowSafetyLease(
                 )
                 if source_device is None or suspended_device is None:
                     raise FollowSafetyLeaseConflictError(
-                        "Follow authority actual fact is unavailable"
+                        "Follow authority actual fact is unavailable",
+                        (
+                            source_playback_context_id
+                            if source_device is None
+                            else suspended_playback_context_id
+                        ),
                     )
+                source_playback = (
+                    json.loads(source_device.playback_json)
+                    if source_device.playback_json
+                    else {}
+                )
+                suspended_playback = (
+                    json.loads(suspended_device.playback_json)
+                    if suspended_device.playback_json
+                    else {}
+                )
                 if (
                     source_device.device_session_id
                     != source_authority_device_session_id
                     or source_device.context_epoch != source_record.epoch
                     or source_device.applied_control_version
                     != source_record.control_version
+                    or source_playback.get("_connectionNonce")
+                    != source_connection_nonce
                 ):
                     raise FollowSafetyLeaseConflictError(
-                        "Follow source actual fact is not settled"
+                        "Follow source actual fact is not settled",
+                        source_playback_context_id,
                     )
                 if (
                     suspended_device.device_session_id
@@ -649,9 +690,12 @@ def createFollowSafetyLease(
                     or suspended_device.context_epoch != suspended_record.epoch
                     or suspended_device.applied_control_version
                     != suspended_record.control_version
+                    or suspended_playback.get("_connectionNonce")
+                    != suspended_connection_nonce
                 ):
                     raise FollowSafetyLeaseConflictError(
-                        "Follow suspended actual fact is not settled"
+                        "Follow suspended actual fact is not settled",
+                        suspended_playback_context_id,
                     )
                 for context_record in (source_record, suspended_record):
                     pending_exists = (
@@ -674,7 +718,8 @@ def createFollowSafetyLease(
                     )
                     if pending_exists:
                         raise FollowSafetyLeaseConflictError(
-                            "Follow Context has pending control"
+                            "Follow Context has pending control",
+                            context_record.playback_context_id,
                         )
 
                 start_ack = {
@@ -740,7 +785,8 @@ def createFollowSafetyLease(
                 )
                 if occupied is not None:
                     raise FollowSafetyLeaseConflictError(
-                        "Suspended Context already has a Follow safety lease"
+                        "Suspended Context already has a Follow safety lease",
+                        suspended_playback_context_id,
                     )
                 lease_count = (
                     EmoFollowSafetyLease.select()
@@ -830,7 +876,8 @@ def createFollowSafetyLease(
                     ):
                         return serializeFollowSafetyLease(existing), False
                     raise FollowSafetyLeaseConflictError(
-                        "Follow safety lease conflicts with current occupancy"
+                        "Follow safety lease conflicts with current occupancy",
+                        suspended_playback_context_id,
                     ) from exc
                 return serializeFollowSafetyLease(created), True
         finally:

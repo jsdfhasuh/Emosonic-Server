@@ -4,7 +4,7 @@ import os
 import threading
 import time
 import uuid
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from flask import (
@@ -57,7 +57,13 @@ from .protocol_metadata import (
     get_strict_v2_metadata,
     get_strict_v2_registration_metadata,
 )
-from .follow_store import recoverFollowSafetyLeasesForStartup
+from .follow_store import (
+    FollowSafetyLeaseConflictError,
+    FollowSafetyLeaseLimitError,
+    createFollowSafetyLease,
+    getFollowSafetyLeaseForFollower,
+    recoverFollowSafetyLeasesForStartup,
+)
 from .strict_v2_acceptance import consume_binding_emit_failure
 from .strict_v2_contract import (
     ACTION_SCHEMAS,
@@ -191,6 +197,21 @@ def _ordinary_control_dispatch_barrier(playback_context_id):
             playback_context_id,
             threading.RLock(),
         )
+
+
+@contextmanager
+def _ordinary_control_dispatch_barrier_set(playback_context_ids):
+    locks = [
+        _ordinary_control_dispatch_barrier(playback_context_id)
+        for playback_context_id in sorted(set(playback_context_ids))
+    ]
+    for dispatch_lock in locks:
+        dispatch_lock.acquire()
+    try:
+        yield
+    finally:
+        for dispatch_lock in reversed(locks):
+            dispatch_lock.release()
 
 
 def _physical_generation_key(user_name, client_id):
@@ -371,7 +392,9 @@ class CapabilityRequiredError(PermissionError):
 
 
 class FollowConflictError(Exception):
-    pass
+    def __init__(self, message, playback_context_id=None):
+        super().__init__(message)
+        self.playback_context_id = playback_context_id
 
 
 class FollowControlForbiddenError(PermissionError):
@@ -6951,38 +6974,208 @@ def _validate_player_request_state(payload):
             raise ValueError(f"player.requestState {field_name} must be a boolean")
 
 
+def _follow_start_replay_or_conflict(
+    current_user_name,
+    follower_client_id,
+    follower_device_session_id,
+    source_playback_context_id,
+    start_fingerprint,
+):
+    existing = getFollowSafetyLeaseForFollower(
+        current_user_name,
+        follower_client_id,
+        follower_device_session_id,
+    )
+    if existing is None:
+        return None
+    if (
+        existing["sourcePlaybackContextId"] == source_playback_context_id
+        and existing["startRequestFingerprint"] == start_fingerprint
+    ):
+        return existing
+    raise FollowConflictError(
+        "Follower already has another Follow safety lease",
+        existing["suspendedPlaybackContextId"],
+    )
+
+
+def _follow_replay_relationship(lease):
+    return {
+        "followerClientId": lease["followerClientId"],
+        "followerSessionId": lease["followerDeviceSessionId"],
+        "sourceClientId": lease["sourceAuthorityClientId"],
+        "sourceSessionId": None,
+        "sourcePlaybackContextId": lease["sourcePlaybackContextId"],
+        "userName": lease["userName"],
+        "active": lease["phase"] == "active",
+    }
+
+
+def _require_follow_generation_player(
+    current_user_name,
+    generation,
+    required_capabilities,
+    playback_context_id,
+    source=False,
+):
+    if not state.matches_current_physical_generation(
+        generation["userName"],
+        generation["clientId"],
+        generation["deviceSessionId"],
+        generation["sid"],
+        generation["connectionNonce"],
+        generation["connectionEpoch"],
+    ):
+        if source:
+            raise PlaybackAuthorityOfflineError(
+                "Follow source physical generation changed"
+            )
+        raise PermissionError("Follower physical generation changed")
+    if not socketio.server.manager.is_connected(
+        generation["sid"],
+        namespace="/emo",
+    ):
+        if source:
+            raise PlaybackAuthorityOfflineError("Follow source is offline")
+        raise PermissionError("Follower Socket is unavailable")
+    try:
+        eligibility = requireEffectiveAtPlayer(
+            state,
+            current_user_name,
+            generation["clientId"],
+            now_ms=_server_time_ms(),
+            require_broadcast=False,
+            required_capabilities=required_capabilities,
+        )
+    except EffectiveAtEligibilityError as exc:
+        if exc.reason == "capability_required":
+            raise CapabilityRequiredError(str(exc)) from exc
+        if source and exc.reason == "offline":
+            raise PlaybackAuthorityOfflineError(str(exc)) from exc
+        raise FollowConflictError(str(exc), playback_context_id) from exc
+    if (
+        eligibility["clockGate"].get("connectionNonce")
+        != generation["connectionNonce"]
+    ):
+        raise FollowConflictError(
+            "Follow clock gate belongs to another physical generation",
+            playback_context_id,
+        )
+    return eligibility["client"]
+
+
+def _validate_follow_start_transaction(
+    current_user_name,
+    source_context,
+    source_fact,
+    suspended_context,
+    suspended_fact,
+    follower_generation,
+    source_generation,
+):
+    source_playback_context_id = source_context["playbackContextId"]
+    suspended_playback_context_id = suspended_context["playbackContextId"]
+    if (
+        source_context.get("authorityClientId") != source_generation["clientId"]
+        or source_context.get("authorityDeviceSessionId")
+        != source_generation["deviceSessionId"]
+    ):
+        raise FollowConflictError(
+            "Follow source authority binding changed",
+            source_playback_context_id,
+        )
+    if (
+        suspended_context.get("authorityClientId")
+        != follower_generation["clientId"]
+        or suspended_context.get("authorityDeviceSessionId")
+        != follower_generation["deviceSessionId"]
+    ):
+        raise FollowConflictError(
+            "Follow suspended authority binding changed",
+            suspended_playback_context_id,
+        )
+
+    _require_follow_generation_player(
+        current_user_name,
+        follower_generation,
+        (
+            CAPABILITY_PLAYBACK_CONTEXT_V2,
+            CAPABILITY_EFFECTIVE_AT,
+            CAPABILITY_CAN_PLAY,
+            CAPABILITY_CAN_PAUSE,
+            CAPABILITY_CAN_SEEK,
+            CAPABILITY_SUPPORTS_FOLLOW,
+        ),
+        suspended_playback_context_id,
+    )
+    _require_follow_generation_player(
+        current_user_name,
+        source_generation,
+        (
+            CAPABILITY_PLAYBACK_CONTEXT_V2,
+            CAPABILITY_EFFECTIVE_AT,
+        ),
+        source_playback_context_id,
+        source=True,
+    )
+    if source_fact.get("connectionNonce") != source_generation["connectionNonce"]:
+        raise FollowConflictError(
+            "Follow source fact belongs to another physical generation",
+            source_playback_context_id,
+        )
+    if (
+        suspended_fact.get("connectionNonce")
+        != follower_generation["connectionNonce"]
+        or suspended_fact.get("isAuthority") is not True
+    ):
+        raise FollowConflictError(
+            "Follow suspended fact belongs to another physical generation",
+            suspended_playback_context_id,
+        )
+    try:
+        validateBroadcastSourceState(
+            source_context,
+            source_fact,
+            now_ms=_server_time_ms(),
+            has_unsettled_controls=False,
+            require_playing=False,
+        )
+    except EffectiveAtEligibilityError as exc:
+        if exc.reason == "queue_required":
+            raise PlaybackContextQueueRequiredError(dict(source_context)) from exc
+        raise FollowConflictError(
+            str(exc),
+            source_playback_context_id,
+        ) from exc
+
+
 def _handle_follow_start(current_user_name, current_client, payload, request_id, sid):
     if current_client is None:
         raise PermissionError("Register the device before starting follow playback")
 
     strict_v2 = _is_strict_playback_context_v2(current_client)
     if strict_v2 or _is_follow_context_payload(payload):
-        if strict_v2 and not _client_supports(current_client, CAPABILITY_SUPPORTS_FOLLOW):
-            raise CapabilityRequiredError("strict-v2 client does not support Follow")
+        if not strict_v2:
+            raise CapabilityRequiredError("Follow requires strict-v2 PlaybackContext")
         _reject_session_id_for_strict_v2(payload, strict_v2)
-        if strict_v2 and not _has_role(current_client, "player"):
-            raise PermissionError("Follow requires the player role")
-        if strict_v2 and not _client_supports(current_client, CAPABILITY_CAN_PLAY):
-            raise CapabilityRequiredError("Follow requires canPlay")
+        if not _client_supports(current_client, CAPABILITY_SUPPORTS_FOLLOW):
+            raise CapabilityRequiredError("strict-v2 client does not support Follow")
+        if not _has_role(current_client, "player"):
+            raise CapabilityRequiredError("Follow requires the player role")
+        for capability in (
+            CAPABILITY_PLAYBACK_CONTEXT_V2,
+            CAPABILITY_EFFECTIVE_AT,
+            CAPABILITY_CAN_PLAY,
+            CAPABILITY_CAN_PAUSE,
+            CAPABILITY_CAN_SEEK,
+        ):
+            if not _client_supports(current_client, capability):
+                raise CapabilityRequiredError(
+                    "Follow requires %s" % capability
+                )
         source_playback_context_id = payload.get("sourcePlaybackContextId")
-        if source_playback_context_id is None:
-            source_playback_context_id = payload.get("playbackContextId")
         if not isinstance(source_playback_context_id, str) or not source_playback_context_id:
             raise ValueError("follow.start requires a non-empty sourcePlaybackContextId")
-
-        playback_context = _get_existing_playback_context(
-            source_playback_context_id,
-            current_user_name,
-        )
-        if playback_context is None:
-            raise LookupError("Playback context not found")
-        _ensure_playback_context_for_user(playback_context, current_user_name)
-        _ensure_playback_context_active(playback_context)
-
-        source_client_id = playback_context.get("authorityClientId")
-        if source_client_id == current_client.get("clientId"):
-            raise ValueError("follow.start source cannot be the current client")
-
         device_session_id = _resolve_v2_device_session_id(
             payload,
             current_client,
@@ -6992,27 +7185,252 @@ def _handle_follow_start(current_user_name, current_client, payload, request_id,
             raise ValueError("follow.start requires a non-empty deviceSessionId")
         if strict_v2 and device_session_id != current_client.get("deviceSessionId"):
             raise PermissionError("deviceSessionId does not match the registered device")
-
-        existing = state.get_follow_relationship(current_client.get("clientId"))
-        if existing is not None:
-            if existing.get("sourcePlaybackContextId") != source_playback_context_id:
-                raise FollowConflictError(
-                    "Follow relationship already targets another playback context"
-                )
-            state.subscribe_playback_context(sid, source_playback_context_id)
-            _send_ack(request_id)
-            return existing
-
-        relationship = state.start_follow_relationship(
-            current_client.get("clientId"),
-            device_session_id,
-            source_client_id,
-            None,
-            current_user_name,
-            source_playback_context_id=source_playback_context_id,
+        follower_client_id = current_client.get("clientId")
+        start_fingerprint = request_fingerprint(
+            "command",
+            "follow.start",
+            payload,
         )
-        state.subscribe_playback_context(sid, source_playback_context_id)
-        _send_ack(request_id)
+        replay = _follow_start_replay_or_conflict(
+            current_user_name,
+            follower_client_id,
+            device_session_id,
+            source_playback_context_id,
+            start_fingerprint,
+        )
+        if replay is not None:
+            _send_ack(request_id, replay["startAck"])
+            return _follow_replay_relationship(replay)
+
+        source_context = _get_existing_playback_context(
+            source_playback_context_id,
+            current_user_name,
+        )
+        if source_context is None:
+            raise LookupError("Playback context not found")
+        _ensure_playback_context_for_user(source_context, current_user_name)
+        _ensure_playback_context_active(source_context)
+        source_client_id = source_context.get("authorityClientId")
+        source_device_session_id = source_context.get(
+            "authorityDeviceSessionId"
+        )
+        if not isinstance(source_client_id, str) or not source_client_id:
+            raise FollowConflictError(
+                "Follow source authority is unavailable",
+                source_playback_context_id,
+            )
+        if (
+            not isinstance(source_device_session_id, str)
+            or not source_device_session_id
+        ):
+            raise FollowConflictError(
+                "Follow source authority device is unavailable",
+                source_playback_context_id,
+            )
+
+        suspended_bindings = listActivePlaybackContextBindings(
+            current_user_name,
+            follower_client_id,
+            device_session_id,
+        )
+        if len(suspended_bindings) != 1:
+            raise FollowConflictError(
+                "Follower requires one exact active suspended Context",
+                (
+                    suspended_bindings[0]["playbackContextId"]
+                    if suspended_bindings
+                    else None
+                ),
+            )
+        suspended_playback_context_id = suspended_bindings[0][
+            "playbackContextId"
+        ]
+        lifecycle_keys = tuple(
+            sorted(
+                {
+                    (current_user_name, follower_client_id),
+                    (current_user_name, source_client_id),
+                }
+            )
+        )
+        with strictPhysicalGenerationLockSet(lifecycle_keys):
+            with _ordinary_control_dispatch_barrier_set(
+                (
+                    source_playback_context_id,
+                    suspended_playback_context_id,
+                )
+            ):
+                replay = _follow_start_replay_or_conflict(
+                    current_user_name,
+                    follower_client_id,
+                    device_session_id,
+                    source_playback_context_id,
+                    start_fingerprint,
+                )
+                if replay is not None:
+                    lease = replay
+                    created = False
+                    relationship = _follow_replay_relationship(replay)
+                else:
+                    current_source_context = getPlaybackContextStateForUser(
+                        source_playback_context_id,
+                        current_user_name,
+                    )
+                    current_suspended_context = getPlaybackContextStateForUser(
+                        suspended_playback_context_id,
+                        current_user_name,
+                    )
+                    if (
+                        current_source_context is None
+                        or current_source_context.get("lifecycle") != "active"
+                    ):
+                        raise FollowConflictError(
+                            "Follow source Context is unavailable",
+                            source_playback_context_id,
+                        )
+                    if (
+                        current_suspended_context is None
+                        or current_suspended_context.get("lifecycle") != "active"
+                    ):
+                        raise FollowConflictError(
+                            "Follow suspended Context is unavailable",
+                            suspended_playback_context_id,
+                        )
+                    if (
+                        current_source_context.get("authorityClientId")
+                        != source_client_id
+                        or current_source_context.get(
+                            "authorityDeviceSessionId"
+                        )
+                        != source_device_session_id
+                    ):
+                        raise FollowConflictError(
+                            "Follow source authority changed",
+                            source_playback_context_id,
+                        )
+                    if (
+                        current_suspended_context.get("authorityClientId")
+                        != follower_client_id
+                        or current_suspended_context.get(
+                            "authorityDeviceSessionId"
+                        )
+                        != device_session_id
+                    ):
+                        raise FollowConflictError(
+                            "Follow suspended authority changed",
+                            suspended_playback_context_id,
+                        )
+                    follower_generation = state.get_current_physical_generation(
+                        current_user_name,
+                        follower_client_id,
+                        device_session_id,
+                        expected_sid=sid,
+                    )
+                    if follower_generation is None:
+                        raise PermissionError(
+                            "Follower physical generation is unavailable"
+                        )
+                    source_generation = state.get_current_physical_generation(
+                        current_user_name,
+                        source_client_id,
+                        source_device_session_id,
+                    )
+                    if source_generation is None:
+                        raise PlaybackAuthorityOfflineError(
+                            "Follow source authority is offline"
+                        )
+                    if (
+                        follower_generation["clientId"]
+                        == source_generation["clientId"]
+                        and follower_generation["deviceSessionId"]
+                        == source_generation["deviceSessionId"]
+                    ):
+                        raise FollowConflictError(
+                            "Follow source and follower exact pair must differ",
+                            source_playback_context_id,
+                        )
+                    try:
+                        lease, created = createFollowSafetyLease(
+                            user_name=current_user_name,
+                            follower_client_id=follower_generation["clientId"],
+                            follower_device_session_id=follower_generation[
+                                "deviceSessionId"
+                            ],
+                            follower_connection_nonce=follower_generation[
+                                "connectionNonce"
+                            ],
+                            follower_connection_epoch=follower_generation[
+                                "connectionEpoch"
+                            ],
+                            source_playback_context_id=(
+                                source_playback_context_id
+                            ),
+                            source_authority_client_id=source_generation[
+                                "clientId"
+                            ],
+                            source_authority_device_session_id=(
+                                source_generation["deviceSessionId"]
+                            ),
+                            source_connection_nonce=source_generation[
+                                "connectionNonce"
+                            ],
+                            source_connection_epoch=source_generation[
+                                "connectionEpoch"
+                            ],
+                            suspended_playback_context_id=(
+                                suspended_playback_context_id
+                            ),
+                            suspended_authority_client_id=(
+                                follower_generation["clientId"]
+                            ),
+                            suspended_authority_device_session_id=(
+                                follower_generation["deviceSessionId"]
+                            ),
+                            suspended_connection_nonce=follower_generation[
+                                "connectionNonce"
+                            ],
+                            suspended_connection_epoch=follower_generation[
+                                "connectionEpoch"
+                            ],
+                            start_request_fingerprint=start_fingerprint,
+                            server_time_ms=_server_time_ms(),
+                            pre_mutation_validator=(
+                                lambda source, source_fact, suspended, suspended_fact: (
+                                    _validate_follow_start_transaction(
+                                        current_user_name,
+                                        source,
+                                        source_fact,
+                                        suspended,
+                                        suspended_fact,
+                                        follower_generation,
+                                        source_generation,
+                                    )
+                                )
+                            ),
+                        )
+                    except FollowSafetyLeaseConflictError as exc:
+                        raise FollowConflictError(
+                            str(exc),
+                            exc.playback_context_id
+                            or suspended_playback_context_id,
+                        ) from exc
+                    relationship = _follow_replay_relationship(lease)
+                    if created:
+                        relationship = state.start_follow_relationship(
+                            follower_generation["clientId"],
+                            follower_generation["deviceSessionId"],
+                            source_generation["clientId"],
+                            None,
+                            current_user_name,
+                            source_playback_context_id=(
+                                source_playback_context_id
+                            ),
+                        )
+                        state.subscribe_playback_context(
+                            sid,
+                            source_playback_context_id,
+                        )
+        _send_ack(request_id, lease["startAck"])
         return relationship
 
     source_client_id = payload.get("sourceClientId") or payload.get("followSourceClientId")
@@ -12034,7 +12452,31 @@ class EmoNamespace(Namespace):
                 )
             )
         except FollowConflictError as exc:
-            _send_error("conflict", str(exc), request_id)
+            playback_context = (
+                getPlaybackContextStateForUser(
+                    exc.playback_context_id,
+                    current_user_name,
+                )
+                if isinstance(exc.playback_context_id, str)
+                and exc.playback_context_id
+                else None
+            ) or {}
+            _send_error(
+                "conflict",
+                str(exc),
+                request_id,
+                **_live_context_cursor_fields(
+                    playback_context,
+                    current_user_name,
+                ),
+            )
+        except FollowSafetyLeaseLimitError as exc:
+            _send_error(
+                "rate_limited",
+                str(exc),
+                request_id,
+                retryAfterMs=1000,
+            )
         except BroadcastConflictError as exc:
             event_name = _get_action_event_name(action) or "bad_message"
             _log_emo_event(
@@ -12138,7 +12580,10 @@ class EmoNamespace(Namespace):
                 "authority_offline",
                 str(exc),
                 request_id,
-                playbackContextId=payload.get("playbackContextId"),
+                playbackContextId=(
+                    payload.get("playbackContextId")
+                    or payload.get("sourcePlaybackContextId")
+                ),
             )
         except CoreProfileNotReady as exc:
             _log_emo_event(

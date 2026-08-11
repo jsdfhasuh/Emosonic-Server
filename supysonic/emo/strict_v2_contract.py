@@ -813,7 +813,6 @@ _ACK_ONLY_REQUEST_ACTIONS = {
     "player.seek",
     "player.next",
     "player.prev",
-    "follow.start",
     "follow.stop",
     "playback.handoff.cancel",
     "broadcast.play",
@@ -1812,6 +1811,58 @@ def _validate_output_ack(payload: object) -> str:
         if ack["status"] != "preparing":
             _output_error("handoff start status must be preparing")
         _output_int(ack["controlVersion"], "handoff start controlVersion", 1)
+    elif request_action == "follow.start":
+        ack = _output_object(
+            payload,
+            {
+                "action",
+                "status",
+                "sourcePlaybackContextId",
+                "suspendedPlaybackContextId",
+                "suspendedAuthorityClientId",
+                "suspendedAuthorityDeviceSessionId",
+                "suspendedEpoch",
+                "suspendedVersion",
+                "suspendedQueueRevision",
+                "suspendedControlVersion",
+                "suspendedAppliedControlVersion",
+            },
+            set(),
+            "follow.start ACK payload",
+        )
+        if ack["status"] != "active":
+            _output_error("follow.start ACK status must be active")
+        for field_name in (
+            "sourcePlaybackContextId",
+            "suspendedPlaybackContextId",
+            "suspendedAuthorityClientId",
+            "suspendedAuthorityDeviceSessionId",
+        ):
+            _output_string(
+                ack[field_name],
+                "follow.start ACK %s" % field_name,
+            )
+        if ack["sourcePlaybackContextId"] == ack["suspendedPlaybackContextId"]:
+            _output_error("follow.start ACK Contexts must differ")
+        for field_name in (
+            "suspendedEpoch",
+            "suspendedVersion",
+            "suspendedQueueRevision",
+            "suspendedControlVersion",
+            "suspendedAppliedControlVersion",
+        ):
+            _output_int(
+                ack[field_name],
+                "follow.start ACK %s" % field_name,
+                1,
+            )
+        if (
+            ack["suspendedAppliedControlVersion"]
+            != ack["suspendedControlVersion"]
+        ):
+            _output_error(
+                "follow.start ACK applied control version must be settled"
+            )
     elif request_action == "broadcast.start":
         ack = _output_object(
             payload,
