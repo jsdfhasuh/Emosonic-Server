@@ -57,6 +57,7 @@ from .protocol_metadata import (
     get_strict_v2_metadata,
     get_strict_v2_registration_metadata,
 )
+from .follow_store import recoverFollowSafetyLeasesForStartup
 from .strict_v2_acceptance import consume_binding_emit_failure
 from .strict_v2_contract import (
     ACTION_SCHEMAS,
@@ -567,6 +568,14 @@ def init_socketio(app):
                 len(recovered_controls),
             )
         state.restore_strict_playback_contexts(listPlaybackContexts())
+        recovered_follow_leases = recoverFollowSafetyLeasesForStartup(
+            _server_time_ms()
+        )
+        if recovered_follow_leases:
+            logger.warning(
+                "Recovered %d Follow safety fences after restart",
+                len(recovered_follow_leases),
+            )
         failed_handoffs = failActivePlaybackHandoffsForRestart()
         if failed_handoffs:
             logger.warning(

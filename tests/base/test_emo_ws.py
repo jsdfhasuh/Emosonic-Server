@@ -221,6 +221,10 @@ class EmoWebSocketTestCase(unittest.TestCase):
       return_value=[],
     ), mock.patch.object(
       emo_ws,
+      "recoverFollowSafetyLeasesForStartup",
+      side_effect=record("follow-recovery", []),
+    ), mock.patch.object(
+      emo_ws,
       "failActivePlaybackHandoffsForRestart",
       side_effect=record("handoff-recovery", []),
     ), mock.patch.object(
@@ -259,6 +263,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
         "watchdog-reset",
         "core-recovery",
         "context-restore",
+        "follow-recovery",
         "handoff-recovery",
         "memory-broadcast-recovery",
         "durable-broadcast-recovery",
@@ -301,6 +306,54 @@ class EmoWebSocketTestCase(unittest.TestCase):
       self.assertFalse(strict_v2_safety.accepts_connections())
       self.assertFalse(strict_v2_safety.begin_request())
       restore_contexts.assert_not_called()
+      recover_handoffs.assert_not_called()
+      recover_memory_broadcasts.assert_not_called()
+      recover_durable_broadcasts.assert_not_called()
+      start_watchdog.assert_not_called()
+    finally:
+      strict_v2_safety.configure(self.app.config["WEBAPP"])
+
+  def test_socketio_follow_recovery_failure_blocks_later_profile_recovery(self):
+    strict_v2_safety.configure(self.app.config["WEBAPP"])
+    try:
+      with mock.patch.object(socketio, "init_app"), mock.patch.object(
+        emo_ws,
+        "recoverPendingPlaybackControlsForStartup",
+        return_value={"recoveredTransactions": [], "mutated": False},
+      ), mock.patch.object(
+        emo_ws,
+        "listPlaybackContexts",
+        return_value=[],
+      ), mock.patch.object(
+        emo_ws.state,
+        "restore_strict_playback_contexts",
+      ) as restore_contexts, mock.patch.object(
+        emo_ws,
+        "recoverFollowSafetyLeasesForStartup",
+        side_effect=RuntimeError("injected Follow recovery failure"),
+      ), mock.patch.object(
+        emo_ws,
+        "failActivePlaybackHandoffsForRestart",
+      ) as recover_handoffs, mock.patch.object(
+        emo_ws.state,
+        "stop_active_broadcasts_for_restart",
+      ) as recover_memory_broadcasts, mock.patch.object(
+        emo_ws,
+        "stopNonterminalBroadcastsForRestart",
+      ) as recover_durable_broadcasts, mock.patch.object(
+        socketio,
+        "start_background_task",
+      ) as start_watchdog:
+        with self.assertRaisesRegex(
+          RuntimeError,
+          "injected Follow recovery failure",
+        ):
+          init_socketio(self.app)
+
+      restore_contexts.assert_called_once_with([])
+      self.assertEqual(strict_v2_safety.startup_recovery_state(), "failed")
+      self.assertFalse(strict_v2_safety.accepts_connections())
+      self.assertFalse(strict_v2_safety.begin_request())
       recover_handoffs.assert_not_called()
       recover_memory_broadcasts.assert_not_called()
       recover_durable_broadcasts.assert_not_called()

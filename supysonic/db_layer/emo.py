@@ -308,6 +308,64 @@ class EmoCoreStartupRecovery(_Model):
         )
 
 
+class EmoFollowSafetyLease(_Model):
+    id = PrimaryKeyField()
+    user_name = CharField(64)
+    follower_client_id = CharField(128)
+    follower_device_session_id = CharField(128)
+    follower_connection_nonce = CharField(128)
+    follower_connection_epoch = IntegerField(default=1)
+    source_playback_context_id = CharField(128)
+    source_authority_client_id = CharField(128)
+    source_authority_device_session_id = CharField(128)
+    source_connection_nonce = CharField(128)
+    source_connection_epoch = IntegerField(default=1)
+    suspended_playback_context_id = CharField(128)
+    suspended_authority_client_id = CharField(128)
+    suspended_authority_device_session_id = CharField(128)
+    suspended_connection_nonce = CharField(128)
+    suspended_connection_epoch = IntegerField(default=1)
+    suspended_epoch = IntegerField()
+    suspended_version = IntegerField()
+    suspended_queue_revision = IntegerField()
+    suspended_control_version = IntegerField()
+    suspended_applied_control_version = IntegerField()
+    phase = CharField(32, default="active")
+    follow_reconnect_grace_expires_at_ms = BigIntegerField(null=True)
+    source_recovery_deadline_at_ms = BigIntegerField(null=True)
+    lease_fingerprint = CharField(64, unique=True)
+    start_request_fingerprint = CharField(64)
+    start_ack_json = TextField()
+    stop_request_fingerprint = CharField(64, null=True)
+    cleanup_fingerprint = CharField(64, null=True)
+    created_at_ms = BigIntegerField()
+    updated_at_ms = BigIntegerField()
+    created_at = DateTimeField(default=now)
+    updated_at = DateTimeField(default=now)
+
+    class Meta:
+        indexes = (
+            (
+                (
+                    'user_name',
+                    'follower_client_id',
+                    'follower_device_session_id',
+                ),
+                True,
+            ),
+            (('user_name', 'suspended_playback_context_id'), True),
+            (
+                (
+                    'user_name',
+                    'phase',
+                    'follow_reconnect_grace_expires_at_ms',
+                ),
+                False,
+            ),
+            (('source_playback_context_id', 'phase'), False),
+        )
+
+
 class EmoPlaybackPrepareTransaction(_Model):
     id = PrimaryKeyField()
     playback_context_id = CharField(128)

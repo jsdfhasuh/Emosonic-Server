@@ -15,6 +15,7 @@ from ..db import (
     EmoBroadcastFence,
     EmoCoreStartupRecovery,
     EmoDevicePlaybackState,
+    EmoFollowSafetyLease,
     EmoLocalQueue,
     EmoPlaybackControlTransaction,
     EmoPlaybackControlReconciliation,
@@ -69,6 +70,15 @@ class PlaybackContextBroadcastBarrierError(PlaybackContextEnsureConflictError):
         Exception.__init__(
             self,
             "Playback context is occupied by an active Broadcast",
+        )
+        self.playback_context = playback_context
+
+
+class PlaybackContextFollowBarrierError(PlaybackContextEnsureConflictError):
+    def __init__(self, playback_context=None):
+        Exception.__init__(
+            self,
+            "Playback context is occupied by an active Follow safety lease",
         )
         self.playback_context = playback_context
 
@@ -350,6 +360,40 @@ def _broadcast_fence_for_pair(
     )
 
 
+def _follow_safety_lease_for_context(playback_context_id):
+    return EmoFollowSafetyLease.get_or_none(
+        (
+            EmoFollowSafetyLease.suspended_playback_context_id
+            == playback_context_id
+        )
+        & (
+            EmoFollowSafetyLease.phase.in_(
+                ("active", "reconnectGrace", "cleanupRequired")
+            )
+        )
+    )
+
+
+def _follow_safety_lease_for_pair(
+    user_name,
+    client_id,
+    device_session_id,
+):
+    return EmoFollowSafetyLease.get_or_none(
+        (EmoFollowSafetyLease.user_name == user_name)
+        & (EmoFollowSafetyLease.follower_client_id == client_id)
+        & (
+            EmoFollowSafetyLease.follower_device_session_id
+            == device_session_id
+        )
+        & (
+            EmoFollowSafetyLease.phase.in_(
+                ("active", "reconnectGrace", "cleanupRequired")
+            )
+        )
+    )
+
+
 def _canonical_context_for_barrier(playback_context_id):
     record = EmoPlaybackContext.get_or_none(
         EmoPlaybackContext.playback_context_id == playback_context_id
@@ -366,6 +410,32 @@ def _raise_broadcast_fence(
     if restore_in_progress and fence.phase == "restorePending":
         raise PlaybackContextRestoreInProgressError(playback_context or {})
     raise PlaybackContextBroadcastBarrierError(playback_context)
+
+
+def _raise_follow_fence(lease, playback_context_id=None):
+    context_id = playback_context_id or lease.suspended_playback_context_id
+    playback_context = _canonical_context_for_barrier(context_id)
+    raise PlaybackContextFollowBarrierError(playback_context)
+
+
+def requireFollowSafetyLeaseResourceAvailable(
+    playback_context_id=None,
+    user_name=None,
+    client_id=None,
+    device_session_id=None,
+):
+    if playback_context_id is not None:
+        lease = _follow_safety_lease_for_context(playback_context_id)
+        if lease is not None:
+            _raise_follow_fence(lease, playback_context_id)
+    if user_name is not None:
+        lease = _follow_safety_lease_for_pair(
+            user_name,
+            client_id,
+            device_session_id,
+        )
+        if lease is not None:
+            _raise_follow_fence(lease)
 
 
 def _require_broadcast_context_mutation_allowed(
@@ -417,6 +487,9 @@ def _serialize_strict_playback_context_mutation(function):
         with _strict_playback_context_lock(playback_context_id):
             open_connection(reuse=True)
             try:
+                requireFollowSafetyLeaseResourceAvailable(
+                    playback_context_id=playback_context_id,
+                )
                 _require_broadcast_context_mutation_allowed(
                     playback_context_id,
                     function.__name__,
@@ -435,6 +508,9 @@ def _serialize_strict_playback_context_close(function):
             open_connection(reuse=True)
             try:
                 if user_name is None:
+                    requireFollowSafetyLeaseResourceAvailable(
+                        playback_context_id=playback_context_id,
+                    )
                     _require_broadcast_context_mutation_allowed(
                         playback_context_id,
                         function.__name__,
@@ -449,6 +525,9 @@ def _serialize_strict_playback_context_close(function):
                         & (EmoPlaybackContext.user_name == user_name)
                     )
                     if visible_record is not None:
+                        requireFollowSafetyLeaseResourceAvailable(
+                            playback_context_id=playback_context_id,
+                        )
                         _require_broadcast_context_mutation_allowed(
                             playback_context_id,
                             function.__name__,
@@ -4394,6 +4473,13 @@ def ensureStrictPlaybackContextState(
                                 authority_device_session_id,
                             )
                             if not candidates:
+                                requireFollowSafetyLeaseResourceAvailable(
+                                    user_name=user_name,
+                                    client_id=authority_client_id,
+                                    device_session_id=(
+                                        authority_device_session_id
+                                    ),
+                                )
                                 if pair_fence is not None:
                                     _raise_broadcast_fence(
                                         pair_fence,
@@ -4462,6 +4548,17 @@ def ensureStrictPlaybackContextState(
                             would_initialize = bool(queue_song_ids) and not bool(
                                 json.loads(record.queue_json)
                             )
+                            if rebind or would_initialize:
+                                requireFollowSafetyLeaseResourceAvailable(
+                                    playback_context_id=(
+                                        record.playback_context_id
+                                    ),
+                                    user_name=user_name,
+                                    client_id=authority_client_id,
+                                    device_session_id=(
+                                        authority_device_session_id
+                                    ),
+                                )
                             context_fences = _broadcast_fences_for_context(
                                 record.playback_context_id
                             )
@@ -5524,6 +5621,11 @@ def createStrictPlaybackHandoff(
         with _strict_authority_pair_transaction(
             (old_authority_pair, target_pair)
         ):
+            requireFollowSafetyLeaseResourceAvailable(
+                user_name=user_name,
+                client_id=target_client_id,
+                device_session_id=target_device_session_id,
+            )
             target_fence = _broadcast_fence_for_pair(
                 user_name,
                 target_client_id,
@@ -5588,6 +5690,9 @@ def createStrictPlaybackHandoff(
                 snapshot.pop(field_name, None)
             if target_contexts:
                 standby = target_contexts[0]
+                requireFollowSafetyLeaseResourceAvailable(
+                    playback_context_id=standby.playback_context_id,
+                )
                 standby_fences = _broadcast_fences_for_context(
                     standby.playback_context_id
                 )
@@ -5665,6 +5770,12 @@ def completeStrictPlaybackHandoff(
     with _strict_playback_context_lock_set(context_ids):
         open_connection(reuse=True)
         try:
+            requireFollowSafetyLeaseResourceAvailable(
+                playback_context_id=playback_context_id,
+                user_name=user_name,
+                client_id=target_client_id,
+                device_session_id=target_device_session_id,
+            )
             _require_broadcast_context_mutation_allowed(
                 playback_context_id,
                 "completeStrictPlaybackHandoff",
@@ -5680,6 +5791,9 @@ def completeStrictPlaybackHandoff(
                     target_fence.playback_context_id or playback_context_id,
                 )
             if isinstance(standby_context_id, str) and standby_context_id:
+                requireFollowSafetyLeaseResourceAvailable(
+                    playback_context_id=standby_context_id,
+                )
                 standby_fences = _broadcast_fences_for_context(
                     standby_context_id
                 )

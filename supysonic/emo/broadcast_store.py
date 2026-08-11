@@ -27,7 +27,12 @@ from ..db import (
     now,
     open_connection,
 )
-from .ws_store import strictAuthorityPairLockSet, strictPlaybackContextLockSet
+from .ws_store import (
+    PlaybackContextFollowBarrierError,
+    requireFollowSafetyLeaseResourceAvailable,
+    strictAuthorityPairLockSet,
+    strictPlaybackContextLockSet,
+)
 from .strict_v2_effective_at import projectBroadcastPositionMs
 
 
@@ -480,6 +485,15 @@ def _start_participant_is_available(
         client_id,
         str(participant["deviceSessionId"]),
     )
+    try:
+        requireFollowSafetyLeaseResourceAvailable(
+            playback_context_id=context_id,
+            user_name=user_name,
+            client_id=client_id,
+            device_session_id=str(participant["deviceSessionId"]),
+        )
+    except PlaybackContextFollowBarrierError:
+        return False
     if (
         EmoBroadcastFence.select()
         .where(EmoBroadcastFence.resource_key.in_((context_key, pair_key)))
@@ -741,6 +755,9 @@ def createBroadcastState(
                         raise BroadcastResourceConflictError(
                             "Source Context already has a nonterminal Broadcast"
                         )
+                    requireFollowSafetyLeaseResourceAvailable(
+                        playback_context_id=playback_context_id,
+                    )
                     selected_participants = list(participant_payloads)
                     if skip_unavailable_participants:
                         selected_participants = []
@@ -779,6 +796,15 @@ def createBroadcastState(
                         for participant in selected_participants[available_slots:]:
                             skipped_ids.add(str(participant["clientId"]))
                         selected_participants = selected_participants[:available_slots]
+                    for participant in selected_participants:
+                        requireFollowSafetyLeaseResourceAvailable(
+                            playback_context_id=str(
+                                participant["suspendedPlaybackContextId"]
+                            ),
+                            user_name=user_name,
+                            client_id=str(participant["clientId"]),
+                            device_session_id=str(participant["deviceSessionId"]),
+                        )
                     if not selected_participants:
                         if participant_payloads and available_slots == 0:
                             raise BroadcastLimitError(

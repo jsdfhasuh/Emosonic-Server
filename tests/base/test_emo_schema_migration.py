@@ -47,6 +47,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
         db.EmoPlaybackControlTransaction,
         db.EmoPlaybackControlReconciliation,
         db.EmoCoreStartupRecovery,
+        db.EmoFollowSafetyLease,
         db.EmoPlaybackLocalIntent,
     )
     CLOSE_FIELDS = (
@@ -75,6 +76,8 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
     AUTHORITY_INDEX = "idx_emo_control_authority_generation"
     RECONCILIATION_INDEX = "idx_emo_reconcile_gap"
     RECOVERY_INDEX = "idx_emo_core_recovery_status_completed"
+    FOLLOW_USER_INDEX = "idx_emo_follow_user_phase_deadline"
+    FOLLOW_SOURCE_INDEX = "idx_emo_follow_source_phase"
     RETENTION_INDEXES = {
         "idx_emo_context_close_retention": (
             "emo_playback_context",
@@ -290,7 +293,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             self._assert_external_r11_transaction_schema()
             self._assert_external_r18_broadcast_schema()
             self._assert_external_core_schema_parity(provider)
-            self.assertEqual(db.Meta["schema_version"].value, "20260810")
+            self.assertEqual(db.Meta["schema_version"].value, "20260811")
             self._record_external_evidence(
                 provider,
                 "clean",
@@ -322,7 +325,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             self._assert_external_r11_transaction_schema()
             self._assert_external_r18_broadcast_schema()
             self._assert_external_core_schema_parity(provider)
-            self.assertEqual(db.Meta["schema_version"].value, "20260810")
+            self.assertEqual(db.Meta["schema_version"].value, "20260811")
             self._record_external_evidence(
                 provider,
                 "upgrade_from_20260708",
@@ -565,6 +568,36 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             "emo_core_startup_recovery",
             ("recovery_fingerprint",),
         )
+        self._assert_external_named_index(
+            provider,
+            "emo_follow_safety_lease",
+            self.FOLLOW_USER_INDEX,
+            (
+                "user_name",
+                "phase",
+                "follow_reconnect_grace_expires_at_ms",
+            ),
+        )
+        self._assert_external_named_index(
+            provider,
+            "emo_follow_safety_lease",
+            self.FOLLOW_SOURCE_INDEX,
+            ("source_playback_context_id", "phase"),
+        )
+        for columns in (
+            ("lease_fingerprint",),
+            (
+                "user_name",
+                "follower_client_id",
+                "follower_device_session_id",
+            ),
+            ("user_name", "suspended_playback_context_id"),
+        ):
+            self._assert_external_unique_index(
+                provider,
+                "emo_follow_safety_lease",
+                columns,
+            )
         for index_name, (table_name, columns) in self.RETENTION_INDEXES.items():
             self._assert_external_named_index(
                 provider,
@@ -636,6 +669,18 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             index_columns(self.RECOVERY_INDEX),
             ("status", "completed_at_ms"),
         )
+        self.assertEqual(
+            index_columns(self.FOLLOW_USER_INDEX),
+            (
+                "user_name",
+                "phase",
+                "follow_reconnect_grace_expires_at_ms",
+            ),
+        )
+        self.assertEqual(
+            index_columns(self.FOLLOW_SOURCE_INDEX),
+            ("source_playback_context_id", "phase"),
+        )
         for index_name, (_table_name, columns) in self.RETENTION_INDEXES.items():
             self.assertEqual(index_columns(index_name), columns, index_name)
 
@@ -655,6 +700,22 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             (
                 "emo_core_startup_recovery",
                 ("recovery_fingerprint",),
+            ),
+            (
+                "emo_follow_safety_lease",
+                ("lease_fingerprint",),
+            ),
+            (
+                "emo_follow_safety_lease",
+                (
+                    "user_name",
+                    "follower_client_id",
+                    "follower_device_session_id",
+                ),
+            ),
+            (
+                "emo_follow_safety_lease",
+                ("user_name", "suspended_playback_context_id"),
             ),
         ):
             indexes = db.db.execute_sql(
@@ -1102,7 +1163,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 },
             )
             self._assert_sqlite_core_schema_parity()
-            self.assertEqual(db.Meta["schema_version"].value, "20260810")
+            self.assertEqual(db.Meta["schema_version"].value, "20260811")
         finally:
             db.release_database()
             os.remove(path)
@@ -1146,6 +1207,9 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 ).read_text("utf-8")
                 retention_migration = (
                     root / "migration" / provider / "20260810.sql"
+                ).read_text("utf-8")
+                follow_migration = (
+                    root / "migration" / provider / "20260811.sql"
                 ).read_text("utf-8")
                 for field_name in required_fields:
                     self.assertIn(field_name, base_schema)
@@ -1245,6 +1309,15 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                     self.assertIn(index_name, retention_migration)
                     for column_name in columns:
                         self.assertIn(column_name, retention_migration)
+                for field in db.EmoFollowSafetyLease._meta.sorted_fields:
+                    self.assertIn(field.column_name, base_schema)
+                    self.assertIn(field.column_name, follow_migration)
+                for index_name in (
+                    self.FOLLOW_USER_INDEX,
+                    self.FOLLOW_SOURCE_INDEX,
+                ):
+                    self.assertIn(index_name, base_schema)
+                    self.assertIn(index_name, follow_migration)
                 for table_name in (
                     "emo_broadcast",
                     "emo_broadcast_intent_outcome",
@@ -1325,6 +1398,33 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             db.release_database()
             os.remove(path)
 
+    def test_sqlite_20260810_forward_migration_creates_follow_lease_schema(self):
+        handle, path = tempfile.mkstemp()
+        os.close(handle)
+        initialized = False
+        try:
+            database_uri = "sqlite:///" + path
+            db.init_database(database_uri)
+            initialized = True
+            db.db.execute_sql("DROP TABLE emo_follow_safety_lease")
+            (
+                db.Meta.update(value="20260810")
+                .where(db.Meta.key == "schema_version")
+                .execute()
+            )
+            db.release_database()
+            initialized = False
+
+            db.init_database(database_uri)
+            initialized = True
+            self.assertEqual(db.Meta["schema_version"].value, "20260811")
+            self._assert_sqlite_core_schema_parity()
+            self.assertEqual(db.EmoFollowSafetyLease.select().count(), 0)
+        finally:
+            if initialized:
+                db.release_database()
+            os.remove(path)
+
     def _run_20260728_non_empty_upgrade(self, provider: str, database_uri: str) -> None:
         database_available = False
         initialized = False
@@ -1343,7 +1443,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
 
             db.init_database(database_uri)
             initialized = True
-            self.assertEqual(db.Meta["schema_version"].value, "20260810")
+            self.assertEqual(db.Meta["schema_version"].value, "20260811")
             self._assert_20260728_upgrade_rows()
             context_before = db.db.execute_sql(
                 "SELECT playback_context_id, lifecycle, epoch, version, "
@@ -1378,7 +1478,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
 
             db.init_database(database_uri)
             initialized = True
-            self.assertEqual(db.Meta["schema_version"].value, "20260810")
+            self.assertEqual(db.Meta["schema_version"].value, "20260811")
             self._assert_20260728_recovery_rows()
             replay = recoverPendingPlaybackControlsForStartup(1780000040000)
             self.assertFalse(replay["mutated"])
