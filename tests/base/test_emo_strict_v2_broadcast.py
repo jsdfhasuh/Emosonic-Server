@@ -2678,7 +2678,13 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
                 {
                     "userName": "alice",
                     "sourceClientId": "authority-1",
+                    "sourceDeviceSessionId": "device:authority-1",
+                    "sourceConnectionNonce": "authority-nonce-1",
+                    "sourceConnectionEpoch": 1,
                     "targetClientId": "participant-1",
+                    "targetDeviceSessionId": "device:participant-1",
+                    "targetConnectionNonce": "participant-nonce-1",
+                    "targetConnectionEpoch": 1,
                 },
                 "device:participant-1",
             )
@@ -2737,7 +2743,13 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             "handoffId": "handoff-blocked-target",
             "userName": "alice",
             "sourceClientId": "other-source",
+            "sourceDeviceSessionId": "device:other-source",
+            "sourceConnectionNonce": "other-source-nonce",
+            "sourceConnectionEpoch": 1,
             "targetClientId": "participant-1",
+            "targetDeviceSessionId": "device:participant-1",
+            "targetConnectionNonce": "participant-nonce-1",
+            "targetConnectionEpoch": 1,
             "baseControlVersion": source_result.canonical_context[
                 "controlVersion"
             ],
@@ -2753,7 +2765,13 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             playback_context_id="context-handoff-other-source",
             user_name="alice",
             source_client_id="other-source",
+            source_device_session_id="device:other-source",
+            source_connection_nonce="other-source-nonce",
+            source_connection_epoch=1,
             target_client_id="participant-1",
+            target_device_session_id="device:participant-1",
+            target_connection_nonce="participant-nonce-1",
+            target_connection_epoch=1,
             status="committing",
             base_control_version=source_result.canonical_context[
                 "controlVersion"
@@ -2767,6 +2785,12 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
                 "alice",
                 "participant-1",
                 "device:participant-1",
+                expected_source_client_id="other-source",
+                expected_source_device_session_id="device:other-source",
+                expected_source_connection_nonce="other-source-nonce",
+                expected_source_connection_epoch=1,
+                expected_target_connection_nonce="participant-nonce-1",
+                expected_target_connection_epoch=1,
             )
         unchanged_source = getPlaybackContextState(
             "context-handoff-other-source"

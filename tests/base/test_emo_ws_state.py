@@ -1069,6 +1069,7 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
             "playback:alice:main",
             "phone-1",
             "pc-1",
+            target_device_session_id="root:pc",
             expected_control_version=1,
             playback_state={
                 "state": "playing",
@@ -1082,6 +1083,7 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
 
         self.assertEqual(transferred["playbackContextId"], "playback:alice:main")
         self.assertEqual(transferred["authorityClientId"], "pc-1")
+        self.assertEqual(transferred["authorityDeviceSessionId"], "root:pc")
         self.assertEqual(transferred["originClientId"], "controller-1")
         self.assertEqual(transferred["controlVersion"], 2)
         self.assertEqual(transferred["positionMs"], 200)

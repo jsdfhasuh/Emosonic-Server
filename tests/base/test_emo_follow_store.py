@@ -467,7 +467,13 @@ class EmoFollowStoreTestCase(unittest.TestCase):
             {
                 "userName": "alice",
                 "sourceClientId": "source-1",
+                "sourceDeviceSessionId": "device:source-1",
+                "sourceConnectionNonce": "source-nonce-1",
+                "sourceConnectionEpoch": 1,
                 "targetClientId": "follower-1",
+                "targetDeviceSessionId": "device:follower-1",
+                "targetConnectionNonce": "follower-nonce-1",
+                "targetConnectionEpoch": 1,
                 "baseControlVersion": 1,
                 "handoffId": "handoff-existing",
                 "snapshot": {
@@ -562,7 +568,13 @@ class EmoFollowStoreTestCase(unittest.TestCase):
                     {
                         "userName": "alice",
                         "sourceClientId": "source-1",
+                        "sourceDeviceSessionId": "device:source-1",
+                        "sourceConnectionNonce": "source-nonce-1",
+                        "sourceConnectionEpoch": 1,
                         "targetClientId": "follower-1",
+                        "targetDeviceSessionId": "device:follower-1",
+                        "targetConnectionNonce": "follower-nonce-1",
+                        "targetConnectionEpoch": 1,
                         "baseControlVersion": 1,
                         "handoffId": "handoff-race",
                         "snapshot": {
@@ -1181,7 +1193,13 @@ class EmoFollowStoreTestCase(unittest.TestCase):
                 {
                     "userName": "alice",
                     "sourceClientId": "source-1",
+                    "sourceDeviceSessionId": "device:source-1",
+                    "sourceConnectionNonce": "source-nonce-1",
+                    "sourceConnectionEpoch": 1,
                     "targetClientId": "follower-1",
+                    "targetDeviceSessionId": "device:follower-1",
+                    "targetConnectionNonce": "follower-nonce-1",
+                    "targetConnectionEpoch": 1,
                     "baseControlVersion": 1,
                     "handoffId": "handoff-1",
                 },

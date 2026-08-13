@@ -251,7 +251,14 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
         )
         return response["payload"]
 
-    def report_web_context(self, player, context_id, device_session_id, client_seq=1):
+    def report_web_context(
+        self,
+        player,
+        context_id,
+        device_session_id,
+        client_seq=1,
+        state=None,
+    ):
         context = getPlaybackContextState(context_id)
         player.emit(
             "message",
@@ -264,7 +271,7 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
                     "deviceSessionId": device_session_id,
                     "origin": "passive",
                     "appliedControlVersion": context["controlVersion"],
-                    "state": context["state"],
+                    "state": state or context["state"],
                     "trackId": context["trackId"],
                     "positionMs": context["positionMs"],
                     "positionSampledAtServerMs": int(time.time() * 1000),
@@ -1116,12 +1123,20 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
     def test_exact_web_handoff_completes_controller_and_two_player_flow(self):
         self.login()
         source = self.register_web_player(
-            "web-player-source", "web-player-device:source"
+            "web-player-source",
+            "web-player-device:source",
+            effective_at_playback=True,
         )
         context = self.create_web_context(
             source,
             context_id="ctx-handoff",
             device_session_id="web-player-device:source",
+        )
+        self.report_web_context(
+            source,
+            "ctx-handoff",
+            "web-player-device:source",
+            state="playing",
         )
         target = self.register_web_player(
             "web-player-target",
@@ -1136,6 +1151,7 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
         start["payload"] = {
             "playbackContextId": "ctx-handoff",
             "targetClientId": "web-player-target",
+            "targetDeviceSessionId": "web-player-device:target",
             "baseControlVersion": context["controlVersion"],
         }
         control.emit("message", start, namespace="/emo")
@@ -1145,6 +1161,7 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
             for message in control_start_messages
             if message.get("requestId") == start["requestId"]
         )
+        self.assertEqual(start_ack["action"], "system.ack", start_ack)
         handoff_id = start_ack["payload"]["handoffId"]
         prepare_id = start_ack["payload"]["prepareId"]
         prepare = next(

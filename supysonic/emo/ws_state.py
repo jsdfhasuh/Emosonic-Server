@@ -525,30 +525,16 @@ class WebSocketState:
         stale_after_seconds=DEFAULT_CLIENT_STALE_SECONDS,
         now=None,
         pre_remove_callback=None,
+        lifecycle_key_resolver=None,
     ):
         if stale_after_seconds is None or stale_after_seconds <= 0:
             return []
 
         now = time.time() if now is None else now
-        with self._lock:
-            stale_keys = []
-            for client_key, client_info in self._clients.items():
-                last_seen_at = client_info.get("lastSeenAt") or client_info.get(
-                    "connectedAt"
-                )
-                if (
-                    last_seen_at is not None
-                    and now - last_seen_at > stale_after_seconds
-                ):
-                    stale_keys.append(client_key)
-
-        removed = []
-        with strictPhysicalGenerationLockSet(stale_keys):
-            for client_key in stale_keys:
-                with self._lock:
-                    client_info = self._clients.get(client_key)
-                    if client_info is None:
-                        continue
+        while True:
+            with self._lock:
+                observed = []
+                for client_key, client_info in self._clients.items():
                     last_seen_at = client_info.get("lastSeenAt") or client_info.get(
                         "connectedAt"
                     )
@@ -557,56 +543,120 @@ class WebSocketState:
                         or now - last_seen_at <= stale_after_seconds
                     ):
                         continue
-                    client_id = client_info.get("clientId")
                     sid = self._client_to_sid.get(client_key)
                     session_info = (
                         None if sid is None else self._sessions.get(sid)
                     )
-                    callback_client = dict(client_info)
-                    callback_session = (
-                        None
-                        if session_info is None
-                        else dict(session_info)
+                    observed.append(
+                        (
+                            client_key,
+                            dict(client_info),
+                            None if session_info is None else dict(session_info),
+                            sid,
+                        )
                     )
-                if pre_remove_callback is not None:
-                    pre_remove_callback(callback_client, callback_session)
-                with self._lock:
-                    client_info = self._clients.get(client_key)
-                    if client_info is None:
-                        continue
-                    last_seen_at = client_info.get("lastSeenAt") or client_info.get(
-                        "connectedAt"
+            if not observed:
+                return []
+
+            lifecycle_keys = {item[0] for item in observed}
+            if lifecycle_key_resolver is not None:
+                for _client_key, client_info, session_info, _sid in observed:
+                    lifecycle_keys.update(
+                        lifecycle_key_resolver(client_info, session_info) or ()
                     )
-                    if (
-                        last_seen_at is None
-                        or now - last_seen_at <= stale_after_seconds
-                    ):
-                        continue
-                    client_id = client_info.get("clientId")
-                    sid = self._client_to_sid.get(client_key)
-                    if sid is not None:
-                        session_info = self._sessions.get(sid)
+
+            removed = []
+            retry = False
+            with strictPhysicalGenerationLockSet(lifecycle_keys):
+                current_observed = []
+                for client_key, _client_info, _session_info, _sid in observed:
+                    with self._lock:
+                        client_info = self._clients.get(client_key)
+                        if client_info is None:
+                            continue
+                        last_seen_at = client_info.get("lastSeenAt") or client_info.get(
+                            "connectedAt"
+                        )
                         if (
-                            session_info is not None
-                            and session_info.get("clientId") == client_id
+                            last_seen_at is None
+                            or now - last_seen_at <= stale_after_seconds
                         ):
-                            session_info["clientId"] = None
-                    self._client_to_sid.pop(client_key, None)
-                    removed_client = self._clients.pop(client_key)
-                    self._clear_device_volume_state_locked(
-                        removed_client.get("userName"),
-                        client_id,
-                        removed_client.get("deviceSessionId"),
-                    )
-                    self._mark_broadcast_participant_offline_locked(
-                        client_id,
-                        now=now,
-                    )
-                    self._deactivate_follow_relationships_for_client_locked(
-                        client_id,
-                        now=now,
-                    )
-                    removed.append(removed_client)
+                            continue
+                        sid = self._client_to_sid.get(client_key)
+                        session_info = (
+                            None if sid is None else self._sessions.get(sid)
+                        )
+                        current_observed.append(
+                            (
+                                client_key,
+                                dict(client_info),
+                                None
+                                if session_info is None
+                                else dict(session_info),
+                                sid,
+                            )
+                        )
+                if lifecycle_key_resolver is not None:
+                    current_keys = {item[0] for item in current_observed}
+                    for (
+                        _client_key,
+                        client_info,
+                        session_info,
+                        _sid,
+                    ) in current_observed:
+                        current_keys.update(
+                            lifecycle_key_resolver(client_info, session_info) or ()
+                        )
+                    if not current_keys <= lifecycle_keys:
+                        retry = True
+                if retry:
+                    continue
+
+                for (
+                    client_key,
+                    callback_client,
+                    callback_session,
+                    observed_sid,
+                ) in current_observed:
+                    if pre_remove_callback is not None:
+                        pre_remove_callback(callback_client, callback_session)
+                    with self._lock:
+                        client_info = self._clients.get(client_key)
+                        if client_info is None:
+                            continue
+                        last_seen_at = client_info.get("lastSeenAt") or client_info.get(
+                            "connectedAt"
+                        )
+                        if (
+                            last_seen_at is None
+                            or now - last_seen_at <= stale_after_seconds
+                            or self._client_to_sid.get(client_key) != observed_sid
+                        ):
+                            continue
+                        client_id = client_info.get("clientId")
+                        if observed_sid is not None:
+                            session_info = self._sessions.get(observed_sid)
+                            if (
+                                session_info is not None
+                                and session_info.get("clientId") == client_id
+                            ):
+                                session_info["clientId"] = None
+                        self._client_to_sid.pop(client_key, None)
+                        removed_client = self._clients.pop(client_key)
+                        self._clear_device_volume_state_locked(
+                            removed_client.get("userName"),
+                            client_id,
+                            removed_client.get("deviceSessionId"),
+                        )
+                        self._mark_broadcast_participant_offline_locked(
+                            client_id,
+                            now=now,
+                        )
+                        self._deactivate_follow_relationships_for_client_locked(
+                            client_id,
+                            now=now,
+                        )
+                        removed.append(removed_client)
             return [dict(client) for client in removed]
 
     def unregister_session(self, sid):
@@ -1895,6 +1945,7 @@ class WebSocketState:
         playback_context_id,
         source_client_id,
         target_client_id,
+        target_device_session_id=None,
         expected_control_version=None,
         next_control_version=None,
         playback_state=None,
@@ -1922,6 +1973,8 @@ class WebSocketState:
             previous_track_id = context.get("trackId")
             previous_index = context.get("currentIndex", 0)
             context["authorityClientId"] = target_client_id
+            if target_device_session_id is not None:
+                context["authorityDeviceSessionId"] = target_device_session_id
             context["originClientId"] = origin_client_id or source_client_id
             if "queueSongIds" in playback_state:
                 context["queueSongIds"] = list(playback_state.get("queueSongIds") or [])
@@ -1967,6 +2020,12 @@ class WebSocketState:
         snapshot,
         prepare_id=None,
         origin_client_id=None,
+        source_device_session_id=None,
+        source_connection_nonce=None,
+        source_connection_epoch=None,
+        target_device_session_id=None,
+        target_connection_nonce=None,
+        target_connection_epoch=None,
         now=None,
     ):
         now_ms = _timestamp_ms(now)
@@ -2004,6 +2063,21 @@ class WebSocketState:
                 "createdAtMs": now_ms,
                 "updatedAtMs": now_ms,
             }
+            generation = {
+                "sourceDeviceSessionId": source_device_session_id,
+                "sourceConnectionNonce": source_connection_nonce,
+                "sourceConnectionEpoch": source_connection_epoch,
+                "targetDeviceSessionId": target_device_session_id,
+                "targetConnectionNonce": target_connection_nonce,
+                "targetConnectionEpoch": target_connection_epoch,
+            }
+            handoff.update(
+                {
+                    field_name: value
+                    for field_name, value in generation.items()
+                    if value is not None
+                }
+            )
             if prepare_id is not None:
                 handoff["prepareId"] = prepare_id
             self._handoffs[handoff_id] = handoff
@@ -2102,7 +2176,11 @@ class WebSocketState:
 
     def fail_playback_handoffs_for_disconnect(
         self,
+        user_name: str,
         client_id: str,
+        device_session_id: str,
+        connection_nonce: str,
+        connection_epoch: int,
         now: Optional[float] = None,
     ) -> List[Dict[str, object]]:
         now_ms = _timestamp_ms(now)
@@ -2116,11 +2194,31 @@ class WebSocketState:
                     "committing",
                 ):
                     continue
-                if handoff.get("targetClientId") == client_id:
+                target_matches = (
+                    handoff.get("userName") == user_name
+                    and handoff.get("targetClientId") == client_id
+                    and handoff.get("targetDeviceSessionId")
+                    == device_session_id
+                    and handoff.get("targetConnectionNonce")
+                    == connection_nonce
+                    and handoff.get("targetConnectionEpoch")
+                    == connection_epoch
+                )
+                source_matches = (
+                    handoff.get("userName") == user_name
+                    and handoff.get("sourceClientId") == client_id
+                    and handoff.get("sourceDeviceSessionId")
+                    == device_session_id
+                    and handoff.get("sourceConnectionNonce")
+                    == connection_nonce
+                    and handoff.get("sourceConnectionEpoch")
+                    == connection_epoch
+                )
+                if target_matches:
                     handoff["status"] = "failed"
                     handoff["errorCode"] = "target_disconnected"
                     handoff["errorMessage"] = "Handoff target disconnected"
-                elif handoff.get("sourceClientId") == client_id:
+                elif source_matches:
                     handoff["status"] = "cancelled"
                     handoff["errorCode"] = "source_disconnected"
                     handoff["errorMessage"] = "Handoff source disconnected"

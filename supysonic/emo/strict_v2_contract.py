@@ -149,7 +149,13 @@ ACTION_SCHEMAS = {
     ),
     "follow.stop": ActionSchema("command", ("sourcePlaybackContextId",)),
     "playback.handoff.start": ActionSchema(
-        "command", ("playbackContextId", "targetClientId", "baseControlVersion")
+        "command",
+        (
+            "playbackContextId",
+            "targetClientId",
+            "targetDeviceSessionId",
+            "baseControlVersion",
+        ),
     ),
     "playback.ready": ActionSchema(
         "event",

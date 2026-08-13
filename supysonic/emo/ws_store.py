@@ -83,6 +83,15 @@ class PlaybackContextFollowBarrierError(PlaybackContextEnsureConflictError):
         self.playback_context = playback_context
 
 
+class PlaybackContextHandoffBarrierError(PlaybackContextEnsureConflictError):
+    def __init__(self, playback_context=None):
+        Exception.__init__(
+            self,
+            "Playback context is occupied by an active Handoff",
+        )
+        self.playback_context = playback_context
+
+
 class PlaybackContextRestoreInProgressError(Exception):
     def __init__(self, playback_context):
         super().__init__("Original playback context restore is in progress")
@@ -155,6 +164,23 @@ _TRACK_CHANGING_CONTROL_ACTIONS = frozenset(
     }
 )
 _TERMINAL_CONTROL_STATUSES = ("committed", "failed", "superseded")
+HANDOFF_NONTERMINAL_STATUSES = (
+    "preparing",
+    "ready",
+    "committed",
+    "committing",
+)
+HANDOFF_TERMINAL_STATUSES = (
+    "completed",
+    "cancelled",
+    "failed",
+    "timed_out",
+    # Historical rows used transport- and runtime-facing spellings.
+    "canceled",
+    "timedOut",
+    "aborted",
+    "superseded",
+)
 
 STRICT_CORE_RETENTION_LIMIT = 512
 STRICT_CORE_RETRY_WINDOW_MS = 10 * 60 * 1000
@@ -339,6 +365,13 @@ _SOURCE_BROADCAST_ALLOWED_MUTATIONS = {
     "settlePlaybackControlTransaction",
 }
 
+_HANDOFF_ALLOWED_CONTEXT_MUTATIONS = {
+    "createStrictPlaybackHandoff",
+    "commitStrictPlaybackHandoff",
+    "completeStrictPlaybackHandoff",
+    "terminateStrictPlaybackHandoff",
+}
+
 
 def _broadcast_fences_for_context(playback_context_id):
     return list(
@@ -418,6 +451,239 @@ def _raise_follow_fence(lease, playback_context_id=None):
     raise PlaybackContextFollowBarrierError(playback_context)
 
 
+def _handoff_snapshot(record):
+    snapshot = _load_json_object(record.snapshot_json) or {}
+    return _sanitize_handoff_snapshot(snapshot)
+
+
+def _sanitize_handoff_snapshot(value):
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_handoff_snapshot(item)
+            for key, item in value.items()
+            if key not in {"sid", "sourceSid", "targetSid", "requestSid"}
+        }
+    if isinstance(value, list):
+        return [_sanitize_handoff_snapshot(item) for item in value]
+    return value
+
+
+def serializePlaybackHandoff(record):
+    if record is None:
+        return None
+    snapshot = _handoff_snapshot(record)
+    payload = {
+        "handoffId": record.handoff_id,
+        "requestId": record.request_id,
+        "playbackContextId": record.playback_context_id,
+        "userName": record.user_name,
+        "sourceClientId": record.source_client_id,
+        "targetClientId": record.target_client_id,
+        "originClientId": record.origin_client_id,
+        "status": record.status,
+        "baseControlVersion": record.base_control_version,
+        "controlVersion": snapshot.get("handoffControlVersion"),
+        "prepareId": snapshot.get("prepareId"),
+        "prepareExpiresAtMs": snapshot.get("prepareExpiresAtMs"),
+        "completeExpiresAtMs": snapshot.get("completeExpiresAtMs"),
+        "snapshot": snapshot,
+        "errorCode": record.error_code,
+        "errorMessage": record.error_message,
+        "createdAt": record.created_at.timestamp(),
+        "updatedAt": record.updated_at.timestamp(),
+    }
+    generation = {
+        "sourceDeviceSessionId": record.source_device_session_id,
+        "sourceConnectionNonce": record.source_connection_nonce,
+        "sourceConnectionEpoch": record.source_connection_epoch,
+        "targetDeviceSessionId": record.target_device_session_id,
+        "targetConnectionNonce": record.target_connection_nonce,
+        "targetConnectionEpoch": record.target_connection_epoch,
+    }
+    payload.update(
+        {field_name: value for field_name, value in generation.items() if value is not None}
+    )
+    return payload
+
+
+def _handoff_has_complete_generation(record):
+    return all(
+        isinstance(value, str) and value.strip()
+        for value in (
+            record.source_device_session_id,
+            record.source_connection_nonce,
+            record.target_device_session_id,
+            record.target_connection_nonce,
+        )
+    ) and all(
+        type(value) is int and value == 1
+        for value in (
+            record.source_connection_epoch,
+            record.target_connection_epoch,
+        )
+    )
+
+
+def _require_handoff_generation(record):
+    if not _handoff_has_complete_generation(record):
+        raise PlaybackHandoffTargetConflictError(
+            "Playback handoff physical generation is incomplete"
+        )
+
+
+def _active_handoff_records(user_name=None):
+    expression = EmoPlaybackHandoff.status.in_(HANDOFF_NONTERMINAL_STATUSES)
+    if user_name is not None:
+        expression &= EmoPlaybackHandoff.user_name == user_name
+    return list(
+        EmoPlaybackHandoff.select()
+        .where(expression)
+        .order_by(EmoPlaybackHandoff.created_at, EmoPlaybackHandoff.handoff_id)
+    )
+
+
+def _active_handoff_for_context(playback_context_id, user_name=None):
+    for record in _active_handoff_records(user_name=user_name):
+        if record.playback_context_id == playback_context_id:
+            return record, "source"
+        if _handoff_snapshot(record).get(
+            "targetStandbyPlaybackContextId"
+        ) == playback_context_id:
+            return record, "standby"
+    return None, None
+
+
+def _handoff_occupies_context(record, playback_context_id):
+    if record.playback_context_id == playback_context_id:
+        return True
+    return _handoff_snapshot(record).get(
+        "targetStandbyPlaybackContextId"
+    ) == playback_context_id
+
+
+def _handoff_occupies_pair(record, user_name, client_id, device_session_id):
+    if record.user_name != user_name:
+        return False
+    return (
+        record.target_client_id == client_id
+        and record.target_device_session_id == device_session_id
+    ) or (
+        record.source_client_id == client_id
+        and record.source_device_session_id == device_session_id
+    )
+
+
+def _handoff_source_update_changes_actual(record, payload, existing=None):
+    baseline = (
+        _device_playback_state_payload(existing)
+        if existing is not None
+        else _handoff_snapshot(record)
+    )
+    expected_track_id = baseline.get("trackId")
+    expected_state = baseline.get("state")
+    expected_rate = baseline.get("playbackRate", 1.0)
+    expected_position_ms = baseline.get("positionMs", 0)
+    expected_sample_ms = baseline.get("positionSampledAtServerMs", 0)
+    return (
+        payload.get("trackId") != expected_track_id
+        or payload.get("state") != expected_state
+        or payload.get("playbackRate", 1.0) != expected_rate
+        or payload.get("positionMs", 0) < expected_position_ms
+        or payload.get("positionSampledAtServerMs", 0) < expected_sample_ms
+    )
+
+
+def _settle_handoff_source_changed(record):
+    record.status = "failed"
+    record.error_code = "source_changed"
+    record.error_message = "Handoff source playback changed"
+    record.updated_at = now()
+    record.save(
+        only=(
+            EmoPlaybackHandoff.status,
+            EmoPlaybackHandoff.error_code,
+            EmoPlaybackHandoff.error_message,
+            EmoPlaybackHandoff.updated_at,
+        )
+    )
+    return serializePlaybackHandoff(record)
+
+
+def _handoff_generation_matches(
+    record,
+    role,
+    user_name,
+    client_id,
+    device_session_id,
+    connection_nonce,
+    connection_epoch,
+):
+    return (
+        record.user_name == user_name
+        and getattr(record, "%s_client_id" % role) == client_id
+        and getattr(record, "%s_device_session_id" % role)
+        == device_session_id
+        and getattr(record, "%s_connection_nonce" % role)
+        == connection_nonce
+        and getattr(record, "%s_connection_epoch" % role)
+        == connection_epoch
+    )
+
+
+def _validate_handoff_generation_arguments(
+    user_name,
+    client_id,
+    device_session_id,
+    connection_nonce,
+    connection_epoch,
+):
+    for field_name, value in (
+        ("userName", user_name),
+        ("clientId", client_id),
+        ("deviceSessionId", device_session_id),
+        ("connectionNonce", connection_nonce),
+    ):
+        _require_non_empty_string(value, field_name, 128)
+    _require_integer(connection_epoch, "connectionEpoch", 1)
+    if connection_epoch != 1:
+        raise ValueError("connectionEpoch must be exactly 1")
+
+
+def _raise_handoff_fence(record, playback_context_id=None):
+    context_id = playback_context_id or record.playback_context_id
+    playback_context = _canonical_context_for_barrier(context_id)
+    raise PlaybackContextHandoffBarrierError(playback_context)
+
+
+def requirePlaybackHandoffResourceAvailable(
+    playback_context_id=None,
+    user_name=None,
+    client_id=None,
+    device_session_id=None,
+    mutation_name=None,
+    allowed_handoff_id=None,
+):
+    records = _active_handoff_records(user_name=user_name)
+    for record in records:
+        if (
+            allowed_handoff_id is not None
+            and record.handoff_id == allowed_handoff_id
+        ):
+            continue
+        if playback_context_id is not None and _handoff_occupies_context(
+            record,
+            playback_context_id,
+        ):
+            _raise_handoff_fence(record, playback_context_id)
+        if user_name is not None and _handoff_occupies_pair(
+            record,
+            user_name,
+            client_id,
+            device_session_id,
+        ):
+            _raise_handoff_fence(record)
+
+
 def requireFollowSafetyLeaseResourceAvailable(
     playback_context_id=None,
     user_name=None,
@@ -490,6 +756,26 @@ def _serialize_strict_playback_context_mutation(function):
                 requireFollowSafetyLeaseResourceAvailable(
                     playback_context_id=playback_context_id,
                 )
+                if function.__name__ != "applyStrictPlaybackUpdate":
+                    allowed_handoff_id = None
+                    if function.__name__ == "createStrictPlaybackHandoff" and args:
+                        handoff = args[0]
+                        if isinstance(handoff, dict):
+                            allowed_handoff_id = handoff.get("handoffId")
+                    elif (
+                        function.__name__
+                        in {
+                            "commitStrictPlaybackHandoff",
+                            "terminateStrictPlaybackHandoff",
+                        }
+                        and args
+                    ):
+                        allowed_handoff_id = args[0]
+                    requirePlaybackHandoffResourceAvailable(
+                        playback_context_id=playback_context_id,
+                        mutation_name=function.__name__,
+                        allowed_handoff_id=allowed_handoff_id,
+                    )
                 _require_broadcast_context_mutation_allowed(
                     playback_context_id,
                     function.__name__,
@@ -3158,6 +3444,45 @@ def applyStrictPlaybackUpdate(
             terminal_control_versions = []
             control_reconciliation = None
             natural_terminal = False
+            handoff_settlement = None
+            handoff_source_changes = False
+            handoff_record, handoff_role = _active_handoff_for_context(
+                playback_context_id,
+                user_name=user_name,
+            )
+            if handoff_record is not None:
+                if handoff_role != "source":
+                    _raise_handoff_fence(
+                        handoff_record,
+                        playback_context_id,
+                    )
+                _require_handoff_generation(handoff_record)
+                if not _handoff_generation_matches(
+                    handoff_record,
+                    "source",
+                    user_name,
+                    client_id,
+                    device_session_id,
+                    connection_nonce,
+                    handoff_record.source_connection_epoch,
+                ):
+                    _raise_handoff_fence(
+                        handoff_record,
+                        playback_context_id,
+                    )
+                if origin == "remoteCommand":
+                    _raise_handoff_fence(
+                        handoff_record,
+                        playback_context_id,
+                    )
+                handoff_source_changes = origin == "localUser" or (
+                    origin == "passive"
+                    and _handoff_source_update_changes_actual(
+                        handoff_record,
+                        payload,
+                        existing=existing if same_scope else None,
+                    )
+                )
 
             if origin == "passive":
                 applied = payload["appliedControlVersion"]
@@ -3186,6 +3511,10 @@ def applyStrictPlaybackUpdate(
                 if last_applied is not None and applied != last_applied:
                     raise PlaybackControlTransactionConflictError(
                         "Passive update cannot advance appliedControlVersion"
+                    )
+                if handoff_source_changes:
+                    handoff_settlement = _settle_handoff_source_changed(
+                        handoff_record
                     )
                 reconciliation_result = _reconcile_terminal_control_gap(
                     record,
@@ -3445,6 +3774,10 @@ def applyStrictPlaybackUpdate(
                         "terminalControlVersions": [],
                     }
 
+                if handoff_source_changes:
+                    handoff_settlement = _settle_handoff_source_changed(
+                        handoff_record
+                    )
                 superseded_through = record.control_version
                 record.control_version += 1
                 record.version += 1
@@ -3543,6 +3876,8 @@ def applyStrictPlaybackUpdate(
             }
             if control_reconciliation is not None:
                 result["controlReconciliation"] = control_reconciliation
+            if handoff_settlement is not None:
+                result["handoffSettlement"] = handoff_settlement
             if natural_terminal:
                 result["naturalTerminal"] = True
             if post_mutation_hook is not None:
@@ -4480,6 +4815,13 @@ def ensureStrictPlaybackContextState(
                                         authority_device_session_id
                                     ),
                                 )
+                                requirePlaybackHandoffResourceAvailable(
+                                    user_name=user_name,
+                                    client_id=authority_client_id,
+                                    device_session_id=(
+                                        authority_device_session_id
+                                    ),
+                                )
                                 if pair_fence is not None:
                                     _raise_broadcast_fence(
                                         pair_fence,
@@ -4550,6 +4892,16 @@ def ensureStrictPlaybackContextState(
                             )
                             if rebind or would_initialize:
                                 requireFollowSafetyLeaseResourceAvailable(
+                                    playback_context_id=(
+                                        record.playback_context_id
+                                    ),
+                                    user_name=user_name,
+                                    client_id=authority_client_id,
+                                    device_session_id=(
+                                        authority_device_session_id
+                                    ),
+                                )
+                                requirePlaybackHandoffResourceAvailable(
                                     playback_context_id=(
                                         record.playback_context_id
                                     ),
@@ -4868,15 +5220,14 @@ def closeStrictPlaybackContextState(
                         current,
                         "Playback context has a pending control transaction",
                     )
-                has_nonterminal_handoff = (
-                    EmoPlaybackHandoff.select()
-                    .where(
-                        (EmoPlaybackHandoff.playback_context_id == playback_context_id)
-                        & EmoPlaybackHandoff.status.in_(
-                            ("preparing", "ready", "committed", "committing")
-                        )
+                has_nonterminal_handoff = any(
+                    _handoff_occupies_context(
+                        handoff_record,
+                        playback_context_id,
                     )
-                    .exists()
+                    for handoff_record in _active_handoff_records(
+                        user_name=user_name
+                    )
                 )
                 if has_nonterminal_handoff:
                     raise PlaybackContextCloseConflictError(
@@ -5558,6 +5909,7 @@ def updatePlaybackContextState(playback_context_id, user_name, playback_context)
 def _active_handoff_target_context_records(
     user_name: str,
     target_client_id: str,
+    target_device_session_id: str,
 ) -> List[EmoPlaybackContext]:
     return list(
         EmoPlaybackContext.select()
@@ -5565,6 +5917,10 @@ def _active_handoff_target_context_records(
             (EmoPlaybackContext.user_name == user_name)
             & (EmoPlaybackContext.lifecycle == "active")
             & (EmoPlaybackContext.authority_client_id == target_client_id)
+            & (
+                EmoPlaybackContext.authority_device_session_id
+                == target_device_session_id
+            )
         )
         .order_by(EmoPlaybackContext.playback_context_id)
         .limit(3)
@@ -5608,6 +5964,28 @@ def createStrictPlaybackHandoff(
     user_name = handoff["userName"]
     source_client_id = handoff["sourceClientId"]
     target_client_id = handoff["targetClientId"]
+    source_device_session_id = handoff.get("sourceDeviceSessionId")
+    source_connection_nonce = handoff.get("sourceConnectionNonce")
+    source_connection_epoch = handoff.get("sourceConnectionEpoch")
+    durable_target_device_session_id = handoff.get("targetDeviceSessionId")
+    target_connection_nonce = handoff.get("targetConnectionNonce")
+    target_connection_epoch = handoff.get("targetConnectionEpoch")
+    for field_name, value in (
+        ("sourceDeviceSessionId", source_device_session_id),
+        ("sourceConnectionNonce", source_connection_nonce),
+        ("targetDeviceSessionId", durable_target_device_session_id),
+        ("targetConnectionNonce", target_connection_nonce),
+    ):
+        _require_non_empty_string(value, field_name, 128)
+    for field_name, value in (
+        ("sourceConnectionEpoch", source_connection_epoch),
+        ("targetConnectionEpoch", target_connection_epoch),
+    ):
+        _require_integer(value, field_name, 1)
+        if value != 1:
+            raise ValueError("%s must be exactly 1" % field_name)
+    if durable_target_device_session_id != target_device_session_id:
+        raise ValueError("Handoff target device generation does not match")
     open_connection(reuse=True)
     try:
         initial_source = EmoPlaybackContext.get_or_none(
@@ -5629,6 +6007,12 @@ def createStrictPlaybackHandoff(
                 client_id=target_client_id,
                 device_session_id=target_device_session_id,
             )
+            requirePlaybackHandoffResourceAvailable(
+                user_name=user_name,
+                client_id=target_client_id,
+                device_session_id=target_device_session_id,
+                allowed_handoff_id=handoff["handoffId"],
+            )
             target_fence = _broadcast_fence_for_pair(
                 user_name,
                 target_client_id,
@@ -5649,6 +6033,13 @@ def createStrictPlaybackHandoff(
                 raise PermissionError(
                     "Playback handoff source is no longer authority"
                 )
+            if (
+                source_record.authority_device_session_id
+                != source_device_session_id
+            ):
+                raise PermissionError(
+                    "Playback handoff source device is no longer authority"
+                )
             if source_record.control_version != handoff["baseControlVersion"]:
                 raise PlaybackContextStaleVersionError(
                     _playback_context_payload(source_record),
@@ -5662,14 +6053,21 @@ def createStrictPlaybackHandoff(
             )
             if active_handoff is not None:
                 if active_handoff.handoff_id == handoff["handoffId"]:
-                    existing_snapshot = (
-                        json.loads(active_handoff.snapshot_json)
-                        if active_handoff.snapshot_json
-                        else {}
-                    )
-                    existing = dict(handoff)
-                    existing["snapshot"] = existing_snapshot
-                    existing["status"] = active_handoff.status
+                    existing = serializePlaybackHandoff(active_handoff)
+                    if any(
+                        existing.get(field_name) != handoff.get(field_name)
+                        for field_name in (
+                            "sourceDeviceSessionId",
+                            "sourceConnectionNonce",
+                            "sourceConnectionEpoch",
+                            "targetDeviceSessionId",
+                            "targetConnectionNonce",
+                            "targetConnectionEpoch",
+                        )
+                    ):
+                        raise PlaybackHandoffTargetConflictError(
+                            "Playback handoff physical generation conflicts"
+                        )
                     return existing, False
                 raise PlaybackHandoffTargetConflictError(
                     "Playback handoff already in progress"
@@ -5678,6 +6076,7 @@ def createStrictPlaybackHandoff(
             target_contexts = _active_handoff_target_context_records(
                 user_name,
                 target_client_id,
+                target_device_session_id,
             )
             if len(target_contexts) > 1:
                 raise PlaybackHandoffTargetConflictError(
@@ -5695,6 +6094,10 @@ def createStrictPlaybackHandoff(
                 standby = target_contexts[0]
                 requireFollowSafetyLeaseResourceAvailable(
                     playback_context_id=standby.playback_context_id,
+                )
+                requirePlaybackHandoffResourceAvailable(
+                    playback_context_id=standby.playback_context_id,
+                    allowed_handoff_id=handoff["handoffId"],
                 )
                 standby_fences = _broadcast_fences_for_context(
                     standby.playback_context_id
@@ -5722,22 +6125,75 @@ def createStrictPlaybackHandoff(
                         ),
                     }
                 )
+            source_device_record = EmoDevicePlaybackState.get_or_none(
+                (
+                    EmoDevicePlaybackState.playback_context_id
+                    == playback_context_id
+                )
+                & (
+                    EmoDevicePlaybackState.owner_client_id
+                    == source_client_id
+                )
+                & (
+                    EmoDevicePlaybackState.device_session_id
+                    == source_device_session_id
+                )
+            )
+            source_device_payload = (
+                _device_playback_state_payload(source_device_record)
+                if source_device_record is not None
+                else {}
+            )
+            snapshot.update(
+                {
+                    "sourceEpoch": source_record.epoch,
+                    "sourceVersion": source_record.version,
+                    "sourceQueueRevision": source_record.queue_revision,
+                    "sourceControlVersion": source_record.control_version,
+                    "trackId": source_device_payload.get(
+                        "trackId",
+                        source_record.track_id,
+                    ),
+                    "state": source_device_payload.get(
+                        "state",
+                        source_record.state,
+                    ),
+                    "positionMs": source_device_payload.get(
+                        "positionMs",
+                        source_record.position_ms,
+                    ),
+                    "positionSampledAtServerMs": source_device_payload.get(
+                        "positionSampledAtServerMs",
+                        int(source_record.updated_at.timestamp() * 1000),
+                    ),
+                    "playbackRate": source_device_payload.get(
+                        "playbackRate",
+                        1.0,
+                    ),
+                }
+            )
             record = EmoPlaybackHandoff.create(
                 handoff_id=handoff["handoffId"],
                 request_id=handoff.get("requestId"),
                 playback_context_id=playback_context_id,
                 user_name=user_name,
                 source_client_id=source_client_id,
+                source_device_session_id=source_device_session_id,
+                source_connection_nonce=source_connection_nonce,
+                source_connection_epoch=source_connection_epoch,
                 target_client_id=target_client_id,
+                target_device_session_id=target_device_session_id,
+                target_connection_nonce=target_connection_nonce,
+                target_connection_epoch=target_connection_epoch,
                 origin_client_id=handoff.get("originClientId"),
                 status="preparing",
                 base_control_version=handoff["baseControlVersion"],
-                snapshot_json=json.dumps(snapshot, ensure_ascii=True),
+                snapshot_json=json.dumps(
+                    _sanitize_handoff_snapshot(snapshot),
+                    ensure_ascii=True,
+                ),
             )
-            payload = dict(handoff)
-            payload["snapshot"] = snapshot
-            payload["status"] = record.status
-            return payload, True
+            return serializePlaybackHandoff(record), True
     finally:
         close_connection()
 
@@ -5749,7 +6205,28 @@ def completeStrictPlaybackHandoff(
     target_client_id: str,
     target_device_session_id: str,
     position_ms: Optional[int] = None,
+    *,
+    expected_source_client_id: str,
+    expected_source_device_session_id: str,
+    expected_source_connection_nonce: str,
+    expected_source_connection_epoch: int,
+    expected_target_connection_nonce: str,
+    expected_target_connection_epoch: int,
 ) -> Optional[PlaybackHandoffCompleteResult]:
+    _validate_handoff_generation_arguments(
+        user_name,
+        expected_source_client_id,
+        expected_source_device_session_id,
+        expected_source_connection_nonce,
+        expected_source_connection_epoch,
+    )
+    _validate_handoff_generation_arguments(
+        user_name,
+        target_client_id,
+        target_device_session_id,
+        expected_target_connection_nonce,
+        expected_target_connection_epoch,
+    )
     open_connection(reuse=True)
     try:
         handoff_record = EmoPlaybackHandoff.get_or_none(
@@ -5779,6 +6256,14 @@ def completeStrictPlaybackHandoff(
                 client_id=target_client_id,
                 device_session_id=target_device_session_id,
             )
+            requirePlaybackHandoffResourceAvailable(
+                playback_context_id=playback_context_id,
+                user_name=user_name,
+                client_id=target_client_id,
+                device_session_id=target_device_session_id,
+                mutation_name="completeStrictPlaybackHandoff",
+                allowed_handoff_id=handoff_id,
+            )
             _require_broadcast_context_mutation_allowed(
                 playback_context_id,
                 "completeStrictPlaybackHandoff",
@@ -5797,6 +6282,11 @@ def completeStrictPlaybackHandoff(
                 requireFollowSafetyLeaseResourceAvailable(
                     playback_context_id=standby_context_id,
                 )
+                requirePlaybackHandoffResourceAvailable(
+                    playback_context_id=standby_context_id,
+                    mutation_name="completeStrictPlaybackHandoff",
+                    allowed_handoff_id=handoff_id,
+                )
                 standby_fences = _broadcast_fences_for_context(
                     standby_context_id
                 )
@@ -5814,6 +6304,22 @@ def completeStrictPlaybackHandoff(
             target_client_id,
             target_device_session_id,
             position_ms=position_ms,
+            expected_source_client_id=expected_source_client_id,
+            expected_source_device_session_id=(
+                expected_source_device_session_id
+            ),
+            expected_source_connection_nonce=(
+                expected_source_connection_nonce
+            ),
+            expected_source_connection_epoch=(
+                expected_source_connection_epoch
+            ),
+            expected_target_connection_nonce=(
+                expected_target_connection_nonce
+            ),
+            expected_target_connection_epoch=(
+                expected_target_connection_epoch
+            ),
         )
 
 
@@ -5824,6 +6330,13 @@ def _completeStrictPlaybackHandoffLocked(
     target_client_id: str,
     target_device_session_id: str,
     position_ms: Optional[int] = None,
+    *,
+    expected_source_client_id: str,
+    expected_source_device_session_id: str,
+    expected_source_connection_nonce: str,
+    expected_source_connection_epoch: int,
+    expected_target_connection_nonce: str,
+    expected_target_connection_epoch: int,
 ) -> Optional[PlaybackHandoffCompleteResult]:
     open_connection(reuse=True)
     try:
@@ -5886,6 +6399,31 @@ def _completeStrictPlaybackHandoffLocked(
                 raise ValueError("Playback handoff context does not match")
             if handoff_record.target_client_id != target_client_id:
                 raise PermissionError("Playback handoff target does not match")
+            _require_handoff_generation(handoff_record)
+            if not _handoff_generation_matches(
+                handoff_record,
+                "source",
+                user_name,
+                expected_source_client_id,
+                expected_source_device_session_id,
+                expected_source_connection_nonce,
+                expected_source_connection_epoch,
+            ):
+                raise PlaybackHandoffTargetConflictError(
+                    "Playback handoff source physical generation changed"
+                )
+            if not _handoff_generation_matches(
+                handoff_record,
+                "target",
+                user_name,
+                target_client_id,
+                target_device_session_id,
+                expected_target_connection_nonce,
+                expected_target_connection_epoch,
+            ):
+                raise PlaybackHandoffTargetConflictError(
+                    "Playback handoff target physical generation changed"
+                )
 
             snapshot = (
                 json.loads(handoff_record.snapshot_json)
@@ -5902,21 +6440,12 @@ def _completeStrictPlaybackHandoffLocked(
                         EmoDevicePlaybackState.owner_client_id
                         == target_client_id
                     )
+                    & (
+                        EmoDevicePlaybackState.device_session_id
+                        == target_device_session_id
+                    )
                 )
-                handoff_payload = {
-                    "handoffId": handoff_record.handoff_id,
-                    "requestId": handoff_record.request_id,
-                    "playbackContextId": handoff_record.playback_context_id,
-                    "userName": handoff_record.user_name,
-                    "sourceClientId": handoff_record.source_client_id,
-                    "targetClientId": handoff_record.target_client_id,
-                    "originClientId": handoff_record.origin_client_id,
-                    "status": handoff_record.status,
-                    "baseControlVersion": handoff_record.base_control_version,
-                    "controlVersion": snapshot.get("handoffControlVersion"),
-                    "prepareId": snapshot.get("prepareId"),
-                    "snapshot": snapshot,
-                }
+                handoff_payload = serializePlaybackHandoff(handoff_record)
                 return PlaybackHandoffCompleteResult(
                     _playback_context_payload(context_record),
                     handoff_payload,
@@ -5930,6 +6459,13 @@ def _completeStrictPlaybackHandoffLocked(
                 raise ValueError("Playback handoff is not committing")
             if context_record.authority_client_id != handoff_record.source_client_id:
                 raise PermissionError("Playback handoff source is no longer authority")
+            if (
+                context_record.authority_device_session_id
+                != handoff_record.source_device_session_id
+            ):
+                raise PermissionError(
+                    "Playback handoff source device is no longer authority"
+                )
             if context_record.control_version != handoff_record.base_control_version:
                 raise PlaybackContextStaleVersionError(
                     _playback_context_payload(context_record),
@@ -5942,6 +6478,7 @@ def _completeStrictPlaybackHandoffLocked(
             target_contexts = _active_handoff_target_context_records(
                 user_name,
                 target_client_id,
+                target_device_session_id,
             )
             if len(target_contexts) > 1:
                 raise PlaybackHandoffTargetConflictError(
@@ -6077,20 +6614,7 @@ def _completeStrictPlaybackHandoffLocked(
             handoff_record.error_message = None
             handoff_record.updated_at = now()
             handoff_record.save()
-            handoff_payload = {
-                "handoffId": handoff_record.handoff_id,
-                "requestId": handoff_record.request_id,
-                "playbackContextId": handoff_record.playback_context_id,
-                "userName": handoff_record.user_name,
-                "sourceClientId": handoff_record.source_client_id,
-                "targetClientId": handoff_record.target_client_id,
-                "originClientId": handoff_record.origin_client_id,
-                "status": handoff_record.status,
-                "baseControlVersion": handoff_record.base_control_version,
-                "controlVersion": next_control_version,
-                "prepareId": snapshot.get("prepareId"),
-                "snapshot": snapshot,
-            }
+            handoff_payload = serializePlaybackHandoff(handoff_record)
             return PlaybackHandoffCompleteResult(
                 context_payload,
                 handoff_payload,
@@ -6111,12 +6635,22 @@ def terminateStrictPlaybackHandoff(
     status: str,
     error_code: Optional[str] = None,
     error_message: Optional[str] = None,
+    expected_generation_role: Optional[str] = None,
+    expected_device_session_id: Optional[str] = None,
+    expected_connection_nonce: Optional[str] = None,
+    expected_connection_epoch: Optional[int] = None,
 ) -> Optional[Tuple[Dict[str, object], bool]]:
     if status not in ("cancelled", "failed", "timed_out"):
         raise ValueError("Unsupported handoff terminal status")
     open_connection(reuse=True)
     try:
-        with _strict_playback_context_transaction():
+        observed = EmoPlaybackHandoff.get_or_none(
+            EmoPlaybackHandoff.handoff_id == handoff_id
+        )
+        if observed is None:
+            return None
+        _observed_contexts, authority_pairs = _handoff_lock_keys((observed,))
+        with _strict_authority_pair_transaction(authority_pairs):
             record = EmoPlaybackHandoff.get_or_none(
                 EmoPlaybackHandoff.handoff_id == handoff_id
             )
@@ -6126,33 +6660,45 @@ def terminateStrictPlaybackHandoff(
                 raise ValueError("Playback handoff context does not match")
             if record.user_name != user_name:
                 raise PermissionError("Playback handoff belongs to another user")
-            snapshot = json.loads(record.snapshot_json) if record.snapshot_json else {}
+            if expected_generation_role is not None:
+                if expected_generation_role not in {"source", "target"}:
+                    raise ValueError(
+                        "expectedGenerationRole must be source or target"
+                    )
+                _validate_handoff_generation_arguments(
+                    user_name,
+                    getattr(
+                        record,
+                        "%s_client_id" % expected_generation_role,
+                    ),
+                    expected_device_session_id,
+                    expected_connection_nonce,
+                    expected_connection_epoch,
+                )
+                if not _handoff_generation_matches(
+                    record,
+                    expected_generation_role,
+                    user_name,
+                    getattr(
+                        record,
+                        "%s_client_id" % expected_generation_role,
+                    ),
+                    expected_device_session_id,
+                    expected_connection_nonce,
+                    expected_connection_epoch,
+                ):
+                    raise PlaybackHandoffTargetConflictError(
+                        "Playback handoff physical generation changed"
+                    )
             transitioned = False
-            if record.status in ("preparing", "ready", "committed", "committing"):
+            if record.status in HANDOFF_NONTERMINAL_STATUSES:
                 record.status = status
                 record.error_code = error_code
                 record.error_message = error_message
                 record.updated_at = now()
                 record.save()
                 transitioned = True
-            payload = {
-                "handoffId": record.handoff_id,
-                "requestId": record.request_id,
-                "playbackContextId": record.playback_context_id,
-                "userName": record.user_name,
-                "sourceClientId": record.source_client_id,
-                "targetClientId": record.target_client_id,
-                "originClientId": record.origin_client_id,
-                "status": record.status,
-                "baseControlVersion": record.base_control_version,
-                "controlVersion": snapshot.get("handoffControlVersion"),
-                "prepareId": snapshot.get("prepareId"),
-                "completeExpiresAtMs": snapshot.get("completeExpiresAtMs"),
-                "snapshot": snapshot,
-                "errorCode": record.error_code,
-                "errorMessage": record.error_message,
-            }
-            return payload, transitioned
+            return serializePlaybackHandoff(record), transitioned
     finally:
         close_connection()
 
@@ -6176,6 +6722,7 @@ def commitStrictPlaybackHandoff(
                 raise ValueError("Playback handoff context does not match")
             if record.user_name != user_name:
                 raise PermissionError("Playback handoff belongs to another user")
+            _require_handoff_generation(record)
             snapshot = json.loads(record.snapshot_json) if record.snapshot_json else {}
             transitioned = False
             if record.status == "preparing":
@@ -6185,24 +6732,7 @@ def commitStrictPlaybackHandoff(
                 record.updated_at = now()
                 record.save()
                 transitioned = True
-            payload = {
-                "handoffId": record.handoff_id,
-                "requestId": record.request_id,
-                "playbackContextId": record.playback_context_id,
-                "userName": record.user_name,
-                "sourceClientId": record.source_client_id,
-                "targetClientId": record.target_client_id,
-                "originClientId": record.origin_client_id,
-                "status": record.status,
-                "baseControlVersion": record.base_control_version,
-                "controlVersion": snapshot.get("handoffControlVersion"),
-                "prepareId": snapshot.get("prepareId"),
-                "completeExpiresAtMs": snapshot.get("completeExpiresAtMs"),
-                "snapshot": snapshot,
-                "errorCode": record.error_code,
-                "errorMessage": record.error_message,
-            }
-            return payload, transitioned
+            return serializePlaybackHandoff(record), transitioned
     finally:
         close_connection()
 
@@ -6275,25 +6805,86 @@ def listPlaybackContexts():
 
 
 def failActivePlaybackHandoffsForRestart():
-    open_connection(reuse=True)
-    try:
-        with db.atomic():
-            query = EmoPlaybackHandoff.select().where(
-                EmoPlaybackHandoff.status.in_(
-                    ("preparing", "ready", "committed", "committing")
+    while True:
+        open_connection(reuse=True)
+        try:
+            observed = list(
+                EmoPlaybackHandoff.select().where(
+                    EmoPlaybackHandoff.status.in_(HANDOFF_NONTERMINAL_STATUSES)
                 )
             )
-            reconciled = []
-            for record in query:
-                record.status = "failed"
-                record.error_code = "server_restart"
-                record.error_message = "Server restarted before handoff completed"
-                record.updated_at = now()
-                record.save()
-                reconciled.append(record.handoff_id)
+            context_ids, authority_pairs = _handoff_lock_keys(observed)
+        finally:
+            close_connection()
+
+        retry = False
+        with _strict_playback_context_lock_set(context_ids):
+            with _strict_authority_pair_lock(authority_pairs):
+                open_connection(reuse=True)
+                try:
+                    with _strict_playback_context_transaction():
+                        records = list(
+                            EmoPlaybackHandoff.select()
+                            .where(
+                                EmoPlaybackHandoff.status.in_(
+                                    HANDOFF_NONTERMINAL_STATUSES
+                                )
+                            )
+                            .order_by(
+                                EmoPlaybackHandoff.playback_context_id,
+                                EmoPlaybackHandoff.handoff_id,
+                            )
+                        )
+                        current_context_ids, current_pairs = _handoff_lock_keys(
+                            records
+                        )
+                        if not (
+                            current_context_ids <= context_ids
+                            and current_pairs <= authority_pairs
+                        ):
+                            retry = True
+                        else:
+                            reconciled = []
+                            for record in records:
+                                record.status = "failed"
+                                record.error_code = "server_restart"
+                                record.error_message = (
+                                    "Server restarted before handoff completed"
+                                )
+                                record.updated_at = now()
+                                record.save()
+                                reconciled.append(record.handoff_id)
+                finally:
+                    close_connection()
+        if not retry:
             return reconciled
-    finally:
-        close_connection()
+
+
+def _handoff_lock_keys(records):
+    context_ids = set()
+    authority_pairs = set()
+    for record in records:
+        context_ids.add(record.playback_context_id)
+        standby_context_id = _handoff_snapshot(record).get(
+            "targetStandbyPlaybackContextId"
+        )
+        if isinstance(standby_context_id, str) and standby_context_id:
+            context_ids.add(standby_context_id)
+        authority_pairs.add(
+            _strict_authority_pair_key(
+                record.user_name,
+                record.source_client_id,
+                record.source_device_session_id,
+            )
+        )
+        authority_pairs.add(
+            _strict_authority_pair_key(
+                record.user_name,
+                record.target_client_id,
+                record.target_device_session_id,
+            )
+        )
+    return frozenset(context_ids), frozenset(authority_pairs)
 
 
 def _device_playback_state_payload(record):
@@ -6511,26 +7102,7 @@ def getPlaybackHandoff(handoff_id):
         )
         if record is None:
             return None
-        payload = json.loads(record.snapshot_json) if record.snapshot_json else {}
-        return {
-            "handoffId": record.handoff_id,
-            "requestId": record.request_id,
-            "playbackContextId": record.playback_context_id,
-            "userName": record.user_name,
-            "sourceClientId": record.source_client_id,
-            "targetClientId": record.target_client_id,
-            "originClientId": record.origin_client_id,
-            "status": record.status,
-            "baseControlVersion": record.base_control_version,
-            "controlVersion": payload.get("handoffControlVersion"),
-            "prepareId": payload.get("prepareId"),
-            "completeExpiresAtMs": payload.get("completeExpiresAtMs"),
-            "snapshot": payload,
-            "errorCode": record.error_code,
-            "errorMessage": record.error_message,
-            "createdAt": record.created_at.timestamp(),
-            "updatedAt": record.updated_at.timestamp(),
-        }
+        return serializePlaybackHandoff(record)
     finally:
         close_connection()
 
@@ -6552,26 +7124,7 @@ def getPlaybackHandoffByRequest(user_name, origin_client_id, request_id):
         )
         if record is None:
             return None
-        payload = json.loads(record.snapshot_json) if record.snapshot_json else {}
-        return {
-            "handoffId": record.handoff_id,
-            "requestId": record.request_id,
-            "playbackContextId": record.playback_context_id,
-            "userName": record.user_name,
-            "sourceClientId": record.source_client_id,
-            "targetClientId": record.target_client_id,
-            "originClientId": record.origin_client_id,
-            "status": record.status,
-            "baseControlVersion": record.base_control_version,
-            "controlVersion": payload.get("handoffControlVersion"),
-            "prepareId": payload.get("prepareId"),
-            "completeExpiresAtMs": payload.get("completeExpiresAtMs"),
-            "snapshot": payload,
-            "errorCode": record.error_code,
-            "errorMessage": record.error_message,
-            "createdAt": record.created_at.timestamp(),
-            "updatedAt": record.updated_at.timestamp(),
-        }
+        return serializePlaybackHandoff(record)
     finally:
         close_connection()
 
@@ -6585,36 +7138,76 @@ def getActivePlaybackHandoffs(playback_context_id):
             EmoPlaybackHandoff.select()
             .where(
                 (EmoPlaybackHandoff.playback_context_id == playback_context_id)
-                & EmoPlaybackHandoff.status.in_(("preparing", "ready", "committed"))
+                & EmoPlaybackHandoff.status.in_(HANDOFF_NONTERMINAL_STATUSES)
             )
             .order_by(EmoPlaybackHandoff.created_at.asc())
         )
-        handoffs = []
-        for record in query:
-            payload = json.loads(record.snapshot_json) if record.snapshot_json else {}
-            handoffs.append(
-                {
-                    "handoffId": record.handoff_id,
-                    "requestId": record.request_id,
-                    "playbackContextId": record.playback_context_id,
-                    "userName": record.user_name,
-                    "sourceClientId": record.source_client_id,
-                    "targetClientId": record.target_client_id,
-                    "originClientId": record.origin_client_id,
-                    "status": record.status,
-                    "baseControlVersion": record.base_control_version,
-                    "controlVersion": payload.get("handoffControlVersion"),
-                    "prepareId": payload.get("prepareId"),
-                    "prepareExpiresAtMs": payload.get("prepareExpiresAtMs"),
-                    "completeExpiresAtMs": payload.get("completeExpiresAtMs"),
-                    "snapshot": payload,
-                    "errorCode": record.error_code,
-                    "errorMessage": record.error_message,
-                    "createdAt": record.created_at.timestamp(),
-                    "updatedAt": record.updated_at.timestamp(),
-                }
+        return [serializePlaybackHandoff(record) for record in query]
+    finally:
+        close_connection()
+
+
+def listActivePlaybackHandoffsForPhysicalGeneration(
+    user_name,
+    client_id,
+    device_session_id,
+    connection_nonce,
+    connection_epoch,
+):
+    _validate_handoff_generation_arguments(
+        user_name,
+        client_id,
+        device_session_id,
+        connection_nonce,
+        connection_epoch,
+    )
+    open_connection(reuse=True)
+    try:
+        source_match = (
+            (EmoPlaybackHandoff.source_client_id == client_id)
+            & (
+                EmoPlaybackHandoff.source_device_session_id
+                == device_session_id
             )
-        return handoffs
+            & (
+                EmoPlaybackHandoff.source_connection_nonce
+                == connection_nonce
+            )
+            & (
+                EmoPlaybackHandoff.source_connection_epoch
+                == connection_epoch
+            )
+        )
+        target_match = (
+            (EmoPlaybackHandoff.target_client_id == client_id)
+            & (
+                EmoPlaybackHandoff.target_device_session_id
+                == device_session_id
+            )
+            & (
+                EmoPlaybackHandoff.target_connection_nonce
+                == connection_nonce
+            )
+            & (
+                EmoPlaybackHandoff.target_connection_epoch
+                == connection_epoch
+            )
+        )
+        query = (
+            EmoPlaybackHandoff.select()
+            .where(
+                (EmoPlaybackHandoff.user_name == user_name)
+                & EmoPlaybackHandoff.status.in_(
+                    HANDOFF_NONTERMINAL_STATUSES
+                )
+                & (source_match | target_match)
+            )
+            .order_by(
+                EmoPlaybackHandoff.playback_context_id,
+                EmoPlaybackHandoff.handoff_id,
+            )
+        )
+        return [serializePlaybackHandoff(record) for record in query]
     finally:
         close_connection()
 
@@ -6622,7 +7215,7 @@ def getActivePlaybackHandoffs(playback_context_id):
 def savePlaybackHandoff(handoff):
     payload = dict(handoff)
     handoff_id = payload.get("handoffId")
-    snapshot = dict(payload.get("snapshot") or {})
+    snapshot = _sanitize_handoff_snapshot(dict(payload.get("snapshot") or {}))
     if payload.get("controlVersion") is not None:
         snapshot.setdefault("handoffControlVersion", payload.get("controlVersion"))
     if payload.get("prepareId") is not None:
@@ -6635,13 +7228,20 @@ def savePlaybackHandoff(handoff):
             EmoPlaybackHandoff.handoff_id == handoff_id
         )
         if record is None:
+            _validate_optional_handoff_generation_payload(payload)
             EmoPlaybackHandoff.create(
                 handoff_id=handoff_id,
                 request_id=payload.get("requestId"),
                 playback_context_id=payload.get("playbackContextId"),
                 user_name=payload.get("userName"),
                 source_client_id=payload.get("sourceClientId"),
+                source_device_session_id=payload.get("sourceDeviceSessionId"),
+                source_connection_nonce=payload.get("sourceConnectionNonce"),
+                source_connection_epoch=payload.get("sourceConnectionEpoch"),
                 target_client_id=payload.get("targetClientId"),
+                target_device_session_id=payload.get("targetDeviceSessionId"),
+                target_connection_nonce=payload.get("targetConnectionNonce"),
+                target_connection_epoch=payload.get("targetConnectionEpoch"),
                 origin_client_id=payload.get("originClientId"),
                 status=payload.get("status") or "preparing",
                 base_control_version=payload.get("baseControlVersion") or 0,
@@ -6651,18 +7251,93 @@ def savePlaybackHandoff(handoff):
             )
             return
 
-        record.request_id = payload.get("requestId")
-        record.playback_context_id = payload.get("playbackContextId")
-        record.user_name = payload.get("userName")
-        record.source_client_id = payload.get("sourceClientId")
-        record.target_client_id = payload.get("targetClientId")
-        record.origin_client_id = payload.get("originClientId")
-        record.status = payload.get("status") or "preparing"
-        record.base_control_version = payload.get("baseControlVersion") or 0
+        incoming_status = payload.get("status")
+        if incoming_status is None:
+            incoming_status = record.status
+        _require_immutable_handoff_binding(record, payload)
+        if record.status in HANDOFF_TERMINAL_STATUSES:
+            if incoming_status != record.status:
+                raise PlaybackHandoffTargetConflictError(
+                    "Playback handoff terminal status is immutable"
+                )
+            return
+
+        record.status = incoming_status
         record.snapshot_json = json.dumps(snapshot, ensure_ascii=True)
         record.error_code = payload.get("errorCode")
         record.error_message = payload.get("errorMessage")
+        _validate_optional_handoff_generation_record(record)
         record.updated_at = now()
         record.save()
     finally:
         close_connection()
+
+
+def _require_immutable_handoff_binding(record, payload):
+    immutable_fields = (
+        ("requestId", "request_id"),
+        ("playbackContextId", "playback_context_id"),
+        ("userName", "user_name"),
+        ("sourceClientId", "source_client_id"),
+        ("sourceDeviceSessionId", "source_device_session_id"),
+        ("sourceConnectionNonce", "source_connection_nonce"),
+        ("sourceConnectionEpoch", "source_connection_epoch"),
+        ("targetClientId", "target_client_id"),
+        ("targetDeviceSessionId", "target_device_session_id"),
+        ("targetConnectionNonce", "target_connection_nonce"),
+        ("targetConnectionEpoch", "target_connection_epoch"),
+        ("originClientId", "origin_client_id"),
+        ("baseControlVersion", "base_control_version"),
+    )
+    for payload_name, record_name in immutable_fields:
+        if payload_name not in payload:
+            continue
+        incoming = payload[payload_name]
+        persisted = getattr(record, record_name)
+        if incoming != persisted or (
+            payload_name.endswith("Epoch")
+            and type(incoming) is not type(persisted)
+        ):
+            raise PlaybackHandoffTargetConflictError(
+                "Playback handoff %s is immutable" % payload_name
+            )
+
+
+def _validate_optional_handoff_generation_payload(payload):
+    generation_fields = (
+        "sourceDeviceSessionId",
+        "sourceConnectionNonce",
+        "sourceConnectionEpoch",
+        "targetDeviceSessionId",
+        "targetConnectionNonce",
+        "targetConnectionEpoch",
+    )
+    supplied = [payload.get(field_name) for field_name in generation_fields]
+    if not any(value is not None for value in supplied):
+        return
+    if any(value is None for value in supplied):
+        raise PlaybackHandoffTargetConflictError(
+            "Playback handoff physical generation is incomplete"
+        )
+    for field_name in ("source", "target"):
+        _validate_handoff_generation_arguments(
+            payload.get("userName"),
+            payload.get("%sClientId" % field_name),
+            payload.get("%sDeviceSessionId" % field_name),
+            payload.get("%sConnectionNonce" % field_name),
+            payload.get("%sConnectionEpoch" % field_name),
+        )
+
+
+def _validate_optional_handoff_generation_record(record):
+    values = (
+        record.source_device_session_id,
+        record.source_connection_nonce,
+        record.source_connection_epoch,
+        record.target_device_session_id,
+        record.target_connection_nonce,
+        record.target_connection_epoch,
+    )
+    if not any(value is not None for value in values):
+        return
+    _require_handoff_generation(record)

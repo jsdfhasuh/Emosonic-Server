@@ -327,6 +327,7 @@ class StrictV2ContractTestCase(unittest.TestCase):
             "payload": {
                 "playbackContextId": "context-1",
                 "targetClientId": "phone-2",
+                "targetDeviceSessionId": "device:phone-2",
                 "baseControlVersion": 1,
             },
         }

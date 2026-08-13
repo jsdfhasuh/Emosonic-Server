@@ -1,4 +1,5 @@
 import concurrent.futures
+from contextlib import contextmanager
 from datetime import datetime
 import hashlib
 import json
@@ -20,6 +21,7 @@ from supysonic.emo.ws_store import (
     PlaybackContextCloseInvariantError,
     PlaybackContextClosedError,
     PlaybackContextEnsureConflictError,
+    PlaybackContextHandoffBarrierError,
     PlaybackContextIntentConflictError,
     PlaybackContextRestoreInProgressError,
     PlaybackContextStaleVersionError,
@@ -107,6 +109,41 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         db.release_database()
         os.remove(self.db_path)
 
+    def _complete_exact_handoff(
+        self,
+        playback_context_id,
+        handoff_id,
+        user_name,
+        target_client_id,
+        target_device_session_id,
+        position_ms=None,
+    ):
+        handoff = getPlaybackHandoff(handoff_id)
+        return completeStrictPlaybackHandoff(
+            playback_context_id,
+            handoff_id,
+            user_name,
+            target_client_id,
+            target_device_session_id,
+            position_ms=position_ms,
+            expected_source_client_id=handoff["sourceClientId"],
+            expected_source_device_session_id=(
+                handoff["sourceDeviceSessionId"]
+            ),
+            expected_source_connection_nonce=(
+                handoff["sourceConnectionNonce"]
+            ),
+            expected_source_connection_epoch=(
+                handoff["sourceConnectionEpoch"]
+            ),
+            expected_target_connection_nonce=(
+                handoff["targetConnectionNonce"]
+            ),
+            expected_target_connection_epoch=(
+                handoff["targetConnectionEpoch"]
+            ),
+        )
+
     def _create_exact_transaction(
         self,
         command_control_version=2,
@@ -154,6 +191,68 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             0,
             "playing",
         )
+
+    def _create_exact_handoff_source(
+        self,
+        playback_context_id="handoff-source-context",
+        handoff_id="handoff-source-1",
+    ):
+        createStrictPlaybackContextState(
+            playback_context_id,
+            "alice",
+            "source-player",
+            "device:source-player",
+            ["song-1"],
+            0,
+            100,
+            "playing",
+        )
+        applyStrictPlaybackUpdate(
+            playback_context_id,
+            "alice",
+            "source-player",
+            "device:source-player",
+            "source-nonce",
+            {
+                "playbackContextId": playback_context_id,
+                "deviceSessionId": "device:source-player",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 100,
+                "positionSampledAtServerMs": 900,
+                "playbackRate": 1.0,
+                "clientSeq": 1,
+            },
+            1000,
+        )
+        handoff, created = createStrictPlaybackHandoff(
+            playback_context_id,
+            {
+                "handoffId": handoff_id,
+                "requestId": handoff_id + "-request",
+                "playbackContextId": playback_context_id,
+                "userName": "alice",
+                "sourceClientId": "source-player",
+                "sourceDeviceSessionId": "device:source-player",
+                "sourceConnectionNonce": "source-nonce",
+                "sourceConnectionEpoch": 1,
+                "targetClientId": "target-player",
+                "targetDeviceSessionId": "device:target-player",
+                "targetConnectionNonce": "target-nonce",
+                "targetConnectionEpoch": 1,
+                "originClientId": "controller-1",
+                "status": "preparing",
+                "baseControlVersion": 1,
+                "controlVersion": 2,
+                "prepareId": handoff_id + "-prepare",
+                "snapshot": {},
+            },
+            "device:target-player",
+        )
+        self.assertTrue(created)
+        return handoff
 
     def _retention_control_values(
         self,
@@ -611,7 +710,13 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                     "playbackContextId": source_context_id,
                     "userName": "alice",
                     "sourceClientId": source_client_id,
+                    "sourceDeviceSessionId": "device:%s" % source_client_id,
+                    "sourceConnectionNonce": "source-nonce-%d" % iteration,
+                    "sourceConnectionEpoch": 1,
                     "targetClientId": target_client_id,
+                    "targetDeviceSessionId": target_device_session_id,
+                    "targetConnectionNonce": "target-nonce-%d" % iteration,
+                    "targetConnectionEpoch": 1,
                     "originClientId": "controller-1",
                     "status": "preparing",
                     "baseControlVersion": 1,
@@ -632,7 +737,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             def complete_handoff():
                 barrier.wait()
                 try:
-                    return completeStrictPlaybackHandoff(
+                    return self._complete_exact_handoff(
                         source_context_id,
                         handoff_id,
                         "alice",
@@ -659,6 +764,8 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                     return "initialized"
                 except PlaybackContextClosedError:
                     return "context_closed"
+                except PlaybackContextHandoffBarrierError:
+                    return "handoff_fenced"
 
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=2
@@ -671,14 +778,14 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             source_context = getPlaybackContextState(source_context_id)
             target_context = getPlaybackContextState(target_context_id)
             if handoff_result == "conflict":
-                self.assertEqual(control_result, "initialized")
+                self.assertEqual(control_result, "handoff_fenced")
                 self.assertEqual(
                     source_context["authorityClientId"],
                     source_client_id,
                 )
                 self.assertEqual(target_context["lifecycle"], "active")
-                self.assertEqual(target_context["state"], "paused")
-                self.assertEqual(target_context["controlVersion"], 2)
+                self.assertEqual(target_context["state"], "idle")
+                self.assertEqual(target_context["controlVersion"], 1)
                 self.assertEqual(
                     getPlaybackHandoff(handoff_id)["status"],
                     "committed",
@@ -686,7 +793,10 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 continue
 
             self.assertTrue(handoff_result.mutated)
-            self.assertEqual(control_result, "context_closed")
+            self.assertIn(
+                control_result,
+                {"context_closed", "handoff_fenced"},
+            )
             self.assertEqual(
                 handoff_result.affected_authority_pairs,
                 tuple(
@@ -721,7 +831,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 target_context_id,
             )
 
-            replay_result = completeStrictPlaybackHandoff(
+            replay_result = self._complete_exact_handoff(
                 source_context_id,
                 handoff_id,
                 "alice",
@@ -762,7 +872,13 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             "playbackContextId": "handoff-start-source",
             "userName": "alice",
             "sourceClientId": "source-player",
+            "sourceDeviceSessionId": "device:source-player",
+            "sourceConnectionNonce": "source-nonce",
+            "sourceConnectionEpoch": 1,
             "targetClientId": "target-player",
+            "targetDeviceSessionId": "device:target-player",
+            "targetConnectionNonce": "target-nonce",
+            "targetConnectionEpoch": 1,
             "originClientId": "controller-1",
             "status": "preparing",
             "baseControlVersion": 1,
@@ -882,7 +998,13 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 "playbackContextId": "context-handoff",
                 "userName": "alice",
                 "sourceClientId": "source-1",
+                "sourceDeviceSessionId": "device:source-1",
+                "sourceConnectionNonce": "source-nonce-1",
+                "sourceConnectionEpoch": 1,
                 "targetClientId": "target-1",
+                "targetDeviceSessionId": "device:target-1",
+                "targetConnectionNonce": "target-nonce-1",
+                "targetConnectionEpoch": 1,
                 "originClientId": "controller-1",
                 "status": "committed",
                 "baseControlVersion": 1,
@@ -899,7 +1021,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         def complete():
             barrier.wait()
             try:
-                result = completeStrictPlaybackHandoff(
+                result = self._complete_exact_handoff(
                     "context-handoff",
                     "handoff-1",
                     "alice",
@@ -943,6 +1065,73 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             self.assertEqual(context["authorityClientId"], "source-1")
             self.assertEqual(context["controlVersion"], 1)
 
+    def test_complete_handoff_rejects_changed_expected_physical_generation(self):
+        createStrictPlaybackContextState(
+            "context-generation-cas",
+            "alice",
+            "source-1",
+            "device:source-1",
+            ["song-1"],
+            0,
+            100,
+            "playing",
+        )
+        payload = {
+            "handoffId": "handoff-generation-cas",
+            "requestId": "handoff-start-generation-cas",
+            "playbackContextId": "context-generation-cas",
+            "userName": "alice",
+            "sourceClientId": "source-1",
+            "sourceDeviceSessionId": "device:source-1",
+            "sourceConnectionNonce": "source-nonce-cas",
+            "sourceConnectionEpoch": 1,
+            "targetClientId": "target-1",
+            "targetDeviceSessionId": "device:target-1",
+            "targetConnectionNonce": "target-nonce-cas",
+            "targetConnectionEpoch": 1,
+            "originClientId": "controller-1",
+            "status": "committed",
+            "baseControlVersion": 1,
+            "controlVersion": 2,
+            "prepareId": "prepare-generation-cas",
+            "snapshot": {"handoffControlVersion": 2},
+        }
+        savePlaybackHandoff(payload)
+        before_context = getPlaybackContextState("context-generation-cas")
+        before_handoff = getPlaybackHandoff("handoff-generation-cas")
+
+        for field_name, value in (
+            ("expected_source_connection_nonce", "replacement-source-nonce"),
+            ("expected_target_connection_nonce", "replacement-target-nonce"),
+        ):
+            with self.subTest(field=field_name):
+                arguments = {
+                    "expected_source_client_id": "source-1",
+                    "expected_source_device_session_id": "device:source-1",
+                    "expected_source_connection_nonce": "source-nonce-cas",
+                    "expected_source_connection_epoch": 1,
+                    "expected_target_connection_nonce": "target-nonce-cas",
+                    "expected_target_connection_epoch": 1,
+                }
+                arguments[field_name] = value
+                with self.assertRaises(PlaybackHandoffTargetConflictError):
+                    completeStrictPlaybackHandoff(
+                        "context-generation-cas",
+                        "handoff-generation-cas",
+                        "alice",
+                        "target-1",
+                        "device:target-1",
+                        **arguments,
+                    )
+                self.assertEqual(
+                    getPlaybackContextState("context-generation-cas"),
+                    before_context,
+                )
+                self.assertEqual(
+                    getPlaybackHandoff("handoff-generation-cas"),
+                    before_handoff,
+                )
+
     def test_complete_and_timeout_handoff_have_one_atomic_terminal_winner(self):
         createStrictPlaybackContextState(
             "context-timeout",
@@ -961,7 +1150,13 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 "playbackContextId": "context-timeout",
                 "userName": "alice",
                 "sourceClientId": "source-1",
+                "sourceDeviceSessionId": "device:source-1",
+                "sourceConnectionNonce": "source-nonce-timeout",
+                "sourceConnectionEpoch": 1,
                 "targetClientId": "target-1",
+                "targetDeviceSessionId": "device:target-1",
+                "targetConnectionNonce": "target-nonce-timeout",
+                "targetConnectionEpoch": 1,
                 "originClientId": "controller-1",
                 "status": "committed",
                 "baseControlVersion": 1,
@@ -978,7 +1173,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         def complete():
             barrier.wait()
             try:
-                result = completeStrictPlaybackHandoff(
+                result = self._complete_exact_handoff(
                     "context-timeout",
                     "handoff-timeout",
                     "alice",
@@ -1039,7 +1234,13 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 "playbackContextId": "context-close-race",
                 "userName": "alice",
                 "sourceClientId": "source-1",
+                "sourceDeviceSessionId": "device:source-1",
+                "sourceConnectionNonce": "source-nonce-close",
+                "sourceConnectionEpoch": 1,
                 "targetClientId": "target-1",
+                "targetDeviceSessionId": "device:target-1",
+                "targetConnectionNonce": "target-nonce-close",
+                "targetConnectionEpoch": 1,
                 "originClientId": "controller-1",
                 "status": "committed",
                 "baseControlVersion": 1,
@@ -1064,7 +1265,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         def complete_handoff():
             barrier.wait()
             try:
-                completed = completeStrictPlaybackHandoff(
+                completed = self._complete_exact_handoff(
                     "context-close-race",
                     "handoff-close-race",
                     "alice",
@@ -1849,6 +2050,60 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertEqual(handoff["status"], "failed")
         self.assertEqual(handoff["errorCode"], "server_restart")
 
+    def test_restart_handoff_recovery_uses_context_pair_database_lock_order(self):
+        handoff = self._create_exact_handoff_source(
+            playback_context_id="restart-lock-context",
+            handoff_id="restart-lock-handoff",
+        )
+        events = []
+        original_context_locks = ws_store._strict_playback_context_lock_set
+        original_pair_locks = ws_store._strict_authority_pair_lock
+        original_transaction = ws_store._strict_playback_context_transaction
+
+        @contextmanager
+        def context_locks(keys):
+            events.append(("context", tuple(sorted(keys))))
+            with original_context_locks(keys):
+                yield
+
+        @contextmanager
+        def pair_locks(keys):
+            events.append(("pair", tuple(sorted(keys))))
+            with original_pair_locks(keys):
+                yield
+
+        @contextmanager
+        def transaction():
+            events.append(("database", None))
+            with original_transaction():
+                yield
+
+        with mock.patch.object(
+            ws_store,
+            "_strict_playback_context_lock_set",
+            context_locks,
+        ), mock.patch.object(
+            ws_store,
+            "_strict_authority_pair_lock",
+            pair_locks,
+        ), mock.patch.object(
+            ws_store,
+            "_strict_playback_context_transaction",
+            transaction,
+        ):
+            reconciled = failActivePlaybackHandoffsForRestart()
+
+        self.assertEqual(reconciled, [handoff["handoffId"]])
+        self.assertEqual([event[0] for event in events], ["context", "pair", "database"])
+        self.assertEqual(events[0][1], ("restart-lock-context",))
+        self.assertEqual(
+            events[1][1],
+            (
+                ("alice", "source-player", "device:source-player"),
+                ("alice", "target-player", "device:target-player"),
+            ),
+        )
+
     def test_update_playback_context_state_requires_existing_record(self):
         missing = updatePlaybackContextState(
             "playback:alice:missing",
@@ -2191,6 +2446,153 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertEqual(handoff["baseControlVersion"], 3)
         self.assertEqual(handoff["controlVersion"], 4)
         self.assertEqual(handoff["snapshot"]["trackId"], "song-1")
+
+    def test_handoff_snapshot_sanitizer_removes_nested_raw_sid_fields(self):
+        savePlaybackHandoff(
+            {
+                "handoffId": "handoff-sanitized",
+                "requestId": "request-sanitized",
+                "playbackContextId": "playback:alice:sanitized",
+                "userName": "alice",
+                "sourceClientId": "phone-1",
+                "targetClientId": "pc-1",
+                "originClientId": "phone-1",
+                "status": "preparing",
+                "baseControlVersion": 3,
+                "snapshot": {
+                    "sid": "root-sid",
+                    "businessSidLabel": "preserved",
+                    "nested": {
+                        "sourceSid": "source-sid",
+                        "items": [
+                            {"targetSid": "target-sid", "trackId": "song-1"},
+                            {"requestSid": "request-sid", "positionMs": 25},
+                        ],
+                    },
+                },
+            }
+        )
+
+        snapshot = getPlaybackHandoff("handoff-sanitized")["snapshot"]
+        self.assertNotIn("sid", snapshot)
+        self.assertNotIn("sourceSid", snapshot["nested"])
+        self.assertNotIn("targetSid", snapshot["nested"]["items"][0])
+        self.assertNotIn("requestSid", snapshot["nested"]["items"][1])
+        self.assertEqual(snapshot["businessSidLabel"], "preserved")
+        self.assertEqual(snapshot["nested"]["items"][0]["trackId"], "song-1")
+        self.assertEqual(snapshot["nested"]["items"][1]["positionMs"], 25)
+
+    def test_existing_handoff_binding_and_generation_are_immutable(self):
+        payload = {
+            "handoffId": "handoff-immutable-generation",
+            "requestId": "request-immutable-generation",
+            "playbackContextId": "playback:alice:immutable",
+            "userName": "alice",
+            "sourceClientId": "source-1",
+            "sourceDeviceSessionId": "device:source-1",
+            "sourceConnectionNonce": "source-nonce-immutable",
+            "sourceConnectionEpoch": 1,
+            "targetClientId": "target-1",
+            "targetDeviceSessionId": "device:target-1",
+            "targetConnectionNonce": "target-nonce-immutable",
+            "targetConnectionEpoch": 1,
+            "originClientId": "controller-1",
+            "status": "preparing",
+            "baseControlVersion": 3,
+            "controlVersion": 4,
+            "snapshot": {"trackId": "song-1"},
+        }
+        savePlaybackHandoff(payload)
+        before = getPlaybackHandoff(payload["handoffId"])
+
+        for field_name, changed_value in (
+            ("playbackContextId", "playback:alice:replacement"),
+            ("userName", "mallory"),
+            ("sourceClientId", "replacement-source"),
+            ("sourceDeviceSessionId", "device:replacement-source"),
+            ("sourceConnectionNonce", "replacement-source-nonce"),
+            ("sourceConnectionEpoch", True),
+            ("targetClientId", "replacement-target"),
+            ("targetDeviceSessionId", "device:replacement-target"),
+            ("targetConnectionNonce", "replacement-target-nonce"),
+            ("targetConnectionEpoch", True),
+            ("originClientId", "replacement-controller"),
+            ("baseControlVersion", 4),
+        ):
+            with self.subTest(field=field_name):
+                changed = dict(payload)
+                changed["status"] = "committed"
+                changed["snapshot"] = {"trackId": "song-2"}
+                changed[field_name] = changed_value
+                with self.assertRaises(PlaybackHandoffTargetConflictError):
+                    savePlaybackHandoff(changed)
+                self.assertEqual(getPlaybackHandoff(payload["handoffId"]), before)
+
+        updated = dict(payload)
+        updated["status"] = "committed"
+        updated["snapshot"] = {"trackId": "song-2"}
+        savePlaybackHandoff(updated)
+        persisted = getPlaybackHandoff(payload["handoffId"])
+        self.assertEqual(persisted["status"], "committed")
+        self.assertEqual(persisted["snapshot"]["trackId"], "song-2")
+        for field_name in (
+            "playbackContextId",
+            "userName",
+            "sourceClientId",
+            "sourceDeviceSessionId",
+            "sourceConnectionNonce",
+            "sourceConnectionEpoch",
+            "targetClientId",
+            "targetDeviceSessionId",
+            "targetConnectionNonce",
+            "targetConnectionEpoch",
+            "originClientId",
+            "baseControlVersion",
+        ):
+            self.assertEqual(persisted[field_name], before[field_name])
+
+    def test_legacy_handoff_terminal_statuses_cannot_reenter_active_lifecycle(self):
+        terminal_statuses = (
+            "completed",
+            "cancelled",
+            "failed",
+            "timed_out",
+            "canceled",
+            "timedOut",
+            "aborted",
+            "superseded",
+        )
+        for terminal_status in terminal_statuses:
+            with self.subTest(status=terminal_status):
+                handoff_id = "legacy-terminal-" + terminal_status
+                payload = {
+                    "handoffId": handoff_id,
+                    "requestId": handoff_id + "-request",
+                    "playbackContextId": "playback:alice:legacy",
+                    "userName": "alice",
+                    "sourceClientId": "phone-1",
+                    "targetClientId": "pc-1",
+                    "originClientId": "phone-1",
+                    "status": terminal_status,
+                    "baseControlVersion": 3,
+                    "snapshot": {"trackId": "song-1"},
+                }
+                savePlaybackHandoff(payload)
+                before = getPlaybackHandoff(handoff_id)
+
+                savePlaybackHandoff(dict(payload))
+                self.assertEqual(getPlaybackHandoff(handoff_id), before)
+
+                replay_without_status = dict(payload)
+                replay_without_status.pop("status")
+                savePlaybackHandoff(replay_without_status)
+                self.assertEqual(getPlaybackHandoff(handoff_id), before)
+
+                reactivated = dict(payload)
+                reactivated["status"] = "preparing"
+                with self.assertRaises(PlaybackHandoffTargetConflictError):
+                    savePlaybackHandoff(reactivated)
+                self.assertEqual(getPlaybackHandoff(handoff_id), before)
 
     def test_get_playback_handoff_by_request_is_scoped_by_origin_client(self):
         savePlaybackHandoff(
@@ -4874,6 +5276,149 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertEqual(context["positionMs"], 500)
         self.assertEqual(device["appliedControlVersion"], 2)
         self.assertEqual(device["positionMs"], 500)
+
+    def test_handoff_source_passive_progress_uses_current_device_baseline(self):
+        self._create_exact_handoff_source()
+
+        first_progress = applyStrictPlaybackUpdate(
+            "handoff-source-context",
+            "alice",
+            "source-player",
+            "device:source-player",
+            "source-nonce",
+            {
+                "playbackContextId": "handoff-source-context",
+                "deviceSessionId": "device:source-player",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 250,
+                "positionSampledAtServerMs": 1100,
+                "playbackRate": 1.0,
+                "clientSeq": 2,
+            },
+            1200,
+        )
+        second_progress = applyStrictPlaybackUpdate(
+            "handoff-source-context",
+            "alice",
+            "source-player",
+            "device:source-player",
+            "source-nonce",
+            {
+                "playbackContextId": "handoff-source-context",
+                "deviceSessionId": "device:source-player",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 300,
+                "positionSampledAtServerMs": 1200,
+                "playbackRate": 1.0,
+                "clientSeq": 3,
+            },
+            1300,
+        )
+
+        self.assertNotIn("handoffSettlement", first_progress)
+        self.assertNotIn("handoffSettlement", second_progress)
+        self.assertEqual(getPlaybackHandoff("handoff-source-1")["status"], "preparing")
+        self.assertEqual(
+            getDevicePlaybackState("handoff-source-context", "source-player")[
+                "positionMs"
+            ],
+            300,
+        )
+
+    def test_handoff_source_changed_precedes_actual_and_rolls_back_atomically(self):
+        self._create_exact_handoff_source()
+        events = []
+        original_settle = ws_store._settle_handoff_source_changed
+        original_save_device = ws_store._save_strict_device_state_record
+
+        def settle(record):
+            events.append("handoff_terminal")
+            return original_settle(record)
+
+        def save_device(*args, **kwargs):
+            events.append("device_actual")
+            return original_save_device(*args, **kwargs)
+
+        changed_payload = {
+            "playbackContextId": "handoff-source-context",
+            "deviceSessionId": "device:source-player",
+            "origin": "passive",
+            "appliedControlVersion": 1,
+            "state": "paused",
+            "trackId": "song-1",
+            "positionMs": 250,
+            "positionSampledAtServerMs": 1100,
+            "playbackRate": 1.0,
+            "clientSeq": 2,
+        }
+        with mock.patch.object(
+            ws_store,
+            "_settle_handoff_source_changed",
+            side_effect=settle,
+        ), mock.patch.object(
+            ws_store,
+            "_save_strict_device_state_record",
+            side_effect=save_device,
+        ):
+            changed = applyStrictPlaybackUpdate(
+                "handoff-source-context",
+                "alice",
+                "source-player",
+                "device:source-player",
+                "source-nonce",
+                changed_payload,
+                1200,
+            )
+
+        self.assertEqual(events, ["handoff_terminal", "device_actual"])
+        self.assertEqual(changed["handoffSettlement"]["status"], "failed")
+        self.assertEqual(
+            changed["handoffSettlement"]["errorCode"],
+            "source_changed",
+        )
+        self.assertEqual(getPlaybackHandoff("handoff-source-1")["status"], "failed")
+        self.assertEqual(
+            getDevicePlaybackState("handoff-source-context", "source-player")["state"],
+            "paused",
+        )
+
+        self._create_exact_handoff_source(
+            playback_context_id="handoff-rollback-context",
+            handoff_id="handoff-rollback",
+        )
+        before_device = getDevicePlaybackState(
+            "handoff-rollback-context",
+            "source-player",
+        )
+        rollback_payload = dict(changed_payload)
+        rollback_payload["playbackContextId"] = "handoff-rollback-context"
+
+        def fail_after_mutation(*_args):
+            raise RuntimeError("injected source update rollback")
+
+        with self.assertRaisesRegex(RuntimeError, "injected source update rollback"):
+            applyStrictPlaybackUpdate(
+                "handoff-rollback-context",
+                "alice",
+                "source-player",
+                "device:source-player",
+                "source-nonce",
+                rollback_payload,
+                1200,
+                post_mutation_hook=fail_after_mutation,
+            )
+
+        self.assertEqual(getPlaybackHandoff("handoff-rollback")["status"], "preparing")
+        self.assertEqual(
+            getDevicePlaybackState("handoff-rollback-context", "source-player"),
+            before_device,
+        )
 
     def test_stale_applied_feedback_returns_source_only_correction_without_mutation(self):
         createStrictPlaybackContextState(

@@ -279,7 +279,7 @@
       "profile": "handoff",
       "type": "command",
       "contractSection": "5.4/6.8",
-      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "targetClientId:string", "baseControlVersion:int>=0"], "optional": []},
+      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "targetClientId:string", "targetDeviceSessionId:string", "baseControlVersion:int>=0"], "optional": []},
       "settlement": "correlated_ack",
       "serverPushes": ["playback.prepare"],
       "roleCapabilityGate": "controller; online source canPause; target player prepare/effectiveAt/canPlay",

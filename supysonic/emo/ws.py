@@ -136,6 +136,7 @@ from .ws_store import (
     getPlaybackStates,
     getQueueState,
     listActivePlaybackContextBindings,
+    listActivePlaybackHandoffsForPhysicalGeneration,
     listActivePlaybackPrepareTransactions,
     listAllPendingPlaybackControlTransactions,
     listExpiredPlaybackControlTransactions,
@@ -244,6 +245,250 @@ def _control_lifecycle_keys(transaction):
         if key is not None:
             keys.append(key)
     return tuple(sorted(set(keys)))
+
+
+def _handoff_lifecycle_keys(handoff):
+    user_name = handoff.get("userName")
+    keys = []
+    for client_id in (
+        handoff.get("sourceClientId"),
+        handoff.get("targetClientId"),
+    ):
+        key = _physical_generation_key(user_name, client_id)
+        if key is not None:
+            keys.append(key)
+    return tuple(sorted(set(keys)))
+
+
+HANDOFF_NONTERMINAL_STATUSES = frozenset(
+    ("preparing", "ready", "committed", "committing")
+)
+
+
+@contextmanager
+def _handoff_lifecycle_scope(resolve_handoffs, base_keys=()):
+    """Lock every stable client observed in a live Handoff set."""
+    locked_keys = {
+        key for key in base_keys if key is not None
+    }
+    while True:
+        observed = tuple(resolve_handoffs() or ())
+        candidate_keys = set(locked_keys)
+        for handoff in observed:
+            candidate_keys.update(_handoff_lifecycle_keys(handoff))
+        with strictPhysicalGenerationLockSet(candidate_keys):
+            current = tuple(resolve_handoffs() or ())
+            current_keys = set(locked_keys)
+            for handoff in current:
+                current_keys.update(_handoff_lifecycle_keys(handoff))
+            if not current_keys <= candidate_keys:
+                locked_keys.update(current_keys)
+                continue
+            yield current
+            return
+
+
+@contextmanager
+def _locked_handoff_lifecycle(handoff_id):
+    def resolve_handoff():
+        handoff = getPlaybackHandoff(handoff_id)
+        return () if handoff is None else (handoff,)
+
+    with _handoff_lifecycle_scope(resolve_handoff):
+        handoff = getPlaybackHandoff(handoff_id)
+        if handoff is None:
+            yield None
+            return
+        playback_context_id = handoff.get("playbackContextId")
+        context_ids = (
+            (playback_context_id,)
+            if isinstance(playback_context_id, str) and playback_context_id
+            else ()
+        )
+        with _ordinary_control_dispatch_barrier_set(context_ids):
+            yield getPlaybackHandoff(handoff_id)
+
+
+def _current_stable_client_generation(user_name, client_id):
+    client = state.get_client(client_id, user_name=user_name)
+    if client is None:
+        return None
+    device_session_id = client.get("deviceSessionId")
+    if not isinstance(device_session_id, str) or not device_session_id:
+        return None
+    return state.get_current_physical_generation(
+        user_name,
+        client_id,
+        device_session_id,
+    )
+
+
+def _active_handoffs_for_generation(generation):
+    if generation is None:
+        return []
+    return listActivePlaybackHandoffsForPhysicalGeneration(
+        generation["userName"],
+        generation["clientId"],
+        generation["deviceSessionId"],
+        generation["connectionNonce"],
+        generation["connectionEpoch"],
+    )
+
+
+def _handoff_generation_role(handoff, generation):
+    if generation is None or handoff.get("userName") != generation.get("userName"):
+        return None
+    for role in ("source", "target"):
+        prefix = role[0].lower() + role[1:]
+        if (
+            handoff.get("%sClientId" % prefix) == generation.get("clientId")
+            and handoff.get("%sDeviceSessionId" % prefix)
+            == generation.get("deviceSessionId")
+            and handoff.get("%sConnectionNonce" % prefix)
+            == generation.get("connectionNonce")
+            and handoff.get("%sConnectionEpoch" % prefix)
+            == generation.get("connectionEpoch")
+        ):
+            return role
+    return None
+
+
+def _current_handoff_generation(handoff, role, expected_sid=None):
+    prefix = role[0].lower() + role[1:]
+    try:
+        generation = state.get_current_physical_generation(
+            handoff["userName"],
+            handoff["%sClientId" % prefix],
+            handoff["%sDeviceSessionId" % prefix],
+            expected_sid=expected_sid,
+        )
+    except (KeyError, ValueError):
+        return None
+    if generation is None:
+        return None
+    if (
+        generation["connectionNonce"]
+        != handoff.get("%sConnectionNonce" % prefix)
+        or generation["connectionEpoch"]
+        != handoff.get("%sConnectionEpoch" % prefix)
+    ):
+        return None
+    return generation
+
+
+def _has_exact_handoff_generations(handoff):
+    return all(
+        isinstance(handoff.get(field_name), str)
+        and bool(handoff[field_name])
+        for field_name in (
+            "userName",
+            "sourceClientId",
+            "sourceDeviceSessionId",
+            "sourceConnectionNonce",
+            "targetClientId",
+            "targetDeviceSessionId",
+            "targetConnectionNonce",
+        )
+    ) and all(
+        type(handoff.get(field_name)) is int
+        and handoff[field_name] == 1
+        for field_name in (
+            "sourceConnectionEpoch",
+            "targetConnectionEpoch",
+        )
+    )
+
+
+def _require_current_handoff_generations(
+    handoff,
+    target_expected_sid=None,
+    require_source=True,
+):
+    source_generation = (
+        _current_handoff_generation(handoff, "source")
+        if require_source
+        else None
+    )
+    if require_source and source_generation is None:
+        raise PlaybackAuthorityOfflineError(
+            "Playback handoff source physical generation changed"
+        )
+    target_generation = _current_handoff_generation(
+        handoff,
+        "target",
+        expected_sid=target_expected_sid,
+    )
+    if target_generation is None:
+        raise PlaybackAuthorityOfflineError(
+            "Playback handoff target physical generation changed"
+        )
+    return source_generation, target_generation
+
+
+def _settle_handoffs_for_generation(generation):
+    handoffs = _active_handoffs_for_generation(generation)
+    context_ids = tuple(
+        sorted(
+            {
+                handoff["playbackContextId"]
+                for handoff in handoffs
+                if isinstance(handoff.get("playbackContextId"), str)
+                and handoff["playbackContextId"]
+            }
+        )
+    )
+    transitioned_handoffs = []
+    with _ordinary_control_dispatch_barrier_set(context_ids):
+        for handoff in _active_handoffs_for_generation(generation):
+            role = _handoff_generation_role(handoff, generation)
+            if role is None:
+                continue
+            status = "failed" if role == "target" else "cancelled"
+            error_code = "%s_disconnected" % role
+            terminal_result = terminateStrictPlaybackHandoff(
+                handoff["playbackContextId"],
+                handoff["handoffId"],
+                handoff["userName"],
+                status,
+                error_code=error_code,
+                error_message="Handoff %s disconnected" % role,
+                expected_generation_role=role,
+                expected_device_session_id=generation["deviceSessionId"],
+                expected_connection_nonce=generation["connectionNonce"],
+                expected_connection_epoch=generation["connectionEpoch"],
+            )
+            if terminal_result is None:
+                continue
+            terminal_handoff, transitioned = terminal_result
+            state.update_playback_handoff(
+                terminal_handoff["handoffId"],
+                status=terminal_handoff["status"],
+                error_code=terminal_handoff.get("errorCode"),
+                error_message=terminal_handoff.get("errorMessage"),
+            )
+            prepare_id = terminal_handoff.get("prepareId")
+            if prepare_id:
+                state.finish_prepare_if_preparing(prepare_id, status)
+            if transitioned:
+                transitioned_handoffs.append(terminal_handoff)
+    return transitioned_handoffs
+
+
+def _emit_handoff_terminal_outcomes(handoffs, action):
+    for handoff in handoffs:
+        _run_post_commit_push(
+            action,
+            None,
+            lambda item=handoff: _broadcast_handoff_cancel(
+                item,
+                item.get("errorCode") or "disconnected",
+            ),
+        )
+        _run_post_commit_push(
+            action,
+            None,
+            lambda item=handoff: _broadcast_handoff_status(item),
+        )
 
 ALLOWED_PRE_AUTH = {"auth.login"}
 EVENT_CONFIRMED_ACTIONS = {
@@ -494,10 +739,10 @@ def _get_control_execution_timeout_ms():
 
 
 def _list_clients(user_name=None, session_id=None):
+    _prune_stale_profile_clients(_get_client_stale_seconds())
     return state.list_clients(
         user_name=user_name,
         session_id=session_id,
-        stale_after_seconds=_get_client_stale_seconds(),
     )
 
 
@@ -2849,9 +3094,31 @@ def _required_broadcast_ready_clients(owner_client_id, participant_ids):
 
 def _send_playback_prepare(prepare, payload):
     user_name = (prepare.get("commitPayload") or {}).get("userName")
+    handoff_id = (prepare.get("commitPayload") or {}).get("handoffId")
+    handoff = (
+        state.get_playback_handoff(handoff_id) or getPlaybackHandoff(handoff_id)
+        if handoff_id
+        else None
+    )
     for target_client_id in prepare.get("targetClientIds") or []:
         target_client = state.get_client(target_client_id, user_name=user_name)
-        target_sid = state.get_sid_for_client(target_client_id, user_name=user_name)
+        exact_handoff = (
+            handoff is not None and _has_exact_handoff_generations(handoff)
+        )
+        target_generation = (
+            _current_handoff_generation(handoff, "target")
+            if exact_handoff
+            else None
+        )
+        if exact_handoff:
+            if target_generation is None:
+                continue
+            target_sid = target_generation["sid"]
+        else:
+            target_sid = state.get_sid_for_client(
+                target_client_id,
+                user_name=user_name,
+            )
         if target_client is None or target_sid is None:
             continue
         target_payload = dict(payload)
@@ -2913,8 +3180,7 @@ def _send_target_player_play(
 
 
 def _send_strict_handoff_commit(
-    target_client_id: str,
-    user_name: str,
+    handoff: Dict[str, object],
     playback_context_id: str,
     handoff_id: str,
     source_client_id: str,
@@ -2922,11 +3188,8 @@ def _send_strict_handoff_commit(
     effective_at_server_ms: int,
     position_ms: int,
 ) -> bool:
-    target_sid = state.get_sid_for_client(
-        target_client_id,
-        user_name=user_name,
-    )
-    if target_sid is None:
+    target_generation = _current_handoff_generation(handoff, "target")
+    if target_generation is None:
         return False
     _emit_message(
         _build_message(
@@ -2941,7 +3204,7 @@ def _send_strict_handoff_commit(
                 "positionMs": position_ms,
             },
         ),
-        target_sid,
+        target_generation["sid"],
     )
     return True
 
@@ -3040,7 +3303,7 @@ def _expire_prepare_later(prepare_id):
     _expire_prepare(prepare_id)
 
 
-def _expire_prepare(prepare_id):
+def _expire_prepare(prepare_id, _handoff_lifecycle_locked=False):
     prepare = state.get_prepare(prepare_id)
     if prepare is None or prepare.get("status") != "preparing":
         return None
@@ -3051,6 +3314,12 @@ def _expire_prepare(prepare_id):
         return _commit_prepare(prepare)
     commit_payload = prepare.get("commitPayload") or {}
     handoff_id = commit_payload.get("handoffId")
+    if handoff_id and not _handoff_lifecycle_locked:
+        with _locked_handoff_lifecycle(handoff_id):
+            return _expire_prepare(
+                prepare_id,
+                _handoff_lifecycle_locked=True,
+            )
     if handoff_id:
         terminal_result = terminateStrictPlaybackHandoff(
             commit_payload.get("playbackContextId"),
@@ -3093,10 +3362,6 @@ def _expire_prepare(prepare_id):
                 prepare.get("requestId"),
                 lambda: _broadcast_handoff_status(
                     handoff,
-                    include_sid=state.get_sid_for_client(
-                        commit_payload.get("targetClientId"),
-                        user_name=commit_payload.get("userName"),
-                    ),
                 ),
             )
         else:
@@ -3226,7 +3491,13 @@ def _expire_handoff_complete_later(handoff_id):
     _expire_handoff_complete(handoff_id)
 
 
-def _expire_handoff_complete(handoff_id):
+def _expire_handoff_complete(handoff_id, _handoff_lifecycle_locked=False):
+    if not _handoff_lifecycle_locked:
+        with _locked_handoff_lifecycle(handoff_id):
+            return _expire_handoff_complete(
+                handoff_id,
+                _handoff_lifecycle_locked=True,
+            )
     handoff = state.get_playback_handoff(handoff_id) or getPlaybackHandoff(
         handoff_id
     )
@@ -3308,10 +3579,6 @@ def _expire_handoff_complete(handoff_id):
             expired.get("requestId"),
             lambda: _broadcast_handoff_status(
                 expired,
-                include_sid=state.get_sid_for_client(
-                    expired.get("targetClientId"),
-                    user_name=expired.get("userName"),
-                ),
             ),
         )
     else:
@@ -3326,7 +3593,11 @@ def _expire_handoff_complete(handoff_id):
     return expired
 
 
-def _commit_prepare(prepare, post_commit_request_id=None):
+def _commit_prepare(
+    prepare,
+    post_commit_request_id=None,
+    _handoff_lifecycle_locked=False,
+):
     if prepare.get("status") != "preparing":
         return None
     if not _prepare_ready_to_commit(prepare):
@@ -3354,6 +3625,37 @@ def _commit_prepare(prepare, post_commit_request_id=None):
     if action == "playback.handoff.start" and _is_strict_playback_context_v2(
         handoff_target
     ):
+        handoff_id = commit_payload.get("handoffId")
+        handoff = getPlaybackHandoff(handoff_id)
+        if handoff is None:
+            return None
+        if not _handoff_lifecycle_locked:
+            with _locked_handoff_lifecycle(handoff_id):
+                current_prepare = state.get_prepare(prepare.get("prepareId"))
+                if current_prepare is None:
+                    return None
+                return _commit_prepare(
+                    current_prepare,
+                    post_commit_request_id=post_commit_request_id,
+                    _handoff_lifecycle_locked=True,
+                )
+        handoff = getPlaybackHandoff(handoff_id)
+        if handoff is None:
+            return None
+        try:
+            _source_generation, target_generation = (
+                _require_current_handoff_generations(handoff)
+            )
+        except PlaybackAuthorityOfflineError:
+            terminateStrictPlaybackHandoff(
+                handoff.get("playbackContextId"),
+                handoff_id,
+                handoff.get("userName"),
+                "failed",
+                error_code="target_disconnected",
+                error_message="Handoff physical generation changed before commit",
+            )
+            return None
         effective_at_server_ms = _effective_at_server_ms(PROTOCOL_TWO_PHASE)
         complete_expires_at_ms = (
             effective_at_server_ms + HANDOFF_COMPLETE_TIMEOUT_MS
@@ -3376,18 +3678,13 @@ def _commit_prepare(prepare, post_commit_request_id=None):
         if claimed_prepare is None:
             return None
         target_client = state.get_client(
-            commit_payload["targetClientId"],
-            user_name=commit_payload.get("userName"),
-        )
-        target_sid = state.get_sid_for_client(
-            commit_payload["targetClientId"],
-            user_name=commit_payload.get("userName"),
+            target_generation["clientId"],
+            user_name=handoff.get("userName"),
         )
         if (
             target_client is None
-            or target_sid != commit_payload.get("targetSid")
             or _device_session_id(target_client)
-            != commit_payload.get("targetDeviceSessionId")
+            != target_generation["deviceSessionId"]
         ):
             terminateStrictPlaybackHandoff(
                 commit_payload.get("playbackContextId"),
@@ -3416,8 +3713,7 @@ def _commit_prepare(prepare, post_commit_request_id=None):
                 "playback.ready",
                 post_commit_request_id,
                 lambda: _send_strict_handoff_commit(
-                    commit_payload["targetClientId"],
-                    commit_payload.get("userName"),
+                    handoff,
                     commit_payload["playbackContextId"],
                     commit_payload["handoffId"],
                     commit_payload.get("sourceClientId"),
@@ -7145,6 +7441,21 @@ def _follow_connection_generation(client_info, session_info):
     return values
 
 
+def _profile_connection_lifecycle_keys(client_info, session_info):
+    generation = _follow_connection_generation(client_info, session_info)
+    if generation is None:
+        return ()
+    keys = {
+        _physical_generation_key(
+            generation["userName"],
+            generation["clientId"],
+        )
+    }
+    for handoff in _active_handoffs_for_generation(generation):
+        keys.update(_handoff_lifecycle_keys(handoff))
+    return tuple(sorted(key for key in keys if key is not None))
+
+
 def _mark_follow_connection_unavailable(client_info, session_info):
     generation = _follow_connection_generation(client_info, session_info)
     if generation is None:
@@ -7189,6 +7500,40 @@ def _mark_follow_connection_unavailable(client_info, session_info):
             generation["clientId"]
         )
     return updated
+
+
+def _mark_profile_connection_unavailable(client_info, session_info):
+    generation = _follow_connection_generation(client_info, session_info)
+    follow_transitions = _mark_follow_connection_unavailable(
+        client_info,
+        session_info,
+    )
+    handoff_transitions = (
+        [] if generation is None else _settle_handoffs_for_generation(generation)
+    )
+    return follow_transitions, handoff_transitions
+
+
+def _prune_stale_profile_clients(stale_after_seconds):
+    handoff_transitions = []
+
+    def transition_profiles(client_info, session_info):
+        _follow, handoffs = _mark_profile_connection_unavailable(
+            client_info,
+            session_info,
+        )
+        handoff_transitions.extend(handoffs)
+
+    removed = state.prune_stale_clients(
+        stale_after_seconds,
+        pre_remove_callback=transition_profiles,
+        lifecycle_key_resolver=_profile_connection_lifecycle_keys,
+    )
+    _emit_handoff_terminal_outcomes(
+        handoff_transitions,
+        "playback.handoff.cancel",
+    )
+    return removed
 
 
 def _sweep_follow_safety_leases(
@@ -7979,7 +8324,13 @@ def _build_ready_complete_payload(current_client, payload):
     return ready_payload
 
 
-def _handle_playback_ready(current_client, payload, request_id):
+def _handle_playback_ready(
+    current_client,
+    payload,
+    request_id,
+    request_sid=None,
+    _handoff_lifecycle_locked=False,
+):
     if current_client is None:
         raise PermissionError("Register the device before sending playback ready")
 
@@ -8023,6 +8374,27 @@ def _handle_playback_ready(current_client, payload, request_id):
             "targetDeviceSessionId"
         ):
             raise PermissionError("playback.ready device does not match handoff target")
+        handoff = getPlaybackHandoff(commit_payload.get("handoffId"))
+        if handoff is None:
+            raise LookupError("Playback handoff not found")
+        if not _handoff_lifecycle_locked:
+            with _locked_handoff_lifecycle(handoff["handoffId"]):
+                return _handle_playback_ready(
+                    current_client,
+                    payload,
+                    request_id,
+                    request_sid=request_sid,
+                    _handoff_lifecycle_locked=True,
+                )
+        handoff = getPlaybackHandoff(commit_payload.get("handoffId"))
+        if handoff is None:
+            raise LookupError("Playback handoff not found")
+        _require_current_handoff_generations(
+            handoff,
+            target_expected_sid=request_sid,
+            require_source=handoff.get("status")
+            in ("preparing", "ready", "committed", "committing"),
+        )
 
     if prepare.get("status") != "preparing":
         if not strict_v2:
@@ -8102,6 +8474,7 @@ def _handle_playback_ready(current_client, payload, request_id):
         committed = _commit_prepare(
             updated_prepare,
             post_commit_request_id=request_id,
+            _handoff_lifecycle_locked=_handoff_lifecycle_locked,
         )
     if not strict_v2:
         _send_ack(
@@ -9685,7 +10058,22 @@ def _handle_strict_v2_playback_update(
             raise PermissionError(
                 "Playback update physical generation is unavailable"
             )
-        with strictPhysicalGenerationLockSet((lifecycle_key,)):
+        def resolve_update_handoffs():
+            generation = _current_stable_client_generation(
+                current_user_name,
+                authority_client_id,
+            )
+            return _active_handoffs_for_generation(generation)
+
+        lifecycle_scope = (
+            _handoff_lifecycle_scope(
+                resolve_update_handoffs,
+                base_keys=(lifecycle_key,),
+            )
+            if persisted_broadcast is None
+            else strictPhysicalGenerationLockSet((lifecycle_key,))
+        )
+        with lifecycle_scope:
             authority_generation = state.get_current_physical_generation(
                 current_user_name,
                 authority_client_id,
@@ -9769,6 +10157,27 @@ def _handle_strict_v2_playback_update(
         raise LookupError("Playback context not found")
     broadcast_mutation = result.pop("_broadcastMutation", None)
     playback_context = result["playbackContext"]
+    handoff_settlement = result.get("handoffSettlement")
+    if handoff_settlement is not None:
+        state.update_playback_handoff(
+            handoff_settlement["handoffId"],
+            status=handoff_settlement["status"],
+            error_code=handoff_settlement.get("errorCode"),
+            error_message=handoff_settlement.get("errorMessage"),
+        )
+        _run_post_commit_push(
+            "playback.update",
+            request_id,
+            lambda: _broadcast_handoff_cancel(
+                handoff_settlement,
+                handoff_settlement.get("errorCode") or "source_changed",
+            ),
+        )
+        _run_post_commit_push(
+            "playback.update",
+            request_id,
+            lambda: _broadcast_handoff_status(handoff_settlement),
+        )
     for command_control_version in result.get(
         "terminalControlVersions",
         (),
@@ -9891,6 +10300,15 @@ def _build_handoff_status_payload(handoff):
     return payload
 
 
+def _current_handoff_generation_sids(handoff):
+    target_sids = set()
+    for role in ("source", "target"):
+        generation = _current_handoff_generation(handoff, role)
+        if generation is not None:
+            target_sids.add(generation["sid"])
+    return target_sids
+
+
 def _broadcast_handoff_status(handoff, include_sid=None):
     user_name = handoff.get("userName")
     playback_context_id = handoff.get("playbackContextId")
@@ -9901,13 +10319,12 @@ def _broadcast_handoff_status(handoff, include_sid=None):
             user_name=user_name,
         )
     )
-    target_sids.update(
-        state.list_context_participant_sids(
-            playback_context_id,
-            user_name=user_name,
-        )
-    )
-    if include_sid is not None:
+    generation_sids = _current_handoff_generation_sids(handoff)
+    target_sids.update(generation_sids)
+    if include_sid is not None and (
+        not _has_exact_handoff_generations(handoff)
+        or include_sid in generation_sids
+    ):
         target_sids.add(include_sid)
     for target_sid in target_sids:
         _emit_message(message, target_sid)
@@ -9948,18 +10365,12 @@ def _broadcast_handoff_cancel(
             user_name=handoff.get("userName"),
         )
     )
-    for client_id in (
-        handoff.get("sourceClientId"),
-        handoff.get("targetClientId"),
-        handoff.get("originClientId"),
+    generation_sids = _current_handoff_generation_sids(handoff)
+    target_sids.update(generation_sids)
+    if include_sid is not None and (
+        not _has_exact_handoff_generations(handoff)
+        or include_sid in generation_sids
     ):
-        target_sid = state.get_sid_for_client(
-            client_id,
-            user_name=handoff.get("userName"),
-        )
-        if target_sid is not None:
-            target_sids.add(target_sid)
-    if include_sid is not None:
         target_sids.add(include_sid)
     for target_sid in target_sids:
         _emit_message(message, target_sid)
@@ -10043,10 +10454,21 @@ def _require_online_handoff_target(handoff):
         target_client_id,
         user_name=handoff.get("userName"),
     )
-    target_sid = state.get_sid_for_client(
-        target_client_id,
-        user_name=handoff.get("userName"),
+    target_generation = (
+        _current_handoff_generation(handoff, "target")
+        if _has_exact_handoff_generations(handoff)
+        else None
     )
+    target_sid = (
+        target_generation["sid"]
+        if target_generation is not None
+        else state.get_sid_for_client(
+            target_client_id,
+            user_name=handoff.get("userName"),
+        )
+    )
+    if _has_exact_handoff_generations(handoff) and target_generation is None:
+        raise LookupError("Handoff target physical generation is offline")
     if target_client is None and state.get_client(target_client_id) is not None:
         raise PermissionError("Cross-user handoff is not allowed")
     if target_client is None or target_sid is None:
@@ -10103,7 +10525,20 @@ def _rebuild_handoff_prepare_if_missing(handoff, context, request_sid):
         return handoff
 
     target_client_id = handoff.get("targetClientId")
-    target_client = _require_online_handoff_target(handoff)
+    strict_generation = handoff.get("targetConnectionNonce") is not None
+    if strict_generation:
+        _source_generation, target_generation = (
+            _require_current_handoff_generations(handoff)
+        )
+        target_client = state.get_client(
+            target_generation["clientId"],
+            user_name=handoff.get("userName"),
+        )
+        if target_client is None:
+            raise LookupError("Handoff target client is offline")
+    else:
+        target_generation = None
+        target_client = _require_online_handoff_target(handoff)
 
     playback_context_id = handoff.get("playbackContextId")
     source_client_id = handoff.get("sourceClientId")
@@ -10125,10 +10560,7 @@ def _rebuild_handoff_prepare_if_missing(handoff, context, request_sid):
     snapshot["prepareId"] = prepare_id
     snapshot["prepareExpiresAtMs"] = expires_at_ms
     snapshot["targetDeviceSessionId"] = target_device_session_id
-    snapshot["targetSid"] = state.get_sid_for_client(
-        target_client_id,
-        user_name=handoff.get("userName"),
-    )
+    snapshot.pop("targetSid", None)
     if state.get_playback_handoff(handoff.get("handoffId")) is None:
         handoff = state.create_playback_handoff(
             handoff.get("handoffId"),
@@ -10142,6 +10574,12 @@ def _rebuild_handoff_prepare_if_missing(handoff, context, request_sid):
             snapshot,
             prepare_id=prepare_id,
             origin_client_id=origin_client_id,
+            source_device_session_id=handoff.get("sourceDeviceSessionId"),
+            source_connection_nonce=handoff.get("sourceConnectionNonce"),
+            source_connection_epoch=handoff.get("sourceConnectionEpoch"),
+            target_device_session_id=handoff.get("targetDeviceSessionId"),
+            target_connection_nonce=handoff.get("targetConnectionNonce"),
+            target_connection_epoch=handoff.get("targetConnectionEpoch"),
         )
 
     handoff = dict(handoff)
@@ -10155,7 +10593,11 @@ def _rebuild_handoff_prepare_if_missing(handoff, context, request_sid):
         "targetClientId": target_client_id,
         "originClientId": origin_client_id,
         "targetDeviceSessionId": target_device_session_id,
-        "targetSid": snapshot.get("targetSid"),
+        "sourceDeviceSessionId": handoff.get("sourceDeviceSessionId"),
+        "sourceConnectionNonce": handoff.get("sourceConnectionNonce"),
+        "sourceConnectionEpoch": handoff.get("sourceConnectionEpoch"),
+        "targetConnectionNonce": handoff.get("targetConnectionNonce"),
+        "targetConnectionEpoch": handoff.get("targetConnectionEpoch"),
         "timelineId": context.get("timelineId") or f"playback:{playback_context_id}",
         "queueSongIds": list(context.get("queueSongIds") or []),
         "currentIndex": context.get("currentIndex", 0),
@@ -10206,7 +10648,20 @@ def _restore_ready_handoff_if_missing(handoff, context):
     ):
         return handoff
 
-    target_client = _require_online_handoff_target(handoff)
+    exact_handoff = _has_exact_handoff_generations(handoff)
+    if exact_handoff:
+        _source_generation, target_generation = (
+            _require_current_handoff_generations(handoff)
+        )
+        target_client = state.get_client(
+            target_generation["clientId"],
+            user_name=handoff.get("userName"),
+        )
+        if target_client is None:
+            raise LookupError("Handoff target client is offline")
+    else:
+        target_generation = None
+        target_client = _require_online_handoff_target(handoff)
     snapshot = dict(handoff.get("snapshot") or context)
     control_version = handoff.get("controlVersion")
     if control_version is None:
@@ -10229,6 +10684,12 @@ def _restore_ready_handoff_if_missing(handoff, context):
         snapshot,
         prepare_id=handoff.get("prepareId"),
         origin_client_id=handoff.get("originClientId"),
+        source_device_session_id=handoff.get("sourceDeviceSessionId"),
+        source_connection_nonce=handoff.get("sourceConnectionNonce"),
+        source_connection_epoch=handoff.get("sourceConnectionEpoch"),
+        target_device_session_id=handoff.get("targetDeviceSessionId"),
+        target_connection_nonce=handoff.get("targetConnectionNonce"),
+        target_connection_epoch=handoff.get("targetConnectionEpoch"),
     )
     complete_expires_at_ms = _server_time_ms() + HANDOFF_COMPLETE_TIMEOUT_MS
     restored = state.update_playback_handoff(
@@ -10239,24 +10700,35 @@ def _restore_ready_handoff_if_missing(handoff, context):
     savePlaybackHandoff(restored)
     effective_at_server_ms = _effective_at_server_ms(PROTOCOL_TWO_PHASE)
     target_device_session_id = _device_session_id(target_client)
-    _send_target_player_play(
-        restored.get("targetClientId"),
-        restored.get("sourceClientId"),
-        restored.get("requestId"),
-        target_device_session_id,
-        effective_at_server_ms,
-        control_version,
-        extra_payload={
-            "playbackContextId": restored.get("playbackContextId"),
-            "deviceSessionId": target_device_session_id,
-            "handoffId": restored.get("handoffId"),
-            "trackId": context.get("trackId"),
-            "positionMs": context.get("positionMs", 0),
-            "state": context.get("state") or "playing",
-            "completeExpiresAtServerMs": complete_expires_at_ms,
-        },
-        user_name=restored.get("userName"),
-    )
+    if exact_handoff:
+        _send_strict_handoff_commit(
+            restored,
+            restored["playbackContextId"],
+            restored["handoffId"],
+            restored.get("sourceClientId"),
+            control_version,
+            effective_at_server_ms,
+            context.get("positionMs", 0),
+        )
+    else:
+        _send_target_player_play(
+            restored.get("targetClientId"),
+            restored.get("sourceClientId"),
+            restored.get("requestId"),
+            target_device_session_id,
+            effective_at_server_ms,
+            control_version,
+            extra_payload={
+                "playbackContextId": restored.get("playbackContextId"),
+                "deviceSessionId": target_device_session_id,
+                "handoffId": restored.get("handoffId"),
+                "trackId": context.get("trackId"),
+                "positionMs": context.get("positionMs", 0),
+                "state": context.get("state") or "playing",
+                "completeExpiresAtServerMs": complete_expires_at_ms,
+            },
+            user_name=restored.get("userName"),
+        )
     socketio.start_background_task(
         _expire_handoff_complete_later,
         restored.get("handoffId"),
@@ -10274,9 +10746,27 @@ def _send_handoff_release(
 ):
     if not isinstance(target_client_id, str) or not target_client_id:
         return False
-    target_sid = state.get_sid_for_client(
-        target_client_id,
-        user_name=handoff.get("userName"),
+    target_role = None
+    for role in ("source", "target"):
+        prefix = role[0].lower() + role[1:]
+        if handoff.get("%sClientId" % prefix) == target_client_id:
+            target_role = role
+            break
+    exact_handoff = _has_exact_handoff_generations(handoff)
+    target_generation = (
+        _current_handoff_generation(handoff, target_role)
+        if exact_handoff and target_role is not None
+        else None
+    )
+    target_sid = (
+        target_generation["sid"]
+        if target_generation is not None
+        else None
+        if exact_handoff
+        else state.get_sid_for_client(
+            target_client_id,
+            user_name=handoff.get("userName"),
+        )
     )
     if target_sid is None:
         return False
@@ -10324,7 +10814,14 @@ def _send_handoff_release(
     return True
 
 
-def _handle_handoff_start(current_user_name, current_client, payload, request_id, request_sid):
+def _handle_handoff_start(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+    request_sid,
+    _lifecycle_locked=False,
+):
     if current_client is None:
         raise PermissionError("Register the device before starting handoff")
 
@@ -10366,6 +10863,43 @@ def _handle_handoff_start(current_user_name, current_client, payload, request_id
         raise ValueError("playback.handoff.start requires a non-empty targetClientId")
     if source_client_id == target_client_id:
         raise ValueError("playback.handoff.start source and target must be different")
+    if not _lifecycle_locked:
+        lifecycle_keys = tuple(
+            key
+            for key in (
+                _physical_generation_key(current_user_name, source_client_id),
+                _physical_generation_key(current_user_name, target_client_id),
+                _physical_generation_key(current_user_name, origin_client_id),
+            )
+            if key is not None
+        )
+
+        def resolve_context_handoffs():
+            return getActivePlaybackHandoffs(playback_context_id)
+
+        with _handoff_lifecycle_scope(
+            resolve_context_handoffs,
+            base_keys=lifecycle_keys,
+        ):
+            with _ordinary_control_dispatch_barrier(playback_context_id):
+                locked_client = state.get_client_for_sid(request_sid)
+                if (
+                    locked_client is None
+                    or locked_client.get("clientId") != origin_client_id
+                    or locked_client.get("deviceSessionId")
+                    != current_client.get("deviceSessionId")
+                ):
+                    raise PermissionError(
+                        "Playback handoff requester physical generation changed"
+                    )
+                return _handle_handoff_start(
+                    current_user_name,
+                    locked_client,
+                    payload,
+                    request_id,
+                    request_sid,
+                    _lifecycle_locked=True,
+                )
 
     existing_handoff = (
         state.get_playback_handoff_by_request(
@@ -10397,6 +10931,13 @@ def _handle_handoff_start(current_user_name, current_client, payload, request_id
         if existing_handoff.get("targetClientId") != target_client_id:
             raise ControlConflictError(
                 "Playback handoff requestId already belongs to another target",
+                current_control_version=context.get("controlVersion", 0),
+            )
+        if strict_v2 and existing_handoff.get(
+            "targetDeviceSessionId"
+        ) != payload.get("targetDeviceSessionId"):
+            raise ControlConflictError(
+                "Playback handoff requestId already belongs to another target device",
                 current_control_version=context.get("controlVersion", 0),
             )
         expired_handoff = _expire_stale_handoff(existing_handoff)
@@ -10450,23 +10991,49 @@ def _handle_handoff_start(current_user_name, current_client, payload, request_id
     ):
         raise PermissionError("Only handoff source or a controller can start handoff")
 
-    source_client = state.get_client(
+    source_device_session_id = context.get("authorityDeviceSessionId")
+    source_generation = state.get_current_physical_generation(
+        current_user_name,
         source_client_id,
-        user_name=current_user_name,
+        source_device_session_id,
     )
-    source_sid = state.get_sid_for_client(
+    source_client = state.get_client(
         source_client_id,
         user_name=current_user_name,
     )
     if source_client is not None and source_client.get("userName") != current_user_name:
         raise PermissionError("Handoff source belongs to another user")
+    if source_client is None or source_generation is None:
+        raise PlaybackAuthorityOfflineError("Playback context authority is offline")
+    if not socketio.server.manager.is_connected(
+        source_generation["sid"],
+        namespace="/emo",
+    ):
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority socket is unavailable"
+        )
     if strict_v2:
-        if source_client is None or source_sid is None:
-            raise PlaybackAuthorityOfflineError("Playback context authority is offline")
         if not _has_role(source_client, "player"):
             raise PermissionError("Playback context authority must be a player")
-        if not _client_supports(source_client, CAPABILITY_CAN_PAUSE):
-            raise CapabilityRequiredError("Handoff source requires canPause")
+        try:
+            requireEffectiveAtPlayer(
+                state,
+                current_user_name,
+                source_client_id,
+                required_capabilities=(
+                    CAPABILITY_PLAYBACK_CONTEXT_V2,
+                    CAPABILITY_EFFECTIVE_AT,
+                    CAPABILITY_CAN_PAUSE,
+                ),
+                require_broadcast=False,
+            )
+        except EffectiveAtEligibilityError as exc:
+            if exc.reason == "capability_required":
+                raise CapabilityRequiredError(str(exc)) from exc
+            raise ControlConflictError(
+                str(exc),
+                current_control_version=context.get("controlVersion", 0),
+            ) from exc
         if (
             source_client.get("deviceSessionId")
             != context.get("authorityDeviceSessionId")
@@ -10474,19 +11041,61 @@ def _handle_handoff_start(current_user_name, current_client, payload, request_id
             raise PlaybackAuthorityOfflineError(
                 "Playback context authority device is unavailable"
             )
+        try:
+            validateBroadcastSourceState(
+                context,
+                getDevicePlaybackState(
+                    playback_context_id,
+                    source_client_id,
+                ),
+                now_ms=_server_time_ms(),
+                has_unsettled_controls=bool(
+                    listPendingPlaybackControlTransactions(
+                        playback_context_id,
+                        context["epoch"],
+                    )
+                ),
+            )
+        except EffectiveAtEligibilityError as exc:
+            raise ControlConflictError(
+                str(exc),
+                current_control_version=context.get("controlVersion", 0),
+            ) from exc
 
+    requested_target_device_session_id = payload.get("targetDeviceSessionId")
+    if strict_v2 and (
+        not isinstance(requested_target_device_session_id, str)
+        or not requested_target_device_session_id
+    ):
+        raise ValueError(
+            "playback.handoff.start requires a non-empty targetDeviceSessionId"
+        )
     target_client = state.get_client(
-        target_client_id,
-        user_name=current_user_name,
-    )
-    target_sid = state.get_sid_for_client(
         target_client_id,
         user_name=current_user_name,
     )
     if target_client is None and state.get_client(target_client_id) is not None:
         raise PermissionError("Cross-user handoff is not allowed")
-    if target_client is None or target_sid is None:
+    if target_client is None:
         raise LookupError("Handoff target client is offline")
+    target_device_session_id = (
+        requested_target_device_session_id
+        if strict_v2
+        else _device_session_id(target_client)
+    )
+    target_generation = state.get_current_physical_generation(
+        current_user_name,
+        target_client_id,
+        target_device_session_id,
+    )
+    if target_generation is None:
+        raise LookupError("Handoff target physical generation is offline")
+    target_sid = target_generation["sid"]
+    if strict_v2 and not socketio.server.manager.is_connected(
+        target_sid,
+        namespace="/emo",
+    ):
+        raise LookupError("Handoff target physical generation is offline")
     if target_client.get("userName") != current_user_name:
         raise PermissionError("Cross-user handoff is not allowed")
     if not _has_role(target_client, "player"):
@@ -10511,6 +11120,8 @@ def _handle_handoff_start(current_user_name, current_client, payload, request_id
                     CAPABILITY_PLAYBACK_PREPARE,
                     CAPABILITY_EFFECTIVE_AT,
                     CAPABILITY_CAN_PLAY,
+                    CAPABILITY_CAN_PAUSE,
+                    CAPABILITY_CAN_SEEK,
                 ),
             )
         except EffectiveAtEligibilityError as exc:
@@ -10546,8 +11157,8 @@ def _handle_handoff_start(current_user_name, current_client, payload, request_id
     snapshot["handoffControlVersion"] = control_version
     snapshot["prepareId"] = prepare_id
     snapshot["prepareExpiresAtMs"] = prepare_expires_at_ms
-    snapshot["targetDeviceSessionId"] = _device_session_id(target_client)
-    snapshot["targetSid"] = target_sid
+    if strict_v2 and target_device_session_id != _device_session_id(target_client):
+        raise PermissionError("Handoff target device generation changed")
     try:
         handoff = state.create_playback_handoff(
             handoff_id,
@@ -10561,13 +11172,42 @@ def _handle_handoff_start(current_user_name, current_client, payload, request_id
             snapshot,
             prepare_id=prepare_id,
             origin_client_id=origin_client_id,
+            source_device_session_id=(
+                source_generation["deviceSessionId"]
+                if source_generation is not None
+                else None
+            ),
+            source_connection_nonce=(
+                source_generation["connectionNonce"]
+                if source_generation is not None
+                else None
+            ),
+            source_connection_epoch=(
+                source_generation["connectionEpoch"]
+                if source_generation is not None
+                else None
+            ),
+            target_device_session_id=(
+                target_generation["deviceSessionId"]
+                if target_generation is not None
+                else None
+            ),
+            target_connection_nonce=(
+                target_generation["connectionNonce"]
+                if target_generation is not None
+                else None
+            ),
+            target_connection_epoch=(
+                target_generation["connectionEpoch"]
+                if target_generation is not None
+                else None
+            ),
         )
     except PlaybackAuthorityMismatchError:
         raise ControlConflictError(
             "Playback handoff already in progress",
             current_control_version=context.get("controlVersion", 0),
         )
-    target_device_session_id = _device_session_id(target_client)
     try:
         persisted_handoff, _created = createStrictPlaybackHandoff(
             playback_context_id,
@@ -10590,7 +11230,11 @@ def _handle_handoff_start(current_user_name, current_client, payload, request_id
         "targetClientId": target_client_id,
         "originClientId": origin_client_id,
         "targetDeviceSessionId": target_device_session_id,
-        "targetSid": target_sid,
+        "sourceDeviceSessionId": handoff.get("sourceDeviceSessionId"),
+        "sourceConnectionNonce": handoff.get("sourceConnectionNonce"),
+        "sourceConnectionEpoch": handoff.get("sourceConnectionEpoch"),
+        "targetConnectionNonce": handoff.get("targetConnectionNonce"),
+        "targetConnectionEpoch": handoff.get("targetConnectionEpoch"),
         "timelineId": context.get("timelineId") or f"playback:{playback_context_id}",
         "queueSongIds": list(context.get("queueSongIds") or []),
         "currentIndex": context.get("currentIndex", 0),
@@ -10652,6 +11296,7 @@ def _handle_handoff_complete(
     payload: Dict[str, object],
     request_id: str,
     request_sid: Optional[str] = None,
+    _handoff_lifecycle_locked: bool = False,
 ) -> Dict[str, object]:
     if current_client is None:
         raise PermissionError("Register the device before completing handoff")
@@ -10663,14 +11308,33 @@ def _handle_handoff_complete(
     handoff_id = payload.get("handoffId")
     if not isinstance(handoff_id, str) or not handoff_id:
         raise ValueError("playback.handoff.complete requires a non-empty handoffId")
-    handoff = state.get_playback_handoff(handoff_id) or getPlaybackHandoff(handoff_id)
+    strict_v2 = _is_strict_playback_context_v2(current_client)
+    handoff = (
+        getPlaybackHandoff(handoff_id)
+        if strict_v2
+        else state.get_playback_handoff(handoff_id)
+        or getPlaybackHandoff(handoff_id)
+    )
     if handoff is None:
         raise LookupError("Playback handoff not found")
+    if strict_v2 and not _handoff_lifecycle_locked:
+        with _locked_handoff_lifecycle(handoff_id):
+            return _handle_handoff_complete(
+                current_user_name,
+                current_client,
+                payload,
+                request_id,
+                request_sid=request_sid,
+                _handoff_lifecycle_locked=True,
+            )
+    if strict_v2:
+        handoff = getPlaybackHandoff(handoff_id)
+        if handoff is None:
+            raise LookupError("Playback handoff not found")
     _ensure_handoff_for_user(handoff, current_user_name)
     if handoff.get("targetClientId") != current_client.get("clientId"):
         raise PermissionError("playback.handoff.complete sender must be targetClientId")
 
-    strict_v2 = _is_strict_playback_context_v2(current_client)
     if strict_v2:
         playback_context_id = payload.get("playbackContextId")
         if playback_context_id != handoff.get("playbackContextId"):
@@ -10680,17 +11344,25 @@ def _handle_handoff_complete(
             raise LookupError("Playback context not found")
         _ensure_playback_context_for_user(playback_context, current_user_name)
         _ensure_playback_context_active(playback_context)
-        snapshot = handoff.get("snapshot") or {}
-        target_device_session_id = current_client.get("deviceSessionId")
-        if target_device_session_id != snapshot.get("targetDeviceSessionId"):
+        target_device_session_id = handoff.get("targetDeviceSessionId")
+        if target_device_session_id != current_client.get("deviceSessionId"):
             raise PermissionError(
                 "playback.handoff.complete device does not match handoff target"
             )
-        target_sid = snapshot.get("targetSid")
-        if target_sid is not None and request_sid != target_sid:
-            raise PermissionError(
-                "playback.handoff.complete socket does not match handoff target"
-            )
+        source_generation, target_generation = (
+            _require_current_handoff_generations(
+            handoff,
+            target_expected_sid=request_sid,
+            require_source=handoff.get("status") != "completed",
+        )
+        )
+        if source_generation is None:
+            source_generation = {
+                "clientId": handoff.get("sourceClientId"),
+                "deviceSessionId": handoff.get("sourceDeviceSessionId"),
+                "connectionNonce": handoff.get("sourceConnectionNonce"),
+                "connectionEpoch": handoff.get("sourceConnectionEpoch"),
+            }
         if handoff.get("status") not in (
             "committed",
             "committing",
@@ -10708,6 +11380,22 @@ def _handle_handoff_complete(
                 current_client.get("clientId"),
                 target_device_session_id,
                 position_ms=payload.get("positionMs"),
+                expected_source_client_id=source_generation["clientId"],
+                expected_source_device_session_id=(
+                    source_generation["deviceSessionId"]
+                ),
+                expected_source_connection_nonce=(
+                    source_generation["connectionNonce"]
+                ),
+                expected_source_connection_epoch=(
+                    source_generation["connectionEpoch"]
+                ),
+                expected_target_connection_nonce=(
+                    target_generation["connectionNonce"]
+                ),
+                expected_target_connection_epoch=(
+                    target_generation["connectionEpoch"]
+                ),
             )
         except ValueError as exc:
             if str(exc) == "Playback handoff is not committing":
@@ -10799,6 +11487,7 @@ def _handle_handoff_complete(
             playback_context_id,
             handoff.get("sourceClientId"),
             handoff.get("targetClientId"),
+            target_device_session_id=handoff.get("targetDeviceSessionId"),
             expected_control_version=handoff.get("baseControlVersion"),
             next_control_version=control_version,
             playback_state=playback_payload,
@@ -10858,7 +11547,14 @@ def _handle_handoff_complete(
     return handoff
 
 
-def _handle_handoff_cancel(current_user_name, current_client, payload, request_id):
+def _handle_handoff_cancel(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+    request_sid=None,
+    _handoff_lifecycle_locked=False,
+):
     if current_client is None:
         raise PermissionError("Register the device before canceling handoff")
     _reject_session_id_for_strict_v2(
@@ -10874,6 +11570,44 @@ def _handle_handoff_cancel(current_user_name, current_client, payload, request_i
     _ensure_handoff_for_user(handoff, current_user_name)
     strict_v2 = _is_strict_playback_context_v2(current_client)
     if strict_v2:
+        if not _handoff_lifecycle_locked:
+            sender_key = _physical_generation_key(
+                current_user_name,
+                current_client.get("clientId"),
+            )
+            with _handoff_lifecycle_scope(
+                lambda: tuple(
+                    item
+                    for item in (getPlaybackHandoff(handoff_id),)
+                    if item is not None
+                ),
+                base_keys=() if sender_key is None else (sender_key,),
+            ):
+                with _ordinary_control_dispatch_barrier(
+                    handoff["playbackContextId"]
+                ):
+                    locked_client = state.get_client_for_sid(request_sid)
+                    if (
+                        locked_client is None
+                        or locked_client.get("clientId")
+                        != current_client.get("clientId")
+                        or locked_client.get("deviceSessionId")
+                        != current_client.get("deviceSessionId")
+                    ):
+                        raise PermissionError(
+                            "Playback handoff cancel sender generation changed"
+                        )
+                    return _handle_handoff_cancel(
+                        current_user_name,
+                        locked_client,
+                        payload,
+                        request_id,
+                        request_sid=request_sid,
+                        _handoff_lifecycle_locked=True,
+                    )
+        handoff = getPlaybackHandoff(handoff_id)
+        if handoff is None:
+            raise LookupError("Playback handoff not found")
         if payload.get("playbackContextId") != handoff.get("playbackContextId"):
             raise ValueError("playback.handoff.cancel playbackContextId does not match")
         status = handoff.get("status")
@@ -10891,11 +11625,43 @@ def _handle_handoff_cancel(current_user_name, current_client, payload, request_i
             handoff.get("originClientId"),
         ):
             raise PermissionError("Only handoff members can cancel handoff")
+        sender_role = None
+        if current_client.get("clientId") == handoff.get("sourceClientId"):
+            sender_role = "source"
+        elif current_client.get("clientId") == handoff.get("targetClientId"):
+            sender_role = "target"
+        sender_generation = None
+        if sender_role is not None:
+            sender_generation = _current_handoff_generation(
+                handoff,
+                sender_role,
+                expected_sid=request_sid,
+            )
+            if sender_generation is None:
+                raise PermissionError(
+                    "Playback handoff cancel sender generation changed"
+                )
         terminal_result = terminateStrictPlaybackHandoff(
             handoff.get("playbackContextId"),
             handoff_id,
             current_user_name,
             "cancelled",
+            expected_generation_role=sender_role,
+            expected_device_session_id=(
+                None
+                if sender_generation is None
+                else sender_generation["deviceSessionId"]
+            ),
+            expected_connection_nonce=(
+                None
+                if sender_generation is None
+                else sender_generation["connectionNonce"]
+            ),
+            expected_connection_epoch=(
+                None
+                if sender_generation is None
+                else sender_generation["connectionEpoch"]
+            ),
         )
         if terminal_result is None:
             raise LookupError("Playback handoff not found")
@@ -10919,17 +11685,17 @@ def _handle_handoff_cancel(current_user_name, current_client, payload, request_i
             "playback.handoff.cancel",
             request_id,
             lambda: _broadcast_handoff_cancel(
-                handoff,
-                reason,
-                include_sid=request.sid,
+                    handoff,
+                    reason,
+                    include_sid=request_sid,
             ),
         )
         _run_post_commit_push(
             "playback.handoff.cancel",
             request_id,
             lambda: _broadcast_handoff_status(
-                handoff,
-                include_sid=request.sid,
+                    handoff,
+                    include_sid=request_sid,
             ),
         )
         return handoff
@@ -11014,26 +11780,54 @@ class EmoNamespace(Namespace):
         _log_socket_access("connect")
         _log_emo_event(logging.INFO, "socket_connect", sid=request.sid)
 
-    def on_disconnect(self):
+    def on_disconnect(self, _reason=None):
         observed_session = state.get_session(request.sid) or {}
         observed_client = state.get_client_for_sid(request.sid)
+        observed_generation = _follow_connection_generation(
+            observed_client,
+            observed_session,
+        )
         lifecycle_key = _physical_generation_key(
             observed_session.get("userName"),
             observed_session.get("clientId"),
         )
-        with strictPhysicalGenerationLockSet(
-            () if lifecycle_key is None else (lifecycle_key,)
+        handoff_transitions = []
+
+        def resolve_disconnect_handoffs():
+            return _active_handoffs_for_generation(observed_generation)
+
+        with _handoff_lifecycle_scope(
+            resolve_disconnect_handoffs,
+            base_keys=() if lifecycle_key is None else (lifecycle_key,),
         ):
-            if observed_client is not None:
+            current_session = state.get_session(request.sid) or {}
+            current_client = state.get_client_for_sid(request.sid)
+            current_generation = _follow_connection_generation(
+                current_client,
+                current_session,
+            )
+            if (
+                observed_generation is not None
+                and current_generation == observed_generation
+            ):
                 try:
-                    _mark_follow_connection_unavailable(
-                        observed_client,
-                        observed_session,
+                    _follow, handoff_transitions = (
+                        _mark_profile_connection_unavailable(
+                            current_client,
+                            current_session,
+                        )
                     )
                 except Exception:
                     logger.exception(
-                        "Unable to transition Follow leases for disconnect"
+                        "Unable to transition profile state for disconnect"
                     )
+                _settle_authority_connection_controls_unknown(
+                    current_generation["userName"],
+                    current_generation["clientId"],
+                    current_generation["deviceSessionId"],
+                    current_generation["connectionNonce"],
+                    lifecycle_locked=True,
+                )
             session_info, client_info = state.unregister_session(request.sid)
             if session_info is not None and session_info.get("connectionNonce"):
                 connection_nonce = session_info["connectionNonce"]
@@ -11042,69 +11836,14 @@ class EmoNamespace(Namespace):
                 strict_v2_safety.clear_connection(connection_nonce)
                 with _source_terminal_replay_lock:
                     _source_terminal_replays.pop(connection_nonce, None)
-            if client_info is not None:
-                _settle_authority_connection_controls_unknown(
-                    client_info.get("userName"),
-                    client_info.get("clientId"),
-                    client_info.get("deviceSessionId"),
-                    (session_info or {}).get("connectionNonce"),
-                    lifecycle_locked=True,
-                )
         _log_socket_access("disconnect")
         _log_emo_event(logging.INFO, "socket_disconnect", sid=request.sid)
+        _emit_handoff_terminal_outcomes(
+            handoff_transitions,
+            "playback.handoff.cancel",
+        )
         if client_info is not None:
             _suspend_strict_broadcasts_for_authority_disconnect(client_info)
-            for handoff in state.fail_playback_handoffs_for_disconnect(
-                client_info.get("clientId")
-            ):
-                terminal_result = terminateStrictPlaybackHandoff(
-                    handoff.get("playbackContextId"),
-                    handoff.get("handoffId"),
-                    handoff.get("userName"),
-                    handoff.get("status"),
-                    error_code=handoff.get("errorCode"),
-                    error_message=handoff.get("errorMessage"),
-                )
-                if terminal_result is None:
-                    continue
-                handoff, transitioned = terminal_result
-                state.update_playback_handoff(
-                    handoff.get("handoffId"),
-                    status=handoff.get("status"),
-                    error_code=handoff.get("errorCode"),
-                    error_message=handoff.get("errorMessage"),
-                )
-                if not transitioned:
-                    continue
-                if (handoff.get("snapshot") or {}).get("targetDeviceSessionId"):
-                    _run_post_commit_push(
-                        "playback.handoff.cancel",
-                        None,
-                        lambda: _broadcast_handoff_cancel(
-                            handoff,
-                            handoff.get("errorCode") or "disconnected",
-                        ),
-                    )
-                    include_sid = None
-                    for client_id in (
-                        handoff.get("targetClientId"),
-                        handoff.get("sourceClientId"),
-                        handoff.get("originClientId"),
-                    ):
-                        include_sid = state.get_sid_for_client(
-                            client_id,
-                            user_name=handoff.get("userName"),
-                        )
-                        if include_sid is not None:
-                            break
-                    _run_post_commit_push(
-                        "playback.handoff.cancel",
-                        None,
-                        lambda: _broadcast_handoff_status(
-                            handoff,
-                            include_sid=include_sid,
-                        ),
-                    )
             _broadcast_clients(client_info["userName"])
         elif session_info is not None and session_info.get("userName"):
             _broadcast_clients(session_info["userName"])
@@ -11231,10 +11970,7 @@ class EmoNamespace(Namespace):
 
         state.touch_session(request.sid)
         try:
-            state.prune_stale_clients(
-                _get_client_stale_seconds(),
-                pre_remove_callback=_mark_follow_connection_unavailable,
-            )
+            _prune_stale_profile_clients(_get_client_stale_seconds())
         except Exception:
             logger.exception(
                 "Unable to prune stale clients after Follow transition failure"
@@ -11333,8 +12069,22 @@ class EmoNamespace(Namespace):
                     current_user_name,
                     payload.get("clientId"),
                 )
-                with strictPhysicalGenerationLockSet(
-                    () if registration_key is None else (registration_key,)
+                def resolve_replacement_handoffs():
+                    return _active_handoffs_for_generation(
+                        _current_stable_client_generation(
+                            current_user_name,
+                            payload.get("clientId"),
+                        )
+                    )
+
+                handoff_transitions = []
+                with _handoff_lifecycle_scope(
+                    resolve_replacement_handoffs,
+                    base_keys=(
+                        ()
+                        if registration_key is None
+                        else (registration_key,)
+                    ),
                 ):
                     previous_sid = state.get_sid_for_client(
                         payload.get("clientId"),
@@ -11352,16 +12102,12 @@ class EmoNamespace(Namespace):
                         else None
                     )
                     if previous_client is not None:
-                        _mark_follow_connection_unavailable(
-                            previous_client,
-                            previous_session,
+                        _follow, handoff_transitions = (
+                            _mark_profile_connection_unavailable(
+                                previous_client,
+                                previous_session,
+                            )
                         )
-                    current_client = _register_device(
-                        request.sid,
-                        current_user_name,
-                        payload,
-                    )
-                    if previous_client is not None:
                         _settle_authority_connection_controls_unknown(
                             previous_client.get("userName"),
                             previous_client.get("clientId"),
@@ -11369,6 +12115,15 @@ class EmoNamespace(Namespace):
                             previous_session.get("connectionNonce"),
                             lifecycle_locked=True,
                         )
+                    current_client = _register_device(
+                        request.sid,
+                        current_user_name,
+                        payload,
+                    )
+                _emit_handoff_terminal_outcomes(
+                    handoff_transitions,
+                    "playback.handoff.cancel",
+                )
                 if _is_strict_playback_context_v2(current_client):
                     broadcast_participant_replay = (
                         _prepare_strict_broadcast_participant_registration(
@@ -11723,6 +12478,7 @@ class EmoNamespace(Namespace):
                         current_client,
                         payload,
                         request_id,
+                        request_sid=request.sid,
                     )
                 _log_emo_event(
                     logging.INFO,
@@ -11739,6 +12495,7 @@ class EmoNamespace(Namespace):
                     current_client,
                     payload,
                     request_id,
+                    request_sid=request.sid,
                 )
                 if _is_strict_playback_context_v2(current_client):
                     prepare = state.get_prepare(payload.get("prepareId")) or {}
