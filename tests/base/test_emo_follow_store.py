@@ -475,6 +475,7 @@ class EmoFollowStoreTestCase(unittest.TestCase):
                 "targetConnectionNonce": "follower-nonce-1",
                 "targetConnectionEpoch": 1,
                 "baseControlVersion": 1,
+                "controlVersion": 2,
                 "handoffId": "handoff-existing",
                 "snapshot": {
                     "targetDeviceSessionId": "device:follower-1",
@@ -576,6 +577,7 @@ class EmoFollowStoreTestCase(unittest.TestCase):
                         "targetConnectionNonce": "follower-nonce-1",
                         "targetConnectionEpoch": 1,
                         "baseControlVersion": 1,
+                        "controlVersion": 2,
                         "handoffId": "handoff-race",
                         "snapshot": {
                             "targetDeviceSessionId": "device:follower-1",
@@ -1201,6 +1203,7 @@ class EmoFollowStoreTestCase(unittest.TestCase):
                     "targetConnectionNonce": "follower-nonce-1",
                     "targetConnectionEpoch": 1,
                     "baseControlVersion": 1,
+                    "controlVersion": 2,
                     "handoffId": "handoff-1",
                 },
                 "device:follower-1",

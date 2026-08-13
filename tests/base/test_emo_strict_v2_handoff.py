@@ -17,6 +17,7 @@ from supysonic.emo.ws import (
 )
 from supysonic.emo.ws_store import (
     failActivePlaybackHandoffsForRestart,
+    getActivePlaybackHandoffs,
     getDevicePlaybackStates,
     getPlaybackContextState,
     getPlaybackHandoff,
@@ -173,7 +174,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
             {"action", "handoffId", "prepareId", "status", "controlVersion"},
         )
         self.assertEqual(start_ack["payload"]["status"], "preparing")
-        self.assertEqual(start_ack["payload"]["controlVersion"], 2)
+        self.assertEqual(start_ack["payload"]["controlVersion"], 1)
         source_generation = get_state().get_current_physical_generation(
             "alice",
             "source-1",
@@ -221,16 +222,26 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
                 "prepareId",
                 "sourceClientId",
                 "authorityClientId",
+                "authorityDeviceSessionId",
                 "deviceSessionId",
                 "queueSongIds",
                 "currentIndex",
                 "trackId",
                 "positionMs",
+                "positionSampledAtServerMs",
+                "playbackRate",
                 "controlVersion",
+                "sourceEpoch",
+                "sourceVersion",
+                "sourceQueueRevision",
                 "timelineId",
             },
         )
         self.assertEqual(prepare["payload"]["deviceSessionId"], "device:target-1")
+        self.assertEqual(prepare["payload"]["controlVersion"], 1)
+        self.assertEqual(prepare["payload"]["sourceEpoch"], 1)
+        self.assertEqual(prepare["payload"]["sourceVersion"], 1)
+        self.assertEqual(prepare["payload"]["sourceQueueRevision"], 1)
         self.assertFalse(
             any(message["action"] == "playback.prepare" for message in self.get_messages(source))
         )
@@ -273,9 +284,18 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
                 "handoffId",
                 "controlVersion",
                 "sourceClientId",
+                "serverTimeMs",
                 "effectiveAtServerMs",
                 "positionMs",
+                "playbackRate",
             },
+        )
+        self.assertEqual(commit["payload"]["controlVersion"], 2)
+        self.assertEqual(commit["payload"]["playbackRate"], 1.0)
+        self.assertGreaterEqual(
+            commit["payload"]["effectiveAtServerMs"]
+            - commit["payload"]["serverTimeMs"],
+            250,
         )
         self.assertGreaterEqual(
             commit["payload"]["effectiveAtServerMs"] - ready_started_at_ms,
@@ -784,7 +804,122 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         )
         self.assertEqual(self.get_messages(target), [])
 
-    def test_start_prepare_push_failure_keeps_ack_and_idempotent_handoff(self):
+    def test_duplicate_start_rebuilds_prepare_without_reenqueue(self):
+        _source, target, controller = self.connect_handoff_devices()
+        first_ack = self.get_ack(
+            self.start_handoff(controller, "handoff-start-first"),
+            "handoff-start-first",
+        )
+        first_prepare = next(
+            message
+            for message in self.get_messages(target)
+            if message["action"] == "playback.prepare"
+        )
+        ws_state = get_state()
+        with ws_state._lock:
+            ws_state._pending_prepares.pop(
+                first_ack["payload"]["prepareId"],
+                None,
+            )
+
+        retry_ack = self.get_ack(
+            self.start_handoff(controller, "handoff-start-rebuilt"),
+            "handoff-start-rebuilt",
+        )
+
+        self.assertEqual(
+            retry_ack["payload"]["handoffId"],
+            first_ack["payload"]["handoffId"],
+        )
+        self.assertEqual(
+            retry_ack["payload"]["prepareId"],
+            first_prepare["payload"]["prepareId"],
+        )
+        self.assertEqual(self.get_messages(target), [])
+        rebuilt = ws_state.get_prepare(first_ack["payload"]["prepareId"])
+        self.assertIsNotNone(rebuilt)
+        self.assertEqual(
+            rebuilt["expiresAtMs"],
+            getPlaybackHandoff(first_ack["payload"]["handoffId"])[
+                "prepareExpiresAtMs"
+            ],
+        )
+
+    def test_duplicate_and_late_ready_do_not_reenqueue_commit(self):
+        _source, target, controller = self.connect_handoff_devices()
+        start_ack = self.get_ack(
+            self.start_handoff(controller),
+            "handoff-start-1",
+        )
+        prepare = next(
+            message
+            for message in self.get_messages(target)
+            if message["action"] == "playback.prepare"
+        )
+
+        def send_ready(request_id):
+            target.emit(
+                "message",
+                {
+                    "type": "event",
+                    "action": "playback.ready",
+                    "requestId": request_id,
+                    "payload": {
+                        "playbackContextId": "context-handoff-1",
+                        "handoffId": start_ack["payload"]["handoffId"],
+                        "prepareId": prepare["payload"]["prepareId"],
+                        "ready": True,
+                    },
+                },
+                namespace="/emo",
+            )
+            return self.get_messages(target)
+
+        first_messages = send_ready("handoff-ready-first")
+        self.assertEqual(
+            sum(
+                message["action"] == "player.play"
+                for message in first_messages
+            ),
+            1,
+        )
+        duplicate_messages = send_ready("handoff-ready-duplicate")
+        self.assertEqual(
+            [message["action"] for message in duplicate_messages],
+            ["playback.handoff.status"],
+        )
+        self.assertEqual(
+            get_state().get_prepare(prepare["payload"]["prepareId"])["status"],
+            "committed",
+        )
+
+        ws_state = get_state()
+        with ws_state._lock:
+            ws_state._pending_prepares.pop(
+                prepare["payload"]["prepareId"],
+                None,
+            )
+        late_messages = send_ready("handoff-ready-late")
+
+        self.assertEqual(
+            [message["action"] for message in late_messages],
+            ["playback.handoff.status"],
+        )
+        self.assertEqual(
+            late_messages[0]["payload"]["status"],
+            "committing",
+        )
+        handoff = getPlaybackHandoff(start_ack["payload"]["handoffId"])
+        self.assertEqual(handoff["status"], "committed")
+        self.assertEqual(
+            sum(
+                message["action"] == "player.play"
+                for message in duplicate_messages + late_messages
+            ),
+            0,
+        )
+
+    def test_start_prepare_enqueue_failure_is_terminal_without_ack(self):
         _source, target, controller = self.connect_handoff_devices()
 
         with mock.patch(
@@ -793,26 +928,36 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         ):
             first_messages = self.start_handoff(controller)
 
-        first_ack = self.get_ack(first_messages, "handoff-start-1")
+        error = self.get_error(first_messages, "handoff-start-1")
+        self.assertEqual(error["payload"]["code"], "internal_error")
+        target_messages = self.get_messages(target)
         self.assertEqual(
-            [message["action"] for message in first_messages],
-            ["system.ack"],
+            [message["action"] for message in target_messages],
+            ["playback.handoff.cancel"],
         )
-        self.assertEqual(first_ack["payload"]["status"], "preparing")
-        self.assertEqual(self.get_messages(target), [])
-        handoff = getPlaybackHandoff(first_ack["payload"]["handoffId"])
-        self.assertEqual(handoff["status"], "preparing")
+        self.assertEqual(
+            target_messages[0]["payload"]["reason"],
+            "prepare_failed",
+        )
+        self.assertEqual(target_messages[0]["payload"]["controlVersion"], 1)
+        handoffs = getActivePlaybackHandoffs("context-handoff-1")
+        self.assertEqual(handoffs, [])
+        handoff = getPlaybackHandoffByRequest(
+            "alice",
+            "controller-1",
+            "handoff-start-1",
+        )
+        self.assertEqual(handoff["status"], "failed")
+        self.assertEqual(handoff["errorCode"], "prepare_failed")
+        self.assertEqual(handoff["controlVersion"], 2)
+        self.assertEqual(
+            getPlaybackContextState("context-handoff-1")["controlVersion"],
+            1,
+        )
 
         retry_messages = self.start_handoff(controller)
-        retry_ack = self.get_ack(retry_messages, "handoff-start-1")
-        self.assertEqual(
-            retry_ack["payload"]["handoffId"],
-            first_ack["payload"]["handoffId"],
-        )
-        self.assertEqual(
-            retry_ack["payload"]["prepareId"],
-            first_ack["payload"]["prepareId"],
-        )
+        retry_error = self.get_error(retry_messages, "handoff-start-1")
+        self.assertEqual(retry_error["payload"]["code"], "internal_error")
         self.assertEqual(self.get_messages(target), [])
 
     def test_start_ack_emit_failure_still_sends_one_prepare_and_replays_ack(self):
@@ -863,7 +1008,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         )
         self.assertEqual(self.get_messages(target), [])
 
-    def test_ready_commit_push_failure_replays_committing_confirmation(self):
+    def test_ready_commit_enqueue_failure_replays_failed_confirmation(self):
         source, target, controller = self.connect_handoff_devices()
         start_ack = self.get_ack(
             self.start_handoff(controller),
@@ -905,20 +1050,32 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         ):
             target.emit("message", ready_request, namespace="/emo")
 
-        self.assertEqual(settled_before_push, [True])
+        self.assertEqual(settled_before_push, [False])
         ready_messages = self.get_messages(target)
         self.assertEqual(
             [message["action"] for message in ready_messages],
-            ["playback.handoff.status"],
+            ["playback.handoff.cancel", "playback.handoff.status"],
         )
-        self.assertEqual(ready_messages[0]["payload"]["status"], "committing")
+        self.assertEqual(ready_messages[0]["payload"]["reason"], "commit_failed")
+        self.assertEqual(ready_messages[0]["payload"]["controlVersion"], 1)
+        self.assertEqual(ready_messages[1]["payload"]["status"], "failed")
+        self.assertEqual(
+            ready_messages[1]["payload"]["errorCode"],
+            "commit_failed",
+        )
         self.assertFalse(
             any(message["action"] == "player.play" for message in ready_messages)
         )
         context = getPlaybackContextState("context-handoff-1")
         handoff = getPlaybackHandoff(start_ack["payload"]["handoffId"])
         self.assertEqual(context["authorityClientId"], "source-1")
-        self.assertIn(handoff["status"], {"committed", "committing"})
+        self.assertEqual(handoff["status"], "failed")
+        self.assertEqual(handoff["errorCode"], "commit_failed")
+        self.assertEqual(
+            get_state().get_prepare(prepare["payload"]["prepareId"])["status"],
+            "failed",
+        )
+        self.assertEqual(context["controlVersion"], 1)
 
         self.get_messages(source)
         self.get_messages(controller)
@@ -928,7 +1085,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
             [message["action"] for message in replay_messages],
             ["playback.handoff.status"],
         )
-        self.assertEqual(replay_messages[0]["payload"]["status"], "committing")
+        self.assertEqual(replay_messages[0]["payload"]["status"], "failed")
         self.assertEqual(self.get_messages(source), [])
 
     def test_start_requires_controller_and_target_prepare_capabilities(self):
@@ -1212,7 +1369,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
                 "playbackContextId": "context-handoff-1",
                 "handoffId": start_ack["payload"]["handoffId"],
                 "reason": "user_cancelled",
-                "controlVersion": 2,
+                "controlVersion": 1,
             },
         )
         self.assertEqual(

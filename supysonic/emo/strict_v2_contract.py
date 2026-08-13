@@ -2450,14 +2450,34 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
                     "handoffId",
                     "controlVersion",
                     "sourceClientId",
+                    "serverTimeMs",
                     "effectiveAtServerMs",
                     "positionMs",
+                    "playbackRate",
                 },
                 set(),
                 "handoff commit payload",
             )
             _output_string(control["handoffId"], "handoff commit handoffId")
-            _output_int(control["effectiveAtServerMs"], "handoff commit effectiveAtServerMs", 1)
+            effective_at = _output_int(
+                control["effectiveAtServerMs"],
+                "handoff commit effectiveAtServerMs",
+                1,
+            )
+            server_time = _output_int(
+                control["serverTimeMs"],
+                "handoff commit serverTimeMs",
+            )
+            if effective_at - server_time < 250:
+                _output_error(
+                    "handoff commit effective-at lead must be at least 250ms"
+                )
+            playback_rate = _output_number(
+                control["playbackRate"],
+                "handoff commit playbackRate",
+            )
+            if not 0.5 <= playback_rate <= 2.0:
+                _output_error("handoff commit playbackRate is invalid")
         else:
             required = {
                 "playbackContextId",
@@ -2586,11 +2606,17 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
                 "prepareId",
                 "sourceClientId",
                 "authorityClientId",
+                "authorityDeviceSessionId",
                 "deviceSessionId",
                 "queueSongIds",
                 "currentIndex",
                 "positionMs",
+                "positionSampledAtServerMs",
+                "playbackRate",
                 "controlVersion",
+                "sourceEpoch",
+                "sourceVersion",
+                "sourceQueueRevision",
             },
             {"trackId", "timelineId"},
             "playback.prepare payload",
@@ -2601,6 +2627,7 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
             "prepareId",
             "sourceClientId",
             "authorityClientId",
+            "authorityDeviceSessionId",
             "deviceSessionId",
         ):
             _output_string(prepare[field_name], "playback.prepare %s" % field_name)
@@ -2613,7 +2640,27 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
         if current_index >= len(queue):
             _output_error("playback.prepare currentIndex is outside queueSongIds")
         _output_int(prepare["positionMs"], "playback.prepare positionMs")
+        _output_int(
+            prepare["positionSampledAtServerMs"],
+            "playback.prepare positionSampledAtServerMs",
+        )
+        playback_rate = _output_number(
+            prepare["playbackRate"],
+            "playback.prepare playbackRate",
+        )
+        if not 0.5 <= playback_rate <= 2.0:
+            _output_error("playback.prepare playbackRate is invalid")
         _output_int(prepare["controlVersion"], "playback.prepare controlVersion", 1)
+        for field_name in (
+            "sourceEpoch",
+            "sourceVersion",
+            "sourceQueueRevision",
+        ):
+            _output_int(
+                prepare[field_name],
+                "playback.prepare %s" % field_name,
+                1,
+            )
         if "trackId" in prepare and prepare["trackId"] != queue[current_index]:
             _output_error("playback.prepare trackId must match current queue item")
         if "timelineId" in prepare:

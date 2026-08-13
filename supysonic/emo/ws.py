@@ -143,6 +143,7 @@ from .ws_store import (
     listPendingPlaybackControlTransactions,
     listPendingPlaybackControlTransactionsForAuthorityConnection,
     listPlaybackContexts,
+    markStrictPlaybackHandoffCommitEnqueued,
     markPlaybackControlTransactionExecutionEligible,
     mutateStrictPlaybackContextControl,
     mutateStrictPlaybackContextQueue,
@@ -3093,13 +3094,16 @@ def _required_broadcast_ready_clients(owner_client_id, participant_ids):
 
 
 def _send_playback_prepare(prepare, payload):
-    user_name = (prepare.get("commitPayload") or {}).get("userName")
-    handoff_id = (prepare.get("commitPayload") or {}).get("handoffId")
+    commit_payload = prepare.get("commitPayload") or {}
+    user_name = commit_payload.get("userName")
+    handoff_id = commit_payload.get("handoffId")
+    strict_handoff = commit_payload.get("_strictV2Handoff") is True
     handoff = (
         state.get_playback_handoff(handoff_id) or getPlaybackHandoff(handoff_id)
         if handoff_id
         else None
     )
+    sent_target_ids = set()
     for target_client_id in prepare.get("targetClientIds") or []:
         target_client = state.get_client(target_client_id, user_name=user_name)
         exact_handoff = (
@@ -3112,7 +3116,7 @@ def _send_playback_prepare(prepare, payload):
         )
         if exact_handoff:
             if target_generation is None:
-                continue
+                return False
             target_sid = target_generation["sid"]
         else:
             target_sid = state.get_sid_for_client(
@@ -3120,6 +3124,8 @@ def _send_playback_prepare(prepare, payload):
                 user_name=user_name,
             )
         if target_client is None or target_sid is None:
+            if strict_handoff:
+                return False
             continue
         target_payload = dict(payload)
         is_context_prepare = _is_context_payload(target_payload)
@@ -3143,6 +3149,10 @@ def _send_playback_prepare(prepare, payload):
                 targetClientId=target_client_id,
             )
         _emit_message(message, target_sid)
+        sent_target_ids.add(target_client_id)
+    return not strict_handoff or sent_target_ids == set(
+        prepare.get("targetClientIds") or []
+    )
 
 
 def _send_target_player_play(
@@ -3185,8 +3195,10 @@ def _send_strict_handoff_commit(
     handoff_id: str,
     source_client_id: str,
     control_version: int,
+    server_time_ms: int,
     effective_at_server_ms: int,
     position_ms: int,
+    playback_rate: float,
 ) -> bool:
     target_generation = _current_handoff_generation(handoff, "target")
     if target_generation is None:
@@ -3200,8 +3212,10 @@ def _send_strict_handoff_commit(
                 "handoffId": handoff_id,
                 "controlVersion": control_version,
                 "sourceClientId": source_client_id,
+                "serverTimeMs": server_time_ms,
                 "effectiveAtServerMs": effective_at_server_ms,
                 "positionMs": position_ms,
+                "playbackRate": playback_rate,
             },
         ),
         target_generation["sid"],
@@ -3656,7 +3670,10 @@ def _commit_prepare(
                 error_message="Handoff physical generation changed before commit",
             )
             return None
-        effective_at_server_ms = _effective_at_server_ms(PROTOCOL_TWO_PHASE)
+        server_time_ms = _server_time_ms()
+        effective_at_server_ms = (
+            server_time_ms + _commit_lead_ms(PROTOCOL_TWO_PHASE)
+        )
         complete_expires_at_ms = (
             effective_at_server_ms + HANDOFF_COMPLETE_TIMEOUT_MS
         )
@@ -3671,9 +3688,29 @@ def _commit_prepare(
         handoff, transitioned = terminal_result
         if not transitioned:
             return None
+        if handoff.get("status") == "failed":
+            failed_prepare = state.finish_prepare_if_preparing(
+                prepare["prepareId"],
+                "failed",
+            )
+            state.update_playback_handoff(
+                commit_payload["handoffId"],
+                status="failed",
+                error_code=handoff.get("errorCode") or "source_changed",
+                error_message=handoff.get("errorMessage"),
+            )
+            _run_post_commit_push(
+                "playback.ready",
+                post_commit_request_id,
+                lambda: _broadcast_handoff_cancel(
+                    handoff,
+                    handoff.get("errorCode") or "source_changed",
+                ),
+            )
+            return failed_prepare or handoff
         claimed_prepare = state.finish_prepare_if_preparing(
             prepare["prepareId"],
-            "committed",
+            "committing",
         )
         if claimed_prepare is None:
             return None
@@ -3686,7 +3723,7 @@ def _commit_prepare(
             or _device_session_id(target_client)
             != target_generation["deviceSessionId"]
         ):
-            terminateStrictPlaybackHandoff(
+            terminal = terminateStrictPlaybackHandoff(
                 commit_payload.get("playbackContextId"),
                 commit_payload.get("handoffId"),
                 commit_payload.get("userName"),
@@ -3694,34 +3731,80 @@ def _commit_prepare(
                 error_code="target_disconnected",
                 error_message="Handoff target changed before commit",
             )
-            return None
+            failed = handoff if terminal is None else terminal[0]
+            state.update_playback_handoff(
+                commit_payload["handoffId"],
+                status="failed",
+                error_code="target_disconnected",
+                error_message="Handoff target changed before commit",
+            )
+            state.finish_prepare(prepare["prepareId"], "failed")
+            return failed
         handoff = state.update_playback_handoff(
             commit_payload["handoffId"],
-            status="committed",
+            status="committing",
             complete_expires_at_ms=complete_expires_at_ms,
+            snapshot=handoff.get("snapshot") or {},
         ) or handoff
-        if post_commit_request_id is not None:
-            _store_event_confirmations(
-                [_build_handoff_status_message(handoff)]
-            )
-        socketio.start_background_task(
-            _expire_handoff_complete_later,
-            commit_payload["handoffId"],
-        )
         if _is_strict_playback_context_v2(target_client):
-            _run_post_commit_push(
-                "playback.ready",
-                post_commit_request_id,
-                lambda: _send_strict_handoff_commit(
+            try:
+                enqueued = _send_strict_handoff_commit(
                     handoff,
                     commit_payload["playbackContextId"],
                     commit_payload["handoffId"],
                     commit_payload.get("sourceClientId"),
-                    commit_payload["controlVersion"],
+                    handoff["controlVersion"],
+                    server_time_ms,
                     effective_at_server_ms,
-                    commit_payload.get("positionMs", 0),
-                ),
-            )
+                    (handoff.get("snapshot") or {}).get("positionMs", 0),
+                    (handoff.get("snapshot") or {}).get(
+                        "playbackRate",
+                        1.0,
+                    ),
+                )
+                if not enqueued:
+                    raise RuntimeError(
+                        "Handoff commit could not be enqueued"
+                    )
+                marked = markStrictPlaybackHandoffCommitEnqueued(
+                    commit_payload["playbackContextId"],
+                    commit_payload["handoffId"],
+                    commit_payload["userName"],
+                )
+                if marked is None:
+                    raise RuntimeError("Playback handoff disappeared")
+                handoff, _marked = marked
+            except Exception as exc:
+                terminal = terminateStrictPlaybackHandoff(
+                    commit_payload["playbackContextId"],
+                    commit_payload["handoffId"],
+                    commit_payload["userName"],
+                    "failed",
+                    error_code="commit_failed",
+                    error_message="Handoff commit could not be enqueued",
+                )
+                failed = handoff if terminal is None else terminal[0]
+                state.update_playback_handoff(
+                    commit_payload["handoffId"],
+                    status="failed",
+                    error_code="commit_failed",
+                    error_message="Handoff commit could not be enqueued",
+                )
+                state.finish_prepare(prepare["prepareId"], "failed")
+                logger.error(
+                    "Strict handoff commit enqueue failed for %s: %s",
+                    commit_payload["handoffId"],
+                    type(exc).__name__,
+                )
+                _run_post_commit_push(
+                    "playback.ready",
+                    post_commit_request_id,
+                    lambda: _send_handoff_cancel_to_target(
+                        failed,
+                        "commit_failed",
+                    ),
+                )
+                return failed
         else:
             _send_target_player_play(
                 commit_payload["targetClientId"],
@@ -3741,6 +3824,21 @@ def _commit_prepare(
                 },
                 user_name=commit_payload.get("userName"),
             )
+        state.finish_prepare(prepare["prepareId"], "committed")
+        handoff = state.update_playback_handoff(
+            commit_payload["handoffId"],
+            status="committed",
+            complete_expires_at_ms=complete_expires_at_ms,
+            snapshot=handoff.get("snapshot") or {},
+        ) or handoff
+        if post_commit_request_id is not None:
+            _store_event_confirmations(
+                [_build_handoff_status_message(handoff)]
+            )
+        socketio.start_background_task(
+            _expire_handoff_complete_later,
+            commit_payload["handoffId"],
+        )
         return handoff
 
     claimed_prepare = state.finish_prepare_if_preparing(
@@ -3751,7 +3849,10 @@ def _commit_prepare(
         return None
     prepare = claimed_prepare
     commit_payload = prepare.get("commitPayload") or {}
-    effective_at_server_ms = _effective_at_server_ms(PROTOCOL_TWO_PHASE)
+    server_time_ms = _server_time_ms()
+    effective_at_server_ms = (
+        server_time_ms + _commit_lead_ms(PROTOCOL_TWO_PHASE)
+    )
 
     if action == "broadcast.start":
         broadcast = state.create_broadcast(
@@ -8351,7 +8452,49 @@ def _handle_playback_ready(
     strict_v2 = _is_strict_playback_context_v2(current_client)
     if prepare is None:
         if strict_v2:
-            raise LookupError("Playback prepare not found")
+            handoff_id = payload.get("handoffId")
+            handoff = (
+                getPlaybackHandoff(handoff_id)
+                if isinstance(handoff_id, str) and handoff_id
+                else None
+            )
+            if handoff is None or handoff.get("prepareId") != prepare_id:
+                raise LookupError("Playback prepare not found")
+            if payload.get("playbackContextId") != handoff.get(
+                "playbackContextId"
+            ):
+                raise ValueError(
+                    "playback.ready playbackContextId does not match handoff"
+                )
+            if current_client_id != handoff.get("targetClientId"):
+                raise PermissionError(
+                    "playback.ready sender is not the handoff target"
+                )
+            if current_client.get("deviceSessionId") != handoff.get(
+                "targetDeviceSessionId"
+            ):
+                raise PermissionError(
+                    "playback.ready device does not match handoff target"
+                )
+            if not _handoff_lifecycle_locked:
+                with _locked_handoff_lifecycle(handoff_id):
+                    return _handle_playback_ready(
+                        current_client,
+                        payload,
+                        request_id,
+                        request_sid=request_sid,
+                        _handoff_lifecycle_locked=True,
+                    )
+            handoff = getPlaybackHandoff(handoff_id)
+            if handoff is None or handoff.get("prepareId") != prepare_id:
+                raise LookupError("Playback prepare not found")
+            _require_current_handoff_generations(
+                handoff,
+                target_expected_sid=request_sid,
+                require_source=handoff.get("status")
+                in HANDOFF_NONTERMINAL_STATUSES,
+            )
+            return handoff
         _send_ack(request_id, {"ignored": True, "prepareId": prepare_id})
         return None
     commit_payload = prepare.get("commitPayload") or {}
@@ -10262,19 +10405,27 @@ def _ensure_handoff_for_user(handoff, user_name):
         raise PermissionError("Playback handoff belongs to another user")
 
 
-def _send_handoff_start_ack(request_id, handoff, duplicate=False):
+def _send_handoff_start_ack(
+    request_id,
+    handoff,
+    duplicate=False,
+    strict_v2=False,
+):
     status = handoff.get("status") or "preparing"
     payload = {
         "handoffId": handoff.get("handoffId"),
         "prepareId": handoff.get("prepareId"),
-        "controlVersion": handoff.get("controlVersion"),
+        "controlVersion": handoff.get(
+            "baseControlVersion" if strict_v2 else "controlVersion"
+        ),
         "status": status,
     }
     _send_ack(request_id, payload)
 
 
 def _build_handoff_status_payload(handoff):
-    status = handoff.get("status")
+    durable_status = handoff.get("status")
+    status = durable_status
     status = {
         "aborted": "failed",
         "canceled": "cancelled",
@@ -10286,7 +10437,11 @@ def _build_handoff_status_payload(handoff):
         "playbackContextId": handoff.get("playbackContextId"),
         "handoffId": handoff.get("handoffId"),
         "status": status,
-        "controlVersion": handoff.get("controlVersion"),
+        "controlVersion": (
+            handoff.get("controlVersion")
+            if durable_status in {"committed", "committing", "completed"}
+            else handoff.get("baseControlVersion")
+        ),
     }
     source_client_id = handoff.get("sourceClientId")
     if source_client_id:
@@ -10348,7 +10503,7 @@ def _broadcast_handoff_cancel(
         "playbackContextId": handoff.get("playbackContextId"),
         "handoffId": handoff.get("handoffId"),
         "reason": reason,
-        "controlVersion": handoff.get("controlVersion"),
+        "controlVersion": handoff.get("baseControlVersion"),
     }
     if handoff.get("errorCode"):
         payload["errorCode"] = handoff["errorCode"]
@@ -10377,6 +10532,33 @@ def _broadcast_handoff_cancel(
     return message
 
 
+def _send_handoff_cancel_to_target(
+    handoff: Dict[str, object],
+    reason: str,
+) -> bool:
+    target_generation = _current_handoff_generation(handoff, "target")
+    if target_generation is None:
+        return False
+    payload = {
+        "playbackContextId": handoff.get("playbackContextId"),
+        "handoffId": handoff.get("handoffId"),
+        "reason": reason,
+        "controlVersion": handoff.get("baseControlVersion"),
+        "errorCode": handoff.get("errorCode") or reason,
+    }
+    if handoff.get("errorMessage"):
+        payload["errorMessage"] = handoff["errorMessage"]
+    _emit_message(
+        _build_message(
+            "command",
+            "playback.handoff.cancel",
+            payload,
+        ),
+        target_generation["sid"],
+    )
+    return True
+
+
 def _handoff_expiry_ms(handoff):
     snapshot = handoff.get("snapshot") or {}
     status = handoff.get("status")
@@ -10385,7 +10567,7 @@ def _handoff_expiry_ms(handoff):
         if expires_at_ms is None:
             expires_at_ms = snapshot.get("prepareExpiresAtMs")
         timeout_ms = HANDOFF_PREPARE_TIMEOUT_MS
-    elif status in ("ready", "committed"):
+    elif status in ("ready", "committed", "committing"):
         expires_at_ms = handoff.get("completeExpiresAtMs")
         if expires_at_ms is None:
             expires_at_ms = snapshot.get("completeExpiresAtMs")
@@ -10515,7 +10697,12 @@ def _require_online_handoff_target(handoff):
     return target_client
 
 
-def _rebuild_handoff_prepare_if_missing(handoff, context, request_sid):
+def _rebuild_handoff_prepare_if_missing(
+    handoff,
+    context,
+    request_sid,
+    strict_v2=False,
+):
     prepare_id = handoff.get("prepareId")
     if (
         handoff.get("status") != "preparing"
@@ -10525,8 +10712,9 @@ def _rebuild_handoff_prepare_if_missing(handoff, context, request_sid):
         return handoff
 
     target_client_id = handoff.get("targetClientId")
-    strict_generation = handoff.get("targetConnectionNonce") is not None
-    if strict_generation:
+    exact_handoff = _has_exact_handoff_generations(handoff)
+    structured_lane = handoff.get("contextEpoch") is not None
+    if exact_handoff:
         _source_generation, target_generation = (
             _require_current_handoff_generations(handoff)
         )
@@ -10554,13 +10742,16 @@ def _rebuild_handoff_prepare_if_missing(handoff, context, request_sid):
         control_version = context.get("controlVersion", 0) + 1
 
     now_ms = _server_time_ms()
-    expires_at_ms = now_ms + HANDOFF_PREPARE_TIMEOUT_MS
+    expires_at_ms = _handoff_expiry_ms(handoff)
+    if expires_at_ms is None:
+        expires_at_ms = now_ms + HANDOFF_PREPARE_TIMEOUT_MS
     snapshot = dict(handoff.get("snapshot") or context)
-    snapshot["handoffControlVersion"] = control_version
-    snapshot["prepareId"] = prepare_id
-    snapshot["prepareExpiresAtMs"] = expires_at_ms
-    snapshot["targetDeviceSessionId"] = target_device_session_id
-    snapshot.pop("targetSid", None)
+    if not structured_lane:
+        snapshot["handoffControlVersion"] = control_version
+        snapshot["prepareId"] = prepare_id
+        snapshot["prepareExpiresAtMs"] = expires_at_ms
+        snapshot["targetDeviceSessionId"] = target_device_session_id
+        snapshot.pop("targetSid", None)
     if state.get_playback_handoff(handoff.get("handoffId")) is None:
         handoff = state.create_playback_handoff(
             handoff.get("handoffId"),
@@ -10584,7 +10775,8 @@ def _rebuild_handoff_prepare_if_missing(handoff, context, request_sid):
 
     handoff = dict(handoff)
     handoff["snapshot"] = snapshot
-    savePlaybackHandoff(handoff)
+    if not structured_lane:
+        savePlaybackHandoff(handoff)
     commit_payload = {
         "userName": handoff.get("userName"),
         "handoffId": handoff.get("handoffId"),
@@ -10598,15 +10790,21 @@ def _rebuild_handoff_prepare_if_missing(handoff, context, request_sid):
         "sourceConnectionEpoch": handoff.get("sourceConnectionEpoch"),
         "targetConnectionNonce": handoff.get("targetConnectionNonce"),
         "targetConnectionEpoch": handoff.get("targetConnectionEpoch"),
-        "timelineId": context.get("timelineId") or f"playback:{playback_context_id}",
-        "queueSongIds": list(context.get("queueSongIds") or []),
-        "currentIndex": context.get("currentIndex", 0),
-        "trackId": context.get("trackId"),
-        "positionMs": context.get("positionMs", 0),
-        "state": context.get("state") or "stopped",
-        "queueRevision": context.get("queueRevision", 0),
+        "timelineId": snapshot.get("timelineId")
+        or context.get("timelineId")
+        or f"playback:{playback_context_id}",
+        "queueSongIds": list(snapshot.get("queueSongIds") or []),
+        "currentIndex": snapshot.get("currentIndex", 0),
+        "trackId": snapshot.get("trackId"),
+        "positionMs": snapshot.get("positionMs", 0),
+        "state": snapshot.get("state") or "stopped",
+        "queueRevision": snapshot.get(
+            "sourceQueueRevision",
+            snapshot.get("queueRevision", 0),
+        ),
         "baseControlVersion": base_control_version,
         "controlVersion": control_version,
+        "_strictV2Handoff": strict_v2,
     }
     prepare = state.create_prepare(
         prepare_id,
@@ -10621,6 +10819,10 @@ def _rebuild_handoff_prepare_if_missing(handoff, context, request_sid):
         request_sid=request_sid,
         request_id=handoff.get("requestId"),
     )
+    if strict_v2:
+        socketio.start_background_task(_expire_prepare_later, prepare_id)
+        return handoff
+
     prepare_payload = {
         "prepareId": prepare_id,
         "handoffId": handoff.get("handoffId"),
@@ -10641,27 +10843,17 @@ def _rebuild_handoff_prepare_if_missing(handoff, context, request_sid):
     return handoff
 
 
-def _restore_ready_handoff_if_missing(handoff, context):
+def _restore_ready_handoff_if_missing(handoff, context, strict_v2=False):
     if (
         handoff.get("status") != "ready"
         or state.get_playback_handoff(handoff.get("handoffId")) is not None
     ):
         return handoff
 
-    exact_handoff = _has_exact_handoff_generations(handoff)
-    if exact_handoff:
-        _source_generation, target_generation = (
-            _require_current_handoff_generations(handoff)
-        )
-        target_client = state.get_client(
-            target_generation["clientId"],
-            user_name=handoff.get("userName"),
-        )
-        if target_client is None:
-            raise LookupError("Handoff target client is offline")
-    else:
-        target_generation = None
-        target_client = _require_online_handoff_target(handoff)
+    if strict_v2:
+        return handoff
+
+    target_client = _require_online_handoff_target(handoff)
     snapshot = dict(handoff.get("snapshot") or context)
     control_version = handoff.get("controlVersion")
     if control_version is None:
@@ -10697,38 +10889,28 @@ def _restore_ready_handoff_if_missing(handoff, context):
         status="ready",
         complete_expires_at_ms=complete_expires_at_ms,
     )
-    savePlaybackHandoff(restored)
+    if handoff.get("contextEpoch") is None:
+        savePlaybackHandoff(restored)
     effective_at_server_ms = _effective_at_server_ms(PROTOCOL_TWO_PHASE)
     target_device_session_id = _device_session_id(target_client)
-    if exact_handoff:
-        _send_strict_handoff_commit(
-            restored,
-            restored["playbackContextId"],
-            restored["handoffId"],
-            restored.get("sourceClientId"),
-            control_version,
-            effective_at_server_ms,
-            context.get("positionMs", 0),
-        )
-    else:
-        _send_target_player_play(
-            restored.get("targetClientId"),
-            restored.get("sourceClientId"),
-            restored.get("requestId"),
-            target_device_session_id,
-            effective_at_server_ms,
-            control_version,
-            extra_payload={
-                "playbackContextId": restored.get("playbackContextId"),
-                "deviceSessionId": target_device_session_id,
-                "handoffId": restored.get("handoffId"),
-                "trackId": context.get("trackId"),
-                "positionMs": context.get("positionMs", 0),
-                "state": context.get("state") or "playing",
-                "completeExpiresAtServerMs": complete_expires_at_ms,
-            },
-            user_name=restored.get("userName"),
-        )
+    _send_target_player_play(
+        restored.get("targetClientId"),
+        restored.get("sourceClientId"),
+        restored.get("requestId"),
+        target_device_session_id,
+        effective_at_server_ms,
+        control_version,
+        extra_payload={
+            "playbackContextId": restored.get("playbackContextId"),
+            "deviceSessionId": target_device_session_id,
+            "handoffId": restored.get("handoffId"),
+            "trackId": context.get("trackId"),
+            "positionMs": context.get("positionMs", 0),
+            "state": context.get("state") or "playing",
+            "completeExpiresAtServerMs": complete_expires_at_ms,
+        },
+        user_name=restored.get("userName"),
+    )
     socketio.start_background_task(
         _expire_handoff_complete_later,
         restored.get("handoffId"),
@@ -10949,17 +11131,24 @@ def _handle_handoff_start(
                     existing_handoff,
                     context,
                     request_sid,
+                    strict_v2=strict_v2,
                 )
                 existing_handoff = _restore_ready_handoff_if_missing(
                     existing_handoff,
                     context,
+                    strict_v2=strict_v2,
                 )
             except PlaybackAuthorityMismatchError:
                 raise ControlConflictError(
                     "Playback handoff already in progress",
                     current_control_version=context.get("controlVersion", 0),
                 )
-        _send_handoff_start_ack(request_id, existing_handoff, duplicate=True)
+        _send_handoff_start_ack(
+            request_id,
+            existing_handoff,
+            duplicate=True,
+            strict_v2=strict_v2,
+        )
         return existing_handoff
 
     for active_handoff in getActivePlaybackHandoffs(playback_context_id):
@@ -10975,8 +11164,14 @@ def _handle_handoff_start(
                 active_handoff,
                 context,
                 request_sid,
+                strict_v2=True,
             )
-            _send_handoff_start_ack(request_id, active_handoff, duplicate=True)
+            _send_handoff_start_ack(
+                request_id,
+                active_handoff,
+                duplicate=True,
+                strict_v2=True,
+            )
             return active_handoff
         raise ControlConflictError(
             "Playback handoff already in progress",
@@ -11221,6 +11416,7 @@ def _handle_handoff_start(
         handoff_id,
         snapshot=persisted_handoff.get("snapshot") or {},
     ) or persisted_handoff
+    frozen_snapshot = handoff.get("snapshot") or {}
 
     commit_payload = {
         "userName": current_user_name,
@@ -11235,15 +11431,17 @@ def _handle_handoff_start(
         "sourceConnectionEpoch": handoff.get("sourceConnectionEpoch"),
         "targetConnectionNonce": handoff.get("targetConnectionNonce"),
         "targetConnectionEpoch": handoff.get("targetConnectionEpoch"),
-        "timelineId": context.get("timelineId") or f"playback:{playback_context_id}",
-        "queueSongIds": list(context.get("queueSongIds") or []),
-        "currentIndex": context.get("currentIndex", 0),
-        "trackId": context.get("trackId"),
-        "positionMs": context.get("positionMs", 0),
-        "state": context.get("state") or "stopped",
-        "queueRevision": context.get("queueRevision", 0),
+        "timelineId": frozen_snapshot.get("timelineId")
+        or f"playback:{playback_context_id}",
+        "queueSongIds": list(frozen_snapshot.get("queueSongIds") or []),
+        "currentIndex": frozen_snapshot.get("currentIndex", 0),
+        "trackId": frozen_snapshot.get("trackId"),
+        "positionMs": frozen_snapshot.get("positionMs", 0),
+        "state": frozen_snapshot.get("state") or "stopped",
+        "queueRevision": frozen_snapshot.get("sourceQueueRevision", 0),
         "baseControlVersion": base_control_version,
         "controlVersion": control_version,
+        "_strictV2Handoff": strict_v2,
     }
     prepare = state.create_prepare(
         prepare_id,
@@ -11265,20 +11463,84 @@ def _handle_handoff_start(
         "deviceSessionId": target_device_session_id,
         "sourceClientId": source_client_id,
         "authorityClientId": source_client_id,
-        "queueSongIds": list(context.get("queueSongIds") or []),
-        "currentIndex": context.get("currentIndex", 0),
-        "trackId": context.get("trackId"),
-        "positionMs": context.get("positionMs", 0),
-        "controlVersion": control_version,
+        "authorityDeviceSessionId": handoff.get(
+            "sourceDeviceSessionId"
+        ),
+        "queueSongIds": list(frozen_snapshot.get("queueSongIds") or []),
+        "currentIndex": frozen_snapshot.get(
+            "currentIndex",
+            0,
+        ),
+        "trackId": frozen_snapshot.get("trackId"),
+        "positionMs": frozen_snapshot.get(
+            "positionMs",
+            0,
+        ),
+        "positionSampledAtServerMs": frozen_snapshot.get(
+            "positionSampledAtServerMs"
+        ),
+        "playbackRate": frozen_snapshot.get(
+            "playbackRate",
+            1.0,
+        ),
+        "controlVersion": (
+            base_control_version if strict_v2 else control_version
+        ),
+        "sourceEpoch": frozen_snapshot.get("sourceEpoch"),
+        "sourceVersion": frozen_snapshot.get("sourceVersion"),
+        "sourceQueueRevision": frozen_snapshot.get("sourceQueueRevision"),
     }
-    if context.get("timelineId"):
-        prepare_payload["timelineId"] = context["timelineId"]
-    _send_handoff_start_ack(request_id, handoff)
-    _run_post_commit_push(
-        "playback.handoff.start",
+    if frozen_snapshot.get("timelineId"):
+        prepare_payload["timelineId"] = frozen_snapshot["timelineId"]
+    if strict_v2:
+        try:
+            if not _send_playback_prepare(prepare, prepare_payload):
+                raise RuntimeError("Handoff prepare could not be enqueued")
+        except Exception as exc:
+            state.finish_prepare_if_preparing(prepare_id, "failed")
+            terminal = terminateStrictPlaybackHandoff(
+                playback_context_id,
+                handoff_id,
+                current_user_name,
+                "failed",
+                error_code="prepare_failed",
+                error_message="Handoff prepare could not be enqueued",
+            )
+            failed = handoff if terminal is None else terminal[0]
+            state.update_playback_handoff(
+                handoff_id,
+                status="failed",
+                error_code="prepare_failed",
+                error_message="Handoff prepare could not be enqueued",
+            )
+            logger.error(
+                "Strict handoff prepare enqueue failed for %s: %s",
+                handoff_id,
+                type(exc).__name__,
+            )
+            _run_post_commit_push(
+                "playback.handoff.start",
+                request_id,
+                lambda: _broadcast_handoff_cancel(
+                    failed,
+                    "prepare_failed",
+                    include_sid=request_sid,
+                ),
+            )
+            raise RuntimeError(
+                "Handoff prepare could not be enqueued"
+            ) from exc
+    _send_handoff_start_ack(
         request_id,
-        lambda: _send_playback_prepare(prepare, prepare_payload),
+        handoff,
+        strict_v2=strict_v2,
     )
+    if not strict_v2:
+        _run_post_commit_push(
+            "playback.handoff.start",
+            request_id,
+            lambda: _send_playback_prepare(prepare, prepare_payload),
+        )
     _run_post_commit_push(
         "playback.handoff.start",
         request_id,

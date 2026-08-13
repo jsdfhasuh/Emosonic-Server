@@ -7268,7 +7268,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
 
         self.assertEqual(self.messages(client), [])
 
-    def test_strict_output_accepts_handoff_commit_without_server_time(self):
+    def test_strict_output_accepts_handoff_commit_with_timing_fields(self):
         validate_strict_output(
             {
                 "type": "command",
@@ -7278,8 +7278,10 @@ class StrictV2CoreTestCase(unittest.TestCase):
                     "handoffId": "handoff-1",
                     "controlVersion": 2,
                     "sourceClientId": "phone-1",
+                    "serverTimeMs": 1780000004500,
                     "effectiveAtServerMs": 1780000005000,
                     "positionMs": 1200,
+                    "playbackRate": 1.0,
                 },
                 "timestamp": 1780000004.5,
                 "connectionNonce": "nonce-1",

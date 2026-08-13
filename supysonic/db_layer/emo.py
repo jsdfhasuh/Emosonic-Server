@@ -444,11 +444,25 @@ class EmoPlaybackHandoff(_Model):
     origin_client_id = CharField(128, null=True)
     status = CharField(32)
     base_control_version = IntegerField(default=0)
+    context_epoch = IntegerField(null=True)
+    provisional_control_version = IntegerField(null=True)
     snapshot_json = TextField(null=True)
     error_code = CharField(64, null=True)
     error_message = TextField(null=True)
     created_at = DateTimeField(default=now)
     updated_at = DateTimeField(default=now)
+
+    class Meta:
+        indexes = (
+            (
+                (
+                    'playback_context_id',
+                    'context_epoch',
+                    'handoff_id',
+                ),
+                False,
+            ),
+        )
 
 
 class EmoBroadcast(_Model):

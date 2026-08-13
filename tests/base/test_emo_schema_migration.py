@@ -59,6 +59,11 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
         "target_connection_nonce",
         "target_connection_epoch",
     )
+    HANDOFF_PROVISIONAL_FIELDS = (
+        "context_epoch",
+        "provisional_control_version",
+    )
+    HANDOFF_PROVISIONAL_INDEX = "idx_emo_handoff_provisional_lane"
     CLOSE_FIELDS = (
         "close_action",
         "close_request_fingerprint",
@@ -323,7 +328,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             self._assert_external_r11_transaction_schema()
             self._assert_external_r18_broadcast_schema()
             self._assert_external_core_schema_parity(provider)
-            self.assertEqual(db.Meta["schema_version"].value, "20260812")
+            self.assertEqual(db.Meta["schema_version"].value, "20260813")
             self._record_external_evidence(
                 provider,
                 "clean",
@@ -355,7 +360,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             self._assert_external_r11_transaction_schema()
             self._assert_external_r18_broadcast_schema()
             self._assert_external_core_schema_parity(provider)
-            self.assertEqual(db.Meta["schema_version"].value, "20260812")
+            self.assertEqual(db.Meta["schema_version"].value, "20260813")
             self._record_external_evidence(
                 provider,
                 "upgrade_from_20260708",
@@ -635,6 +640,12 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 index_name,
                 columns,
             )
+        self._assert_external_named_index(
+            provider,
+            "emo_playback_handoff",
+            self.HANDOFF_PROVISIONAL_INDEX,
+            ("playback_context_id", "context_epoch", "handoff_id"),
+        )
 
     def _assert_sqlite_core_schema_parity(self) -> None:
         for model in self.CORE_MODELS:
@@ -713,6 +724,10 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
         )
         for index_name, (_table_name, columns) in self.RETENTION_INDEXES.items():
             self.assertEqual(index_columns(index_name), columns, index_name)
+        self.assertEqual(
+            index_columns(self.HANDOFF_PROVISIONAL_INDEX),
+            ("playback_context_id", "context_epoch", "handoff_id"),
+        )
 
         for table_name, unique_columns in (
             (
@@ -1045,13 +1060,16 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
         handoff_row = db.db.execute_sql(
             "SELECT handoff_id, status, source_client_id, target_client_id, "
             "%s FROM emo_playback_handoff WHERE handoff_id = "
-            "'legacy-handoff-1'" % ", ".join(self.HANDOFF_GENERATION_FIELDS)
+            "'legacy-handoff-1'" % ", ".join(
+                self.HANDOFF_GENERATION_FIELDS
+                + self.HANDOFF_PROVISIONAL_FIELDS
+            )
         ).fetchone()
         self.assertEqual(
             handoff_row[:4],
             ("legacy-handoff-1", "failed", "player-1", "player-2"),
         )
-        self.assertEqual(handoff_row[4:], (None,) * 6)
+        self.assertEqual(handoff_row[4:], (None,) * 8)
 
     def _assert_large_epoch_round_trip(self) -> None:
         accepted_at_ms = 2**31 + 1000
@@ -1254,7 +1272,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 },
             )
             self._assert_sqlite_core_schema_parity()
-            self.assertEqual(db.Meta["schema_version"].value, "20260812")
+            self.assertEqual(db.Meta["schema_version"].value, "20260813")
         finally:
             db.release_database()
             os.remove(path)
@@ -1304,6 +1322,9 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 ).read_text("utf-8")
                 handoff_migration = (
                     root / "migration" / provider / "20260812.sql"
+                ).read_text("utf-8")
+                handoff_lane_migration = (
+                    root / "migration" / provider / "20260813.sql"
                 ).read_text("utf-8")
                 for field_name in required_fields:
                     self.assertIn(field_name, base_schema)
@@ -1415,6 +1436,14 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 for field_name in self.HANDOFF_GENERATION_FIELDS:
                     self.assertIn(field_name, base_schema)
                     self.assertIn(field_name, handoff_migration)
+                for field_name in self.HANDOFF_PROVISIONAL_FIELDS:
+                    self.assertIn(field_name, base_schema)
+                    self.assertIn(field_name, handoff_lane_migration)
+                self.assertIn(self.HANDOFF_PROVISIONAL_INDEX, base_schema)
+                self.assertIn(
+                    self.HANDOFF_PROVISIONAL_INDEX,
+                    handoff_lane_migration,
+                )
                 for table_name in (
                     "emo_broadcast",
                     "emo_broadcast_intent_outcome",
@@ -1536,7 +1565,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
 
             db.init_database(database_uri)
             initialized = True
-            self.assertEqual(db.Meta["schema_version"].value, "20260812")
+            self.assertEqual(db.Meta["schema_version"].value, "20260813")
             self._assert_sqlite_core_schema_parity()
             self.assertEqual(db.EmoFollowSafetyLease.select().count(), 0)
         finally:
@@ -1562,7 +1591,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
 
             db.init_database(database_uri)
             initialized = True
-            self.assertEqual(db.Meta["schema_version"].value, "20260812")
+            self.assertEqual(db.Meta["schema_version"].value, "20260813")
             self._assert_20260728_upgrade_rows()
             context_before = db.db.execute_sql(
                 "SELECT playback_context_id, lifecycle, epoch, version, "
@@ -1597,7 +1626,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
 
             db.init_database(database_uri)
             initialized = True
-            self.assertEqual(db.Meta["schema_version"].value, "20260812")
+            self.assertEqual(db.Meta["schema_version"].value, "20260813")
             self._assert_20260728_recovery_rows()
             replay = recoverPendingPlaybackControlsForStartup(1780000040000)
             self.assertFalse(replay["mutated"])

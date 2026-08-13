@@ -681,11 +681,20 @@ CREATE TABLE IF NOT EXISTS emo_playback_handoff (
     origin_client_id VARCHAR(128),
     status VARCHAR(32) NOT NULL,
     base_control_version INTEGER NOT NULL DEFAULT 0,
+    context_epoch INTEGER,
+    provisional_control_version INTEGER,
     snapshot_json TEXT,
     error_code VARCHAR(64),
     error_message TEXT,
     created_at DATETIME NOT NULL,
     updated_at DATETIME NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_emo_handoff_provisional_lane
+ON emo_playback_handoff (
+    playback_context_id,
+    context_epoch,
+    handoff_id
 );
 
 CREATE TABLE IF NOT EXISTS shared_track_link (

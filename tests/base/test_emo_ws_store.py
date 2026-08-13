@@ -36,6 +36,7 @@ from supysonic.emo.ws_store import (
     cleanupCoreStartupRecoveryRetention,
     cleanupStrictPlaybackContextRetention,
     applyStrictPlaybackUpdate,
+    commitStrictPlaybackHandoff,
     completeStrictPlaybackHandoff,
     createPlaybackContextState,
     createPlaybackControlTransaction,
@@ -94,6 +95,7 @@ from supysonic.emo.ws_store import (
     terminateStrictPlaybackHandoff,
     updatePlaybackContextState,
     markPlaybackControlTransactionExecutionEligible,
+    markStrictPlaybackHandoffCommitEnqueued,
 )
 
 
@@ -196,6 +198,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self,
         playback_context_id="handoff-source-context",
         handoff_id="handoff-source-1",
+        context_state="playing",
     ):
         createStrictPlaybackContextState(
             playback_context_id,
@@ -205,7 +208,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             ["song-1"],
             0,
             100,
-            "playing",
+            context_state,
         )
         applyStrictPlaybackUpdate(
             playback_context_id,
@@ -253,6 +256,215 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         )
         self.assertTrue(created)
         return handoff
+
+    def test_handoff_commit_separates_canonical_and_source_actual_state(self):
+        handoff = self._create_exact_handoff_source(
+            handoff_id="handoff-canonical-actual-split",
+            context_state="paused",
+        )
+
+        self.assertEqual(handoff["snapshot"]["sourceContextState"], "paused")
+        self.assertEqual(handoff["snapshot"]["state"], "playing")
+        committing, transitioned = commitStrictPlaybackHandoff(
+            handoff["playbackContextId"],
+            handoff["handoffId"],
+            handoff["userName"],
+            9000,
+        )
+
+        self.assertTrue(transitioned)
+        self.assertEqual(committing["status"], "committing")
+        context = getPlaybackContextState(handoff["playbackContextId"])
+        self.assertEqual(context["state"], "paused")
+        self.assertEqual(context["controlVersion"], 1)
+        self.assertEqual(
+            getDevicePlaybackState(
+                handoff["playbackContextId"],
+                handoff["sourceClientId"],
+            )["state"],
+            "playing",
+        )
+
+    def test_handoff_provisional_lane_commit_and_enqueue_are_isolated(self):
+        handoff = self._create_exact_handoff_source(
+            handoff_id="handoff-provisional-isolated",
+        )
+        context_before = getPlaybackContextState(
+            handoff["playbackContextId"]
+        )
+        device_before = getDevicePlaybackState(
+            handoff["playbackContextId"],
+            handoff["sourceClientId"],
+        )
+        self.assertEqual(handoff["contextEpoch"], 1)
+        self.assertEqual(handoff["baseControlVersion"], 1)
+        self.assertEqual(handoff["controlVersion"], 2)
+        self.assertEqual(
+            handoff["snapshot"]["handoffControlVersion"],
+            2,
+        )
+
+        committing, transitioned = commitStrictPlaybackHandoff(
+            handoff["playbackContextId"],
+            handoff["handoffId"],
+            handoff["userName"],
+            9000,
+        )
+
+        self.assertTrue(transitioned)
+        self.assertEqual(committing["status"], "committing")
+        self.assertEqual(committing["completeExpiresAtMs"], 9000)
+        self.assertEqual(
+            getPlaybackContextState(handoff["playbackContextId"]),
+            context_before,
+        )
+        self.assertEqual(
+            getDevicePlaybackState(
+                handoff["playbackContextId"],
+                handoff["sourceClientId"],
+            ),
+            device_before,
+        )
+        self.assertEqual(
+            db.EmoPlaybackControlTransaction.select().count(),
+            0,
+        )
+
+        committing_replay, transitioned = commitStrictPlaybackHandoff(
+            handoff["playbackContextId"],
+            handoff["handoffId"],
+            handoff["userName"],
+            9000,
+        )
+        self.assertFalse(transitioned)
+        self.assertEqual(committing_replay, committing)
+
+        committed, transitioned = markStrictPlaybackHandoffCommitEnqueued(
+            handoff["playbackContextId"],
+            handoff["handoffId"],
+            handoff["userName"],
+        )
+        self.assertTrue(transitioned)
+        self.assertEqual(committed["status"], "committed")
+        replay, transitioned = markStrictPlaybackHandoffCommitEnqueued(
+            handoff["playbackContextId"],
+            handoff["handoffId"],
+            handoff["userName"],
+        )
+        self.assertFalse(transitioned)
+        self.assertEqual(replay, committed)
+        self.assertEqual(
+            getPlaybackContextState(handoff["playbackContextId"]),
+            context_before,
+        )
+        self.assertEqual(
+            db.EmoPlaybackControlTransaction.select().count(),
+            0,
+        )
+
+    def test_handoff_commit_source_cursor_change_fails_without_canonical_write(self):
+        handoff = self._create_exact_handoff_source(
+            handoff_id="handoff-provisional-source-changed",
+        )
+        record = db.EmoPlaybackContext.get(
+            db.EmoPlaybackContext.playback_context_id
+            == handoff["playbackContextId"]
+        )
+        record.version += 1
+        record.save(only=(db.EmoPlaybackContext.version,))
+        changed_context = getPlaybackContextState(
+            handoff["playbackContextId"]
+        )
+
+        failed, transitioned = commitStrictPlaybackHandoff(
+            handoff["playbackContextId"],
+            handoff["handoffId"],
+            handoff["userName"],
+            9000,
+        )
+
+        self.assertTrue(transitioned)
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["errorCode"], "source_changed")
+        self.assertEqual(
+            getPlaybackContextState(handoff["playbackContextId"]),
+            changed_context,
+        )
+        self.assertEqual(
+            db.EmoPlaybackControlTransaction.select().count(),
+            0,
+        )
+        with self.assertRaises(PlaybackHandoffTargetConflictError):
+            markStrictPlaybackHandoffCommitEnqueued(
+                handoff["playbackContextId"],
+                handoff["handoffId"],
+                handoff["userName"],
+            )
+
+    def test_terminal_handoff_releases_provisional_n_plus_one(self):
+        handoff = self._create_exact_handoff_source(
+            handoff_id="handoff-provisional-release",
+        )
+        terminated, transitioned = terminateStrictPlaybackHandoff(
+            handoff["playbackContextId"],
+            handoff["handoffId"],
+            handoff["userName"],
+            "failed",
+            error_code="commit_failed",
+        )
+        self.assertTrue(transitioned)
+        self.assertEqual(terminated["controlVersion"], 2)
+
+        mutated = mutateStrictPlaybackContextControl(
+            handoff["playbackContextId"],
+            "alice",
+            "controller-1",
+            "player.pause",
+            1,
+            requesting_client_id="controller-1",
+            requesting_device_session_id="device:controller-1",
+            requesting_connection_nonce="requester-nonce-1",
+            requesting_connection_epoch=1,
+            authority_client_id="source-player",
+            authority_device_session_id="device:source-player",
+            routed_connection_nonce="source-nonce",
+            routed_connection_epoch=1,
+            accepted_at_ms=1000,
+            execution_timeout_ms=15000,
+        )
+        self.assertEqual(mutated["controlVersion"], 2)
+        self.assertEqual(
+            getPlaybackControlTransaction(
+                handoff["playbackContextId"],
+                1,
+                2,
+            )["status"],
+            "pending",
+        )
+
+    def test_structured_handoff_lane_is_immutable(self):
+        handoff = self._create_exact_handoff_source(
+            handoff_id="handoff-provisional-immutable",
+        )
+        for field_name, changed_value in (
+            ("contextEpoch", 2),
+            ("controlVersion", 3),
+        ):
+            with self.subTest(field=field_name):
+                changed = dict(handoff)
+                changed[field_name] = changed_value
+                with self.assertRaises(PlaybackHandoffTargetConflictError):
+                    savePlaybackHandoff(changed)
+
+        changed_snapshot = dict(handoff)
+        changed_snapshot["snapshot"] = dict(handoff["snapshot"])
+        changed_snapshot["snapshot"]["sourceQueueRevision"] = 2
+        with self.assertRaises(PlaybackHandoffTargetConflictError):
+            savePlaybackHandoff(changed_snapshot)
+        self.assertEqual(
+            getPlaybackHandoff(handoff["handoffId"]),
+            handoff,
+        )
 
     def _retention_control_values(
         self,
@@ -2446,6 +2658,61 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertEqual(handoff["baseControlVersion"], 3)
         self.assertEqual(handoff["controlVersion"], 4)
         self.assertEqual(handoff["snapshot"]["trackId"], "song-1")
+
+    def test_handoff_provisional_lane_is_explicit_and_all_or_none(self):
+        legacy = {
+            "handoffId": "handoff-legacy-null-lane",
+            "requestId": "request-legacy-null-lane",
+            "playbackContextId": "playback:alice:legacy-null-lane",
+            "userName": "alice",
+            "sourceClientId": "phone-1",
+            "targetClientId": "pc-1",
+            "originClientId": "phone-1",
+            "status": "failed",
+            "baseControlVersion": 3,
+            "controlVersion": 4,
+            "snapshot": {
+                "sourceEpoch": 1,
+                "sourceControlVersion": 3,
+                "handoffControlVersion": 4,
+            },
+        }
+        savePlaybackHandoff(legacy)
+        legacy_record = db.EmoPlaybackHandoff.get(
+            db.EmoPlaybackHandoff.handoff_id == legacy["handoffId"]
+        )
+        serialized = getPlaybackHandoff(legacy["handoffId"])
+        self.assertIsNone(legacy_record.context_epoch)
+        self.assertIsNone(legacy_record.provisional_control_version)
+        self.assertIsNone(serialized["contextEpoch"])
+        self.assertEqual(serialized["controlVersion"], 4)
+
+        structured = dict(legacy)
+        structured.update(
+            {
+                "handoffId": "handoff-structured-invalid",
+                "requestId": "request-structured-invalid",
+                "status": "preparing",
+                "contextEpoch": 1,
+            }
+        )
+        malformed = (
+            {key: value for key, value in structured.items() if key != "controlVersion"},
+            dict(structured, contextEpoch=True),
+            dict(structured, controlVersion=5),
+            dict(
+                structured,
+                snapshot=dict(structured["snapshot"], sourceEpoch=2),
+            ),
+        )
+        for index, payload in enumerate(malformed):
+            with self.subTest(case=index):
+                payload = dict(payload)
+                payload["handoffId"] = "handoff-structured-invalid-%d" % index
+                payload["requestId"] = "request-structured-invalid-%d" % index
+                with self.assertRaises(PlaybackHandoffTargetConflictError):
+                    savePlaybackHandoff(payload)
+                self.assertIsNone(getPlaybackHandoff(payload["handoffId"]))
 
     def test_handoff_snapshot_sanitizer_removes_nested_raw_sid_fields(self):
         savePlaybackHandoff(

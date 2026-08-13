@@ -2,7 +2,7 @@ import sys
 
 from .core import db
 
-SCHEMA_VERSION = "20260812"
+SCHEMA_VERSION = "20260813"
 RESOURCE_PACKAGE = "supysonic"
 
 
