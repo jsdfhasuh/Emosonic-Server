@@ -1378,6 +1378,75 @@ class EmoWebSocketStateTestCase(unittest.TestCase):
             ["laptop-1", "tablet-1"],
         )
 
+    def test_strict_follow_source_disconnect_preserves_relationship_until_cleanup(self):
+        self._register_authenticated_client(
+            sid="sid-source",
+            client_id="source-1",
+            device_session_id="device:source-1",
+        )
+        self._register_authenticated_client(
+            sid="sid-follower",
+            client_id="follower-1",
+            device_session_id="device:follower-1",
+        )
+        self.state.start_follow_relationship(
+            "follower-1",
+            "device:follower-1",
+            "source-1",
+            None,
+            "alice",
+            source_playback_context_id="context-source",
+            now=100,
+        )
+
+        self.state.unregister_session("sid-source")
+        self.assertTrue(
+            self.state.get_follow_relationship("follower-1")["active"]
+        )
+
+        removed = self.state.remove_follow_relationship("follower-1")
+        self.assertEqual(removed["sourcePlaybackContextId"], "context-source")
+        self.assertIsNone(
+            self.state.get_follow_relationship(
+                "follower-1",
+                active_only=False,
+            )
+        )
+
+    def test_stale_prune_callback_runs_before_generation_is_removed(self):
+        self._register_authenticated_client(
+            sid="sid-stale",
+            client_id="stale-1",
+            device_session_id="device:stale-1",
+        )
+        callback_observations = []
+
+        def before_remove(client, session):
+            callback_observations.append(
+                (
+                    client["clientId"],
+                    session["connectionNonce"],
+                    self.state.get_sid_for_client(
+                        client["clientId"],
+                        user_name=client["userName"],
+                    ),
+                )
+            )
+
+        removed = self.state.prune_stale_clients(
+            stale_after_seconds=10,
+            now=111,
+            pre_remove_callback=before_remove,
+        )
+
+        self.assertEqual(len(removed), 1)
+        self.assertEqual(callback_observations[0][0], "stale-1")
+        self.assertIsInstance(callback_observations[0][1], str)
+        self.assertEqual(callback_observations[0][2], "sid-stale")
+        self.assertIsNone(
+            self.state.get_sid_for_client("stale-1", user_name="alice")
+        )
+
     def test_create_prepare_supersedes_existing_prepare_for_timeline(self):
         first = self.state.create_prepare(
             "prepare-1",

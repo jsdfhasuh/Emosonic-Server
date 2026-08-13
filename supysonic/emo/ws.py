@@ -62,7 +62,15 @@ from .follow_store import (
     FollowSafetyLeaseLimitError,
     createFollowSafetyLease,
     getFollowSafetyLeaseForFollower,
+    listFollowSafetyLeasesForPhysicalGeneration,
+    markFollowConnectionUnavailable,
+    followSourceContextCloseLock,
+    markFollowSourceContextsClosedInTransaction,
     recoverFollowSafetyLeasesForStartup,
+    refreshFollowSourceGeneration,
+    resumeFollowSafetyLease,
+    stopFollowSafetyLease,
+    sweepFollowSafetyLeaseDeadlines,
 )
 from .strict_v2_acceptance import consume_binding_emit_failure
 from .strict_v2_contract import (
@@ -7011,6 +7019,196 @@ def _follow_replay_relationship(lease):
     }
 
 
+def _restore_follow_live_state(lease, sid):
+    relationship = state.start_follow_relationship(
+        lease["followerClientId"],
+        lease["followerDeviceSessionId"],
+        lease["sourceAuthorityClientId"],
+        None,
+        lease["userName"],
+        source_playback_context_id=lease["sourcePlaybackContextId"],
+    )
+    state.subscribe_playback_context(
+        sid,
+        lease["sourcePlaybackContextId"],
+    )
+    return relationship
+
+
+def _resume_follow_replay(
+    current_user_name,
+    follower_client_id,
+    follower_device_session_id,
+    source_playback_context_id,
+    start_fingerprint,
+    sid,
+    replay,
+):
+    lifecycle_keys = tuple(
+        sorted(
+            {
+                (current_user_name, follower_client_id),
+                (
+                    current_user_name,
+                    replay["sourceAuthorityClientId"],
+                ),
+            }
+        )
+    )
+    context_ids = (
+        replay["sourcePlaybackContextId"],
+        replay["suspendedPlaybackContextId"],
+    )
+    with strictPhysicalGenerationLockSet(lifecycle_keys):
+        with _ordinary_control_dispatch_barrier_set(context_ids):
+            current_replay = _follow_start_replay_or_conflict(
+                current_user_name,
+                follower_client_id,
+                follower_device_session_id,
+                source_playback_context_id,
+                start_fingerprint,
+            )
+            if current_replay is None:
+                return None, None
+            follower_generation = state.get_current_physical_generation(
+                current_user_name,
+                follower_client_id,
+                follower_device_session_id,
+                expected_sid=sid,
+            )
+            if follower_generation is None:
+                raise PermissionError(
+                    "Follower physical generation is unavailable"
+                )
+
+            def validate_generation(_lease):
+                _require_follow_generation_player(
+                    current_user_name,
+                    follower_generation,
+                    (
+                        CAPABILITY_PLAYBACK_CONTEXT_V2,
+                        CAPABILITY_EFFECTIVE_AT,
+                        CAPABILITY_CAN_PLAY,
+                        CAPABILITY_CAN_PAUSE,
+                        CAPABILITY_CAN_SEEK,
+                        CAPABILITY_SUPPORTS_FOLLOW,
+                    ),
+                    current_replay["suspendedPlaybackContextId"],
+                )
+
+            try:
+                lease = resumeFollowSafetyLease(
+                    current_user_name,
+                    follower_client_id,
+                    follower_device_session_id,
+                    follower_generation["connectionNonce"],
+                    follower_generation["connectionEpoch"],
+                    source_playback_context_id,
+                    start_fingerprint,
+                    _server_time_ms(),
+                    pre_mutation_validator=validate_generation,
+                )
+            except FollowSafetyLeaseConflictError as exc:
+                raise FollowConflictError(
+                    str(exc),
+                    exc.playback_context_id
+                    or current_replay["suspendedPlaybackContextId"],
+                ) from exc
+            if lease is None:
+                return None, None
+            relationship = _restore_follow_live_state(lease, sid)
+            return lease, relationship
+
+
+def _follow_connection_generation(client_info, session_info):
+    if client_info is None or session_info is None:
+        return None
+    values = {
+        "userName": client_info.get("userName"),
+        "clientId": client_info.get("clientId"),
+        "deviceSessionId": client_info.get("deviceSessionId"),
+        "connectionNonce": session_info.get("connectionNonce"),
+        "connectionEpoch": session_info.get("connectionEpoch"),
+    }
+    if not all(
+        isinstance(values[field_name], str) and values[field_name]
+        for field_name in (
+            "userName",
+            "clientId",
+            "deviceSessionId",
+            "connectionNonce",
+        )
+    ) or type(values["connectionEpoch"]) is not int or values[
+        "connectionEpoch"
+    ] != 1:
+        return None
+    return values
+
+
+def _mark_follow_connection_unavailable(client_info, session_info):
+    generation = _follow_connection_generation(client_info, session_info)
+    if generation is None:
+        return []
+    leases = listFollowSafetyLeasesForPhysicalGeneration(
+        generation["userName"],
+        generation["clientId"],
+        generation["deviceSessionId"],
+        generation["connectionNonce"],
+        generation["connectionEpoch"],
+    )
+    if not leases:
+        return []
+    context_ids = tuple(
+        sorted(
+            {
+                context_id
+                for lease in leases
+                for context_id in (
+                    lease["sourcePlaybackContextId"],
+                    lease["suspendedPlaybackContextId"],
+                )
+            }
+        )
+    )
+    with _ordinary_control_dispatch_barrier_set(context_ids):
+        updated = markFollowConnectionUnavailable(
+            generation["userName"],
+            generation["clientId"],
+            generation["deviceSessionId"],
+            generation["connectionNonce"],
+            generation["connectionEpoch"],
+            _server_time_ms(),
+        )
+    if any(
+        lease["followerClientId"] == generation["clientId"]
+        and lease["followerDeviceSessionId"]
+        == generation["deviceSessionId"]
+        for lease in leases
+    ):
+        state.deactivate_follow_relationships_for_follower(
+            generation["clientId"]
+        )
+    return updated
+
+
+def _sweep_follow_safety_leases(
+    now_ms: Optional[int] = None,
+) -> List[Dict[str, object]]:
+    transitions = sweepFollowSafetyLeaseDeadlines(
+        _server_time_ms() if now_ms is None else now_ms
+    )
+    for transition in transitions:
+        if transition["reason"] not in (
+            "followerReconnectExpired",
+            "sourceClosed",
+            "sourceRecoveryExpired",
+        ):
+            continue
+        lease = transition["lease"]
+        state.remove_follow_relationship(lease["followerClientId"])
+    return transitions
+
+
 def _require_follow_generation_player(
     current_user_name,
     generation,
@@ -7199,8 +7397,18 @@ def _handle_follow_start(current_user_name, current_client, payload, request_id,
             start_fingerprint,
         )
         if replay is not None:
-            _send_ack(request_id, replay["startAck"])
-            return _follow_replay_relationship(replay)
+            lease, relationship = _resume_follow_replay(
+                current_user_name,
+                follower_client_id,
+                device_session_id,
+                source_playback_context_id,
+                start_fingerprint,
+                sid,
+                replay,
+            )
+            if lease is not None:
+                _send_ack(request_id, lease["startAck"])
+                return relationship
 
         source_context = _get_existing_playback_context(
             source_playback_context_id,
@@ -7268,9 +7476,52 @@ def _handle_follow_start(current_user_name, current_client, payload, request_id,
                     start_fingerprint,
                 )
                 if replay is not None:
-                    lease = replay
+                    follower_generation = (
+                        state.get_current_physical_generation(
+                            current_user_name,
+                            follower_client_id,
+                            device_session_id,
+                            expected_sid=sid,
+                        )
+                    )
+                    if follower_generation is None:
+                        raise PermissionError(
+                            "Follower physical generation is unavailable"
+                        )
+                    try:
+                        lease = resumeFollowSafetyLease(
+                            current_user_name,
+                            follower_client_id,
+                            device_session_id,
+                            follower_generation["connectionNonce"],
+                            follower_generation["connectionEpoch"],
+                            source_playback_context_id,
+                            start_fingerprint,
+                            _server_time_ms(),
+                            pre_mutation_validator=lambda _lease: (
+                                _require_follow_generation_player(
+                                    current_user_name,
+                                    follower_generation,
+                                    (
+                                        CAPABILITY_PLAYBACK_CONTEXT_V2,
+                                        CAPABILITY_EFFECTIVE_AT,
+                                        CAPABILITY_CAN_PLAY,
+                                        CAPABILITY_CAN_PAUSE,
+                                        CAPABILITY_CAN_SEEK,
+                                        CAPABILITY_SUPPORTS_FOLLOW,
+                                    ),
+                                    replay["suspendedPlaybackContextId"],
+                                )
+                            ),
+                        )
+                    except FollowSafetyLeaseConflictError as exc:
+                        raise FollowConflictError(
+                            str(exc),
+                            exc.playback_context_id
+                            or replay["suspendedPlaybackContextId"],
+                        ) from exc
                     created = False
-                    relationship = _follow_replay_relationship(replay)
+                    relationship = _restore_follow_live_state(lease, sid)
                 else:
                     current_source_context = getPlaybackContextStateForUser(
                         source_playback_context_id,
@@ -7481,36 +7732,142 @@ def _handle_follow_stop(current_client, payload, request_id, sid):
 
     strict_v2 = _is_strict_playback_context_v2(current_client)
     if strict_v2 or _is_follow_context_payload(payload):
-        if strict_v2 and not _client_supports(current_client, CAPABILITY_SUPPORTS_FOLLOW):
-            raise CapabilityRequiredError("strict-v2 client does not support Follow")
         _reject_session_id_for_strict_v2(payload, strict_v2)
         source_playback_context_id = payload.get("sourcePlaybackContextId")
         if source_playback_context_id is None:
             source_playback_context_id = payload.get("playbackContextId")
+        if not isinstance(source_playback_context_id, str) or not source_playback_context_id:
+            raise ValueError(
+                "follow.stop requires a non-empty sourcePlaybackContextId"
+            )
+        user_name = current_client.get("userName")
+        follower_client_id = current_client.get("clientId")
+        follower_device_session_id = current_client.get("deviceSessionId")
         relationship = state.get_follow_relationship(current_client.get("clientId"))
         if (
             relationship is not None
-            and source_playback_context_id is not None
             and relationship.get("sourcePlaybackContextId")
             != source_playback_context_id
         ):
             raise FollowConflictError(
                 "Follow relationship targets another playback context"
             )
-        if source_playback_context_id is None and relationship is not None:
-            source_playback_context_id = relationship.get("sourcePlaybackContextId")
+        lease = getFollowSafetyLeaseForFollower(
+            user_name,
+            follower_client_id,
+            follower_device_session_id,
+        )
+        if (
+            lease is not None
+            and lease["sourcePlaybackContextId"]
+            != source_playback_context_id
+        ):
+            raise FollowConflictError(
+                "Follow safety lease targets another playback context",
+                lease["suspendedPlaybackContextId"],
+            )
+        if lease is not None:
+            lifecycle_keys = tuple(
+                sorted(
+                    {
+                        (user_name, follower_client_id),
+                        (user_name, lease["sourceAuthorityClientId"]),
+                    }
+                )
+            )
+            context_ids = (
+                lease["sourcePlaybackContextId"],
+                lease["suspendedPlaybackContextId"],
+            )
+            with strictPhysicalGenerationLockSet(lifecycle_keys):
+                with _ordinary_control_dispatch_barrier_set(context_ids):
+                    current_lease = getFollowSafetyLeaseForFollower(
+                        user_name,
+                        follower_client_id,
+                        follower_device_session_id,
+                    )
+                    if (
+                        current_lease is not None
+                        and current_lease["sourcePlaybackContextId"]
+                        != source_playback_context_id
+                    ):
+                        raise FollowConflictError(
+                            "Follow safety lease targets another playback context",
+                            current_lease["suspendedPlaybackContextId"],
+                        )
+                    follower_generation = (
+                        state.get_current_physical_generation(
+                            user_name,
+                            follower_client_id,
+                            follower_device_session_id,
+                            expected_sid=sid,
+                        )
+                    )
+                    if follower_generation is None:
+                        raise PermissionError(
+                            "Follow stop physical generation is unavailable"
+                        )
 
-        relationship = state.stop_follow_relationship(current_client.get("clientId"))
+                    def validate_stop_generation(current):
+                        if (
+                            current["followerClientId"]
+                            != follower_generation["clientId"]
+                            or current["followerDeviceSessionId"]
+                            != follower_generation["deviceSessionId"]
+                            or not state.matches_current_physical_generation(
+                                follower_generation["userName"],
+                                follower_generation["clientId"],
+                                follower_generation["deviceSessionId"],
+                                follower_generation["sid"],
+                                follower_generation["connectionNonce"],
+                                follower_generation["connectionEpoch"],
+                            )
+                        ):
+                            raise PermissionError(
+                                "Follow stop physical generation changed"
+                            )
 
-        if source_playback_context_id:
-            if not isinstance(source_playback_context_id, str):
-                raise ValueError("follow.stop sourcePlaybackContextId must be a string")
+                    try:
+                        stopped_lease = stopFollowSafetyLease(
+                            user_name,
+                            follower_client_id,
+                            follower_device_session_id,
+                            source_playback_context_id,
+                            request_fingerprint(
+                                "command",
+                                "follow.stop",
+                                payload,
+                            ),
+                            _server_time_ms(),
+                            pre_mutation_validator=(
+                                validate_stop_generation
+                            ),
+                        )
+                    except FollowSafetyLeaseConflictError as exc:
+                        raise FollowConflictError(
+                            str(exc),
+                            exc.playback_context_id
+                            or lease["suspendedPlaybackContextId"],
+                        ) from exc
+                    relationship = state.remove_follow_relationship(
+                        follower_client_id
+                    )
+                    if relationship is None and stopped_lease is not None:
+                        relationship = _follow_replay_relationship(
+                            stopped_lease
+                        )
+                    state.unsubscribe_playback_context(
+                        sid,
+                        source_playback_context_id,
+                    )
+        else:
+            relationship = state.remove_follow_relationship(
+                follower_client_id
+            )
             state.unsubscribe_playback_context(
                 sid,
                 source_playback_context_id,
             )
-        else:
-            state.unsubscribe_playback_context(sid)
 
         _send_ack(request_id)
         return relationship
@@ -8400,6 +8757,10 @@ def _control_watchdog_sweep_later(generation: int) -> None:
         except Exception:
             logger.exception("Strict Broadcast source timeout sweep failed")
         try:
+            _sweep_follow_safety_leases()
+        except Exception:
+            logger.exception("Strict Follow safety lease sweep failed")
+        try:
             compactExpiredBroadcastStates()
         except Exception:
             logger.exception("Strict Broadcast terminal compaction failed")
@@ -9037,32 +9398,32 @@ def _handle_playback_context_close(current_user_name, current_client, payload, r
             "Only the exact playback authority pair or a controller can close context"
         )
 
-    def validate_close_fences(current):
-        followers = state.list_followers_for_source(
-            current.get("authorityClientId"),
+    closed_follow_leases = []
+    with followSourceContextCloseLock((playback_context_id,)):
+        closed_context = closeStrictPlaybackContextState(
+            playback_context_id,
+            current_user_name,
+            expected_epoch=expected_epoch,
+            base_version=base_version,
+            requesting_client_id=current_client.get("clientId"),
+            requesting_device_session_id=current_client.get(
+                "deviceSessionId"
+            ),
+            requester_is_controller=requester_is_controller,
+            post_close_hook=lambda _closed_context: (
+                closed_follow_leases.extend(
+                    markFollowSourceContextsClosedInTransaction(
+                        (playback_context_id,),
+                        _server_time_ms(),
+                    )
+                )
+            ),
         )
-        if any(
-            relationship.get("sourcePlaybackContextId") == playback_context_id
-            for relationship in followers
-        ):
-            raise PlaybackContextCloseConflictError(
-                current,
-                "Playback context has an active Follow relationship",
-            )
-
-    closed_context = closeStrictPlaybackContextState(
-        playback_context_id,
-        current_user_name,
-        expected_epoch=expected_epoch,
-        base_version=base_version,
-        requesting_client_id=current_client.get("clientId"),
-        requesting_device_session_id=current_client.get("deviceSessionId"),
-        requester_is_controller=requester_is_controller,
-        pre_close_validator=validate_close_fences,
-    )
     if closed_context is None:
         raise LookupError("Playback context not found")
     state.restore_playback_context(playback_context_id, closed_context)
+    for lease in closed_follow_leases:
+        state.remove_follow_relationship(lease["followerClientId"])
     _send_ack(request_id, closed_context.close_outcome)
     if closed_context.mutated:
         settled_prepares = _settle_active_context_prepares_for_authority_change(
@@ -9381,6 +9742,15 @@ def _handle_strict_v2_playback_update(
                             require_execution_eligible=True,
                         )
                 if result is not None:
+                    refreshFollowSourceGeneration(
+                        current_user_name,
+                        payload["playbackContextId"],
+                        authority_generation["clientId"],
+                        authority_generation["deviceSessionId"],
+                        authority_generation["connectionNonce"],
+                        authority_generation["connectionEpoch"],
+                        server_time_ms,
+                    )
                     for eligible_transaction in result.get(
                         "executionEligibleTransactions",
                         (),
@@ -10646,6 +11016,7 @@ class EmoNamespace(Namespace):
 
     def on_disconnect(self):
         observed_session = state.get_session(request.sid) or {}
+        observed_client = state.get_client_for_sid(request.sid)
         lifecycle_key = _physical_generation_key(
             observed_session.get("userName"),
             observed_session.get("clientId"),
@@ -10653,6 +11024,16 @@ class EmoNamespace(Namespace):
         with strictPhysicalGenerationLockSet(
             () if lifecycle_key is None else (lifecycle_key,)
         ):
+            if observed_client is not None:
+                try:
+                    _mark_follow_connection_unavailable(
+                        observed_client,
+                        observed_session,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Unable to transition Follow leases for disconnect"
+                    )
             session_info, client_info = state.unregister_session(request.sid)
             if session_info is not None and session_info.get("connectionNonce"):
                 connection_nonce = session_info["connectionNonce"]
@@ -10849,7 +11230,15 @@ class EmoNamespace(Namespace):
                 return
 
         state.touch_session(request.sid)
-        state.prune_stale_clients(_get_client_stale_seconds())
+        try:
+            state.prune_stale_clients(
+                _get_client_stale_seconds(),
+                pre_remove_callback=_mark_follow_connection_unavailable,
+            )
+        except Exception:
+            logger.exception(
+                "Unable to prune stale clients after Follow transition failure"
+            )
 
         if action == "system.ping":
             try:
@@ -10962,6 +11351,11 @@ class EmoNamespace(Namespace):
                         if previous_session is not None
                         else None
                     )
+                    if previous_client is not None:
+                        _mark_follow_connection_unavailable(
+                            previous_client,
+                            previous_session,
+                        )
                     current_client = _register_device(
                         request.sid,
                         current_user_name,

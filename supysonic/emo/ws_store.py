@@ -4745,6 +4745,7 @@ def closeStrictPlaybackContextState(
     requesting_device_session_id=None,
     requester_is_controller=False,
     pre_close_validator=None,
+    post_close_hook=None,
     close_action="playback.context.close",
     close_outcome=None,
 ) -> Optional[PlaybackContextCloseResult]:
@@ -4932,6 +4933,8 @@ def closeStrictPlaybackContextState(
                 record.save(
                     only=tuple(fields)
                 )
+                if post_close_hook is not None:
+                    post_close_hook(dict(_playback_context_payload(record)))
                 if not safe_close:
                     (
                         EmoPlaybackHandoff.update(

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import threading
 from contextlib import contextmanager
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
@@ -24,6 +25,8 @@ from .ws_store import strictAuthorityPairLockSet, strictPlaybackContextLockSet
 
 MAX_USER_FOLLOW_SAFETY_LEASES = 256
 FOLLOW_RECONNECT_GRACE_MS = 30_000
+FOLLOW_SOURCE_RECOVERY_MS = 30_000
+FOLLOW_SOURCE_PLAYING_FRESHNESS_MS = 2_000
 FOLLOW_NONTERMINAL_PHASES = ("active", "reconnectGrace", "cleanupRequired")
 HANDOFF_OCCUPANCY_STATUSES = ("preparing", "ready", "committed", "committing")
 
@@ -279,6 +282,141 @@ def _is_durable_start_replay(
     )
 
 
+def _lease_lock_values(
+    leases: Iterable[Dict[str, object]],
+) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, str, str], ...], Tuple[str, ...]]:
+    context_ids = set()
+    authority_pairs = set()
+    resource_keys = set()
+    for lease in leases:
+        user_name = str(lease["userName"])
+        source_context_id = str(lease["sourcePlaybackContextId"])
+        suspended_context_id = str(lease["suspendedPlaybackContextId"])
+        context_ids.update((source_context_id, suspended_context_id))
+        authority_pairs.update(
+            (
+                (
+                    user_name,
+                    str(lease["sourceAuthorityClientId"]),
+                    str(lease["sourceAuthorityDeviceSessionId"]),
+                ),
+                (
+                    user_name,
+                    str(lease["suspendedAuthorityClientId"]),
+                    str(lease["suspendedAuthorityDeviceSessionId"]),
+                ),
+            )
+        )
+        resource_keys.update(
+            (
+                followUserResourceKey(user_name),
+                followPairResourceKey(
+                    user_name,
+                    str(lease["followerClientId"]),
+                    str(lease["followerDeviceSessionId"]),
+                ),
+                followContextResourceKey(user_name, source_context_id),
+                followContextResourceKey(user_name, suspended_context_id),
+            )
+        )
+    return (
+        tuple(sorted(context_ids)),
+        tuple(sorted(authority_pairs)),
+        tuple(sorted(resource_keys)),
+    )
+
+
+@contextmanager
+def _follow_lease_lock_set(
+    leases: Iterable[Dict[str, object]],
+) -> Iterator[None]:
+    context_ids, authority_pairs, resource_keys = _lease_lock_values(leases)
+    with strictPlaybackContextLockSet(context_ids), strictAuthorityPairLockSet(
+        authority_pairs
+    ), followResourceLock(resource_keys):
+        yield
+
+
+def _list_follow_source_leases(
+    playback_context_ids: Iterable[str],
+) -> List[Dict[str, object]]:
+    context_ids = tuple(sorted(set(playback_context_ids)))
+    open_connection(reuse=True)
+    try:
+        records = EmoFollowSafetyLease.select().where(
+            (
+                EmoFollowSafetyLease.source_playback_context_id.in_(
+                    context_ids
+                )
+            )
+            & (
+                EmoFollowSafetyLease.phase.in_(
+                    FOLLOW_NONTERMINAL_PHASES
+                )
+            )
+        )
+        return [serializeFollowSafetyLease(record) for record in records]
+    finally:
+        close_connection()
+
+
+@contextmanager
+def followSourceContextCloseLock(
+    playback_context_ids: Iterable[str],
+) -> Iterator[None]:
+    context_ids = tuple(sorted(set(playback_context_ids)))
+    for playback_context_id in context_ids:
+        _require_non_empty_string(playback_context_id, "playbackContextId")
+    leases = _list_follow_source_leases(context_ids)
+    lease_context_ids, authority_pairs, resource_keys = _lease_lock_values(
+        leases
+    )
+    all_context_ids = tuple(sorted(set(context_ids) | set(lease_context_ids)))
+    with strictPlaybackContextLockSet(
+        all_context_ids
+    ), strictAuthorityPairLockSet(authority_pairs), followResourceLock(
+        resource_keys
+    ):
+        yield
+
+
+def _lease_fingerprint_material(
+    record: EmoFollowSafetyLease,
+) -> Dict[str, object]:
+    return {
+        "userName": record.user_name,
+        "followerClientId": record.follower_client_id,
+        "followerDeviceSessionId": record.follower_device_session_id,
+        "followerConnectionNonce": record.follower_connection_nonce,
+        "followerConnectionEpoch": record.follower_connection_epoch,
+        "sourcePlaybackContextId": record.source_playback_context_id,
+        "sourceAuthorityClientId": record.source_authority_client_id,
+        "sourceAuthorityDeviceSessionId": (
+            record.source_authority_device_session_id
+        ),
+        "sourceConnectionNonce": record.source_connection_nonce,
+        "sourceConnectionEpoch": record.source_connection_epoch,
+        "suspendedPlaybackContextId": record.suspended_playback_context_id,
+        "suspendedAuthorityClientId": record.suspended_authority_client_id,
+        "suspendedAuthorityDeviceSessionId": (
+            record.suspended_authority_device_session_id
+        ),
+        "suspendedConnectionNonce": record.suspended_connection_nonce,
+        "suspendedConnectionEpoch": record.suspended_connection_epoch,
+        "startAck": json.loads(record.start_ack_json),
+    }
+
+
+def _refresh_lease_fingerprint(record: EmoFollowSafetyLease) -> None:
+    record.lease_fingerprint = _fingerprint(_lease_fingerprint_material(record))
+
+
+def _save_lease(record: EmoFollowSafetyLease, server_time_ms: int) -> None:
+    record.updated_at_ms = server_time_ms
+    record.updated_at = now()
+    record.save()
+
+
 def getFollowSafetyLeaseForFollower(
     user_name: str,
     follower_client_id: str,
@@ -456,6 +594,488 @@ def listFollowSafetyLeases(
         return [serializeFollowSafetyLease(record) for record in query]
     finally:
         close_connection()
+
+
+def listFollowSafetyLeasesForPhysicalGeneration(
+    user_name: str,
+    client_id: str,
+    device_session_id: str,
+    connection_nonce: str,
+    connection_epoch: int,
+) -> List[Dict[str, object]]:
+    for field_name, value in (
+        ("userName", user_name),
+        ("clientId", client_id),
+        ("deviceSessionId", device_session_id),
+        ("connectionNonce", connection_nonce),
+    ):
+        _require_non_empty_string(value, field_name)
+    _require_epoch(connection_epoch, "connectionEpoch")
+    open_connection(reuse=True)
+    try:
+        follower_match = (
+            (EmoFollowSafetyLease.follower_client_id == client_id)
+            & (
+                EmoFollowSafetyLease.follower_device_session_id
+                == device_session_id
+            )
+            & (
+                EmoFollowSafetyLease.follower_connection_nonce
+                == connection_nonce
+            )
+            & (
+                EmoFollowSafetyLease.follower_connection_epoch
+                == connection_epoch
+            )
+        )
+        source_match = (
+            (EmoFollowSafetyLease.source_authority_client_id == client_id)
+            & (
+                EmoFollowSafetyLease.source_authority_device_session_id
+                == device_session_id
+            )
+            & (EmoFollowSafetyLease.source_connection_nonce == connection_nonce)
+            & (EmoFollowSafetyLease.source_connection_epoch == connection_epoch)
+        )
+        records = (
+            EmoFollowSafetyLease.select()
+            .where(
+                (EmoFollowSafetyLease.user_name == user_name)
+                & (EmoFollowSafetyLease.phase.in_(FOLLOW_NONTERMINAL_PHASES))
+                & (follower_match | source_match)
+            )
+            .order_by(EmoFollowSafetyLease.id)
+        )
+        return [serializeFollowSafetyLease(record) for record in records]
+    finally:
+        close_connection()
+
+
+def markFollowConnectionUnavailable(
+    user_name: str,
+    client_id: str,
+    device_session_id: str,
+    connection_nonce: str,
+    connection_epoch: int,
+    server_time_ms: int,
+    reconnect_grace_ms: int = FOLLOW_RECONNECT_GRACE_MS,
+    source_recovery_ms: int = FOLLOW_SOURCE_RECOVERY_MS,
+) -> List[Dict[str, object]]:
+    leases = listFollowSafetyLeasesForPhysicalGeneration(
+        user_name,
+        client_id,
+        device_session_id,
+        connection_nonce,
+        connection_epoch,
+    )
+    _require_integer(server_time_ms, "serverTimeMs")
+    _require_integer(reconnect_grace_ms, "reconnectGraceMs", 1)
+    _require_integer(source_recovery_ms, "sourceRecoveryMs", 1)
+    if not leases:
+        return []
+    lease_ids = [lease["leaseId"] for lease in leases]
+    updated = []
+    with _follow_lease_lock_set(leases):
+        open_connection(reuse=True)
+        try:
+            with _follow_transaction():
+                records = list(
+                    EmoFollowSafetyLease.select()
+                    .where(
+                        (EmoFollowSafetyLease.id.in_(lease_ids))
+                        & (
+                            EmoFollowSafetyLease.phase.in_(
+                                FOLLOW_NONTERMINAL_PHASES
+                            )
+                        )
+                    )
+                    .order_by(EmoFollowSafetyLease.id)
+                )
+                for record in records:
+                    changed = False
+                    follower_match = (
+                        record.user_name == user_name
+                        and record.follower_client_id == client_id
+                        and record.follower_device_session_id
+                        == device_session_id
+                        and record.follower_connection_nonce
+                        == connection_nonce
+                        and record.follower_connection_epoch
+                        == connection_epoch
+                    )
+                    source_match = (
+                        record.user_name == user_name
+                        and record.source_authority_client_id == client_id
+                        and record.source_authority_device_session_id
+                        == device_session_id
+                        and record.source_connection_nonce == connection_nonce
+                        and record.source_connection_epoch == connection_epoch
+                    )
+                    if follower_match and record.phase == "active":
+                        record.phase = "reconnectGrace"
+                        record.follow_reconnect_grace_expires_at_ms = (
+                            server_time_ms + reconnect_grace_ms
+                        )
+                        changed = True
+                    if (
+                        source_match
+                        and record.phase != "cleanupRequired"
+                        and record.source_recovery_deadline_at_ms is None
+                    ):
+                        record.source_recovery_deadline_at_ms = (
+                            server_time_ms + source_recovery_ms
+                        )
+                        changed = True
+                    if changed:
+                        _save_lease(record, server_time_ms)
+                    updated.append(serializeFollowSafetyLease(record))
+        finally:
+            close_connection()
+    return updated
+
+
+def resumeFollowSafetyLease(
+    user_name: str,
+    follower_client_id: str,
+    follower_device_session_id: str,
+    follower_connection_nonce: str,
+    follower_connection_epoch: int,
+    source_playback_context_id: str,
+    start_request_fingerprint: str,
+    server_time_ms: int,
+    pre_mutation_validator: Optional[
+        Callable[[Dict[str, object]], object]
+    ] = None,
+) -> Optional[Dict[str, object]]:
+    for field_name, value in (
+        ("userName", user_name),
+        ("followerClientId", follower_client_id),
+        ("followerDeviceSessionId", follower_device_session_id),
+        ("followerConnectionNonce", follower_connection_nonce),
+        ("sourcePlaybackContextId", source_playback_context_id),
+    ):
+        _require_non_empty_string(value, field_name)
+    _require_epoch(follower_connection_epoch, "followerConnectionEpoch")
+    _require_fingerprint(start_request_fingerprint, "startRequestFingerprint")
+    _require_integer(server_time_ms, "serverTimeMs")
+    existing = getFollowSafetyLeaseForFollower(
+        user_name,
+        follower_client_id,
+        follower_device_session_id,
+    )
+    if existing is None:
+        return None
+    expired_context_id = None
+    result = None
+    with _follow_lease_lock_set((existing,)):
+        open_connection(reuse=True)
+        try:
+            with _follow_transaction():
+                record = _lease_for_follower_query(
+                    user_name,
+                    follower_client_id,
+                    follower_device_session_id,
+                )
+                if record is None:
+                    return None
+                if not _is_durable_start_replay(
+                    record,
+                    user_name,
+                    follower_client_id,
+                    follower_device_session_id,
+                    source_playback_context_id,
+                    record.suspended_playback_context_id,
+                    start_request_fingerprint,
+                ):
+                    raise FollowSafetyLeaseConflictError(
+                        "Follow start does not match the durable safety lease",
+                        record.suspended_playback_context_id,
+                    )
+                if record.phase == "cleanupRequired":
+                    raise FollowSafetyLeaseConflictError(
+                        "Follow safety lease requires cleanup",
+                        record.suspended_playback_context_id,
+                    )
+                if (
+                    record.phase == "reconnectGrace"
+                    and record.follow_reconnect_grace_expires_at_ms is not None
+                    and record.follow_reconnect_grace_expires_at_ms
+                    <= server_time_ms
+                ):
+                    record.phase = "cleanupRequired"
+                    record.follow_reconnect_grace_expires_at_ms = None
+                    record.source_recovery_deadline_at_ms = None
+                    _save_lease(record, server_time_ms)
+                    expired_context_id = record.suspended_playback_context_id
+                else:
+                    current = serializeFollowSafetyLease(record)
+                    if pre_mutation_validator is not None:
+                        pre_mutation_validator(dict(current))
+                    if record.phase == "active":
+                        if (
+                            record.follower_connection_nonce
+                            != follower_connection_nonce
+                            or record.follower_connection_epoch
+                            != follower_connection_epoch
+                        ):
+                            raise FollowSafetyLeaseConflictError(
+                                "Active Follow belongs to another physical generation",
+                                record.suspended_playback_context_id,
+                            )
+                        result = current
+                    else:
+                        if record.stop_request_fingerprint is not None:
+                            raise FollowSafetyLeaseConflictError(
+                                "Follow stop cleanup is pending",
+                                record.suspended_playback_context_id,
+                            )
+                        record.follower_connection_nonce = (
+                            follower_connection_nonce
+                        )
+                        record.follower_connection_epoch = (
+                            follower_connection_epoch
+                        )
+                        record.phase = "active"
+                        record.follow_reconnect_grace_expires_at_ms = None
+                        _refresh_lease_fingerprint(record)
+                        _save_lease(record, server_time_ms)
+                        result = serializeFollowSafetyLease(record)
+        finally:
+            close_connection()
+    if expired_context_id is not None:
+        raise FollowSafetyLeaseConflictError(
+            "Follow reconnect grace expired; cleanup is required",
+            expired_context_id,
+        )
+    return result
+
+
+def refreshFollowSourceGeneration(
+    user_name: str,
+    source_playback_context_id: str,
+    source_authority_client_id: str,
+    source_authority_device_session_id: str,
+    source_connection_nonce: str,
+    source_connection_epoch: int,
+    server_time_ms: int,
+) -> List[Dict[str, object]]:
+    for field_name, value in (
+        ("userName", user_name),
+        ("sourcePlaybackContextId", source_playback_context_id),
+        ("sourceAuthorityClientId", source_authority_client_id),
+        (
+            "sourceAuthorityDeviceSessionId",
+            source_authority_device_session_id,
+        ),
+        ("sourceConnectionNonce", source_connection_nonce),
+    ):
+        _require_non_empty_string(value, field_name)
+    _require_epoch(source_connection_epoch, "sourceConnectionEpoch")
+    _require_integer(server_time_ms, "serverTimeMs")
+    open_connection(reuse=True)
+    try:
+        leases = [
+            serializeFollowSafetyLease(record)
+            for record in EmoFollowSafetyLease.select().where(
+                (EmoFollowSafetyLease.user_name == user_name)
+                & (
+                    EmoFollowSafetyLease.source_playback_context_id
+                    == source_playback_context_id
+                )
+                & (
+                    EmoFollowSafetyLease.phase.in_(
+                        FOLLOW_NONTERMINAL_PHASES
+                    )
+                )
+            )
+        ]
+    finally:
+        close_connection()
+    if not leases:
+        return []
+    lease_ids = [lease["leaseId"] for lease in leases]
+    refreshed = []
+    with _follow_lease_lock_set(leases):
+        open_connection(reuse=True)
+        try:
+            with _follow_transaction():
+                records = list(
+                    EmoFollowSafetyLease.select()
+                    .where(
+                        (EmoFollowSafetyLease.id.in_(lease_ids))
+                        & (
+                            EmoFollowSafetyLease.phase.in_(
+                                FOLLOW_NONTERMINAL_PHASES
+                            )
+                        )
+                    )
+                    .order_by(EmoFollowSafetyLease.id)
+                )
+                for record in records:
+                    if (
+                        record.source_authority_client_id
+                        != source_authority_client_id
+                        or record.source_authority_device_session_id
+                        != source_authority_device_session_id
+                    ):
+                        continue
+                    if record.phase != "cleanupRequired":
+                        changed = (
+                            record.source_connection_nonce
+                            != source_connection_nonce
+                            or record.source_connection_epoch
+                            != source_connection_epoch
+                            or record.source_recovery_deadline_at_ms is not None
+                        )
+                        if changed:
+                            record.source_connection_nonce = (
+                                source_connection_nonce
+                            )
+                            record.source_connection_epoch = (
+                                source_connection_epoch
+                            )
+                            record.source_recovery_deadline_at_ms = None
+                            _refresh_lease_fingerprint(record)
+                            _save_lease(record, server_time_ms)
+                    refreshed.append(serializeFollowSafetyLease(record))
+        finally:
+            close_connection()
+    return refreshed
+
+
+def markFollowSourceContextsClosed(
+    playback_context_ids: Iterable[str],
+    server_time_ms: int,
+) -> List[Dict[str, object]]:
+    context_ids = tuple(sorted(set(playback_context_ids)))
+    for playback_context_id in context_ids:
+        _require_non_empty_string(playback_context_id, "playbackContextId")
+    _require_integer(server_time_ms, "serverTimeMs")
+    if not context_ids:
+        return []
+    with followSourceContextCloseLock(context_ids):
+        open_connection(reuse=True)
+        try:
+            with _follow_transaction():
+                return markFollowSourceContextsClosedInTransaction(
+                    context_ids,
+                    server_time_ms,
+                )
+        finally:
+            close_connection()
+
+
+def markFollowSourceContextsClosedInTransaction(
+    playback_context_ids: Iterable[str],
+    server_time_ms: int,
+) -> List[Dict[str, object]]:
+    context_ids = tuple(sorted(set(playback_context_ids)))
+    for playback_context_id in context_ids:
+        _require_non_empty_string(playback_context_id, "playbackContextId")
+    _require_integer(server_time_ms, "serverTimeMs")
+    if not db.in_transaction():
+        raise RuntimeError(
+            "Follow source close mutation requires an active database transaction"
+        )
+    records = list(
+        EmoFollowSafetyLease.select()
+        .where(
+            (
+                EmoFollowSafetyLease.source_playback_context_id.in_(
+                    context_ids
+                )
+            )
+            & (
+                EmoFollowSafetyLease.phase.in_(
+                    FOLLOW_NONTERMINAL_PHASES
+                )
+            )
+        )
+        .order_by(EmoFollowSafetyLease.id)
+    )
+    closed = []
+    for record in records:
+        record.phase = "cleanupRequired"
+        record.follow_reconnect_grace_expires_at_ms = None
+        record.source_recovery_deadline_at_ms = None
+        _save_lease(record, server_time_ms)
+        closed.append(serializeFollowSafetyLease(record))
+    return closed
+
+
+def stopFollowSafetyLease(
+    user_name: str,
+    follower_client_id: str,
+    follower_device_session_id: str,
+    source_playback_context_id: str,
+    stop_request_fingerprint: str,
+    server_time_ms: int,
+    pre_mutation_validator: Optional[
+        Callable[[Dict[str, object]], object]
+    ] = None,
+) -> Optional[Dict[str, object]]:
+    for field_name, value in (
+        ("userName", user_name),
+        ("followerClientId", follower_client_id),
+        ("followerDeviceSessionId", follower_device_session_id),
+        ("sourcePlaybackContextId", source_playback_context_id),
+    ):
+        _require_non_empty_string(value, field_name)
+    _require_fingerprint(stop_request_fingerprint, "stopRequestFingerprint")
+    _require_integer(server_time_ms, "serverTimeMs")
+    existing = getFollowSafetyLeaseForFollower(
+        user_name,
+        follower_client_id,
+        follower_device_session_id,
+    )
+    if existing is None:
+        return None
+    with _follow_lease_lock_set((existing,)):
+        open_connection(reuse=True)
+        try:
+            with _follow_transaction():
+                record = _lease_for_follower_query(
+                    user_name,
+                    follower_client_id,
+                    follower_device_session_id,
+                )
+                if record is None:
+                    return None
+                if (
+                    record.source_playback_context_id
+                    != source_playback_context_id
+                ):
+                    raise FollowSafetyLeaseConflictError(
+                        "Follow stop targets another source Context",
+                        record.suspended_playback_context_id,
+                    )
+                current = serializeFollowSafetyLease(record)
+                if pre_mutation_validator is not None:
+                    pre_mutation_validator(dict(current))
+                bound_fingerprint = _fingerprint(
+                    {
+                        "action": "follow.stop",
+                        "leaseFingerprint": record.lease_fingerprint,
+                        "requestFingerprint": stop_request_fingerprint,
+                    }
+                )
+                if (
+                    record.stop_request_fingerprint is not None
+                    and record.stop_request_fingerprint != bound_fingerprint
+                ):
+                    raise FollowSafetyLeaseConflictError(
+                        "Follow stop fingerprint conflicts with pending cleanup",
+                        record.suspended_playback_context_id,
+                    )
+                record.stop_request_fingerprint = bound_fingerprint
+                if record.phase == "cleanupRequired":
+                    record.cleanup_fingerprint = bound_fingerprint
+                _save_lease(record, server_time_ms)
+                stopped = serializeFollowSafetyLease(record)
+                record.delete_instance()
+                return stopped
+        finally:
+            close_connection()
 
 
 def createFollowSafetyLease(
@@ -884,6 +1504,171 @@ def createFollowSafetyLease(
             close_connection()
 
 
+def _source_fact_requires_recovery(
+    record: EmoFollowSafetyLease,
+    server_time_ms: int,
+    freshness_ms: int,
+) -> Tuple[bool, bool]:
+    context = EmoPlaybackContext.get_or_none(
+        EmoPlaybackContext.playback_context_id
+        == record.source_playback_context_id
+    )
+    if (
+        context is None
+        or context.user_name != record.user_name
+        or context.lifecycle != "active"
+    ):
+        return True, True
+    if (
+        context.authority_client_id != record.source_authority_client_id
+        or context.authority_device_session_id
+        != record.source_authority_device_session_id
+    ):
+        return True, False
+    device = EmoDevicePlaybackState.get_or_none(
+        (
+            EmoDevicePlaybackState.playback_context_id
+            == record.source_playback_context_id
+        )
+        & (
+            EmoDevicePlaybackState.owner_client_id
+            == record.source_authority_client_id
+        )
+    )
+    if (
+        device is None
+        or device.device_session_id
+        != record.source_authority_device_session_id
+        or device.context_epoch != context.epoch
+        or device.applied_control_version != context.control_version
+    ):
+        return True, False
+    try:
+        queue_song_ids = json.loads(context.queue_json)
+        context_playback = (
+            json.loads(context.playback_json) if context.playback_json else {}
+        )
+        playback = (
+            json.loads(device.playback_json) if device.playback_json else {}
+        )
+    except (TypeError, ValueError):
+        return True, False
+    if playback.get("_connectionNonce") != record.source_connection_nonce:
+        return True, False
+    if context.state == "idle":
+        return False, False
+    if (
+        context.state not in {"playing", "paused", "stopped"}
+        or not isinstance(queue_song_ids, list)
+        or not queue_song_ids
+        or type(context.current_index) is not int
+        or context.current_index < 0
+        or context.current_index >= len(queue_song_ids)
+        or queue_song_ids[context.current_index] != context.track_id
+        or not bool(device.is_authority)
+        or device.state != context.state
+        or device.track_id != context.track_id
+        or type(device.position_ms) is not int
+        or device.position_ms < 0
+    ):
+        return True, False
+    context_rate = context_playback.get("playbackRate", 1.0)
+    device_rate = playback.get("playbackRate", 1.0)
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0.5
+        or value > 2.0
+        for value in (context_rate, device_rate)
+    ) or float(context_rate) != float(device_rate):
+        return True, False
+    for field_name in ("serverUpdatedAtMs", "positionSampledAtServerMs"):
+        value = playback.get(field_name)
+        if type(value) is not int or value > server_time_ms:
+            return True, False
+        if context.state == "playing" and server_time_ms - value > freshness_ms:
+            return True, False
+    return False, False
+
+
+def sweepFollowSafetyLeaseDeadlines(
+    server_time_ms: int,
+    source_recovery_ms: int = FOLLOW_SOURCE_RECOVERY_MS,
+    source_freshness_ms: int = FOLLOW_SOURCE_PLAYING_FRESHNESS_MS,
+) -> List[Dict[str, object]]:
+    _require_integer(server_time_ms, "serverTimeMs")
+    _require_integer(source_recovery_ms, "sourceRecoveryMs", 1)
+    _require_integer(source_freshness_ms, "sourceFreshnessMs", 1)
+    leases = listFollowSafetyLeases()
+    transitions = []
+    for lease in leases:
+        with _follow_lease_lock_set((lease,)):
+            open_connection(reuse=True)
+            try:
+                with _follow_transaction():
+                    record = EmoFollowSafetyLease.get_or_none(
+                        (EmoFollowSafetyLease.id == lease["leaseId"])
+                        & (
+                            EmoFollowSafetyLease.phase.in_(
+                                FOLLOW_NONTERMINAL_PHASES
+                            )
+                        )
+                    )
+                    if record is None:
+                        continue
+                    reason = None
+                    if (
+                        record.phase == "reconnectGrace"
+                        and (
+                            record.follow_reconnect_grace_expires_at_ms is None
+                            or record.follow_reconnect_grace_expires_at_ms
+                            <= server_time_ms
+                        )
+                    ):
+                        record.phase = "cleanupRequired"
+                        record.follow_reconnect_grace_expires_at_ms = None
+                        record.source_recovery_deadline_at_ms = None
+                        reason = "followerReconnectExpired"
+                    elif record.phase != "cleanupRequired":
+                        requires_recovery, source_closed = (
+                            _source_fact_requires_recovery(
+                                record,
+                                server_time_ms,
+                                source_freshness_ms,
+                            )
+                        )
+                        if source_closed:
+                            record.phase = "cleanupRequired"
+                            record.source_recovery_deadline_at_ms = None
+                            reason = "sourceClosed"
+                        elif record.source_recovery_deadline_at_ms is not None:
+                            if (
+                                record.source_recovery_deadline_at_ms
+                                <= server_time_ms
+                            ):
+                                record.phase = "cleanupRequired"
+                                record.source_recovery_deadline_at_ms = None
+                                reason = "sourceRecoveryExpired"
+                        elif requires_recovery:
+                            record.source_recovery_deadline_at_ms = (
+                                server_time_ms + source_recovery_ms
+                            )
+                            reason = "sourceRecoveryStarted"
+                    if reason is None:
+                        continue
+                    _save_lease(record, server_time_ms)
+                    transitions.append(
+                        {
+                            "reason": reason,
+                            "lease": serializeFollowSafetyLease(record),
+                        }
+                    )
+            finally:
+                close_connection()
+    return transitions
+
+
 def recoverFollowSafetyLeasesForStartup(
     server_time_ms: int,
     reconnect_grace_ms: int = FOLLOW_RECONNECT_GRACE_MS,
@@ -906,11 +1691,30 @@ def recoverFollowSafetyLeasesForStartup(
             )
             for record in records:
                 changed = False
-                if record.phase == "active":
-                    record.phase = "reconnectGrace"
-                    record.follow_reconnect_grace_expires_at_ms = (
-                        server_time_ms + reconnect_grace_ms
-                    )
+                if record.stop_request_fingerprint is not None:
+                    if (
+                        record.phase != "cleanupRequired"
+                        or record.follow_reconnect_grace_expires_at_ms
+                        is not None
+                        or record.source_recovery_deadline_at_ms is not None
+                    ):
+                        record.phase = "cleanupRequired"
+                        record.follow_reconnect_grace_expires_at_ms = None
+                        record.source_recovery_deadline_at_ms = None
+                        changed = True
+                elif record.phase == "active":
+                    if (
+                        record.source_recovery_deadline_at_ms is not None
+                        and record.source_recovery_deadline_at_ms
+                        <= server_time_ms
+                    ):
+                        record.phase = "cleanupRequired"
+                        record.source_recovery_deadline_at_ms = None
+                    else:
+                        record.phase = "reconnectGrace"
+                        record.follow_reconnect_grace_expires_at_ms = (
+                            server_time_ms + reconnect_grace_ms
+                        )
                     changed = True
                 elif record.phase == "reconnectGrace" and (
                     record.follow_reconnect_grace_expires_at_ms is None
@@ -920,10 +1724,15 @@ def recoverFollowSafetyLeasesForStartup(
                     record.phase = "cleanupRequired"
                     record.follow_reconnect_grace_expires_at_ms = None
                     changed = True
+                elif record.phase == "cleanupRequired" and (
+                    record.follow_reconnect_grace_expires_at_ms is not None
+                    or record.source_recovery_deadline_at_ms is not None
+                ):
+                    record.follow_reconnect_grace_expires_at_ms = None
+                    record.source_recovery_deadline_at_ms = None
+                    changed = True
                 if changed:
-                    record.updated_at_ms = server_time_ms
-                    record.updated_at = now()
-                    record.save()
+                    _save_lease(record, server_time_ms)
             return [serializeFollowSafetyLease(record) for record in records]
     finally:
         close_connection()

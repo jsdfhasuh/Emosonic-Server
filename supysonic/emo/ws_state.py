@@ -520,7 +520,12 @@ class WebSocketState:
                     client_info["lastSeenAt"] = now
             return dict(session_info)
 
-    def prune_stale_clients(self, stale_after_seconds=DEFAULT_CLIENT_STALE_SECONDS, now=None):
+    def prune_stale_clients(
+        self,
+        stale_after_seconds=DEFAULT_CLIENT_STALE_SECONDS,
+        now=None,
+        pre_remove_callback=None,
+    ):
         if stale_after_seconds is None or stale_after_seconds <= 0:
             return []
 
@@ -539,8 +544,8 @@ class WebSocketState:
 
         removed = []
         with strictPhysicalGenerationLockSet(stale_keys):
-            with self._lock:
-                for client_key in stale_keys:
+            for client_key in stale_keys:
+                with self._lock:
                     client_info = self._clients.get(client_key)
                     if client_info is None:
                         continue
@@ -552,7 +557,31 @@ class WebSocketState:
                         or now - last_seen_at <= stale_after_seconds
                     ):
                         continue
-
+                    client_id = client_info.get("clientId")
+                    sid = self._client_to_sid.get(client_key)
+                    session_info = (
+                        None if sid is None else self._sessions.get(sid)
+                    )
+                    callback_client = dict(client_info)
+                    callback_session = (
+                        None
+                        if session_info is None
+                        else dict(session_info)
+                    )
+                if pre_remove_callback is not None:
+                    pre_remove_callback(callback_client, callback_session)
+                with self._lock:
+                    client_info = self._clients.get(client_key)
+                    if client_info is None:
+                        continue
+                    last_seen_at = client_info.get("lastSeenAt") or client_info.get(
+                        "connectedAt"
+                    )
+                    if (
+                        last_seen_at is None
+                        or now - last_seen_at <= stale_after_seconds
+                    ):
+                        continue
                     client_id = client_info.get("clientId")
                     sid = self._client_to_sid.get(client_key)
                     if sid is not None:
@@ -578,7 +607,7 @@ class WebSocketState:
                         now=now,
                     )
                     removed.append(removed_client)
-                return [dict(client) for client in removed]
+            return [dict(client) for client in removed]
 
     def unregister_session(self, sid):
         with self._lock:
@@ -3024,6 +3053,28 @@ class WebSocketState:
             relationship["updatedAtMs"] = now_ms
             return dict(relationship)
 
+    def remove_follow_relationship(self, follower_client_id):
+        with self._lock:
+            relationship = self._follow_relationships.pop(
+                follower_client_id,
+                None,
+            )
+            return None if relationship is None else dict(relationship)
+
+    def deactivate_follow_relationships_for_follower(
+        self,
+        follower_client_id,
+        now=None,
+    ):
+        now_ms = _timestamp_ms(now)
+        with self._lock:
+            relationship = self._follow_relationships.get(follower_client_id)
+            if relationship is None or not relationship.get("active"):
+                return []
+            relationship["active"] = False
+            relationship["updatedAtMs"] = now_ms
+            return [dict(relationship)]
+
     def stop_follow_relationships_for_context(self, playback_context_id, now=None):
         now_ms = _timestamp_ms(now)
         stopped = []
@@ -3181,9 +3232,14 @@ class WebSocketState:
         for relationship in self._follow_relationships.values():
             if not relationship.get("active"):
                 continue
+            follower_match = relationship.get("followerClientId") == client_id
+            source_match = relationship.get("sourceClientId") == client_id
+            if not follower_match and not source_match:
+                continue
             if (
-                relationship.get("followerClientId") != client_id
-                and relationship.get("sourceClientId") != client_id
+                source_match
+                and not follower_match
+                and relationship.get("sourcePlaybackContextId") is not None
             ):
                 continue
             relationship["active"] = False

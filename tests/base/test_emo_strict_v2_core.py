@@ -10,6 +10,7 @@ from unittest import mock
 from supysonic.db import release_database
 from supysonic.emo import ws as emo_ws
 from supysonic.emo import ws_store as emo_store
+from supysonic.emo.follow_store import getFollowSafetyLeaseForFollower
 from supysonic.emo.strict_v2_acceptance import (
     FAULT_DIRECTORY_ENV,
     arm_binding_emit_failure,
@@ -7753,7 +7754,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
         )
         self.assertEqual(self.messages(owner), [])
 
-    def test_context_close_rejects_active_follow_fence_without_side_effects(self):
+    def test_source_context_close_transitions_follow_to_cleanup_required(self):
         owner = self.ready_strict_client()
         self.create_context(owner)
         self.emit_strict(
@@ -7841,36 +7842,137 @@ class StrictV2CoreTestCase(unittest.TestCase):
         follower_messages = self.messages(follower)
         self.assertEqual(
             [message["action"] for message in close_messages],
-            ["system.error"],
+            ["system.ack", "playback.context.closed"],
         )
-        self.assertEqual(close_messages[0]["payload"]["code"], "conflict")
-        self.assertEqual(
-            {
-                field: close_messages[0]["payload"][field]
-                for field in (
-                    "currentEpoch",
-                    "currentVersion",
-                    "currentQueueRevision",
-                    "currentControlVersion",
-                )
-            },
-            {
-                "currentEpoch": 1,
-                "currentVersion": 1,
-                "currentQueueRevision": 1,
-                "currentControlVersion": 1,
-            },
-        )
-        self.assertFalse(
+        self.assertTrue(
             any(
                 message["action"] == "playback.context.closed"
                 for message in follower_messages
             )
         )
-        self.assertIsNotNone(get_state().get_follow_relationship("follower-1"))
+        self.assertIsNone(get_state().get_follow_relationship("follower-1"))
+        lease = getFollowSafetyLeaseForFollower(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+        )
+        self.assertEqual(lease["phase"], "cleanupRequired")
+        context = getPlaybackContextState("context-1")
+        self.assertEqual(context["lifecycle"], "closed")
+        self.assertEqual(context["version"], 2)
+
+    def test_source_context_close_rolls_back_when_follow_cleanup_fails(self):
+        owner = self.ready_strict_client()
+        self.create_context(owner)
+        self.emit_strict(
+            owner,
+            "event",
+            "playback.update",
+            "follow-source-fact-close-rollback",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "stopped",
+                "positionMs": 1200,
+                "clientSeq": 1,
+                "trackId": "song-2",
+            },
+        )
+        follower = self.ready_strict_client(
+            client_id="follower-1",
+            device_session_id="device:follower-1",
+        )
+        with mock.patch(
+            "supysonic.emo.ws_store._new_playback_context_id",
+            return_value="context-follower-1",
+        ):
+            self.emit_strict(
+                follower,
+                "command",
+                "playback.context.ensure",
+                "follow-suspended-context-close-rollback",
+                {
+                    "deviceSessionId": "device:follower-1",
+                    "queueSongIds": ["song-follower"],
+                    "currentIndex": 0,
+                    "positionMs": 0,
+                    "state": "stopped",
+                },
+            )
+        self.emit_strict(
+            follower,
+            "event",
+            "playback.update",
+            "follow-suspended-fact-close-rollback",
+            {
+                "playbackContextId": "context-follower-1",
+                "deviceSessionId": "device:follower-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "stopped",
+                "positionMs": 0,
+                "clientSeq": 1,
+                "trackId": "song-follower",
+            },
+        )
+        self.emit_strict(
+            follower,
+            "command",
+            "follow.start",
+            "follow-start-close-rollback",
+            {
+                "sourcePlaybackContextId": "context-1",
+                "deviceSessionId": "device:follower-1",
+            },
+        )
+        self.messages(owner)
+        self.messages(follower)
+
+        with mock.patch.object(
+            emo_ws,
+            "markFollowSourceContextsClosedInTransaction",
+            side_effect=RuntimeError("injected Follow close cleanup failure"),
+        ):
+            close_messages = self.emit_strict(
+                owner,
+                "command",
+                "playback.context.close",
+                "context-close-follow-cleanup-failure",
+                {
+                    "playbackContextId": "context-1",
+                    "expectedEpoch": 1,
+                    "baseVersion": 1,
+                },
+            )
+
+        self.assertEqual(
+            [message["action"] for message in close_messages],
+            ["system.error"],
+        )
+        self.assertEqual(
+            close_messages[0]["payload"]["code"],
+            "internal_error",
+        )
         context = getPlaybackContextState("context-1")
         self.assertEqual(context["lifecycle"], "active")
         self.assertEqual(context["version"], 1)
+        lease = getFollowSafetyLeaseForFollower(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+        )
+        self.assertEqual(lease["phase"], "active")
+        self.assertTrue(
+            get_state().get_follow_relationship("follower-1")["active"]
+        )
+        self.assertFalse(
+            any(
+                message["action"] == "playback.context.closed"
+                for message in self.messages(follower)
+            )
+        )
 
     def test_queue_sync_commits_before_emit_and_recovers_after_push_failure(self):
         client = self.ready_strict_client()

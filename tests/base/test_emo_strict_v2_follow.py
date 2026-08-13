@@ -7,6 +7,10 @@ from supysonic.emo import follow_store
 from supysonic.emo import ws as emo_ws
 from supysonic.emo.follow_store import getFollowSafetyLeaseForFollower
 from supysonic.emo.ws_state import get_state
+from supysonic.emo.ws_store import (
+    getDevicePlaybackState,
+    getPlaybackContextState,
+)
 
 from tests.base.test_emo_ws import (
     CAPABILITY_PLAYBACK_CONTEXT_V2,
@@ -154,8 +158,11 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
             retry = self.start_follow(follower, request_id="follow-start-2")
 
         create_lease.assert_not_called()
-        start_relationship.assert_not_called()
-        subscribe.assert_not_called()
+        start_relationship.assert_called_once()
+        subscribe.assert_called_once_with(
+            mock.ANY,
+            "context-source-1",
+        )
         get_relationship.assert_not_called()
 
         self.assertEqual([message["action"] for message in first], ["system.ack"])
@@ -207,6 +214,599 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
 
         self.assertEqual([message["action"] for message in stopped], ["system.ack"])
         self.assertEqual(stopped[0]["payload"], {"action": "follow.stop"})
+        self.assertIsNone(get_state().get_follow_relationship("follower-1"))
+        self.assertIsNone(
+            getFollowSafetyLeaseForFollower(
+                "alice",
+                "follower-1",
+                "device:follower-1",
+            )
+        )
+
+    def test_follower_disconnect_and_reconnect_resume_frozen_lease(self):
+        source = self.connect_device(
+            "alice",
+            "Alic3",
+            "source-1",
+            "device:source-1",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": False,
+            },
+        )
+        follower = self.connect_device(
+            "alice",
+            "Alic3",
+            "follower-1",
+            "device:follower-1",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": True,
+            },
+        )
+        self.prepare_follow_pair(
+            source,
+            follower,
+            source_client_id="source-1",
+            source_device_session_id="device:source-1",
+        )
+        first_ack = self.get_ack(
+            self.start_follow(follower),
+            "follow-start-1",
+        )
+        original = getFollowSafetyLeaseForFollower(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+        )
+
+        follower.disconnect(namespace="/emo")
+        self.clients.remove(follower)
+        grace = getFollowSafetyLeaseForFollower(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+        )
+        self.assertEqual(grace["phase"], "reconnectGrace")
+        self.assertIn("followReconnectGraceExpiresAtMs", grace)
+        self.assertIsNone(get_state().get_follow_relationship("follower-1"))
+
+        replacement = self.connect_device(
+            "alice",
+            "Alic3",
+            "follower-1",
+            "device:follower-1",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": True,
+            },
+        )
+        self.get_messages(replacement)
+        resumed_ack = self.get_ack(
+            self.start_follow(
+                replacement,
+                request_id="follow-resume-1",
+            ),
+            "follow-resume-1",
+        )
+        resumed = getFollowSafetyLeaseForFollower(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+        )
+        generation = get_state().get_current_physical_generation(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+        )
+
+        self.assertEqual(resumed_ack["payload"], first_ack["payload"])
+        self.assertEqual(resumed["phase"], "active")
+        self.assertEqual(
+            resumed["followerConnectionNonce"],
+            generation["connectionNonce"],
+        )
+        self.assertNotEqual(
+            resumed["followerConnectionNonce"],
+            original["followerConnectionNonce"],
+        )
+        self.assertEqual(resumed["startAck"], original["startAck"])
+        self.assertTrue(
+            get_state().get_follow_relationship("follower-1")["active"]
+        )
+        self.assertIn(
+            generation["sid"],
+            get_state().list_playback_context_subscribers(
+                "context-source-1",
+                user_name="alice",
+            ),
+        )
+
+    def test_real_follower_replacement_enters_grace_before_resume(self):
+        source = self.connect_device(
+            "alice",
+            "Alic3",
+            "source-1",
+            "device:source-1",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": False,
+            },
+        )
+        follower = self.connect_device(
+            "alice",
+            "Alic3",
+            "follower-1",
+            "device:follower-1",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": True,
+            },
+        )
+        self.prepare_follow_pair(
+            source,
+            follower,
+            source_client_id="source-1",
+            source_device_session_id="device:source-1",
+        )
+        self.get_ack(self.start_follow(follower), "follow-start-1")
+        original = getFollowSafetyLeaseForFollower(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+        )
+
+        replacement = self.connect_device(
+            "alice",
+            "Alic3",
+            "follower-1",
+            "device:follower-1",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": True,
+            },
+        )
+        if not follower.is_connected(namespace="/emo"):
+            self.clients.remove(follower)
+        self.get_messages(replacement)
+        grace = getFollowSafetyLeaseForFollower(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+        )
+        self.assertEqual(grace["phase"], "reconnectGrace")
+        self.assertEqual(
+            grace["followerConnectionNonce"],
+            original["followerConnectionNonce"],
+        )
+        self.assertIsNone(get_state().get_follow_relationship("follower-1"))
+
+        self.get_ack(
+            self.start_follow(
+                replacement,
+                request_id="follow-replacement-resume",
+            ),
+            "follow-replacement-resume",
+        )
+        resumed = getFollowSafetyLeaseForFollower(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+        )
+        self.assertEqual(resumed["phase"], "active")
+        self.assertNotEqual(
+            resumed["followerConnectionNonce"],
+            original["followerConnectionNonce"],
+        )
+
+    def test_source_disconnect_recovery_clears_on_fresh_generation_fact(self):
+        source = self.connect_device(
+            "alice",
+            "Alic3",
+            "source-1",
+            "device:source-1",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": False,
+            },
+        )
+        follower = self.connect_device(
+            "alice",
+            "Alic3",
+            "follower-1",
+            "device:follower-1",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": True,
+            },
+        )
+        self.prepare_follow_pair(
+            source,
+            follower,
+            source_client_id="source-1",
+            source_device_session_id="device:source-1",
+        )
+        self.get_ack(self.start_follow(follower), "follow-start-1")
+        old_lease = getFollowSafetyLeaseForFollower(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+        )
+
+        source.disconnect(namespace="/emo")
+        self.clients.remove(source)
+        recovering = getFollowSafetyLeaseForFollower(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+        )
+        self.assertEqual(recovering["phase"], "active")
+        self.assertIn("sourceRecoveryDeadlineAtMs", recovering)
+        self.assertTrue(
+            get_state().get_follow_relationship("follower-1")["active"]
+        )
+
+        replacement = self.connect_device(
+            "alice",
+            "Alic3",
+            "source-1",
+            "device:source-1",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": False,
+            },
+        )
+        self.get_messages(replacement)
+        update_messages = self.report_strict_playback_context(
+            replacement,
+            "source-recovery-fact",
+            "context-source-1",
+            "device:source-1",
+            state="stopped",
+            client_seq=1,
+        )
+        self.assertFalse(
+            any(message["action"] == "system.error" for message in update_messages)
+        )
+        recovered = getFollowSafetyLeaseForFollower(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+        )
+        new_generation = get_state().get_current_physical_generation(
+            "alice",
+            "source-1",
+            "device:source-1",
+        )
+        self.assertNotIn("sourceRecoveryDeadlineAtMs", recovered)
+        self.assertEqual(
+            recovered["sourceConnectionNonce"],
+            new_generation["connectionNonce"],
+        )
+        self.assertNotEqual(
+            recovered["sourceConnectionNonce"],
+            old_lease["sourceConnectionNonce"],
+        )
+
+    def test_cleanup_stop_ignores_disabled_capability_and_is_idempotent(self):
+        source = self.connect_device(
+            "alice",
+            "Alic3",
+            "source-1",
+            "device:source-1",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": False,
+            },
+        )
+        follower = self.connect_device(
+            "alice",
+            "Alic3",
+            "follower-1",
+            "device:follower-1",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": True,
+            },
+        )
+        self.prepare_follow_pair(
+            source,
+            follower,
+            source_client_id="source-1",
+            source_device_session_id="device:source-1",
+        )
+        self.get_ack(self.start_follow(follower), "follow-start-1")
+
+        cleanup_client = self.connect_device(
+            "alice",
+            "Alic3",
+            "follower-1",
+            "device:follower-1",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": False,
+            },
+        )
+        if not follower.is_connected(namespace="/emo"):
+            self.clients.remove(follower)
+        self.get_messages(cleanup_client)
+        for request_id in ("follow-stop-cleanup-1", "follow-stop-cleanup-2"):
+            cleanup_client.emit(
+                "message",
+                {
+                    "type": "command",
+                    "action": "follow.stop",
+                    "requestId": request_id,
+                    "payload": {
+                        "sourcePlaybackContextId": "context-source-1"
+                    },
+                },
+                namespace="/emo",
+            )
+            ack = self.get_ack(
+                self.get_messages(cleanup_client),
+                request_id,
+            )
+            self.assertEqual(ack["payload"], {"action": "follow.stop"})
+
+        self.assertIsNone(
+            getFollowSafetyLeaseForFollower(
+                "alice",
+                "follower-1",
+                "device:follower-1",
+            )
+        )
+        self.assertIsNone(get_state().get_follow_relationship("follower-1"))
+
+    def test_follow_feedback_is_rejected_without_changing_durable_lease(self):
+        source = self.connect_device(
+            "alice",
+            "Alic3",
+            "source-1",
+            "device:source-1",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": False,
+            },
+        )
+        follower = self.connect_device(
+            "alice",
+            "Alic3",
+            "follower-1",
+            "device:follower-1",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": True,
+            },
+        )
+        self.prepare_follow_pair(
+            source,
+            follower,
+            source_client_id="source-1",
+            source_device_session_id="device:source-1",
+        )
+        self.get_ack(self.start_follow(follower), "follow-start-1")
+        before = getFollowSafetyLeaseForFollower(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+        )
+
+        follower.emit(
+            "message",
+            {
+                "type": "event",
+                "action": "follow.feedback",
+                "requestId": "follow-feedback-rejected",
+                "payload": {},
+            },
+            namespace="/emo",
+        )
+
+        error = self.get_error(
+            self.get_messages(follower),
+            "follow-feedback-rejected",
+        )
+        self.assertEqual(error["payload"]["code"], "not_supported")
+        self.assertEqual(
+            getFollowSafetyLeaseForFollower(
+                "alice",
+                "follower-1",
+                "device:follower-1",
+            ),
+            before,
+        )
+        self.assertTrue(
+            get_state().get_follow_relationship("follower-1")["active"]
+        )
+
+    def test_follower_playback_update_cannot_mutate_suspended_context(self):
+        source = self.connect_device(
+            "alice",
+            "Alic3",
+            "source-1",
+            "device:source-1",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": False,
+            },
+        )
+        follower = self.connect_device(
+            "alice",
+            "Alic3",
+            "follower-1",
+            "device:follower-1",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": True,
+            },
+        )
+        self.prepare_follow_pair(
+            source,
+            follower,
+            source_client_id="source-1",
+            source_device_session_id="device:source-1",
+        )
+        self.get_ack(self.start_follow(follower), "follow-start-1")
+        before_context = getPlaybackContextState("context-suspended-1")
+        before_device = getDevicePlaybackState(
+            "context-suspended-1",
+            "follower-1",
+        )
+        before_lease = getFollowSafetyLeaseForFollower(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+        )
+
+        follower.emit(
+            "message",
+            {
+                "type": "event",
+                "action": "playback.update",
+                "requestId": "follow-suspended-update-rejected",
+                "payload": {
+                    "playbackContextId": "context-suspended-1",
+                    "deviceSessionId": "device:follower-1",
+                    "origin": "passive",
+                    "appliedControlVersion": 1,
+                    "state": "stopped",
+                    "trackId": "song-follower-1",
+                    "positionMs": 200,
+                    "positionSampledAtServerMs": 1,
+                    "playbackRate": 1.0,
+                    "clientSeq": 2,
+                },
+            },
+            namespace="/emo",
+        )
+
+        error = self.get_error(
+            self.get_messages(follower),
+            "follow-suspended-update-rejected",
+        )
+        self.assertEqual(error["payload"]["code"], "conflict")
+        self.assertEqual(
+            {
+                field: error["payload"][field]
+                for field in (
+                    "currentEpoch",
+                    "currentVersion",
+                    "currentQueueRevision",
+                    "currentControlVersion",
+                )
+            },
+            {
+                "currentEpoch": before_context["epoch"],
+                "currentVersion": before_context["version"],
+                "currentQueueRevision": before_context["queueRevision"],
+                "currentControlVersion": before_context["controlVersion"],
+            },
+        )
+        self.assertEqual(
+            getPlaybackContextState("context-suspended-1"),
+            before_context,
+        )
+        self.assertEqual(
+            getDevicePlaybackState("context-suspended-1", "follower-1"),
+            before_device,
+        )
+        self.assertEqual(
+            getFollowSafetyLeaseForFollower(
+                "alice",
+                "follower-1",
+                "device:follower-1",
+            ),
+            before_lease,
+        )
+
+    def test_deadline_sweep_retains_cleanup_required_fence(self):
+        source = self.connect_device(
+            "alice",
+            "Alic3",
+            "source-1",
+            "device:source-1",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": False,
+            },
+        )
+        follower = self.connect_device(
+            "alice",
+            "Alic3",
+            "follower-1",
+            "device:follower-1",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+                "supportsFollow": True,
+            },
+        )
+        self.prepare_follow_pair(
+            source,
+            follower,
+            source_client_id="source-1",
+            source_device_session_id="device:source-1",
+        )
+        self.get_ack(self.start_follow(follower), "follow-start-1")
+        follower.disconnect(namespace="/emo")
+        self.clients.remove(follower)
+        grace = getFollowSafetyLeaseForFollower(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+        )
+
+        transitions = emo_ws._sweep_follow_safety_leases(
+            grace["followReconnectGraceExpiresAtMs"]
+        )
+
+        self.assertEqual(
+            transitions[0]["reason"],
+            "followerReconnectExpired",
+        )
+        retained = getFollowSafetyLeaseForFollower(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+        )
+        self.assertEqual(retained["phase"], "cleanupRequired")
+        self.assertEqual(db.EmoFollowSafetyLease.select().count(), 1)
         self.assertIsNone(get_state().get_follow_relationship("follower-1"))
 
     def test_starting_a_different_source_conflicts_without_switching(self):
@@ -1136,7 +1736,7 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
             )
         )
 
-    def test_context_close_is_fenced_and_disconnect_clears_relationship(self):
+    def test_source_close_requires_follow_cleanup_and_disconnect_keeps_fence(self):
         owner = self.connect_device(
             "alice",
             "Alic3",
@@ -1184,25 +1784,42 @@ class StrictV2FollowTestCase(EmoWebSocketTestCase):
         close_messages = self.get_messages(owner)
         follower_messages = self.get_messages(follower)
 
-        close_error = self.get_error(
+        close_ack = self.get_ack(
             close_messages,
             "context-close-source-1",
         )
-        self.assertEqual(close_error["payload"]["code"], "conflict")
-        self.assertFalse(
+        self.assertEqual(
+            close_ack["payload"],
+            {"action": "playback.context.close"},
+        )
+        self.assertTrue(
             any(
                 message["action"] == "playback.context.closed"
                 for message in follower_messages
             )
         )
-        self.assertIsNotNone(
+        self.assertIsNone(
             get_state().get_follow_relationship("follower-1")
         )
+        lease = getFollowSafetyLeaseForFollower(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+        )
+        self.assertEqual(lease["phase"], "cleanupRequired")
 
         follower.disconnect(namespace="/emo")
         self.clients.remove(follower)
 
         self.assertIsNone(get_state().get_follow_relationship("follower-1"))
+        self.assertEqual(
+            getFollowSafetyLeaseForFollower(
+                "alice",
+                "follower-1",
+                "device:follower-1",
+            )["phase"],
+            "cleanupRequired",
+        )
 
     def test_follow_relationship_does_not_grant_source_control(self):
         owner = self.connect_device(

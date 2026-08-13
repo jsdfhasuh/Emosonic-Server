@@ -1,4 +1,5 @@
 import concurrent.futures
+import json
 import os
 import tempfile
 import threading
@@ -16,7 +17,14 @@ from supysonic.emo.follow_store import (
     getFollowSafetyLeaseForFollower,
     getFollowSafetyLeaseForSuspendedContext,
     listFollowSafetyLeases,
+    listFollowSafetyLeasesForPhysicalGeneration,
+    markFollowConnectionUnavailable,
+    markFollowSourceContextsClosed,
     recoverFollowSafetyLeasesForStartup,
+    refreshFollowSourceGeneration,
+    resumeFollowSafetyLease,
+    stopFollowSafetyLease,
+    sweepFollowSafetyLeaseDeadlines,
 )
 from supysonic.emo.ws_store import (
     PlaybackContextFollowBarrierError,
@@ -639,6 +647,445 @@ class EmoFollowStoreTestCase(unittest.TestCase):
         final = recoverFollowSafetyLeasesForStartup(50000)
         self.assertEqual(final[0]["phase"], "cleanupRequired")
         self.assertEqual(final[0]["updatedAtMs"], 32000)
+
+    def test_startup_recovery_preserves_client_acquiring_and_stop_pending_safety(self):
+        self.assertEqual(recoverFollowSafetyLeasesForStartup(1000), [])
+
+        self._create_lease()
+        (
+            db.EmoFollowSafetyLease.update(
+                stop_request_fingerprint="b" * 64,
+                source_recovery_deadline_at_ms=9000,
+            )
+            .where(db.EmoFollowSafetyLease.user_name == "alice")
+            .execute()
+        )
+
+        recovered = recoverFollowSafetyLeasesForStartup(2000)
+
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["phase"], "cleanupRequired")
+        self.assertEqual(recovered[0]["stopRequestFingerprint"], "b" * 64)
+        self.assertNotIn("followReconnectGraceExpiresAtMs", recovered[0])
+        self.assertNotIn("sourceRecoveryDeadlineAtMs", recovered[0])
+        self.assertIsNotNone(
+            getFollowSafetyLeaseForSuspendedContext(
+                "alice",
+                "context-suspended",
+            )
+        )
+
+    def test_connection_loss_uses_distinct_follower_and_source_deadlines(self):
+        original, _created = self._create_lease()
+
+        follower = markFollowConnectionUnavailable(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+            "follower-nonce-1",
+            1,
+            2000,
+        )
+        self.assertEqual(len(follower), 1)
+        self.assertEqual(follower[0]["phase"], "reconnectGrace")
+        self.assertEqual(
+            follower[0]["followReconnectGraceExpiresAtMs"],
+            32000,
+        )
+        self.assertNotIn("sourceRecoveryDeadlineAtMs", follower[0])
+
+        repeated = markFollowConnectionUnavailable(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+            "follower-nonce-1",
+            1,
+            3000,
+        )
+        self.assertEqual(
+            repeated[0]["followReconnectGraceExpiresAtMs"],
+            32000,
+        )
+        self.assertEqual(repeated[0]["updatedAtMs"], 2000)
+
+        source = markFollowConnectionUnavailable(
+            "alice",
+            "source-1",
+            "device:source-1",
+            "source-nonce-1",
+            1,
+            4000,
+        )
+        self.assertEqual(source[0]["phase"], "reconnectGrace")
+        self.assertEqual(source[0]["sourceRecoveryDeadlineAtMs"], 34000)
+        self.assertEqual(source[0]["startAck"], original["startAck"])
+        self.assertEqual(
+            listFollowSafetyLeasesForPhysicalGeneration(
+                "alice",
+                "source-1",
+                "device:source-1",
+                "source-nonce-1",
+                1,
+            )[0]["leaseId"],
+            original["leaseId"],
+        )
+
+    def test_source_disconnect_deadline_requires_fresh_generation_fact(self):
+        self._create_lease()
+        disconnected = markFollowConnectionUnavailable(
+            "alice",
+            "source-1",
+            "device:source-1",
+            "source-nonce-1",
+            1,
+            2000,
+            source_recovery_ms=100,
+        )
+        self.assertEqual(disconnected[0]["sourceRecoveryDeadlineAtMs"], 2100)
+
+        self.assertEqual(
+            sweepFollowSafetyLeaseDeadlines(
+                2050,
+                source_recovery_ms=100,
+                source_freshness_ms=2000,
+            ),
+            [],
+        )
+        waiting = getFollowSafetyLeaseForFollower(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+        )
+        self.assertEqual(waiting["sourceRecoveryDeadlineAtMs"], 2100)
+
+        expired = sweepFollowSafetyLeaseDeadlines(
+            2100,
+            source_recovery_ms=100,
+            source_freshness_ms=2000,
+        )
+        self.assertEqual(expired[0]["reason"], "sourceRecoveryExpired")
+        self.assertEqual(expired[0]["lease"]["phase"], "cleanupRequired")
+
+    def test_reconnect_resume_updates_only_live_follower_generation(self):
+        original, _created = self._create_lease()
+        markFollowConnectionUnavailable(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+            "follower-nonce-1",
+            1,
+            2000,
+        )
+        validator_calls = []
+
+        resumed = resumeFollowSafetyLease(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+            "follower-nonce-2",
+            1,
+            "context-source",
+            "a" * 64,
+            3000,
+            pre_mutation_validator=lambda lease: validator_calls.append(lease),
+        )
+
+        self.assertEqual(len(validator_calls), 1)
+        self.assertEqual(validator_calls[0]["phase"], "reconnectGrace")
+        self.assertEqual(resumed["phase"], "active")
+        self.assertEqual(resumed["followerConnectionNonce"], "follower-nonce-2")
+        self.assertEqual(
+            resumed["suspendedConnectionNonce"],
+            "follower-nonce-1",
+        )
+        self.assertNotIn("followReconnectGraceExpiresAtMs", resumed)
+        self.assertEqual(resumed["startAck"], original["startAck"])
+        self.assertNotEqual(resumed["leaseFingerprint"], original["leaseFingerprint"])
+
+        replay = resumeFollowSafetyLease(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+            "follower-nonce-2",
+            1,
+            "context-source",
+            "a" * 64,
+            4000,
+        )
+        self.assertEqual(replay["leaseFingerprint"], resumed["leaseFingerprint"])
+        self.assertEqual(replay["updatedAtMs"], 3000)
+
+    def test_expired_reconnect_requires_cleanup_and_cannot_resume(self):
+        self._create_lease()
+        markFollowConnectionUnavailable(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+            "follower-nonce-1",
+            1,
+            2000,
+            reconnect_grace_ms=100,
+        )
+        markFollowConnectionUnavailable(
+            "alice",
+            "source-1",
+            "device:source-1",
+            "source-nonce-1",
+            1,
+            2050,
+        )
+
+        with self.assertRaises(FollowSafetyLeaseConflictError):
+            resumeFollowSafetyLease(
+                "alice",
+                "follower-1",
+                "device:follower-1",
+                "follower-nonce-2",
+                1,
+                "context-source",
+                "a" * 64,
+                2100,
+            )
+
+        lease = getFollowSafetyLeaseForFollower(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+        )
+        self.assertEqual(lease["phase"], "cleanupRequired")
+        self.assertNotIn("followReconnectGraceExpiresAtMs", lease)
+        self.assertNotIn("sourceRecoveryDeadlineAtMs", lease)
+
+    def test_source_idle_waits_while_stale_playing_uses_bounded_recovery(self):
+        self._create_lease()
+        source = db.EmoPlaybackContext.get(
+            db.EmoPlaybackContext.playback_context_id == "context-source"
+        )
+        source.queue_json = "[]"
+        source.current_index = 0
+        source.track_id = None
+        source.state = "idle"
+        source.position_ms = 0
+        source.save()
+
+        self.assertEqual(sweepFollowSafetyLeaseDeadlines(5000), [])
+        idle_lease = getFollowSafetyLeaseForFollower(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+        )
+        self.assertEqual(idle_lease["phase"], "active")
+        self.assertNotIn("sourceRecoveryDeadlineAtMs", idle_lease)
+
+        source.queue_json = '["song-1"]'
+        source.track_id = "song-1"
+        source.state = "playing"
+        source.save()
+        started = sweepFollowSafetyLeaseDeadlines(
+            5000,
+            source_recovery_ms=100,
+            source_freshness_ms=2000,
+        )
+        self.assertEqual(started[0]["reason"], "sourceRecoveryStarted")
+        self.assertEqual(
+            started[0]["lease"]["sourceRecoveryDeadlineAtMs"],
+            5100,
+        )
+        expired = sweepFollowSafetyLeaseDeadlines(
+            5100,
+            source_recovery_ms=100,
+            source_freshness_ms=2000,
+        )
+        self.assertEqual(expired[0]["reason"], "sourceRecoveryExpired")
+        self.assertEqual(expired[0]["lease"]["phase"], "cleanupRequired")
+        self.assertEqual(db.EmoFollowSafetyLease.select().count(), 1)
+
+    def test_source_recovery_rejects_mismatched_or_future_physical_facts(self):
+        self._create_lease()
+        source = db.EmoPlaybackContext.get(
+            db.EmoPlaybackContext.playback_context_id == "context-source"
+        )
+        device = db.EmoDevicePlaybackState.get(
+            db.EmoDevicePlaybackState.playback_context_id == "context-source"
+        )
+
+        def reset_source():
+            source.queue_json = '["song-1"]'
+            source.current_index = 0
+            source.track_id = "song-1"
+            source.state = "playing"
+            source.playback_json = json.dumps({"playbackRate": 1.0})
+            source.save()
+            device.state = "playing"
+            device.track_id = "song-1"
+            device.position_ms = 100
+            device.is_authority = 1
+            device.playback_json = json.dumps(
+                {
+                    "_connectionNonce": "source-nonce-1",
+                    "playbackRate": 1.0,
+                    "serverUpdatedAtMs": 1000,
+                    "positionSampledAtServerMs": 1000,
+                }
+            )
+            device.save()
+            (
+                db.EmoFollowSafetyLease.update(
+                    phase="active",
+                    source_recovery_deadline_at_ms=None,
+                )
+                .where(db.EmoFollowSafetyLease.user_name == "alice")
+                .execute()
+            )
+
+        mutations = {
+            "canonical queue": lambda: setattr(source, "current_index", 1),
+            "track": lambda: setattr(device, "track_id", "song-other"),
+            "state": lambda: setattr(device, "state", "paused"),
+            "rate": lambda: setattr(
+                device,
+                "playback_json",
+                json.dumps(
+                    {
+                        "_connectionNonce": "source-nonce-1",
+                        "playbackRate": 1.25,
+                        "serverUpdatedAtMs": 1000,
+                        "positionSampledAtServerMs": 1000,
+                    }
+                ),
+            ),
+            "future time": lambda: setattr(
+                device,
+                "playback_json",
+                json.dumps(
+                    {
+                        "_connectionNonce": "source-nonce-1",
+                        "playbackRate": 1.0,
+                        "serverUpdatedAtMs": 2001,
+                        "positionSampledAtServerMs": 1000,
+                    }
+                ),
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                reset_source()
+                mutate()
+                if label == "canonical queue":
+                    source.save()
+                else:
+                    device.save()
+                transitions = sweepFollowSafetyLeaseDeadlines(
+                    2000,
+                    source_recovery_ms=100,
+                )
+                self.assertEqual(len(transitions), 1)
+                self.assertEqual(
+                    transitions[0]["reason"],
+                    "sourceRecoveryStarted",
+                )
+
+        reset_source()
+        source.state = "paused"
+        source.save()
+        device.state = "paused"
+        device.save()
+        self.assertEqual(sweepFollowSafetyLeaseDeadlines(5000), [])
+
+    def test_source_generation_refresh_and_close_preserve_fence(self):
+        original, _created = self._create_lease()
+        markFollowConnectionUnavailable(
+            "alice",
+            "source-1",
+            "device:source-1",
+            "source-nonce-1",
+            1,
+            2000,
+        )
+
+        refreshed = refreshFollowSourceGeneration(
+            "alice",
+            "context-source",
+            "source-1",
+            "device:source-1",
+            "source-nonce-2",
+            1,
+            3000,
+        )
+        self.assertEqual(refreshed[0]["sourceConnectionNonce"], "source-nonce-2")
+        self.assertNotIn("sourceRecoveryDeadlineAtMs", refreshed[0])
+        self.assertNotEqual(refreshed[0]["leaseFingerprint"], original["leaseFingerprint"])
+
+        closed = markFollowSourceContextsClosed(("context-source",), 4000)
+        self.assertEqual(closed[0]["phase"], "cleanupRequired")
+        self.assertIsNotNone(
+            getFollowSafetyLeaseForSuspendedContext(
+                "alice",
+                "context-suspended",
+            )
+        )
+
+    def test_exact_pair_stop_deletes_lease_and_rolls_back_delete_failure(self):
+        self._create_lease()
+        with self.assertRaises(FollowSafetyLeaseConflictError):
+            stopFollowSafetyLease(
+                "alice",
+                "follower-1",
+                "device:follower-1",
+                "context-other",
+                "b" * 64,
+                2000,
+            )
+        self.assertEqual(db.EmoFollowSafetyLease.select().count(), 1)
+
+        with mock.patch.object(
+            follow_store.EmoFollowSafetyLease,
+            "delete_instance",
+            side_effect=RuntimeError("injected stop delete failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "injected stop delete failure"):
+                stopFollowSafetyLease(
+                    "alice",
+                    "follower-1",
+                    "device:follower-1",
+                    "context-source",
+                    "b" * 64,
+                    2000,
+                )
+        rolled_back = getFollowSafetyLeaseForFollower(
+            "alice",
+            "follower-1",
+            "device:follower-1",
+        )
+        self.assertIsNotNone(rolled_back)
+        self.assertNotIn("stopRequestFingerprint", rolled_back)
+
+        with mock.patch.object(
+            follow_store,
+            "MAX_USER_FOLLOW_SAFETY_LEASES",
+            0,
+        ):
+            stopped = stopFollowSafetyLease(
+                "alice",
+                "follower-1",
+                "device:follower-1",
+                "context-source",
+                "b" * 64,
+                3000,
+            )
+        self.assertEqual(stopped["phase"], "active")
+        self.assertIn("stopRequestFingerprint", stopped)
+        self.assertEqual(db.EmoFollowSafetyLease.select().count(), 0)
+        self.assertIsNone(
+            stopFollowSafetyLease(
+                "alice",
+                "follower-1",
+                "device:follower-1",
+                "context-source",
+                "b" * 64,
+                4000,
+            )
+        )
 
     def test_suspended_context_is_fenced_while_source_context_remains_mutable(self):
         self._create_lease()
