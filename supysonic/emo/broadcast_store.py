@@ -452,6 +452,24 @@ def _validate_start_participant_records(
             raise BroadcastResourceConflictError(
                 "Ordinary participant Context changed before Broadcast start"
             )
+        if (
+            EmoPlaybackControlTransaction.select()
+            .where(
+                (
+                    EmoPlaybackControlTransaction.playback_context_id
+                    == participant["suspendedPlaybackContextId"]
+                )
+                & (
+                    EmoPlaybackControlTransaction.epoch
+                    == participant["suspendedEpoch"]
+                )
+                & (EmoPlaybackControlTransaction.status == "pending")
+            )
+            .exists()
+        ):
+            raise BroadcastResourceConflictError(
+                "Ordinary participant Context has unsettled controls"
+            )
         device = EmoDevicePlaybackState.get_or_none(
             (
                 EmoDevicePlaybackState.playback_context_id
@@ -497,6 +515,19 @@ def _start_participant_is_available(
     if (
         EmoBroadcastFence.select()
         .where(EmoBroadcastFence.resource_key.in_((context_key, pair_key)))
+        .exists()
+    ):
+        return False
+    if (
+        EmoPlaybackControlTransaction.select()
+        .where(
+            (EmoPlaybackControlTransaction.playback_context_id == context_id)
+            & (
+                EmoPlaybackControlTransaction.epoch
+                == participant["suspendedEpoch"]
+            )
+            & (EmoPlaybackControlTransaction.status == "pending")
+        )
         .exists()
     ):
         return False

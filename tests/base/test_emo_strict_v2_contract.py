@@ -599,6 +599,44 @@ class StrictV2ContractTestCase(unittest.TestCase):
         with self.assertRaises(StrictRequestValidationError):
             validate_strict_request(invalid_error)
 
+    def test_restore_in_progress_is_valid_only_for_negative_prepared(self):
+        prepared = {
+            "type": "event",
+            "action": "playback.context.prepared",
+            "requestId": "prepared-restore-1",
+            "payload": {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:player-1",
+                "intentId": "intent-1",
+                "ready": False,
+                "errorCode": "restore_in_progress",
+            },
+        }
+        self.assertEqual(validate_strict_request(prepared), prepared)
+
+        invalid_request = copy.deepcopy(prepared)
+        invalid_request["payload"]["ready"] = True
+        with self.assertRaises(StrictRequestValidationError):
+            validate_strict_request(invalid_request)
+
+        confirmation = self._output(
+            "event",
+            "playback.context.prepared",
+            {
+                "playbackContextId": "context-1",
+                "intentId": "intent-1",
+                "ready": False,
+                "errorCode": "restore_in_progress",
+                "controlVersion": 3,
+            },
+        )
+        self.assertEqual(validate_strict_output(confirmation), confirmation)
+
+        invalid_output = copy.deepcopy(confirmation)
+        invalid_output["payload"]["ready"] = True
+        with self.assertRaises(StrictOutputValidationError):
+            validate_strict_output(invalid_output)
+
     def test_validates_all_playback_update_request_shapes(self):
         common = {
             "playbackContextId": "context-1",
@@ -985,6 +1023,16 @@ class StrictV2ContractTestCase(unittest.TestCase):
         unknown["payload"]["currentCursor"] = 5
         with self.assertRaises(StrictOutputValidationError):
             validate_strict_output(unknown)
+
+        restore = copy.deepcopy(message)
+        restore["payload"].update(
+            {
+                "code": "restore_in_progress",
+                "message": "ordinary Context restore is still pending",
+                "retryable": True,
+            }
+        )
+        self.assertEqual(validate_strict_output(restore), restore)
 
         conflict = copy.deepcopy(message)
         conflict["payload"]["code"] = "conflict"

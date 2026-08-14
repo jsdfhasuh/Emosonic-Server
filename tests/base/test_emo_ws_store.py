@@ -7257,6 +7257,309 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 error_code="prepare_timeout",
             )
 
+    def test_restore_pending_prepare_cleanup_is_narrow_and_idempotent(self):
+        context = createStrictPlaybackContextState(
+            "restore-prepare-context",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            0,
+            "paused",
+        ).canonical_context
+        createPlaybackPrepareTransaction(
+            "restore-prepare-context",
+            "alice",
+            context["epoch"],
+            "restore-prepare-intent",
+            "controller-1",
+            "player-1",
+            "device:player-1",
+            "player-nonce-1",
+            1,
+            {},
+            context["controlVersion"],
+            11000,
+        )
+        db.EmoBroadcastFence.create(
+            resource_key="restore-prepare-fence",
+            broadcast_id="restore-prepare-broadcast",
+            user_name="alice",
+            role="ordinary",
+            phase="restorePending",
+            playback_context_id="restore-prepare-context",
+            client_id="player-1",
+            device_session_id="device:player-1",
+        )
+        context_before = getPlaybackContextState("restore-prepare-context")
+        negative = {
+            "playbackContextId": "restore-prepare-context",
+            "intentId": "restore-prepare-intent",
+            "ready": False,
+            "errorCode": "restore_in_progress",
+            "controlVersion": context["controlVersion"],
+        }
+
+        with self.assertRaises(PlaybackContextRestoreInProgressError):
+            settlePlaybackPrepareTransaction(
+                "restore-prepare-context",
+                context["epoch"],
+                "restore-prepare-intent",
+                "ready",
+                dict(negative, ready=True),
+                1000,
+            )
+        with self.assertRaisesRegex(
+            ValueError,
+            "matching negative result",
+        ):
+            settlePlaybackPrepareTransaction(
+                "restore-prepare-context",
+                context["epoch"],
+                "restore-prepare-intent",
+                "failed",
+                dict(negative, errorCode="queue_required"),
+                1000,
+                error_code="queue_required",
+                allow_restore_pending_cleanup=True,
+            )
+        missing, changed = settlePlaybackPrepareTransaction(
+            "restore-prepare-context",
+            context["epoch"],
+            "different-prepare-intent",
+            "failed",
+            dict(negative, intentId="different-prepare-intent"),
+            1000,
+            error_code="restore_in_progress",
+            allow_restore_pending_cleanup=True,
+        )
+        self.assertIsNone(missing)
+        self.assertFalse(changed)
+        self.assertEqual(
+            getPlaybackPrepareTransaction(
+                "restore-prepare-context",
+                context["epoch"],
+                "restore-prepare-intent",
+            )["status"],
+            "preparing",
+        )
+
+        terminal, changed = settlePlaybackPrepareTransaction(
+            "restore-prepare-context",
+            context["epoch"],
+            "restore-prepare-intent",
+            "failed",
+            negative,
+            1001,
+            error_code="restore_in_progress",
+            allow_restore_pending_cleanup=True,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(terminal["status"], "failed")
+        replay, changed = settlePlaybackPrepareTransaction(
+            "restore-prepare-context",
+            context["epoch"],
+            "restore-prepare-intent",
+            "failed",
+            negative,
+            1002,
+            error_code="restore_in_progress",
+            allow_restore_pending_cleanup=True,
+        )
+        self.assertFalse(changed)
+        self.assertEqual(replay, terminal)
+        self.assertEqual(
+            getPlaybackContextState("restore-prepare-context"),
+            context_before,
+        )
+        self.assertEqual(
+            db.EmoBroadcastFence.select()
+            .where(
+                db.EmoBroadcastFence.resource_key
+                == "restore-prepare-fence"
+            )
+            .count(),
+            1,
+        )
+
+    def test_restore_cleanup_never_bypasses_active_or_waiting_fence(self):
+        for phase in ("active", "waitingForSource"):
+            with self.subTest(phase=phase):
+                context_id = "restore-cleanup-%s" % phase
+                client_id = "player-%s" % phase
+                device_session_id = "device:%s" % client_id
+                context = createStrictPlaybackContextState(
+                    context_id,
+                    "alice",
+                    client_id,
+                    device_session_id,
+                    ["song-1"],
+                    0,
+                    0,
+                    "paused",
+                ).canonical_context
+                createPlaybackPrepareTransaction(
+                    context_id,
+                    "alice",
+                    context["epoch"],
+                    "intent-%s" % phase,
+                    "controller-1",
+                    client_id,
+                    device_session_id,
+                    "player-nonce-1",
+                    1,
+                    {},
+                    context["controlVersion"],
+                    11000,
+                )
+                db.EmoBroadcastFence.create(
+                    resource_key="restore-cleanup-fence-%s" % phase,
+                    broadcast_id="restore-cleanup-broadcast-%s" % phase,
+                    user_name="alice",
+                    role="ordinary",
+                    phase=phase,
+                    playback_context_id=context_id,
+                    client_id=client_id,
+                    device_session_id=device_session_id,
+                )
+                with self.assertRaises(PlaybackContextBroadcastBarrierError):
+                    settlePlaybackPrepareTransaction(
+                        context_id,
+                        context["epoch"],
+                        "intent-%s" % phase,
+                        "failed",
+                        {
+                            "playbackContextId": context_id,
+                            "intentId": "intent-%s" % phase,
+                            "ready": False,
+                            "errorCode": "restore_in_progress",
+                            "controlVersion": context["controlVersion"],
+                        },
+                        1000,
+                        error_code="restore_in_progress",
+                        allow_restore_pending_cleanup=True,
+                    )
+                self.assertEqual(
+                    getPlaybackPrepareTransaction(
+                        context_id,
+                        context["epoch"],
+                        "intent-%s" % phase,
+                    )["status"],
+                    "preparing",
+                )
+
+    def test_restore_pending_handoff_cleanup_preserves_context_and_gate(self):
+        context = createStrictPlaybackContextState(
+            "restore-handoff-context",
+            "alice",
+            "source-1",
+            "device:source-1",
+            ["song-1"],
+            0,
+            0,
+            "playing",
+        ).canonical_context
+        db.EmoBroadcastFence.create(
+            resource_key="restore-handoff-fence",
+            broadcast_id="restore-handoff-broadcast",
+            user_name="alice",
+            role="ordinary",
+            phase="restorePending",
+            playback_context_id="restore-handoff-context",
+            client_id="target-1",
+            device_session_id="device:target-1",
+        )
+
+        def create_handoff(handoff_id):
+            db.EmoPlaybackHandoff.create(
+                handoff_id=handoff_id,
+                playback_context_id="restore-handoff-context",
+                user_name="alice",
+                source_client_id="source-1",
+                source_device_session_id="device:source-1",
+                source_connection_nonce="source-nonce-1",
+                source_connection_epoch=1,
+                target_client_id="target-1",
+                target_device_session_id="device:target-1",
+                target_connection_nonce="target-nonce-1",
+                target_connection_epoch=1,
+                status="preparing",
+                base_control_version=context["controlVersion"],
+                context_epoch=context["epoch"],
+                snapshot_json="{}",
+            )
+
+        create_handoff("restore-negative-handoff")
+        context_before = getPlaybackContextState("restore-handoff-context")
+        with self.assertRaises(PlaybackContextRestoreInProgressError):
+            terminateStrictPlaybackHandoff(
+                "restore-handoff-context",
+                "restore-negative-handoff",
+                "alice",
+                "failed",
+                error_code="source_changed",
+            )
+        with self.assertRaisesRegex(ValueError, "restore_in_progress"):
+            terminateStrictPlaybackHandoff(
+                "restore-handoff-context",
+                "restore-negative-handoff",
+                "alice",
+                "failed",
+                error_code="source_changed",
+                allow_restore_pending_cleanup=True,
+            )
+
+        with self.assertRaisesRegex(ValueError, "only permits"):
+            terminateStrictPlaybackHandoff(
+                "restore-handoff-context",
+                "restore-negative-handoff",
+                "alice",
+                "timed_out",
+                error_code="commit_timeout",
+                allow_restore_pending_cleanup=True,
+            )
+        self.assertEqual(
+            getPlaybackHandoff("restore-negative-handoff")["status"],
+            "preparing",
+        )
+
+        terminal, changed = terminateStrictPlaybackHandoff(
+            "restore-handoff-context",
+            "restore-negative-handoff",
+            "alice",
+            "failed",
+            error_code="restore_in_progress",
+            allow_restore_pending_cleanup=True,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(terminal["status"], "failed")
+        self.assertEqual(terminal["errorCode"], "restore_in_progress")
+
+        create_handoff("restore-cancel-handoff")
+        cancelled, changed = terminateStrictPlaybackHandoff(
+            "restore-handoff-context",
+            "restore-cancel-handoff",
+            "alice",
+            "cancelled",
+            allow_restore_pending_cleanup=True,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(
+            getPlaybackContextState("restore-handoff-context"),
+            context_before,
+        )
+        self.assertEqual(
+            db.EmoBroadcastFence.select()
+            .where(
+                db.EmoBroadcastFence.resource_key
+                == "restore-handoff-fence"
+            )
+            .count(),
+            1,
+        )
+
     def test_local_intent_replays_first_canonical_result_and_rejects_conflict(self):
         request_payload = {
             "intentId": "local-1",

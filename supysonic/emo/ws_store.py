@@ -439,7 +439,11 @@ def _canonical_context_for_barrier(playback_context_id):
     record = EmoPlaybackContext.get_or_none(
         EmoPlaybackContext.playback_context_id == playback_context_id
     )
-    return None if record is None else _playback_context_payload(record)
+    if record is None:
+        return None
+    if record.lifecycle == "closed":
+        return _closed_playback_context_payload(record)
+    return _playback_context_payload(record)
 
 
 def _raise_broadcast_fence(
@@ -1018,13 +1022,17 @@ def _require_broadcast_context_mutation_allowed(
     playback_context_id,
     mutation_name,
     restore_in_progress=False,
+    allow_restore_pending_cleanup=False,
 ):
     fences = _broadcast_fences_for_context(playback_context_id)
     ordinary = next(
         (fence for fence in fences if fence.role == "ordinary"),
         None,
     )
-    if ordinary is not None:
+    if ordinary is not None and not (
+        allow_restore_pending_cleanup
+        and ordinary.phase == "restorePending"
+    ):
         _raise_broadcast_fence(
             ordinary,
             playback_context_id,
@@ -1087,9 +1095,22 @@ def _serialize_strict_playback_context_mutation(function):
                         mutation_name=function.__name__,
                         allowed_handoff_id=allowed_handoff_id,
                     )
+                allow_restore_pending_cleanup = (
+                    kwargs.get("allow_restore_pending_cleanup", False)
+                    if function.__name__
+                    in {
+                        "settlePlaybackPrepareTransaction",
+                        "terminateStrictPlaybackHandoff",
+                    }
+                    else False
+                )
                 _require_broadcast_context_mutation_allowed(
                     playback_context_id,
                     function.__name__,
+                    restore_in_progress=True,
+                    allow_restore_pending_cleanup=(
+                        allow_restore_pending_cleanup is True
+                    ),
                 )
             finally:
                 close_connection()
@@ -4434,12 +4455,30 @@ def settlePlaybackPrepareTransaction(
     terminal_at_ms,
     error_code=None,
     error_message=None,
+    allow_restore_pending_cleanup=False,
 ):
     if status not in {"ready", "failed"}:
         raise ValueError("Invalid prepare terminal status")
+    if type(allow_restore_pending_cleanup) is not bool:
+        raise ValueError("allowRestorePendingCleanup must be a boolean")
+    if allow_restore_pending_cleanup and (
+        status != "failed"
+        or error_code != "restore_in_progress"
+        or canonical_result.get("ready") is not False
+        or canonical_result.get("errorCode") != "restore_in_progress"
+    ):
+        raise ValueError(
+            "Restore-pending prepare cleanup requires a matching negative result"
+        )
     canonical_result_json = _canonical_json(canonical_result)
     open_connection(reuse=True)
     try:
+        _require_broadcast_context_mutation_allowed(
+            playback_context_id,
+            "settlePlaybackPrepareTransaction",
+            restore_in_progress=True,
+            allow_restore_pending_cleanup=allow_restore_pending_cleanup,
+        )
         with _strict_playback_context_transaction():
             record = EmoPlaybackPrepareTransaction.get_or_none(
                 (EmoPlaybackPrepareTransaction.playback_context_id == playback_context_id)
@@ -5347,6 +5386,7 @@ def createStrictPlaybackContextState(
                 _raise_broadcast_fence(
                     pair_fence,
                     pair_fence.playback_context_id or playback_context_id,
+                    restore_in_progress=True,
                 )
             record = EmoPlaybackContext.get_or_none(
                 EmoPlaybackContext.playback_context_id == playback_context_id
@@ -6333,6 +6373,7 @@ def createStrictPlaybackHandoff(
                 _raise_broadcast_fence(
                     target_fence,
                     target_fence.playback_context_id or playback_context_id,
+                    restore_in_progress=True,
                 )
             source_record = _getStrictPlaybackContextRecord(
                 playback_context_id,
@@ -6426,6 +6467,7 @@ def createStrictPlaybackHandoff(
                     _raise_broadcast_fence(
                         standby_fences[0],
                         standby.playback_context_id,
+                        restore_in_progress=True,
                     )
                 _require_idle_handoff_standby(
                     standby,
@@ -6807,6 +6849,7 @@ def _completeStrictPlaybackHandoffLocked(
             _require_broadcast_context_mutation_allowed(
                 playback_context_id,
                 "completeStrictPlaybackHandoff",
+                restore_in_progress=True,
             )
             target_fence = _broadcast_fence_for_pair(
                 user_name,
@@ -6817,6 +6860,7 @@ def _completeStrictPlaybackHandoffLocked(
                 _raise_broadcast_fence(
                     target_fence,
                     target_fence.playback_context_id or playback_context_id,
+                    restore_in_progress=True,
                 )
             if isinstance(standby_context_id, str) and standby_context_id:
                 requireFollowSafetyLeaseResourceAvailable(
@@ -6834,6 +6878,7 @@ def _completeStrictPlaybackHandoffLocked(
                     _raise_broadcast_fence(
                         standby_fences[0],
                         standby_context_id,
+                        restore_in_progress=True,
                     )
             complete_expires_at_ms = snapshot.get("completeExpiresAtMs")
             if type(complete_expires_at_ms) is not int:
@@ -7100,11 +7145,28 @@ def terminateStrictPlaybackHandoff(
     expected_device_session_id: Optional[str] = None,
     expected_connection_nonce: Optional[str] = None,
     expected_connection_epoch: Optional[int] = None,
+    allow_restore_pending_cleanup: bool = False,
 ) -> Optional[Tuple[Dict[str, object], bool]]:
     if status not in ("cancelled", "failed", "timed_out"):
         raise ValueError("Unsupported handoff terminal status")
+    if type(allow_restore_pending_cleanup) is not bool:
+        raise ValueError("allowRestorePendingCleanup must be a boolean")
+    if allow_restore_pending_cleanup and not (
+        status == "cancelled"
+        or (status == "failed" and error_code == "restore_in_progress")
+    ):
+        raise ValueError(
+            "Restore-pending Handoff cleanup only permits cancel or "
+            "restore_in_progress failure"
+        )
     open_connection(reuse=True)
     try:
+        _require_broadcast_context_mutation_allowed(
+            playback_context_id,
+            "terminateStrictPlaybackHandoff",
+            restore_in_progress=True,
+            allow_restore_pending_cleanup=allow_restore_pending_cleanup,
+        )
         observed = EmoPlaybackHandoff.get_or_none(
             EmoPlaybackHandoff.handoff_id == handoff_id
         )

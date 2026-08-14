@@ -491,6 +491,7 @@ def _validate_action_combinations(action: str, payload: Dict[str, object]) -> No
             raise StrictRequestValidationError("ready:false requires errorCode")
         elif payload["errorCode"] not in {
             "queue_required",
+            "restore_in_progress",
             "restore_failed",
             "prepare_timeout",
             "authority_changed",
@@ -2368,6 +2369,7 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
         else:
             if prepared.get("errorCode") not in {
                 "queue_required",
+                "restore_in_progress",
                 "restore_failed",
                 "prepare_timeout",
                 "authority_changed",

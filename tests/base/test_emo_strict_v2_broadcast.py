@@ -1,9 +1,12 @@
 import json
+from contextlib import contextmanager
+import threading
 import time
 import unittest
 from unittest import mock
 
 from supysonic import db
+from supysonic.emo import broadcast_store as emo_broadcast_store
 from supysonic.emo import ws as emo_ws
 from supysonic.emo.broadcast_store import terminalBroadcastState
 from supysonic.emo.ws_store import (
@@ -18,7 +21,10 @@ from supysonic.emo.ws_store import (
     createStrictPlaybackHandoff,
     ensureStrictPlaybackContextState,
     getDevicePlaybackState,
+    getPlaybackContextCloseTombstone,
     getPlaybackContextState,
+    getPlaybackHandoff,
+    getPlaybackPrepareTransaction,
     mutateStrictPlaybackContextControl,
     mutateStrictPlaybackContextQueue,
     savePlaybackLocalIntent,
@@ -54,7 +60,7 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         finally:
             self.broadcast_ready_patcher.stop()
 
-    def connect_broadcast_devices(self):
+    def connect_broadcast_devices(self, participant_roles=None):
         authority = self.connect_device(
             "alice",
             "Alic3",
@@ -71,7 +77,7 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             "Alic3",
             "participant-1",
             "device:participant-1",
-            ["player"],
+            participant_roles or ["player"],
             capabilities={
                 CAPABILITY_PLAYBACK_CONTEXT_V2: True,
                 "effectiveAtPlayback": True,
@@ -364,6 +370,82 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             namespace="/emo",
         )
         return self.get_messages(client)
+
+    def terminalize_broadcast_with_restore_pending(
+        self,
+        authority,
+        participant,
+        controller,
+    ):
+        start_ack = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+            ),
+            "broadcast-start-1",
+        )["payload"]
+        persisted = emo_ws.getPersistentBroadcastState(
+            start_ack["broadcastId"]
+        )
+        terminal_snapshot = dict(
+            persisted["snapshot"],
+            lifecycleState="stopped",
+            broadcastRevision=2,
+        )
+        terminalBroadcastState(
+            start_ack["broadcastId"],
+            terminal_snapshot,
+            {
+                "action": "broadcast.stop",
+                "broadcastId": start_ack["broadcastId"],
+            },
+        )
+        for client in (authority, participant, controller):
+            self.get_messages(client)
+        return start_ack
+
+    def create_raced_handoff(
+        self,
+        handoff_id,
+        *,
+        status="preparing",
+        prepare_id=None,
+    ):
+        state = get_state()
+        source_generation = state.get_current_physical_generation(
+            "alice",
+            "authority-1",
+            "device:authority-1",
+        )
+        target_generation = state.get_current_physical_generation(
+            "alice",
+            "participant-1",
+            "device:participant-1",
+        )
+        context = getPlaybackContextState("context-broadcast-source")
+        snapshot = {
+            "prepareId": prepare_id,
+            "completeExpiresAtMs": int(time.time() * 1000) + 10000,
+        }
+        db.EmoPlaybackHandoff.create(
+            handoff_id=handoff_id,
+            playback_context_id="context-broadcast-source",
+            user_name="alice",
+            source_client_id=source_generation["clientId"],
+            source_device_session_id=source_generation["deviceSessionId"],
+            source_connection_nonce=source_generation["connectionNonce"],
+            source_connection_epoch=source_generation["connectionEpoch"],
+            target_client_id=target_generation["clientId"],
+            target_device_session_id=target_generation["deviceSessionId"],
+            target_connection_nonce=target_generation["connectionNonce"],
+            target_connection_epoch=target_generation["connectionEpoch"],
+            status=status,
+            base_control_version=context["controlVersion"],
+            context_epoch=context["epoch"],
+            provisional_control_version=context["controlVersion"] + 1,
+            snapshot_json=json.dumps(snapshot, ensure_ascii=True),
+        )
+        return getPlaybackHandoff(handoff_id)
 
     @staticmethod
     def _push(messages, action="broadcast.start"):
@@ -727,6 +809,208 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         self.assertEqual(error["payload"]["code"], "conflict")
         self.assertEqual(db.EmoBroadcast.select().count(), 0)
         self.get_messages(authority)
+
+    def test_start_skips_participant_with_pending_ordinary_control(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        participant_two = self.connect_device(
+            "alice",
+            "Alic3",
+            "participant-2",
+            "device:participant-2",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+            },
+        )
+        self.ensure_playback_context(
+            participant_two,
+            "context-create-participant-two",
+            playback_context_id="context-participant-two",
+            device_session_id="device:participant-2",
+            queue_song_ids=["participant-two-song"],
+            position_ms=0,
+            state="paused",
+        )
+        for client in (authority, participant, participant_two, controller):
+            self.get_messages(client)
+
+        context = getPlaybackContextState("context-participant-original")
+        requester = get_state().get_current_physical_generation(
+            "alice",
+            "controller-1",
+            "device:controller-1",
+        )
+        routed = get_state().get_current_physical_generation(
+            "alice",
+            "participant-1",
+            "device:participant-1",
+        )
+        createPlaybackControlTransaction(
+            context["playbackContextId"],
+            "alice",
+            context["epoch"],
+            context["controlVersion"] + 1,
+            requester["clientId"],
+            routed["clientId"],
+            routed["deviceSessionId"],
+            routed["connectionNonce"],
+            routed["connectionEpoch"],
+            "player.pause",
+            {"state": "paused"},
+            int(time.time() * 1000),
+            15000,
+            requesting_device_session_id=requester["deviceSessionId"],
+            requesting_connection_nonce=requester["connectionNonce"],
+            requesting_connection_epoch=requester["connectionEpoch"],
+        )
+
+        messages = self.start_strict_broadcast(
+            controller,
+            request_id="broadcast-start-skip-pending-participant",
+            intent_id="intent-skip-pending-participant",
+            participants=["participant-1", "participant-2"],
+        )
+        ack = self.get_ack(
+            messages,
+            "broadcast-start-skip-pending-participant",
+        )["payload"]
+        self.assertEqual(ack["participants"], ["participant-2"])
+        self.assertEqual(ack["skippedClientIds"], ["participant-1"])
+        self.assertFalse(
+            any(
+                message["action"] == "broadcast.start"
+                for message in self.get_messages(participant)
+            )
+        )
+        self.assertEqual(
+            len(
+                [
+                    message
+                    for message in self.get_messages(participant_two)
+                    if message["action"] == "broadcast.start"
+                ]
+            ),
+            1,
+        )
+        db.EmoPlaybackControlTransaction.delete().where(
+            db.EmoPlaybackControlTransaction.playback_context_id
+            == "context-participant-original"
+        ).execute()
+
+    def test_start_rejects_pending_participant_when_skip_is_disabled(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        context = getPlaybackContextState("context-participant-original")
+        requester = get_state().get_current_physical_generation(
+            "alice",
+            "controller-1",
+            "device:controller-1",
+        )
+        routed = get_state().get_current_physical_generation(
+            "alice",
+            "participant-1",
+            "device:participant-1",
+        )
+        createPlaybackControlTransaction(
+            context["playbackContextId"],
+            "alice",
+            context["epoch"],
+            context["controlVersion"] + 1,
+            requester["clientId"],
+            routed["clientId"],
+            routed["deviceSessionId"],
+            routed["connectionNonce"],
+            routed["connectionEpoch"],
+            "player.pause",
+            {"state": "paused"},
+            int(time.time() * 1000),
+            15000,
+            requesting_device_session_id=requester["deviceSessionId"],
+            requesting_connection_nonce=requester["connectionNonce"],
+            requesting_connection_epoch=requester["connectionEpoch"],
+        )
+        create_broadcast = emo_ws.createBroadcastState
+
+        def reject_unavailable_participants(*args, **kwargs):
+            kwargs["skip_unavailable_participants"] = False
+            return create_broadcast(*args, **kwargs)
+
+        with mock.patch.object(
+            emo_ws,
+            "createBroadcastState",
+            side_effect=reject_unavailable_participants,
+        ):
+            messages = self.start_strict_broadcast(
+                controller,
+                request_id="broadcast-start-reject-pending-participant",
+                intent_id="intent-reject-pending-participant",
+                participants=["participant-1"],
+            )
+
+        error = self.get_error(
+            messages,
+            "broadcast-start-reject-pending-participant",
+        )
+        self.assertEqual(error["payload"]["code"], "conflict")
+        self.assertEqual(db.EmoBroadcast.select().count(), 0)
+        self.assertFalse(
+            any(
+                message["action"] == "broadcast.start"
+                for message in self.get_messages(participant)
+            )
+        )
+        self.get_messages(authority)
+        pending = db.EmoPlaybackControlTransaction.get(
+            db.EmoPlaybackControlTransaction.playback_context_id
+            == "context-participant-original"
+        )
+        self.assertEqual(pending.status, "pending")
+        pending.delete_instance()
+
+    def test_start_rejects_missing_requester_exact_generation_without_rows(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        state = get_state()
+        real_generation = state.get_current_physical_generation
+        real_emit = emo_ws._emit_message
+        emitted_actions = []
+
+        def reject_requester(user_name, client_id, device_session_id, **kwargs):
+            if client_id == "controller-1" and kwargs.get("expected_sid"):
+                return None
+            return real_generation(
+                user_name,
+                client_id,
+                device_session_id,
+                **kwargs,
+            )
+
+        def record_emit(message, *args, **kwargs):
+            emitted_actions.append(message.get("action"))
+            return real_emit(message, *args, **kwargs)
+
+        with mock.patch.object(
+            state,
+            "get_current_physical_generation",
+            side_effect=reject_requester,
+        ), mock.patch.object(
+            emo_ws,
+            "_emit_message",
+            side_effect=record_emit,
+        ):
+            messages = self.start_strict_broadcast(
+                controller,
+                request_id="broadcast-start-stale-requester",
+                intent_id="intent-stale-requester",
+                participants=["participant-1"],
+            )
+
+        error = self.get_error(messages, "broadcast-start-stale-requester")
+        self.assertEqual(error["payload"]["code"], "forbidden")
+        self.assertEqual(db.EmoBroadcast.select().count(), 0)
+        self.assertEqual(db.EmoBroadcastIntentOutcome.select().count(), 0)
+        self.assertNotIn("broadcast.start", emitted_actions)
+        self.assertEqual(self.get_messages(authority), [])
+        self.assertEqual(self.get_messages(participant), [])
 
     def _assert_reconnected_source_requires_fresh_feedback_after_queue_sync(
         self,
@@ -2526,6 +2810,396 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         error = self.get_error(messages, "broadcast-start-conflict")
         self.assertEqual(error["payload"]["code"], "conflict")
 
+    def test_authority_replacement_first_rejects_without_broadcast_emit(self):
+        _authority, participant, controller = self.connect_broadcast_devices()
+        replacement = self.connect_device(
+            "alice",
+            "Alic3",
+            "authority-1",
+            "device:authority-replacement-first",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+            },
+        )
+        for client in (replacement, participant, controller):
+            self.get_messages(client)
+
+        real_emit = emo_ws._emit_message
+        emitted_actions = []
+
+        def record_emit(message, *args, **kwargs):
+            emitted_actions.append(message.get("action"))
+            return real_emit(message, *args, **kwargs)
+
+        with mock.patch.object(
+            emo_ws,
+            "_emit_message",
+            side_effect=record_emit,
+        ):
+            messages = self.start_strict_broadcast(
+                controller,
+                request_id="broadcast-start-authority-replaced-first",
+                intent_id="intent-authority-replaced-first",
+                participants=["participant-1"],
+            )
+
+        error = self.get_error(
+            messages,
+            "broadcast-start-authority-replaced-first",
+        )
+        self.assertEqual(error["payload"]["code"], "authority_offline")
+        self.assertEqual(db.EmoBroadcast.select().count(), 0)
+        self.assertNotIn("broadcast.start", emitted_actions)
+        self.assertFalse(
+            any(
+                message["action"] == "broadcast.start"
+                for message in self.get_messages(replacement)
+            )
+        )
+        self.assertFalse(
+            any(
+                message["action"] == "broadcast.start"
+                for message in self.get_messages(participant)
+            )
+        )
+
+    def test_broadcast_start_holds_authority_generation_through_exact_emit(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        replacement = self.connect_authenticated_client(
+            "alice",
+            "Alic3",
+            request_id="auth-broadcast-authority-replacement",
+        )
+        old_authority_sid = get_state().get_sid_for_client(
+            "authority-1",
+            user_name="alice",
+        )
+        replacement_trying = threading.Event()
+        replacement_entered = threading.Event()
+        start_results = []
+        start_errors = []
+        replacement_messages = []
+        replacement_errors = []
+        emitted_targets = []
+        entered_before_old_emit = []
+        real_lifecycle = emo_ws.strictPhysicalGenerationLockSet
+        real_emit = emo_ws._emit_message
+        replacement_thread = None
+
+        def observed_lifecycle(keys):
+            @contextmanager
+            def observed():
+                is_replacement = (
+                    threading.current_thread() is replacement_thread
+                )
+                if is_replacement:
+                    replacement_trying.set()
+                with real_lifecycle(keys):
+                    if is_replacement:
+                        replacement_entered.set()
+                    yield
+
+            return observed()
+
+        def register_replacement():
+            try:
+                replacement_messages.extend(
+                    self.register_device(
+                        replacement,
+                        "register-broadcast-authority-replacement",
+                        {
+                            "clientId": "authority-1",
+                            "deviceSessionId": (
+                                "device:authority-control-first"
+                            ),
+                            "roles": ["player"],
+                            "capabilities": {
+                                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                                "effectiveAtPlayback": True,
+                            },
+                        },
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                replacement_errors.append(exc)
+
+        replacement_thread = threading.Thread(target=register_replacement)
+
+        def emit_and_start_replacement(message, *args, **kwargs):
+            target_sid = args[0] if args else None
+            if message.get("action") == "broadcast.start":
+                emitted_targets.append(target_sid)
+            if (
+                message.get("action") == "broadcast.start"
+                and target_sid == old_authority_sid
+            ):
+                replacement_thread.start()
+                if not replacement_trying.wait(2):
+                    raise RuntimeError(
+                        "replacement did not reach generation lifecycle lock"
+                    )
+                entered_before_old_emit.append(
+                    replacement_entered.is_set()
+                )
+            return real_emit(message, *args, **kwargs)
+
+        def run_start():
+            try:
+                start_results.extend(
+                    self.start_strict_broadcast(
+                        controller,
+                        request_id="broadcast-start-control-first",
+                        intent_id="intent-control-first",
+                        participants=["participant-1"],
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                start_errors.append(exc)
+
+        start_thread = threading.Thread(target=run_start)
+        with mock.patch.object(
+            emo_ws,
+            "strictPhysicalGenerationLockSet",
+            side_effect=observed_lifecycle,
+        ), mock.patch.object(
+            emo_ws,
+            "_emit_message",
+            side_effect=emit_and_start_replacement,
+        ):
+            start_thread.start()
+            start_thread.join(5)
+            if replacement_thread.ident is not None:
+                replacement_thread.join(5)
+
+        self.assertFalse(start_thread.is_alive())
+        self.assertIsNotNone(replacement_thread.ident)
+        self.assertFalse(replacement_thread.is_alive())
+        self.assertEqual(start_errors, [])
+        self.assertEqual(replacement_errors, [])
+        self.assertEqual(entered_before_old_emit, [False])
+        self.assertTrue(replacement_entered.is_set())
+        self.get_ack(start_results, "broadcast-start-control-first")
+        new_authority_sid = get_state().get_sid_for_client(
+            "authority-1",
+            user_name="alice",
+        )
+        self.assertNotEqual(new_authority_sid, old_authority_sid)
+        self.assertEqual(emitted_targets.count(old_authority_sid), 1)
+        self.assertEqual(emitted_targets.count(new_authority_sid), 0)
+        self.assertFalse(
+            any(
+                message["action"] == "broadcast.start"
+                for message in replacement_messages
+            )
+        )
+        self.assertEqual(
+            len(
+                [
+                    message
+                    for message in self.get_messages(participant)
+                    if message["action"] == "broadcast.start"
+                ]
+            ),
+            1,
+        )
+
+    def test_broadcast_start_never_redirects_participant_to_replacement_sid(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        state = get_state()
+        authority_generation = state.get_current_physical_generation(
+            "alice",
+            "authority-1",
+            "device:authority-1",
+        )
+        participant_generation = state.get_current_physical_generation(
+            "alice",
+            "participant-1",
+            "device:participant-1",
+        )
+        owner_generation = state.get_current_physical_generation(
+            "alice",
+            "controller-1",
+            "device:controller-1",
+        )
+        with mock.patch.object(emo_ws, "_run_post_commit_push"):
+            start_messages = self.start_strict_broadcast(
+                controller,
+                request_id="broadcast-start-before-participant-replacement",
+                intent_id="intent-before-participant-replacement",
+                participants=["participant-1"],
+            )
+        start_ack = self.get_ack(
+            start_messages,
+            "broadcast-start-before-participant-replacement",
+        )["payload"]
+        persisted = emo_ws.getPersistentBroadcastState(
+            start_ack["broadcastId"]
+        )
+        replacement = self.connect_device(
+            "alice",
+            "Alic3",
+            "participant-1",
+            "device:participant-replacement",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+            },
+        )
+        self.get_messages(replacement)
+        new_participant_sid = state.get_sid_for_client(
+            "participant-1",
+            user_name="alice",
+        )
+        emitted_targets = []
+
+        def record_emit(message, target_sid):
+            emitted_targets.append((message["action"], target_sid))
+
+        with mock.patch.object(
+            emo_ws,
+            "_emit_message",
+            side_effect=record_emit,
+        ):
+            emo_ws._emit_r18_broadcast_start(
+                persisted,
+                authority_generation,
+                {
+                    ("participant-1", "device:participant-1"):
+                    participant_generation,
+                },
+                owner_generation,
+            )
+
+        self.assertFalse(
+            any(
+                action == "broadcast.start"
+                and target_sid == new_participant_sid
+                for action, target_sid in emitted_targets
+            )
+        )
+        self.assertFalse(
+            state.matches_current_physical_generation(
+                participant_generation["userName"],
+                participant_generation["clientId"],
+                participant_generation["deviceSessionId"],
+                participant_generation["sid"],
+                participant_generation["connectionNonce"],
+                participant_generation["connectionEpoch"],
+            )
+        )
+
+    def test_broadcast_start_emit_holds_only_generation_locks(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        active = {
+            "generation": 0,
+            "context": 0,
+            "pair": 0,
+            "resource": 0,
+            "database": 0,
+            "mutation": 0,
+        }
+        observations = []
+        state = get_state()
+
+        def observed_scope(real_scope, name):
+            def factory(*args, **kwargs):
+                @contextmanager
+                def observed():
+                    with real_scope(*args, **kwargs):
+                        active[name] += 1
+                        try:
+                            yield
+                        finally:
+                            active[name] -= 1
+
+                return observed()
+
+            return factory
+
+        real_emit = emo_ws._emit_message
+
+        def record_emit(message, *args, **kwargs):
+            if message.get("action") == "broadcast.start":
+                observation = dict(active)
+                observation["state"] = bool(
+                    getattr(state._lock, "_is_owned", lambda: False)()
+                )
+                observations.append(observation)
+            return real_emit(message, *args, **kwargs)
+
+        with mock.patch.object(
+            emo_ws,
+            "strictPhysicalGenerationLockSet",
+            side_effect=observed_scope(
+                emo_ws.strictPhysicalGenerationLockSet,
+                "generation",
+            ),
+        ), mock.patch.object(
+            emo_broadcast_store,
+            "strictPlaybackContextLockSet",
+            side_effect=observed_scope(
+                emo_broadcast_store.strictPlaybackContextLockSet,
+                "context",
+            ),
+        ), mock.patch.object(
+            emo_broadcast_store,
+            "strictAuthorityPairLockSet",
+            side_effect=observed_scope(
+                emo_broadcast_store.strictAuthorityPairLockSet,
+                "pair",
+            ),
+        ), mock.patch.object(
+            emo_broadcast_store,
+            "broadcastResourceLock",
+            side_effect=observed_scope(
+                emo_broadcast_store.broadcastResourceLock,
+                "resource",
+            ),
+        ), mock.patch.object(
+            emo_broadcast_store,
+            "broadcastTransaction",
+            side_effect=observed_scope(
+                emo_broadcast_store.broadcastTransaction,
+                "database",
+            ),
+        ), mock.patch.object(
+            emo_ws,
+            "broadcastMutationLock",
+            side_effect=observed_scope(
+                emo_ws.broadcastMutationLock,
+                "mutation",
+            ),
+        ), mock.patch.object(
+            emo_ws,
+            "_emit_message",
+            side_effect=record_emit,
+        ):
+            messages = self.start_strict_broadcast(
+                controller,
+                request_id="broadcast-start-lock-boundary",
+                intent_id="intent-lock-boundary",
+                participants=["participant-1"],
+            )
+
+        self.get_ack(messages, "broadcast-start-lock-boundary")
+        self.assertEqual(len(observations), 3)
+        for observation in observations:
+            self.assertEqual(observation["generation"], 1)
+            for name in (
+                "context",
+                "pair",
+                "resource",
+                "database",
+                "mutation",
+                "state",
+            ):
+                self.assertEqual(observation[name], 0, observation)
+        self.get_messages(authority)
+        self.get_messages(participant)
+
     def test_source_change_before_store_commit_rejects_without_partial_rows(self):
         authority, _participant, controller = self.connect_broadcast_devices()
         create_broadcast = emo_ws.createBroadcastState
@@ -2867,12 +3541,14 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             {
                 key: first["payload"][key]
                 for key in (
+                    "currentEpoch",
                     "currentVersion",
                     "currentQueueRevision",
                     "currentControlVersion",
                 )
             },
             {
+                "currentEpoch": before["epoch"],
                 "currentVersion": before["version"],
                 "currentQueueRevision": before["queueRevision"],
                 "currentControlVersion": before["controlVersion"],
@@ -2881,6 +3557,583 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         self.assertEqual(
             getPlaybackContextState("context-participant-original"),
             before,
+        )
+
+    def test_restore_pending_blocks_full_write_matrix_with_four_cursors(self):
+        authority, participant, controller = self.connect_broadcast_devices(
+            participant_roles=["player", "controller"],
+        )
+        self.terminalize_broadcast_with_restore_pending(
+            authority,
+            participant,
+            controller,
+        )
+        before = getPlaybackContextState("context-participant-original")
+        sampled_at_ms = int(time.time() * 1000)
+        common_control = {
+            "playbackContextId": "context-participant-original",
+            "baseControlVersion": before["controlVersion"],
+        }
+        requests = [
+            (
+                "command",
+                "playback.context.ensure",
+                {
+                    "deviceSessionId": "device:participant-1",
+                    "queueSongIds": ["replacement-song"],
+                    "currentIndex": 0,
+                    "positionMs": 0,
+                    "state": "paused",
+                },
+            ),
+            (
+                "command",
+                "playback.context.prepare",
+                {
+                    "playbackContextId": "context-participant-original",
+                    "intentId": "restore-blocked-prepare",
+                    "baseControlVersion": before["controlVersion"],
+                },
+            ),
+            (
+                "command",
+                "playback.context.close",
+                {
+                    "playbackContextId": "context-participant-original",
+                    "expectedEpoch": before["epoch"],
+                    "baseVersion": before["version"],
+                },
+            ),
+            (
+                "state",
+                "queue.context.sync",
+                {
+                    "playbackContextId": "context-participant-original",
+                    "deviceSessionId": "device:participant-1",
+                    "queueSongIds": ["replacement-song"],
+                    "currentIndex": 0,
+                    "positionMs": 0,
+                    "positionSampledAtServerMs": sampled_at_ms,
+                    "baseQueueRevision": before["queueRevision"],
+                    "baseControlVersion": before["controlVersion"],
+                },
+            ),
+            (
+                "command",
+                "queue.playItem",
+                dict(
+                    common_control,
+                    queueIndex=0,
+                    baseQueueRevision=before["queueRevision"],
+                ),
+            ),
+            ("command", "player.play", dict(common_control)),
+            ("command", "player.pause", dict(common_control)),
+            (
+                "command",
+                "player.seek",
+                dict(common_control, positionMs=0),
+            ),
+            ("command", "player.next", dict(common_control)),
+            ("command", "player.prev", dict(common_control)),
+            (
+                "event",
+                "playback.update",
+                {
+                    "playbackContextId": "context-participant-original",
+                    "deviceSessionId": "device:participant-1",
+                    "origin": "passive",
+                    "appliedControlVersion": before["controlVersion"],
+                    "state": "paused",
+                    "trackId": "original-song-1",
+                    "positionMs": before["positionMs"],
+                    "positionSampledAtServerMs": sampled_at_ms,
+                    "playbackRate": 1.0,
+                    "clientSeq": 1,
+                },
+            ),
+            (
+                "event",
+                "playback.context.prepared",
+                {
+                    "playbackContextId": "context-participant-original",
+                    "deviceSessionId": "device:participant-1",
+                    "intentId": "restore-blocked-prepared",
+                    "ready": True,
+                },
+            ),
+            (
+                "command",
+                "follow.start",
+                {
+                    "sourcePlaybackContextId": "context-broadcast-source",
+                    "deviceSessionId": "device:participant-1",
+                },
+            ),
+            (
+                "command",
+                "broadcast.start",
+                {
+                    "playbackContextId": "context-participant-original",
+                    "intentId": "restore-blocked-broadcast",
+                    "participants": ["authority-1"],
+                },
+            ),
+            (
+                "command",
+                "playback.handoff.start",
+                {
+                    "playbackContextId": "context-participant-original",
+                    "targetClientId": "authority-1",
+                    "targetDeviceSessionId": "device:authority-1",
+                    "baseControlVersion": before["controlVersion"],
+                },
+            ),
+        ]
+        counts_before = {
+            model: model.select().count()
+            for model in (
+                db.EmoPlaybackControlTransaction,
+                db.EmoPlaybackPrepareTransaction,
+                db.EmoPlaybackHandoff,
+                db.EmoBroadcastFence,
+            )
+        }
+
+        for index, (message_type, action, payload) in enumerate(requests):
+            with self.subTest(action=action):
+                request_id = "restore-matrix-%d" % index
+                participant.emit(
+                    "message",
+                    {
+                        "type": message_type,
+                        "action": action,
+                        "requestId": request_id,
+                        "payload": payload,
+                    },
+                    namespace="/emo",
+                )
+                messages = self.get_messages(participant)
+                error = self.get_error(messages, request_id)
+                self.assertEqual(error["payload"]["code"], "restore_in_progress")
+                self.assertTrue(error["payload"]["retryable"])
+                self.assertEqual(
+                    error["payload"]["playbackContextId"],
+                    "context-participant-original",
+                )
+                self.assertEqual(
+                    {
+                        name: error["payload"][name]
+                        for name in (
+                            "currentEpoch",
+                            "currentVersion",
+                            "currentQueueRevision",
+                            "currentControlVersion",
+                        )
+                    },
+                    {
+                        "currentEpoch": before["epoch"],
+                        "currentVersion": before["version"],
+                        "currentQueueRevision": before["queueRevision"],
+                        "currentControlVersion": before["controlVersion"],
+                    },
+                )
+                self.assertEqual(
+                    getPlaybackContextState("context-participant-original"),
+                    before,
+                )
+
+        for model, count in counts_before.items():
+            self.assertEqual(model.select().count(), count, model.__name__)
+        self.assertEqual(self.get_messages(authority), [])
+        self.assertEqual(self.get_messages(controller), [])
+
+    def test_restore_pending_negative_prepared_matches_only(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        self.terminalize_broadcast_with_restore_pending(
+            authority,
+            participant,
+            controller,
+        )
+        restore_fence_count = (
+            db.EmoBroadcastFence.select()
+            .where(
+                (db.EmoBroadcastFence.client_id == "participant-1")
+                & (db.EmoBroadcastFence.phase == "restorePending")
+            )
+            .count()
+        )
+        before = getPlaybackContextState("context-participant-original")
+        generation = get_state().get_current_physical_generation(
+            "alice",
+            "participant-1",
+            "device:participant-1",
+        )
+        db.EmoPlaybackPrepareTransaction.create(
+            playback_context_id="context-participant-original",
+            user_name="alice",
+            epoch=before["epoch"],
+            intent_id="raced-prepare-intent",
+            requesting_client_id="controller-1",
+            authority_client_id="participant-1",
+            authority_device_session_id="device:participant-1",
+            routed_connection_nonce=generation["connectionNonce"],
+            routed_connection_epoch=generation["connectionEpoch"],
+            request_fingerprint="a" * 64,
+            control_version=before["controlVersion"],
+            status="preparing",
+            deadline_at_ms=int(time.time() * 1000) + 10000,
+        )
+
+        def send(intent_id, request_id):
+            participant.emit(
+                "message",
+                {
+                    "type": "event",
+                    "action": "playback.context.prepared",
+                    "requestId": request_id,
+                    "payload": {
+                        "playbackContextId": "context-participant-original",
+                        "deviceSessionId": "device:participant-1",
+                        "intentId": intent_id,
+                        "ready": False,
+                        "errorCode": "restore_in_progress",
+                    },
+                },
+                namespace="/emo",
+            )
+            return self.get_messages(participant)
+
+        mismatched = send(
+            "different-prepare-intent",
+            "restore-negative-prepared-mismatch",
+        )
+        self.assertEqual(
+            self.get_error(
+                mismatched,
+                "restore-negative-prepared-mismatch",
+            )["payload"]["code"],
+            "conflict",
+        )
+        self.assertEqual(
+            getPlaybackPrepareTransaction(
+                "context-participant-original",
+                before["epoch"],
+                "raced-prepare-intent",
+            )["status"],
+            "preparing",
+        )
+
+        matched = send(
+            "raced-prepare-intent",
+            "restore-negative-prepared-match",
+        )
+        confirmation = self._push(
+            matched,
+            "playback.context.prepared",
+        )
+        self.assertFalse(confirmation["payload"]["ready"])
+        self.assertEqual(
+            confirmation["payload"]["errorCode"],
+            "restore_in_progress",
+        )
+        prepared = getPlaybackPrepareTransaction(
+            "context-participant-original",
+            before["epoch"],
+            "raced-prepare-intent",
+        )
+        self.assertEqual(prepared["status"], "failed")
+        self.assertEqual(prepared["errorCode"], "restore_in_progress")
+        self.assertEqual(
+            getPlaybackContextState("context-participant-original"),
+            before,
+        )
+        self.assertEqual(
+            db.EmoBroadcastFence.select()
+            .where(
+                (db.EmoBroadcastFence.client_id == "participant-1")
+                & (db.EmoBroadcastFence.phase == "restorePending")
+            )
+            .count(),
+            restore_fence_count,
+        )
+
+    def test_restore_pending_negative_ready_matches_only(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        self.terminalize_broadcast_with_restore_pending(
+            authority,
+            participant,
+            controller,
+        )
+        restore_fence_count = (
+            db.EmoBroadcastFence.select()
+            .where(
+                (db.EmoBroadcastFence.client_id == "participant-1")
+                & (db.EmoBroadcastFence.phase == "restorePending")
+            )
+            .count()
+        )
+        before = getPlaybackContextState("context-broadcast-source")
+        self.create_raced_handoff(
+            "raced-ready-handoff",
+            prepare_id="raced-ready-prepare",
+        )
+
+        def send(prepare_id, request_id, ready, error_code=None):
+            payload = {
+                "playbackContextId": "context-broadcast-source",
+                "prepareId": prepare_id,
+                "handoffId": "raced-ready-handoff",
+                "ready": ready,
+            }
+            if error_code is not None:
+                payload["errorCode"] = error_code
+            participant.emit(
+                "message",
+                {
+                    "type": "event",
+                    "action": "playback.ready",
+                    "requestId": request_id,
+                    "payload": payload,
+                },
+                namespace="/emo",
+            )
+            return self.get_messages(participant)
+
+        positive = send(
+            "raced-ready-prepare",
+            "restore-positive-ready-blocked",
+            True,
+        )
+        positive_error = self.get_error(
+            positive,
+            "restore-positive-ready-blocked",
+        )
+        self.assertEqual(
+            positive_error["payload"]["code"],
+            "restore_in_progress",
+        )
+        self.assertEqual(
+            getPlaybackHandoff("raced-ready-handoff")["status"],
+            "preparing",
+        )
+
+        mismatched = send(
+            "different-ready-prepare",
+            "restore-negative-ready-mismatch",
+            False,
+            "restore_in_progress",
+        )
+        self.assertEqual(
+            self.get_error(
+                mismatched,
+                "restore-negative-ready-mismatch",
+            )["payload"]["code"],
+            "not_found",
+        )
+        self.assertEqual(
+            getPlaybackHandoff("raced-ready-handoff")["status"],
+            "preparing",
+        )
+
+        matched = send(
+            "raced-ready-prepare",
+            "restore-negative-ready-match",
+            False,
+            "restore_in_progress",
+        )
+        status = self._push(matched, "playback.handoff.status")
+        self.assertEqual(status["payload"]["status"], "failed")
+        handoff = getPlaybackHandoff("raced-ready-handoff")
+        self.assertEqual(handoff["status"], "failed")
+        self.assertEqual(handoff["errorCode"], "restore_in_progress")
+        self.assertEqual(
+            getPlaybackContextState("context-broadcast-source"),
+            before,
+        )
+        self.assertEqual(
+            db.EmoBroadcastFence.select()
+            .where(
+                (db.EmoBroadcastFence.client_id == "participant-1")
+                & (db.EmoBroadcastFence.phase == "restorePending")
+            )
+            .count(),
+            restore_fence_count,
+        )
+
+    def test_restore_pending_blocks_complete_but_allows_handoff_cancel(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        self.terminalize_broadcast_with_restore_pending(
+            authority,
+            participant,
+            controller,
+        )
+        restore_fence_count = (
+            db.EmoBroadcastFence.select()
+            .where(
+                (db.EmoBroadcastFence.client_id == "participant-1")
+                & (db.EmoBroadcastFence.phase == "restorePending")
+            )
+            .count()
+        )
+        before = getPlaybackContextState("context-broadcast-source")
+        handoff = self.create_raced_handoff(
+            "raced-complete-handoff",
+            status="committing",
+            prepare_id="raced-complete-prepare",
+        )
+        sampled_at_ms = int(time.time() * 1000)
+        participant.emit(
+            "message",
+            {
+                "type": "event",
+                "action": "playback.handoff.complete",
+                "requestId": "restore-complete-blocked",
+                "payload": {
+                    "playbackContextId": "context-broadcast-source",
+                    "handoffId": "raced-complete-handoff",
+                    "deviceSessionId": "device:participant-1",
+                    "queueIndex": 0,
+                    "trackId": "source-song-1",
+                    "state": "playing",
+                    "positionMs": 1000,
+                    "positionSampledAtServerMs": sampled_at_ms,
+                    "playbackRate": 1.0,
+                    "appliedControlVersion": handoff["controlVersion"],
+                    "clientSeq": 1,
+                },
+            },
+            namespace="/emo",
+        )
+        blocked = self.get_error(
+            self.get_messages(participant),
+            "restore-complete-blocked",
+        )
+        self.assertEqual(blocked["payload"]["code"], "restore_in_progress")
+        self.assertEqual(
+            getPlaybackHandoff("raced-complete-handoff")["status"],
+            "committing",
+        )
+        self.assertEqual(
+            getPlaybackContextState("context-broadcast-source"),
+            before,
+        )
+
+        participant.emit(
+            "message",
+            {
+                "type": "command",
+                "action": "playback.handoff.cancel",
+                "requestId": "restore-handoff-cancel-allowed",
+                "payload": {
+                    "playbackContextId": "context-broadcast-source",
+                    "handoffId": "raced-complete-handoff",
+                },
+            },
+            namespace="/emo",
+        )
+        cancel_messages = self.get_messages(participant)
+        self.get_ack(cancel_messages, "restore-handoff-cancel-allowed")
+        self.assertEqual(
+            getPlaybackHandoff("raced-complete-handoff")["status"],
+            "cancelled",
+        )
+        self.assertEqual(
+            getPlaybackContextState("context-broadcast-source"),
+            before,
+        )
+        self.assertEqual(
+            db.EmoBroadcastFence.select()
+            .where(
+                (db.EmoBroadcastFence.client_id == "participant-1")
+                & (db.EmoBroadcastFence.phase == "restorePending")
+            )
+            .count(),
+            restore_fence_count,
+        )
+
+    def test_restore_pending_closed_context_uses_tombstone_four_cursors(self):
+        participant = self.connect_device(
+            "alice",
+            "Alic3",
+            "closed-participant",
+            "device:closed-participant",
+            ["player"],
+            capabilities={
+                CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                "effectiveAtPlayback": True,
+            },
+        )
+        self.ensure_playback_context(
+            participant,
+            "create-closed-restore-context",
+            playback_context_id="closed-restore-context",
+            device_session_id="device:closed-participant",
+            queue_song_ids=["closed-song"],
+            position_ms=25,
+            state="paused",
+        )
+        self.get_messages(participant)
+        closeStrictPlaybackContextState(
+            "closed-restore-context",
+            "alice",
+            expected_epoch=1,
+            base_version=1,
+            requesting_client_id="closed-participant",
+            requesting_device_session_id="device:closed-participant",
+        )
+        tombstone = getPlaybackContextCloseTombstone(
+            "closed-restore-context",
+            "alice",
+        )
+        db.EmoBroadcastFence.create(
+            resource_key="restore-closed-pair-fence",
+            broadcast_id="broadcast-closed-restore",
+            user_name="alice",
+            role="ordinary",
+            phase="restorePending",
+            playback_context_id="closed-restore-context",
+            client_id="closed-participant",
+            device_session_id="device:closed-participant",
+        )
+
+        participant.emit(
+            "message",
+            {
+                "type": "command",
+                "action": "playback.context.ensure",
+                "requestId": "restore-closed-ensure",
+                "payload": {
+                    "deviceSessionId": "device:closed-participant",
+                    "queueSongIds": ["replacement-song"],
+                    "currentIndex": 0,
+                    "positionMs": 0,
+                    "state": "paused",
+                },
+            },
+            namespace="/emo",
+        )
+        error = self.get_error(
+            self.get_messages(participant),
+            "restore-closed-ensure",
+        )
+        self.assertEqual(error["payload"]["code"], "restore_in_progress")
+        self.assertEqual(
+            {
+                name: error["payload"][name]
+                for name in (
+                    "currentEpoch",
+                    "currentVersion",
+                    "currentQueueRevision",
+                    "currentControlVersion",
+                )
+            },
+            {
+                "currentEpoch": tombstone["finalEpoch"],
+                "currentVersion": tombstone["finalVersion"],
+                "currentQueueRevision": tombstone["finalQueueRevision"],
+                "currentControlVersion": tombstone["finalControlVersion"],
+            },
         )
 
     def test_broadcast_pause_atomically_targets_source_and_ordinary(self):

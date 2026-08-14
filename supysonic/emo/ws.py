@@ -39,6 +39,8 @@ from .broadcast_store import (
     compactExpiredBroadcastStates,
     createBroadcastRegistrationReplay,
     createBroadcastState,
+    getBroadcastFenceForContext,
+    getBroadcastFenceForPair,
     getBroadcastIntentOutcome,
     getBroadcastStopOutcome,
     getNonterminalBroadcastStateForContext,
@@ -101,6 +103,7 @@ from .strict_v2_runtime import (
 from .strict_v2_safety import resolve_allowed_origins, strict_v2_safety
 from .ws_store import (
     PlaybackContextAuthorityAmbiguousError,
+    PlaybackContextBroadcastBarrierError,
     PlaybackContextCloseConflictError,
     PlaybackContextClosedError,
     PlaybackContextEnsureConflictError,
@@ -129,6 +132,7 @@ from .ws_store import (
     getDevicePlaybackState,
     getPlaybackContextState,
     getPlaybackContextStateForUser,
+    getPlaybackContextCloseTombstone,
     getPlaybackControlTransaction,
     getPlaybackHandoff,
     getPlaybackHandoffByRequest,
@@ -234,6 +238,111 @@ def _physical_generation_key(user_name, client_id):
     ):
         return user_name, client_id
     return None
+
+
+def _broadcast_fence_context_for_user(user_name, fence):
+    if not isinstance(fence, dict):
+        return {}
+    playback_context_id = fence.get("playbackContextId")
+    if not isinstance(playback_context_id, str) or not playback_context_id:
+        return {}
+    context = getPlaybackContextStateForUser(playback_context_id, user_name)
+    if context is not None and context.get("lifecycle") == "closed":
+        tombstone = getPlaybackContextCloseTombstone(
+            playback_context_id,
+            user_name,
+        )
+        if tombstone is not None:
+            return tombstone
+    return context or {}
+
+
+def _require_broadcast_fence_action_allowed(
+    user_name,
+    fence,
+    *,
+    allow_restore_pending_cleanup=False,
+):
+    if fence is None:
+        return
+    playback_context = _broadcast_fence_context_for_user(user_name, fence)
+    if fence.get("phase") == "restorePending":
+        if allow_restore_pending_cleanup:
+            return
+        raise PlaybackContextRestoreInProgressError(playback_context)
+    raise PlaybackContextBroadcastBarrierError(playback_context)
+
+
+def _require_broadcast_pair_action_allowed(
+    user_name,
+    client_id,
+    device_session_id,
+    *,
+    allow_restore_pending_cleanup=False,
+):
+    fence = getBroadcastFenceForPair(
+        user_name,
+        client_id,
+        device_session_id,
+    )
+    _require_broadcast_fence_action_allowed(
+        user_name,
+        fence,
+        allow_restore_pending_cleanup=allow_restore_pending_cleanup,
+    )
+
+
+@contextmanager
+def _strict_broadcast_start_generation_scope(
+    user_name,
+    playback_context_id,
+    requester_client_id,
+    candidate_client_ids,
+):
+    locked_keys = {
+        key
+        for key in (
+            _physical_generation_key(user_name, requester_client_id),
+            *(
+                _physical_generation_key(user_name, client_id)
+                for client_id in candidate_client_ids
+            ),
+        )
+        if key is not None
+    }
+    while True:
+        observed_context = getPlaybackContextStateForUser(
+            playback_context_id,
+            user_name,
+        )
+        authority_key = _physical_generation_key(
+            user_name,
+            None
+            if observed_context is None
+            else observed_context.get("authorityClientId"),
+        )
+        candidate_keys = set(locked_keys)
+        if authority_key is not None:
+            candidate_keys.add(authority_key)
+        with strictPhysicalGenerationLockSet(candidate_keys):
+            current_context = getPlaybackContextStateForUser(
+                playback_context_id,
+                user_name,
+            )
+            current_authority_key = _physical_generation_key(
+                user_name,
+                None
+                if current_context is None
+                else current_context.get("authorityClientId"),
+            )
+            if (
+                current_authority_key is not None
+                and current_authority_key not in candidate_keys
+            ):
+                locked_keys.add(current_authority_key)
+                continue
+            yield current_context
+            return
 
 
 def _control_lifecycle_keys(transaction):
@@ -2778,26 +2887,58 @@ def _get_online_strict_broadcast_authority(current_user_name, context):
     return authority
 
 
+def _get_exact_online_strict_broadcast_authority(
+    current_user_name,
+    context,
+):
+    authority_client_id = context.get("authorityClientId")
+    authority_device_session_id = context.get("authorityDeviceSessionId")
+    generation = state.get_current_physical_generation(
+        current_user_name,
+        authority_client_id,
+        authority_device_session_id,
+    )
+    if generation is None:
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority generation is offline"
+        )
+    authority = state.get_client(
+        authority_client_id,
+        user_name=current_user_name,
+    )
+    if authority is None or authority.get("deviceSessionId") != (
+        authority_device_session_id
+    ):
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority device is not connected"
+        )
+    if not socketio.server.manager.is_connected(
+        generation["sid"],
+        namespace="/emo",
+    ):
+        raise PlaybackAuthorityOfflineError(
+            "Playback context authority socket is unavailable"
+        )
+    if not _strict_broadcast_participant_eligible(authority):
+        raise CapabilityRequiredError(
+            "Playback context authority lacks Broadcast playback capabilities"
+        )
+    return authority, generation
+
+
 def _resolve_strict_broadcast_start_participants(
     current_user_name,
     context,
     payload,
+    candidate_client_ids,
 ):
-    authority = _get_online_strict_broadcast_authority(current_user_name, context)
-    authority_client_id = authority["clientId"]
+    authority_client_id = context["authorityClientId"]
     requested_participants = payload.get("participants")
     participants = []
+    participant_generations = {}
     skipped_client_ids = set()
     explicit = requested_participants is not None
-    candidate_ids = (
-        requested_participants
-        if explicit
-        else [
-            client.get("clientId")
-            for client in _list_clients(user_name=current_user_name)
-            if client.get("clientId")
-        ]
-    )
+    candidate_ids = list(candidate_client_ids)
     candidate_ids = sorted(set(candidate_ids) - {authority_client_id})
     if explicit and len(candidate_ids) > 20:
         raise ValueError("Broadcast participants exceeds 20 ordinary devices")
@@ -2814,7 +2955,16 @@ def _resolve_strict_broadcast_start_participants(
             continue
         if client.get("userName") != current_user_name:
             raise PermissionError("Cross-user broadcast target is not allowed")
-        if not _strict_broadcast_client_online(current_user_name, client_id):
+        device_session_id = client.get("deviceSessionId")
+        generation = state.get_current_physical_generation(
+            current_user_name,
+            client_id,
+            device_session_id,
+        )
+        if generation is None or not socketio.server.manager.is_connected(
+            generation["sid"],
+            namespace="/emo",
+        ):
             if explicit:
                 skipped_client_ids.add(client_id)
             continue
@@ -2831,7 +2981,7 @@ def _resolve_strict_broadcast_start_participants(
         bindings = listActivePlaybackContextBindings(
             current_user_name,
             client_id,
-            client.get("deviceSessionId"),
+            device_session_id,
         )
         if len(bindings) != 1:
             if explicit:
@@ -2855,7 +3005,7 @@ def _resolve_strict_broadcast_start_participants(
         participants.append(
             {
                 "clientId": client_id,
-                "deviceSessionId": client.get("deviceSessionId"),
+                "deviceSessionId": device_session_id,
                 "suspendedPlaybackContextId": suspended_context_id,
                 "suspendedEpoch": suspended["epoch"],
                 "suspendedVersion": suspended["version"],
@@ -2864,6 +3014,7 @@ def _resolve_strict_broadcast_start_participants(
                 "suspendedAppliedControlVersion": applied_control_version,
             }
         )
+        participant_generations[(client_id, device_session_id)] = generation
 
     if not explicit and len(participants) > 20:
         skipped_client_ids.update(
@@ -2875,7 +3026,11 @@ def _resolve_strict_broadcast_start_participants(
             "Broadcast start requires at least one eligible ordinary participant"
         )
     participant_ids = [item["clientId"] for item in participants]
-    return participants, sorted(skipped_client_ids - set(participant_ids))
+    return (
+        participants,
+        sorted(skipped_client_ids - set(participant_ids)),
+        participant_generations,
+    )
 
 
 def _expire_broadcast_authority_disconnect_later(
@@ -5269,18 +5424,93 @@ def _handle_strict_broadcast_start(
     request_id,
 ):
     playback_context_id = payload["playbackContextId"]
-    context = _get_strict_broadcast_context(
+    initial_context = _get_strict_broadcast_context(
         current_user_name,
         playback_context_id,
     )
     client_id = current_client.get("clientId")
-    if client_id != context.get("authorityClientId") and not _has_role(
+    if client_id != initial_context.get("authorityClientId") and not _has_role(
         current_client,
         "controller",
     ):
         raise PermissionError(
             "Broadcast start requires Context authority or controller"
         )
+    requested_participants = payload.get("participants")
+    candidate_client_ids = tuple(
+        sorted(
+            set(
+                requested_participants
+                if requested_participants is not None
+                else (
+                    client.get("clientId")
+                    for client in _list_clients(user_name=current_user_name)
+                    if client.get("clientId")
+                )
+            )
+        )
+    )
+    with _strict_broadcast_start_generation_scope(
+        current_user_name,
+        playback_context_id,
+        client_id,
+        candidate_client_ids,
+    ) as context:
+        if context is None:
+            raise LookupError("Playback context not found")
+        _ensure_playback_context_for_user(context, current_user_name)
+        _ensure_playback_context_active(context)
+        locked_client = state.get_client_for_sid(request.sid)
+        if (
+            locked_client is None
+            or locked_client.get("clientId") != client_id
+            or locked_client.get("deviceSessionId")
+            != current_client.get("deviceSessionId")
+        ):
+            raise PermissionError(
+                "Broadcast requester physical generation changed"
+            )
+        if client_id != context.get("authorityClientId") and not _has_role(
+            locked_client,
+            "controller",
+        ):
+            raise PermissionError(
+                "Broadcast start requires Context authority or controller"
+            )
+        requester_generation = state.get_current_physical_generation(
+            current_user_name,
+            client_id,
+            locked_client.get("deviceSessionId"),
+            expected_sid=request.sid,
+        )
+        if requester_generation is None:
+            raise PermissionError(
+                "Broadcast requester physical generation changed"
+            )
+        persisted, start_ack = _handle_strict_broadcast_start_locked(
+            current_user_name,
+            locked_client,
+            payload,
+            request_id,
+            context,
+            candidate_client_ids,
+            requester_generation,
+        )
+    _send_ack(request_id, start_ack)
+    return persisted
+
+
+def _handle_strict_broadcast_start_locked(
+    current_user_name,
+    current_client,
+    payload,
+    request_id,
+    context,
+    candidate_client_ids,
+    requester_generation,
+):
+    playback_context_id = payload["playbackContextId"]
+    client_id = current_client["clientId"]
     start_fingerprint = request_fingerprint(
         "command",
         "broadcast.start",
@@ -5297,11 +5527,27 @@ def _handle_strict_broadcast_start(
             raise BroadcastConflictError(
                 "Broadcast intentId was reused with different content"
             )
-        _send_ack(request_id, existing_intent["startAck"])
-        return getPersistentBroadcastState(existing_intent["broadcastId"])
-    authority = _get_online_strict_broadcast_authority(
+        return (
+            getPersistentBroadcastState(existing_intent["broadcastId"]),
+            existing_intent["startAck"],
+        )
+    _require_broadcast_pair_action_allowed(
         current_user_name,
-        context,
+        requester_generation["clientId"],
+        requester_generation["deviceSessionId"],
+    )
+    _require_broadcast_fence_action_allowed(
+        current_user_name,
+        getBroadcastFenceForContext(
+            current_user_name,
+            playback_context_id,
+        ),
+    )
+    authority, authority_generation = (
+        _get_exact_online_strict_broadcast_authority(
+            current_user_name,
+            context,
+        )
     )
     try:
         requireEffectiveAtPlayer(
@@ -5332,11 +5578,16 @@ def _handle_strict_broadcast_start(
         )
     except EffectiveAtEligibilityError as exc:
         raise BroadcastConflictError(str(exc)) from exc
-    participant_records, skipped_client_ids = (
+    (
+        participant_records,
+        skipped_client_ids,
+        participant_generations,
+    ) = (
         _resolve_strict_broadcast_start_participants(
             current_user_name,
             context,
             payload,
+            candidate_client_ids,
         )
     )
     participant_ids = sorted(
@@ -5378,6 +5629,9 @@ def _handle_strict_broadcast_start(
     }
     deliveries = []
     for participant in participant_records:
+        participant_generation = participant_generations[
+            (participant["clientId"], participant["deviceSessionId"])
+        ]
         delivery_id = "delivery:%s" % uuid.uuid4()
         execution_payload = dict(snapshot)
         execution_payload.update(
@@ -5400,13 +5654,9 @@ def _handle_strict_broadcast_start(
                     effective_at_server_ms + 8000
                 ),
                 "payload": execution_payload,
-                "connectionNonce": (
-                    state.get_clock_gate_for_client(
-                        current_user_name,
-                        participant["clientId"],
-                    )
-                    or {}
-                ).get("connectionNonce"),
+                "connectionNonce": participant_generation[
+                    "connectionNonce"
+                ],
                 "createdAtMs": server_time_ms,
             }
         )
@@ -5436,8 +5686,7 @@ def _handle_strict_broadcast_start(
         raise BroadcastConflictError(str(exc)) from exc
     if not created["created"]:
         replay_ack = created["intentOutcome"]["startAck"]
-        _send_ack(request_id, replay_ack)
-        return created["broadcast"]
+        return created["broadcast"], replay_ack
     start_ack = created["intentOutcome"]["startAck"]
     persisted = getPersistentBroadcastState(broadcast_id)
     if persisted is None:
@@ -5445,19 +5694,51 @@ def _handle_strict_broadcast_start(
     _run_post_commit_push(
         "broadcast.start",
         request_id,
-        lambda: _emit_r18_broadcast_start(persisted),
+        lambda: _emit_r18_broadcast_start(
+            persisted,
+            authority_generation,
+            participant_generations,
+            requester_generation,
+        ),
     )
-    _send_ack(request_id, start_ack)
-    return persisted
+    return persisted, start_ack
 
 
-def _emit_r18_broadcast_start(persisted):
+def _emit_r18_broadcast_start(
+    persisted,
+    authority_generation,
+    participant_generations,
+    owner_generation,
+):
     snapshot = persisted["snapshot"]
     user_name = persisted["userName"]
-    authority_client_id = snapshot["authorityClientId"]
-    authority_sid = state.get_sid_for_client(
-        authority_client_id,
-        user_name=user_name,
+
+    def exact_sid(generation, client_id, device_session_id):
+        if (
+            not isinstance(generation, dict)
+            or generation.get("userName") != user_name
+            or generation.get("clientId") != client_id
+            or generation.get("deviceSessionId") != device_session_id
+            or not state.matches_current_physical_generation(
+                generation["userName"],
+                generation["clientId"],
+                generation["deviceSessionId"],
+                generation["sid"],
+                generation["connectionNonce"],
+                generation["connectionEpoch"],
+            )
+            or not socketio.server.manager.is_connected(
+                generation["sid"],
+                namespace="/emo",
+            )
+        ):
+            return None
+        return generation["sid"]
+
+    authority_sid = exact_sid(
+        authority_generation,
+        snapshot["authorityClientId"],
+        snapshot["authorityDeviceSessionId"],
     )
     emitted_sids = set()
     if authority_sid is not None:
@@ -5475,23 +5756,18 @@ def _emit_r18_broadcast_start(persisted):
     for participant in persisted.get("participantStates", ()):
         pair = (participant["clientId"], participant["deviceSessionId"])
         delivery = current_deliveries.get(pair)
-        client = state.get_client(pair[0], user_name=user_name)
-        sid = state.get_sid_for_client(pair[0], user_name=user_name)
-        if (
-            delivery is None
-            or client is None
-            or client.get("deviceSessionId") != pair[1]
-            or sid is None
-        ):
+        sid = exact_sid(participant_generations.get(pair), pair[0], pair[1])
+        if delivery is None or sid is None:
             continue
         _emit_message(
             _build_message("event", "broadcast.start", delivery["payload"]),
             sid,
         )
         emitted_sids.add(sid)
-    owner_sid = state.get_sid_for_client(
+    owner_sid = exact_sid(
+        owner_generation,
         snapshot["ownerClientId"],
-        user_name=user_name,
+        owner_generation.get("deviceSessionId"),
     )
     if owner_sid is not None and owner_sid not in emitted_sids:
         _emit_message(
@@ -7835,6 +8111,11 @@ def _handle_follow_start(current_user_name, current_client, payload, request_id,
         if strict_v2 and device_session_id != current_client.get("deviceSessionId"):
             raise PermissionError("deviceSessionId does not match the registered device")
         follower_client_id = current_client.get("clientId")
+        _require_broadcast_pair_action_allowed(
+            current_user_name,
+            follower_client_id,
+            device_session_id,
+        )
         start_fingerprint = request_fingerprint(
             "command",
             "follow.start",
@@ -8051,6 +8332,11 @@ def _handle_follow_start(current_user_name, current_client, payload, request_id,
                             "Follow source and follower exact pair must differ",
                             source_playback_context_id,
                         )
+                    _require_broadcast_pair_action_allowed(
+                        current_user_name,
+                        follower_generation["clientId"],
+                        follower_generation["deviceSessionId"],
+                    )
                     try:
                         lease, created = createFollowSafetyLease(
                             user_name=current_user_name,
@@ -8455,6 +8741,11 @@ def _handle_playback_ready(
 
     prepare = state.get_prepare(prepare_id)
     strict_v2 = _is_strict_playback_context_v2(current_client)
+    allow_restore_pending_cleanup = (
+        strict_v2
+        and ready is False
+        and payload.get("errorCode") == "restore_in_progress"
+    )
     if prepare is None:
         if strict_v2:
             handoff_id = payload.get("handoffId")
@@ -8493,12 +8784,61 @@ def _handle_playback_ready(
             handoff = getPlaybackHandoff(handoff_id)
             if handoff is None or handoff.get("prepareId") != prepare_id:
                 raise LookupError("Playback prepare not found")
-            _require_current_handoff_generations(
+            _source_generation, target_generation = (
+                _require_current_handoff_generations(
                 handoff,
                 target_expected_sid=request_sid,
                 require_source=handoff.get("status")
                 in HANDOFF_NONTERMINAL_STATUSES,
+                )
             )
+            _require_broadcast_pair_action_allowed(
+                handoff["userName"],
+                target_generation["clientId"],
+                target_generation["deviceSessionId"],
+                allow_restore_pending_cleanup=(
+                    allow_restore_pending_cleanup
+                ),
+            )
+            _require_broadcast_fence_action_allowed(
+                handoff["userName"],
+                getBroadcastFenceForContext(
+                    handoff["userName"],
+                    handoff["playbackContextId"],
+                ),
+                allow_restore_pending_cleanup=(
+                    allow_restore_pending_cleanup
+                ),
+            )
+            if allow_restore_pending_cleanup:
+                terminal_result = terminateStrictPlaybackHandoff(
+                    handoff["playbackContextId"],
+                    handoff["handoffId"],
+                    handoff["userName"],
+                    "failed",
+                    error_code="restore_in_progress",
+                    error_message=payload.get("errorMessage"),
+                    expected_generation_role="target",
+                    expected_device_session_id=target_generation[
+                        "deviceSessionId"
+                    ],
+                    expected_connection_nonce=target_generation[
+                        "connectionNonce"
+                    ],
+                    expected_connection_epoch=target_generation[
+                        "connectionEpoch"
+                    ],
+                    allow_restore_pending_cleanup=True,
+                )
+                if terminal_result is None:
+                    raise LookupError("Playback handoff not found")
+                handoff, _transitioned = terminal_result
+                state.update_playback_handoff(
+                    handoff["handoffId"],
+                    status=handoff["status"],
+                    error_code=handoff.get("errorCode"),
+                    error_message=handoff.get("errorMessage"),
+                )
             return handoff
         _send_ack(request_id, {"ignored": True, "prepareId": prepare_id})
         return None
@@ -8537,12 +8877,59 @@ def _handle_playback_ready(
         handoff = getPlaybackHandoff(commit_payload.get("handoffId"))
         if handoff is None:
             raise LookupError("Playback handoff not found")
-        _require_current_handoff_generations(
+        _source_generation, target_generation = (
+            _require_current_handoff_generations(
             handoff,
             target_expected_sid=request_sid,
             require_source=handoff.get("status")
             in ("preparing", "ready", "committed", "committing"),
+            )
         )
+        _require_broadcast_pair_action_allowed(
+            handoff["userName"],
+            target_generation["clientId"],
+            target_generation["deviceSessionId"],
+            allow_restore_pending_cleanup=allow_restore_pending_cleanup,
+        )
+        _require_broadcast_fence_action_allowed(
+            handoff["userName"],
+            getBroadcastFenceForContext(
+                handoff["userName"],
+                handoff["playbackContextId"],
+            ),
+            allow_restore_pending_cleanup=allow_restore_pending_cleanup,
+        )
+        if allow_restore_pending_cleanup and prepare.get("status") == "preparing":
+            terminal_result = terminateStrictPlaybackHandoff(
+                handoff["playbackContextId"],
+                handoff["handoffId"],
+                handoff["userName"],
+                "failed",
+                error_code="restore_in_progress",
+                error_message=payload.get("errorMessage"),
+                expected_generation_role="target",
+                expected_device_session_id=target_generation[
+                    "deviceSessionId"
+                ],
+                expected_connection_nonce=target_generation[
+                    "connectionNonce"
+                ],
+                expected_connection_epoch=target_generation[
+                    "connectionEpoch"
+                ],
+                allow_restore_pending_cleanup=True,
+            )
+            if terminal_result is None:
+                raise LookupError("Playback handoff not found")
+            handoff, _transitioned = terminal_result
+            state.finish_prepare_if_preparing(prepare_id, "failed")
+            state.update_playback_handoff(
+                handoff["handoffId"],
+                status=handoff["status"],
+                error_code=handoff.get("errorCode"),
+                error_message=handoff.get("errorMessage"),
+            )
+            return handoff
 
     if prepare.get("status") != "preparing":
         if not strict_v2:
@@ -9625,13 +10012,31 @@ def _handle_playback_context_prepared(
     if context is None:
         raise LookupError("Playback context not found")
     _ensure_playback_context_for_user(context, current_user_name)
-    _ensure_playback_context_active(context)
     if (
         context.get("authorityClientId") != current_client.get("clientId")
         or context.get("authorityDeviceSessionId") != payload["deviceSessionId"]
         or payload["deviceSessionId"] != current_client.get("deviceSessionId")
     ):
         raise PermissionError("Prepare feedback authority binding mismatch")
+    allow_restore_pending_cleanup = (
+        payload["ready"] is False
+        and payload.get("errorCode") == "restore_in_progress"
+    )
+    _require_broadcast_pair_action_allowed(
+        current_user_name,
+        current_client["clientId"],
+        current_client["deviceSessionId"],
+        allow_restore_pending_cleanup=allow_restore_pending_cleanup,
+    )
+    _require_broadcast_fence_action_allowed(
+        current_user_name,
+        getBroadcastFenceForContext(
+            current_user_name,
+            playback_context_id,
+        ),
+        allow_restore_pending_cleanup=allow_restore_pending_cleanup,
+    )
+    _ensure_playback_context_active(context)
 
     prepare = getPlaybackPrepareTransaction(
         playback_context_id,
@@ -9691,6 +10096,9 @@ def _handle_playback_context_prepared(
             _server_time_ms(),
             error_code=canonical_result.get("errorCode"),
             error_message=canonical_result.get("errorMessage"),
+            allow_restore_pending_cleanup=(
+                allow_restore_pending_cleanup
+            ),
         )
         canonical_result = prepare["canonicalResult"]
 
@@ -11056,6 +11464,24 @@ def _handle_handoff_start(
         raise ValueError("playback.handoff.start requires a non-empty targetClientId")
     if source_client_id == target_client_id:
         raise ValueError("playback.handoff.start source and target must be different")
+    if strict_v2:
+        _require_broadcast_pair_action_allowed(
+            current_user_name,
+            current_client.get("clientId"),
+            current_client.get("deviceSessionId"),
+        )
+        _require_broadcast_fence_action_allowed(
+            current_user_name,
+            getBroadcastFenceForContext(
+                current_user_name,
+                playback_context_id,
+            ),
+        )
+        _require_broadcast_pair_action_allowed(
+            current_user_name,
+            target_client_id,
+            payload.get("targetDeviceSessionId"),
+        )
     if not _lifecycle_locked:
         lifecycle_keys = tuple(
             key
@@ -11978,6 +12404,7 @@ def _handle_handoff_cancel(
                 if sender_generation is None
                 else sender_generation["connectionEpoch"]
             ),
+            allow_restore_pending_cleanup=True,
         )
         if terminal_result is None:
             raise LookupError("Playback handoff not found")
@@ -13764,7 +14191,7 @@ class EmoNamespace(Namespace):
                 "restore_in_progress",
                 str(exc),
                 request_id,
-                **_live_context_cursor_fields(
+                **_closed_context_cursor_fields(
                     playback_context,
                     current_user_name,
                 ),
