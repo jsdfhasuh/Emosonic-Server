@@ -301,7 +301,7 @@
       "profile": "handoff",
       "type": "event",
       "contractSection": "5.4/6.9",
-      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "handoffId:string"], "optional": ["positionMs:int>=0"]},
+      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "handoffId:string", "deviceSessionId:string", "queueIndex:int>=0", "trackId:string", "state:playing", "positionMs:int>=0", "positionSampledAtServerMs:int>=0", "playbackRate:number[0.5,2.0]", "appliedControlVersion:int>=1", "clientSeq:int>=1"], "optional": []},
       "settlement": "event_confirmed",
       "serverPushes": ["playback.handoff.status", "playback.context.status", "playback.handoff.release", "playback.context.bindings.changed"],
       "roleCapabilityGate": "bound handoff target in committing",

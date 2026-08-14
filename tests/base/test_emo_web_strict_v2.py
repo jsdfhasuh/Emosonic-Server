@@ -1194,12 +1194,27 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
         self.assertGreater(commit["payload"]["effectiveAtServerMs"], 0)
 
         complete = self.fixture_message("playback.handoff.complete")
+        current_context = getPlaybackContextState("ctx-handoff")
         complete["payload"] = {
             "playbackContextId": "ctx-handoff",
             "handoffId": handoff_id,
+            "deviceSessionId": "web-player-device:target",
+            "queueIndex": current_context["currentIndex"],
+            "trackId": current_context["trackId"],
+            "state": "playing",
             "positionMs": commit["payload"]["positionMs"],
+            "positionSampledAtServerMs": commit["payload"][
+                "effectiveAtServerMs"
+            ],
+            "playbackRate": commit["payload"]["playbackRate"],
+            "appliedControlVersion": commit["payload"]["controlVersion"],
+            "clientSeq": 1,
         }
-        target.emit("message", complete, namespace="/emo")
+        with mock.patch(
+            "supysonic.emo.ws._server_time_ms",
+            return_value=commit["payload"]["effectiveAtServerMs"],
+        ):
+            target.emit("message", complete, namespace="/emo")
         target_complete_messages = self.messages(target)
         source_complete_messages = self.messages(source)
         control_complete_messages = self.messages(control)

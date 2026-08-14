@@ -163,7 +163,20 @@ ACTION_SCHEMAS = {
         ("handoffId", "errorCode", "errorMessage"),
     ),
     "playback.handoff.complete": ActionSchema(
-        "event", ("playbackContextId", "handoffId"), ("positionMs",)
+        "event",
+        (
+            "playbackContextId",
+            "handoffId",
+            "deviceSessionId",
+            "queueIndex",
+            "trackId",
+            "state",
+            "positionMs",
+            "positionSampledAtServerMs",
+            "playbackRate",
+            "appliedControlVersion",
+            "clientSeq",
+        ),
     ),
     "playback.handoff.cancel": ActionSchema(
         "command", ("playbackContextId", "handoffId"), ("reason",)
@@ -638,6 +651,10 @@ def _validate_action_combinations(action: str, payload: Dict[str, object]) -> No
             raise StrictRequestValidationError("ready:false requires errorCode")
         elif re.fullmatch(r"[a-z][a-z0-9_]{0,63}", payload["errorCode"]) is None:
             raise StrictRequestValidationError("errorCode has an invalid format")
+    if action == "playback.handoff.complete" and payload["state"] != "playing":
+        raise StrictRequestValidationError(
+            "playback.handoff.complete state must be playing"
+        )
 
 
 def validate_strict_request(message: object) -> Dict[str, object]:
@@ -2675,13 +2692,19 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
                 "instruction",
                 "controlVersion",
                 "newAuthorityClientId",
+                "newAuthorityDeviceSessionId",
             },
             set(),
             "playback.handoff.release payload",
         )
         if release["instruction"] != "pause":
             _output_error("playback.handoff.release instruction must be pause")
-        for field_name in ("playbackContextId", "handoffId", "newAuthorityClientId"):
+        for field_name in (
+            "playbackContextId",
+            "handoffId",
+            "newAuthorityClientId",
+            "newAuthorityDeviceSessionId",
+        ):
             _output_string(release[field_name], "handoff release %s" % field_name)
         _output_int(release["controlVersion"], "handoff release controlVersion", 1)
         return None
@@ -2689,7 +2712,13 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
         status = _output_object(
             payload,
             {"playbackContextId", "handoffId", "status", "controlVersion"},
-            {"sourceClientId", "newAuthorityClientId", "errorCode", "errorMessage"},
+            {
+                "sourceClientId",
+                "newAuthorityClientId",
+                "newAuthorityDeviceSessionId",
+                "errorCode",
+                "errorMessage",
+            },
             "playback.handoff.status payload",
         )
         for field_name in ("playbackContextId", "handoffId"):
@@ -2709,11 +2738,23 @@ def _validate_output_payload(action: str, payload: object) -> Optional[str]:
         if "sourceClientId" in status:
             _output_string(status["sourceClientId"], "handoff status sourceClientId")
         if state_name == "completed":
-            if "newAuthorityClientId" not in status:
-                _output_error("completed handoff status requires newAuthorityClientId")
+            if not {
+                "newAuthorityClientId",
+                "newAuthorityDeviceSessionId",
+            }.issubset(status):
+                _output_error(
+                    "completed handoff status requires exact new authority pair"
+                )
             _output_string(status["newAuthorityClientId"], "handoff status newAuthorityClientId")
-        elif "newAuthorityClientId" in status:
-            _output_error("newAuthorityClientId is only allowed for completed status")
+            _output_string(
+                status["newAuthorityDeviceSessionId"],
+                "handoff status newAuthorityDeviceSessionId",
+            )
+        elif (
+            "newAuthorityClientId" in status
+            or "newAuthorityDeviceSessionId" in status
+        ):
+            _output_error("new authority pair is only allowed for completed status")
         if state_name in {"failed", "timedOut"}:
             if "errorCode" not in status:
                 _output_error("failed/timedOut handoff status requires errorCode")

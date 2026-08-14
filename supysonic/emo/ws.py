@@ -83,6 +83,7 @@ from .strict_v2_contract import (
 from .strict_v2_effective_at import (
     EffectiveAtEligibilityError,
     getTrackDurationMs,
+    isClockGateReady,
     projectBroadcastPositionMs,
     requireEffectiveAtPlayer,
     validateBroadcastSourceState,
@@ -3682,6 +3683,10 @@ def _commit_prepare(
             commit_payload.get("handoffId"),
             commit_payload.get("userName"),
             complete_expires_at_ms,
+            effective_at_server_ms,
+            getTrackDurationMs(
+                (handoff.get("snapshot") or {}).get("trackId")
+            ),
         )
         if terminal_result is None:
             return None
@@ -10448,6 +10453,9 @@ def _build_handoff_status_payload(handoff):
         payload["sourceClientId"] = source_client_id
     if status == "completed":
         payload["newAuthorityClientId"] = handoff.get("targetClientId")
+        payload["newAuthorityDeviceSessionId"] = handoff.get(
+            "targetDeviceSessionId"
+        )
     elif status in {"failed", "timedOut"}:
         payload["errorCode"] = handoff.get("errorCode") or "prepare_failed"
         if handoff.get("errorMessage"):
@@ -10972,6 +10980,9 @@ def _send_handoff_release(
                     "instruction": "pause",
                     "controlVersion": handoff.get("controlVersion"),
                     "newAuthorityClientId": authority_client_id,
+                    "newAuthorityDeviceSessionId": handoff.get(
+                        "targetDeviceSessionId"
+                    ),
                 },
             ),
             target_sid,
@@ -11634,6 +11645,26 @@ def _handle_handoff_complete(
                 "Playback handoff is not committing",
                 current_control_version=handoff.get("controlVersion"),
             )
+        server_received_at_ms = _server_time_ms()
+        if handoff.get("status") != "completed":
+            clock_gate = state.get_clock_gate_for_client(
+                current_user_name,
+                target_generation["clientId"],
+            )
+            if (
+                clock_gate is None
+                or clock_gate.get("sid") != target_generation["sid"]
+                or clock_gate.get("connectionNonce")
+                != target_generation["connectionNonce"]
+                or not isClockGateReady(
+                    clock_gate,
+                    now_ms=server_received_at_ms,
+                )
+            ):
+                raise ControlConflictError(
+                    "Handoff target clock gate is not current",
+                    current_control_version=handoff.get("controlVersion"),
+                )
         try:
             result = completeStrictPlaybackHandoff(
                 playback_context_id,
@@ -11642,6 +11673,18 @@ def _handle_handoff_complete(
                 current_client.get("clientId"),
                 target_device_session_id,
                 position_ms=payload.get("positionMs"),
+                queue_index=payload.get("queueIndex"),
+                track_id=payload.get("trackId"),
+                state=payload.get("state"),
+                position_sampled_at_server_ms=payload.get(
+                    "positionSampledAtServerMs"
+                ),
+                playback_rate=payload.get("playbackRate"),
+                applied_control_version=payload.get(
+                    "appliedControlVersion"
+                ),
+                client_seq=payload.get("clientSeq"),
+                server_received_at_ms=server_received_at_ms,
                 expected_source_client_id=source_generation["clientId"],
                 expected_source_device_session_id=(
                     source_generation["deviceSessionId"]
@@ -11669,6 +11712,16 @@ def _handle_handoff_complete(
         if result is None:
             raise LookupError("Playback handoff not found")
         updated_context, completed_handoff, device_state, _mutated = result
+        if result.terminalized:
+            state.restore_playback_context(playback_context_id, updated_context)
+            state.update_playback_handoff(
+                handoff_id,
+                status=completed_handoff.get("status"),
+                error_code=completed_handoff.get("errorCode"),
+                error_message=completed_handoff.get("errorMessage"),
+            )
+            completed_handoff["_completionTimedOut"] = True
+            return completed_handoff
         if result.retired_context is not None:
             retired_context = result.retired_context
             state.restore_playback_context(
@@ -11679,6 +11732,7 @@ def _handle_handoff_complete(
                 retired_context["playbackContextId"]
             )
         if result.mutated:
+            completed_handoff["_completionMutated"] = True
             completed_handoff["_bindingMutation"] = {
                 "mutated": result.mutated,
                 "affectedAuthorityPairs": result.affected_authority_pairs,
@@ -12675,6 +12729,16 @@ class EmoNamespace(Namespace):
                         _store_event_confirmations(
                             [handoff_status_message, context_status_message]
                         )
+                        if handoff.get("_completionTimedOut"):
+                            _run_post_commit_push(
+                                action,
+                                request_id,
+                                lambda: _broadcast_handoff_cancel(
+                                    handoff,
+                                    "commit_timeout",
+                                    include_sid=request.sid,
+                                ),
+                            )
                         _run_post_commit_push(
                             action,
                             request_id,
@@ -12691,21 +12755,22 @@ class EmoNamespace(Namespace):
                                 playback_context_id,
                             ),
                         )
-                        _run_post_commit_push(
-                            action,
-                            request_id,
-                            lambda: _send_handoff_release(
-                                handoff,
-                                handoff.get("sourceClientId"),
-                                "handoff_completed",
-                                authority_client_id=handoff.get(
-                                    "targetClientId"
+                        if handoff.get("_completionMutated"):
+                            _run_post_commit_push(
+                                action,
+                                request_id,
+                                lambda: _send_handoff_release(
+                                    handoff,
+                                    handoff.get("sourceClientId"),
+                                    "handoff_completed",
+                                    authority_client_id=handoff.get(
+                                        "targetClientId"
+                                    ),
+                                    source_client_id=handoff.get(
+                                        "targetClientId"
+                                    ),
                                 ),
-                                source_client_id=handoff.get(
-                                    "targetClientId"
-                                ),
-                            ),
-                        )
+                            )
                         retired_standby_context_id = handoff.get(
                             "_retiredStandbyPlaybackContextId"
                         )

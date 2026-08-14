@@ -1,6 +1,7 @@
 import hashlib
 import heapq
 import json
+import math
 import threading
 import time
 from contextlib import contextmanager
@@ -29,6 +30,10 @@ from ..db import (
     db,
     now,
     open_connection,
+)
+from .strict_v2_effective_at import (
+    projectBroadcastPositionMs,
+    validateFeedbackPositionMs,
 )
 
 
@@ -277,6 +282,7 @@ class PlaybackHandoffCompleteResult(tuple):
         mutated: bool,
         affected_authority_pairs: Iterable[AuthorityPair],
         retired_context: Optional[Dict[str, object]] = None,
+        terminalized: bool = False,
     ):
         result = super().__new__(
             cls,
@@ -295,6 +301,7 @@ class PlaybackHandoffCompleteResult(tuple):
         result.retired_context = (
             None if retired_context is None else dict(retired_context)
         )
+        result.terminalized = bool(terminalized)
         return result
 
 
@@ -610,6 +617,188 @@ def _handoff_source_changed_before_commit(
         & (EmoPlaybackControlTransaction.epoch == context_record.epoch)
         & (EmoPlaybackControlTransaction.status == "pending")
     ).exists()
+
+
+def _handoff_complete_proof(
+    target_device_session_id,
+    queue_index,
+    track_id,
+    state,
+    position_ms,
+    position_sampled_at_server_ms,
+    playback_rate,
+    applied_control_version,
+    client_seq,
+):
+    _require_non_empty_string(
+        target_device_session_id,
+        "deviceSessionId",
+        128,
+    )
+    _require_non_empty_string(track_id, "trackId", 128)
+    for field_name, value, minimum in (
+        ("queueIndex", queue_index, 0),
+        ("positionMs", position_ms, 0),
+        (
+            "positionSampledAtServerMs",
+            position_sampled_at_server_ms,
+            0,
+        ),
+        ("appliedControlVersion", applied_control_version, 1),
+        ("clientSeq", client_seq, 1),
+    ):
+        _require_integer(value, field_name, minimum)
+    if state != "playing":
+        raise ValueError("state must be exactly playing")
+    if (
+        isinstance(playback_rate, bool)
+        or not isinstance(playback_rate, (int, float))
+        or not math.isfinite(playback_rate)
+        or not 0.5 <= playback_rate <= 2.0
+    ):
+        raise ValueError("playbackRate must be within 0.5..2.0")
+    return {
+        "deviceSessionId": target_device_session_id,
+        "queueIndex": queue_index,
+        "trackId": track_id,
+        "state": state,
+        "positionMs": position_ms,
+        "positionSampledAtServerMs": position_sampled_at_server_ms,
+        "playbackRate": float(playback_rate),
+        "appliedControlVersion": applied_control_version,
+        "clientSeq": client_seq,
+    }
+
+
+def _validate_handoff_complete_proof(
+    context_record,
+    handoff_record,
+    snapshot,
+    proof,
+    server_received_at_ms,
+):
+    _require_integer(server_received_at_ms, "serverReceivedAtMs", 0)
+    if proof["deviceSessionId"] != handoff_record.target_device_session_id:
+        raise PlaybackHandoffTargetConflictError(
+            "Playback handoff complete device does not match target"
+        )
+    queue = json.loads(context_record.queue_json)
+    if (
+        proof["queueIndex"] != context_record.current_index
+        or proof["queueIndex"] != snapshot.get("currentIndex")
+        or proof["queueIndex"] >= len(queue)
+    ):
+        raise PlaybackHandoffTargetConflictError(
+            "Playback handoff complete queue index conflicts"
+        )
+    if (
+        proof["trackId"] != context_record.track_id
+        or proof["trackId"] != snapshot.get("trackId")
+        or queue[proof["queueIndex"]] != proof["trackId"]
+    ):
+        raise PlaybackHandoffTargetConflictError(
+            "Playback handoff complete track conflicts"
+        )
+    if proof["state"] != "playing":
+        raise PlaybackHandoffTargetConflictError(
+            "Playback handoff complete state must be playing"
+        )
+    if proof["playbackRate"] != snapshot.get("playbackRate"):
+        raise PlaybackHandoffTargetConflictError(
+            "Playback handoff complete playbackRate conflicts"
+        )
+    if proof["appliedControlVersion"] != handoff_record.provisional_control_version:
+        raise PlaybackHandoffTargetConflictError(
+            "Playback handoff complete applied control version conflicts"
+        )
+
+    sampled_at_ms = proof["positionSampledAtServerMs"]
+    if sampled_at_ms > server_received_at_ms + 50:
+        raise PlaybackHandoffTargetConflictError(
+            "Playback handoff complete sample is too far in the future"
+        )
+    if server_received_at_ms - sampled_at_ms > 2000:
+        raise PlaybackHandoffTargetConflictError(
+            "Playback handoff complete sample is stale"
+        )
+    effective_at_server_ms = snapshot.get("effectiveAtServerMs")
+    commit_position_ms = snapshot.get("positionMs")
+    if type(effective_at_server_ms) is not int or effective_at_server_ms < 0:
+        raise PlaybackHandoffTargetConflictError(
+            "Playback handoff commit effective-at proof is missing"
+        )
+    if type(commit_position_ms) is not int or commit_position_ms < 0:
+        raise PlaybackHandoffTargetConflictError(
+            "Playback handoff commit position proof is missing"
+        )
+    execution_late_ms = sampled_at_ms - effective_at_server_ms
+    if execution_late_ms < 0:
+        raise PlaybackHandoffTargetConflictError(
+            "Playback handoff complete sample precedes effective-at"
+        )
+    if execution_late_ms > 1000:
+        raise PlaybackHandoffTargetConflictError(
+            "Playback handoff complete sample is too late"
+        )
+    duration_ms = snapshot.get("trackDurationMs")
+    if duration_ms is not None and (
+        type(duration_ms) is not int or duration_ms < 0
+    ):
+        raise PlaybackHandoffTargetConflictError(
+            "Playback handoff track duration proof is invalid"
+        )
+    try:
+        validateFeedbackPositionMs(proof["positionMs"], duration_ms)
+        expected_position_ms = projectBroadcastPositionMs(
+            commit_position_ms,
+            effective_at_server_ms,
+            sampled_at_ms,
+            proof["playbackRate"],
+            duration_ms=duration_ms,
+        )
+    except ValueError as exc:
+        raise PlaybackHandoffTargetConflictError(str(exc)) from exc
+    if abs(proof["positionMs"] - expected_position_ms) > 1000:
+        raise PlaybackHandoffTargetConflictError(
+            "Playback handoff complete position proof conflicts"
+        )
+
+
+def _handoff_complete_device_state(
+    context_record,
+    handoff_record,
+    proof,
+    request_fingerprint,
+    server_received_at_ms,
+):
+    canonical = {
+        "playbackContextId": context_record.playback_context_id,
+        "deviceSessionId": handoff_record.target_device_session_id,
+        "sourceClientId": handoff_record.target_client_id,
+        "queueIndex": proof["queueIndex"],
+        "state": proof["state"],
+        "trackId": proof["trackId"],
+        "positionMs": proof["positionMs"],
+        "positionSampledAtServerMs": proof["positionSampledAtServerMs"],
+        "playbackRate": proof["playbackRate"],
+        "appliedControlVersion": proof["appliedControlVersion"],
+        "clientSeq": proof["clientSeq"],
+        "serverUpdatedAtMs": server_received_at_ms,
+        "contextEpoch": context_record.epoch,
+        "isAuthority": True,
+        "mode": "handoff",
+    }
+    playback_json = dict(canonical)
+    playback_json.update(
+        {
+            "_connectionNonce": handoff_record.target_connection_nonce,
+            "_connectionEpoch": handoff_record.target_connection_epoch,
+            "_settledClientSeq": proof["clientSeq"],
+            "_requestFingerprint": request_fingerprint,
+            "_canonicalUpdate": canonical,
+        }
+    )
+    return canonical, playback_json
 
 
 def _fail_handoff_source_changed(record):
@@ -6354,6 +6543,14 @@ def completeStrictPlaybackHandoff(
     target_device_session_id: str,
     position_ms: Optional[int] = None,
     *,
+    queue_index: Optional[int] = None,
+    track_id: Optional[str] = None,
+    state: Optional[str] = None,
+    position_sampled_at_server_ms: Optional[int] = None,
+    playback_rate: Optional[float] = None,
+    applied_control_version: Optional[int] = None,
+    client_seq: Optional[int] = None,
+    server_received_at_ms: Optional[int] = None,
     expected_source_client_id: str,
     expected_source_device_session_id: str,
     expected_source_connection_nonce: str,
@@ -6361,6 +6558,18 @@ def completeStrictPlaybackHandoff(
     expected_target_connection_nonce: str,
     expected_target_connection_epoch: int,
 ) -> Optional[PlaybackHandoffCompleteResult]:
+    proof = _handoff_complete_proof(
+        target_device_session_id,
+        queue_index,
+        track_id,
+        state,
+        position_ms,
+        position_sampled_at_server_ms,
+        playback_rate,
+        applied_control_version,
+        client_seq,
+    )
+    _require_integer(server_received_at_ms, "serverReceivedAtMs", 0)
     _validate_handoff_generation_arguments(
         user_name,
         expected_source_client_id,
@@ -6396,62 +6605,14 @@ def completeStrictPlaybackHandoff(
     if isinstance(standby_context_id, str) and standby_context_id:
         context_ids.append(standby_context_id)
     with _strict_playback_context_lock_set(context_ids):
-        open_connection(reuse=True)
-        try:
-            requireFollowSafetyLeaseResourceAvailable(
-                playback_context_id=playback_context_id,
-                user_name=user_name,
-                client_id=target_client_id,
-                device_session_id=target_device_session_id,
-            )
-            requirePlaybackHandoffResourceAvailable(
-                playback_context_id=playback_context_id,
-                user_name=user_name,
-                client_id=target_client_id,
-                device_session_id=target_device_session_id,
-                mutation_name="completeStrictPlaybackHandoff",
-                allowed_handoff_id=handoff_id,
-            )
-            _require_broadcast_context_mutation_allowed(
-                playback_context_id,
-                "completeStrictPlaybackHandoff",
-            )
-            target_fence = _broadcast_fence_for_pair(
-                user_name,
-                target_client_id,
-                target_device_session_id,
-            )
-            if target_fence is not None:
-                _raise_broadcast_fence(
-                    target_fence,
-                    target_fence.playback_context_id or playback_context_id,
-                )
-            if isinstance(standby_context_id, str) and standby_context_id:
-                requireFollowSafetyLeaseResourceAvailable(
-                    playback_context_id=standby_context_id,
-                )
-                requirePlaybackHandoffResourceAvailable(
-                    playback_context_id=standby_context_id,
-                    mutation_name="completeStrictPlaybackHandoff",
-                    allowed_handoff_id=handoff_id,
-                )
-                standby_fences = _broadcast_fences_for_context(
-                    standby_context_id
-                )
-                if standby_fences:
-                    _raise_broadcast_fence(
-                        standby_fences[0],
-                        standby_context_id,
-                    )
-        finally:
-            close_connection()
         return _completeStrictPlaybackHandoffLocked(
             playback_context_id,
             handoff_id,
             user_name,
             target_client_id,
             target_device_session_id,
-            position_ms=position_ms,
+            proof=proof,
+            server_received_at_ms=server_received_at_ms,
             expected_source_client_id=expected_source_client_id,
             expected_source_device_session_id=(
                 expected_source_device_session_id
@@ -6477,8 +6638,9 @@ def _completeStrictPlaybackHandoffLocked(
     user_name: str,
     target_client_id: str,
     target_device_session_id: str,
-    position_ms: Optional[int] = None,
     *,
+    proof: Dict[str, object],
+    server_received_at_ms: int,
     expected_source_client_id: str,
     expected_source_device_session_id: str,
     expected_source_connection_nonce: str,
@@ -6579,6 +6741,29 @@ def _completeStrictPlaybackHandoffLocked(
                 else {}
             )
             if handoff_record.status == "completed":
+                persisted_fingerprint = snapshot.get(
+                    "handoffCompleteRequestFingerprint"
+                )
+                persisted_proof = snapshot.get("handoffCompleteProof")
+                current_client_seq = (
+                    persisted_proof.get("clientSeq")
+                    if isinstance(persisted_proof, dict)
+                    else None
+                )
+                if (
+                    type(current_client_seq) is not int
+                    or persisted_fingerprint is None
+                ):
+                    raise PlaybackHandoffTargetConflictError(
+                        "Playback handoff completed proof is unavailable"
+                    )
+                if (
+                    proof["clientSeq"] != current_client_seq
+                    or _json_fingerprint(proof) != persisted_fingerprint
+                ):
+                    raise PlaybackClientSequenceConflictError(
+                        current_client_seq
+                    )
                 target_record = EmoDevicePlaybackState.get_or_none(
                     (
                         EmoDevicePlaybackState.playback_context_id
@@ -6605,6 +6790,70 @@ def _completeStrictPlaybackHandoffLocked(
                 )
             if handoff_record.status not in ("committed", "committing"):
                 raise ValueError("Playback handoff is not committing")
+            requireFollowSafetyLeaseResourceAvailable(
+                playback_context_id=playback_context_id,
+                user_name=user_name,
+                client_id=target_client_id,
+                device_session_id=target_device_session_id,
+            )
+            requirePlaybackHandoffResourceAvailable(
+                playback_context_id=playback_context_id,
+                user_name=user_name,
+                client_id=target_client_id,
+                device_session_id=target_device_session_id,
+                mutation_name="completeStrictPlaybackHandoff",
+                allowed_handoff_id=handoff_id,
+            )
+            _require_broadcast_context_mutation_allowed(
+                playback_context_id,
+                "completeStrictPlaybackHandoff",
+            )
+            target_fence = _broadcast_fence_for_pair(
+                user_name,
+                target_client_id,
+                target_device_session_id,
+            )
+            if target_fence is not None:
+                _raise_broadcast_fence(
+                    target_fence,
+                    target_fence.playback_context_id or playback_context_id,
+                )
+            if isinstance(standby_context_id, str) and standby_context_id:
+                requireFollowSafetyLeaseResourceAvailable(
+                    playback_context_id=standby_context_id,
+                )
+                requirePlaybackHandoffResourceAvailable(
+                    playback_context_id=standby_context_id,
+                    mutation_name="completeStrictPlaybackHandoff",
+                    allowed_handoff_id=handoff_id,
+                )
+                standby_fences = _broadcast_fences_for_context(
+                    standby_context_id
+                )
+                if standby_fences:
+                    _raise_broadcast_fence(
+                        standby_fences[0],
+                        standby_context_id,
+                    )
+            complete_expires_at_ms = snapshot.get("completeExpiresAtMs")
+            if type(complete_expires_at_ms) is not int:
+                raise PlaybackHandoffTargetConflictError(
+                    "Playback handoff complete deadline is unavailable"
+                )
+            if server_received_at_ms >= complete_expires_at_ms:
+                handoff_record.status = "timed_out"
+                handoff_record.error_code = "commit_timeout"
+                handoff_record.error_message = "Handoff commit timed out"
+                handoff_record.updated_at = now()
+                handoff_record.save()
+                return PlaybackHandoffCompleteResult(
+                    _playback_context_payload(context_record),
+                    serializePlaybackHandoff(handoff_record),
+                    None,
+                    False,
+                    (),
+                    terminalized=True,
+                )
             _require_handoff_provisional_lane(handoff_record)
             if context_record.authority_client_id != handoff_record.source_client_id:
                 raise PermissionError("Playback handoff source is no longer authority")
@@ -6625,6 +6874,60 @@ def _completeStrictPlaybackHandoffLocked(
                     _playback_context_payload(context_record),
                     "epoch",
                 )
+
+            request_fingerprint = _json_fingerprint(proof)
+            _validate_handoff_complete_proof(
+                context_record,
+                handoff_record,
+                snapshot,
+                proof,
+                server_received_at_ms,
+            )
+            next_context_epoch = max(1, context_record.epoch) + 1
+            target_record = EmoDevicePlaybackState.get_or_none(
+                (
+                    EmoDevicePlaybackState.playback_context_id
+                    == playback_context_id
+                )
+                & (
+                    EmoDevicePlaybackState.owner_client_id
+                    == target_client_id
+                )
+            )
+            if target_record is not None and (
+                target_record.user_name != user_name
+                or target_record.device_session_id
+                != target_device_session_id
+            ):
+                raise PlaybackHandoffTargetConflictError(
+                    "Playback handoff target DevicePlaybackState conflicts"
+                )
+            existing_json = (
+                _load_json_object(target_record.playback_json) or {}
+                if target_record is not None
+                else {}
+            )
+            same_scope = bool(
+                target_record is not None
+                and target_record.context_epoch == next_context_epoch
+                and target_record.device_session_id
+                == target_device_session_id
+                and existing_json.get("_connectionNonce")
+                == handoff_record.target_connection_nonce
+                and existing_json.get("_connectionEpoch", 1)
+                == handoff_record.target_connection_epoch
+            )
+            settled_client_seq = existing_json.get(
+                "_settledClientSeq",
+                target_record.client_seq if target_record is not None else 0,
+            )
+            if type(settled_client_seq) is not int or settled_client_seq < 0:
+                settled_client_seq = (
+                    target_record.client_seq if target_record is not None else 0
+                )
+            current_client_seq = settled_client_seq if same_scope else 0
+            if proof["clientSeq"] <= current_client_seq:
+                raise PlaybackClientSequenceConflictError(current_client_seq)
 
             expected_standby_id = snapshot.get(
                 "targetStandbyPlaybackContextId"
@@ -6691,8 +6994,7 @@ def _completeStrictPlaybackHandoffLocked(
             context_record.authority_device_session_id = target_device_session_id
             context_record.origin_client_id = handoff_record.origin_client_id
             context_record.state = "playing"
-            if position_ms is not None:
-                context_record.position_ms = position_ms
+            context_record.position_ms = proof["positionMs"]
             context_record.control_version = next_control_version
             context_record.version = max(1, context_record.version) + 1
             context_record.epoch = max(1, context_record.epoch) + 1
@@ -6712,55 +7014,62 @@ def _completeStrictPlaybackHandoffLocked(
                 )
                 .execute()
             )
-            target_record = EmoDevicePlaybackState.get_or_none(
-                (
-                    EmoDevicePlaybackState.playback_context_id
-                    == playback_context_id
-                )
-                & (
-                    EmoDevicePlaybackState.owner_client_id == target_client_id
+            device_payload, device_playback_json = (
+                _handoff_complete_device_state(
+                    context_record,
+                    handoff_record,
+                    proof,
+                    request_fingerprint,
+                    server_received_at_ms,
                 )
             )
-            device_payload = {
-                "playbackContextId": playback_context_id,
-                "deviceSessionId": target_device_session_id,
-                "sourceClientId": target_client_id,
-                "state": context_record.state,
-                "trackId": context_record.track_id,
-                "positionMs": context_record.position_ms,
-                "isAuthority": True,
+            device_values = {
+                "device_session_id": target_device_session_id,
+                "owner_client_id": target_client_id,
+                "user_name": user_name,
+                "state": proof["state"],
+                "track_id": proof["trackId"],
+                "position_ms": proof["positionMs"],
+                "is_authority": 1,
                 "mode": "handoff",
+                "context_epoch": context_record.epoch,
+                "applied_control_version": proof[
+                    "appliedControlVersion"
+                ],
+                "client_seq": proof["clientSeq"],
+                "playback_json": json.dumps(
+                    device_playback_json,
+                    ensure_ascii=True,
+                ),
+                "updated_at": now(),
             }
             if target_record is None:
                 target_record = EmoDevicePlaybackState.create(
                     playback_context_id=playback_context_id,
-                    device_session_id=target_device_session_id,
-                    owner_client_id=target_client_id,
-                    user_name=user_name,
-                    state=context_record.state,
-                    track_id=context_record.track_id,
-                    position_ms=context_record.position_ms,
-                    is_authority=1,
-                    mode="handoff",
-                    playback_json=json.dumps(device_payload, ensure_ascii=True),
+                    **device_values,
                 )
             else:
-                target_record.device_session_id = target_device_session_id
-                target_record.user_name = user_name
-                target_record.state = context_record.state
-                target_record.track_id = context_record.track_id
-                target_record.position_ms = context_record.position_ms
-                target_record.is_authority = 1
-                target_record.mode = "handoff"
-                target_record.playback_json = json.dumps(
-                    device_payload,
-                    ensure_ascii=True,
-                )
-                target_record.updated_at = now()
+                for field_name, value in device_values.items():
+                    setattr(target_record, field_name, value)
                 target_record.save()
 
             handoff_record.status = "completed"
             snapshot["handoffControlVersion"] = next_control_version
+            snapshot.update(
+                {
+                    "handoffCompleteProof": proof,
+                    "handoffCompleteRequestFingerprint": request_fingerprint,
+                    "handoffCompleteServerReceivedAtMs": (
+                        server_received_at_ms
+                    ),
+                    "handoffCompleteCanonicalContext": context_payload,
+                    "handoffCompleteDeviceState": device_payload,
+                    "newAuthorityClientId": target_client_id,
+                    "newAuthorityDeviceSessionId": (
+                        target_device_session_id
+                    ),
+                }
+            )
             handoff_record.snapshot_json = json.dumps(snapshot, ensure_ascii=True)
             handoff_record.error_code = None
             handoff_record.error_message = None
@@ -6861,7 +7170,15 @@ def commitStrictPlaybackHandoff(
     handoff_id: str,
     user_name: str,
     complete_expires_at_ms: int,
+    effective_at_server_ms: int,
+    track_duration_ms: Optional[int],
 ) -> Optional[Tuple[Dict[str, object], bool]]:
+    _require_integer(complete_expires_at_ms, "completeExpiresAtMs", 0)
+    _require_integer(effective_at_server_ms, "effectiveAtServerMs", 0)
+    if complete_expires_at_ms < effective_at_server_ms:
+        raise ValueError("completeExpiresAtMs must not precede effectiveAtServerMs")
+    if track_duration_ms is not None:
+        _require_integer(track_duration_ms, "trackDurationMs", 0)
     open_connection(reuse=True)
     try:
         initial_context = EmoPlaybackContext.get_or_none(
@@ -6926,12 +7243,28 @@ def commitStrictPlaybackHandoff(
             source_device = _device_playback_state_payload(
                 source_device_record
             )
+            try:
+                projected_position_ms = projectBroadcastPositionMs(
+                    source_device["positionMs"],
+                    source_device["positionSampledAtServerMs"],
+                    effective_at_server_ms,
+                    source_device["playbackRate"],
+                )
+            except ValueError:
+                _fail_handoff_source_changed(record)
+                return serializePlaybackHandoff(record), True
+            if (
+                track_duration_ms is not None
+                and projected_position_ms >= track_duration_ms
+            ):
+                _fail_handoff_source_changed(record)
+                return serializePlaybackHandoff(record), True
             snapshot.update(
                 {
-                    "positionMs": source_device["positionMs"],
-                    "positionSampledAtServerMs": source_device[
-                        "positionSampledAtServerMs"
-                    ],
+                    "positionMs": projected_position_ms,
+                    "positionSampledAtServerMs": effective_at_server_ms,
+                    "effectiveAtServerMs": effective_at_server_ms,
+                    "trackDurationMs": track_duration_ms,
                     "completeExpiresAtMs": complete_expires_at_ms,
                 }
             )

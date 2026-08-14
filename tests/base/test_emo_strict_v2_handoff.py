@@ -157,6 +157,56 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         )
         return self.get_messages(controller)
 
+    def complete_handoff(
+        self,
+        target: SocketIOTestClient,
+        handoff_id: str,
+        commit: Dict[str, object],
+        request_id: str,
+        position_ms: int = None,
+        client_seq: int = 1,
+        overrides: Dict[str, object] = None,
+        server_received_at_ms: int = None,
+    ) -> List[Dict[str, object]]:
+        commit_payload = commit["payload"]
+        handoff = getPlaybackHandoff(handoff_id)
+        effective_at_server_ms = commit_payload["effectiveAtServerMs"]
+        if server_received_at_ms is None:
+            server_received_at_ms = effective_at_server_ms
+        payload = {
+            "playbackContextId": commit_payload["playbackContextId"],
+            "handoffId": handoff_id,
+            "deviceSessionId": "device:target-1",
+            "queueIndex": 0,
+            "trackId": handoff["snapshot"]["trackId"],
+            "state": "playing",
+            "positionMs": (
+                commit_payload["positionMs"]
+                if position_ms is None
+                else position_ms
+            ),
+            "positionSampledAtServerMs": effective_at_server_ms,
+            "playbackRate": commit_payload["playbackRate"],
+            "appliedControlVersion": commit_payload["controlVersion"],
+            "clientSeq": client_seq,
+        }
+        payload.update(overrides or {})
+        with mock.patch(
+            "supysonic.emo.ws._server_time_ms",
+            return_value=server_received_at_ms,
+        ):
+            target.emit(
+                "message",
+                {
+                    "type": "event",
+                    "action": "playback.handoff.complete",
+                    "requestId": request_id,
+                    "payload": payload,
+                },
+                namespace="/emo",
+            )
+        return self.get_messages(target)
+
     def test_success_uses_strict_settlement_schema_and_atomic_authority_switch(self):
         source, target, controller = self.connect_handoff_devices()
 
@@ -303,22 +353,17 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         )
         self.assertEqual(committing["payload"]["status"], "committing")
         self.get_messages(source)
-
-        target.emit(
-            "message",
-            {
-                "type": "event",
-                "action": "playback.handoff.complete",
-                "requestId": "handoff-complete-1",
-                "payload": {
-                    "playbackContextId": "context-handoff-1",
-                    "handoffId": start_ack["payload"]["handoffId"],
-                    "positionMs": 1500,
-                },
-            },
-            namespace="/emo",
+        before_complete_context = getPlaybackContextState(
+            "context-handoff-1"
         )
-        target_complete_messages = self.get_messages(target)
+
+        target_complete_messages = self.complete_handoff(
+            target,
+            start_ack["payload"]["handoffId"],
+            commit,
+            "handoff-complete-1",
+            position_ms=1500,
+        )
         source_complete_messages = self.get_messages(source)
         controller_complete_messages = self.get_messages(controller)
 
@@ -337,6 +382,20 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
             ],
         )
         release = source_complete_messages[-1]
+        completed_status = source_complete_messages[0]
+        self.assertEqual(
+            {
+                field_name: completed_status["payload"][field_name]
+                for field_name in (
+                    "newAuthorityClientId",
+                    "newAuthorityDeviceSessionId",
+                )
+            },
+            {
+                "newAuthorityClientId": "target-1",
+                "newAuthorityDeviceSessionId": "device:target-1",
+            },
+        )
         self.assertEqual(
             release["payload"],
             {
@@ -345,6 +404,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
                 "instruction": "pause",
                 "controlVersion": 2,
                 "newAuthorityClientId": "target-1",
+                "newAuthorityDeviceSessionId": "device:target-1",
             },
         )
         binding_events = [
@@ -378,6 +438,10 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         self.assertEqual(context["controlVersion"], 2)
         self.assertEqual(context["version"], 2)
         self.assertEqual(context["epoch"], 2)
+        self.assertEqual(
+            context["queueRevision"],
+            before_complete_context["queueRevision"],
+        )
         self.assertEqual(handoff["status"], "completed")
         self.assertEqual(handoff["originClientId"], "controller-1")
         standby = getPlaybackContextState("context-handoff-target-idle")
@@ -390,23 +454,41 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
                 for message in target_complete_messages
             )
         )
-        self.assertEqual(getDevicePlaybackStates("context-handoff-1"), [])
-
-        target.emit(
-            "message",
-            {
-                "type": "event",
-                "action": "playback.handoff.complete",
-                "requestId": "handoff-complete-1",
-                "payload": {
-                    "playbackContextId": "context-handoff-1",
-                    "handoffId": start_ack["payload"]["handoffId"],
-                    "positionMs": 1500,
-                },
-            },
-            namespace="/emo",
+        target_states = getDevicePlaybackStates("context-handoff-1")
+        self.assertEqual(len(target_states), 1)
+        self.assertEqual(target_states[0]["clientSeq"], 1)
+        self.assertEqual(target_states[0]["appliedControlVersion"], 2)
+        self.assertEqual(target_states[0]["contextEpoch"], 2)
+        self.assertEqual(target_states[0]["deviceSessionId"], "device:target-1")
+        self.assertEqual(target_states[0]["positionMs"], 1500)
+        self.assertEqual(
+            target_states[0]["positionSampledAtServerMs"],
+            commit["payload"]["effectiveAtServerMs"],
         )
-        replay_messages = self.get_messages(target)
+        self.assertEqual(target_states[0]["playbackRate"], 1.0)
+        self.assertEqual(target_states[0]["queueIndex"], 0)
+        completion_snapshot = handoff["snapshot"]
+        self.assertEqual(
+            completion_snapshot["newAuthorityDeviceSessionId"],
+            "device:target-1",
+        )
+        self.assertEqual(
+            completion_snapshot["handoffCompleteProof"]["clientSeq"],
+            1,
+        )
+        self.assertNotIn(source_generation["sid"], repr(completion_snapshot))
+        self.assertNotIn(target_generation["sid"], repr(completion_snapshot))
+
+        replay_messages = self.complete_handoff(
+            target,
+            start_ack["payload"]["handoffId"],
+            commit,
+            "handoff-complete-1",
+            position_ms=1500,
+            server_received_at_ms=(
+                commit["payload"]["effectiveAtServerMs"] + 3000
+            ),
+        )
         self.assertEqual(
             [message["action"] for message in replay_messages],
             ["playback.handoff.status", "playback.context.status"],
@@ -422,6 +504,83 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         replayed_context = getPlaybackContextState("context-handoff-1")
         self.assertEqual(replayed_context["version"], 2)
         self.assertEqual(replayed_context["epoch"], 2)
+
+        conflict_messages = self.complete_handoff(
+            target,
+            start_ack["payload"]["handoffId"],
+            commit,
+            "handoff-complete-conflicting-proof",
+            position_ms=1499,
+        )
+        conflict = self.get_error(
+            conflict_messages,
+            "handoff-complete-conflicting-proof",
+        )
+        self.assertEqual(conflict["payload"]["code"], "client_sequence_conflict")
+        self.assertEqual(conflict["payload"]["currentClientSeq"], 1)
+        self.assertEqual(self.get_messages(source), [])
+        self.assertEqual(getPlaybackContextState("context-handoff-1"), replayed_context)
+
+    def test_complete_requires_current_target_clock_gate_without_mutation(self):
+        source, target, controller = self.connect_handoff_devices()
+        start_ack = self.get_ack(
+            self.start_handoff(controller),
+            "handoff-start-1",
+        )
+        prepare = next(
+            message
+            for message in self.get_messages(target)
+            if message["action"] == "playback.prepare"
+        )
+        target.emit(
+            "message",
+            {
+                "type": "event",
+                "action": "playback.ready",
+                "requestId": "handoff-ready-clock-complete",
+                "payload": {
+                    "playbackContextId": "context-handoff-1",
+                    "handoffId": start_ack["payload"]["handoffId"],
+                    "prepareId": prepare["payload"]["prepareId"],
+                    "ready": True,
+                },
+            },
+            namespace="/emo",
+        )
+        commit = next(
+            message
+            for message in self.get_messages(target)
+            if message["action"] == "player.play"
+        )
+        self.get_messages(source)
+        self.get_messages(controller)
+        state = get_state()
+        target_sid = state.get_sid_for_client("target-1", user_name="alice")
+        with state._lock:
+            state._sessions[target_sid]["clockPingCount"] = 2
+        before_context = getPlaybackContextState("context-handoff-1")
+        before_handoff = getPlaybackHandoff(start_ack["payload"]["handoffId"])
+        before_device_states = getDevicePlaybackStates("context-handoff-1")
+
+        messages = self.complete_handoff(
+            target,
+            start_ack["payload"]["handoffId"],
+            commit,
+            "handoff-complete-clock-rejected",
+        )
+
+        error = self.get_error(messages, "handoff-complete-clock-rejected")
+        self.assertEqual(error["payload"]["code"], "conflict")
+        self.assertEqual(getPlaybackContextState("context-handoff-1"), before_context)
+        self.assertEqual(
+            getPlaybackHandoff(start_ack["payload"]["handoffId"]),
+            before_handoff,
+        )
+        self.assertEqual(
+            getDevicePlaybackStates("context-handoff-1"),
+            before_device_states,
+        )
+        self.assertEqual(self.get_messages(source), [])
 
     def test_target_replacement_first_rejects_start_without_side_effects(self):
         source, target, controller = self.connect_handoff_devices()
@@ -701,7 +860,11 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
             },
             namespace="/emo",
         )
-        self.get_messages(target)
+        commit = next(
+            message
+            for message in self.get_messages(target)
+            if message["action"] == "player.play"
+        )
         self.get_messages(source)
         self.get_messages(controller)
         complete_request = {
@@ -711,7 +874,17 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
             "payload": {
                 "playbackContextId": "context-handoff-1",
                 "handoffId": start_ack["payload"]["handoffId"],
+                "deviceSessionId": "device:target-1",
+                "queueIndex": 0,
+                "trackId": "song-1",
+                "state": "playing",
                 "positionMs": 1800,
+                "positionSampledAtServerMs": commit["payload"][
+                    "effectiveAtServerMs"
+                ],
+                "playbackRate": commit["payload"]["playbackRate"],
+                "appliedControlVersion": commit["payload"]["controlVersion"],
+                "clientSeq": 1,
             },
         }
         settled_before_push = []
@@ -731,7 +904,11 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
             "supysonic.emo.ws._broadcast_handoff_status",
             side_effect=fail_after_settlement,
         ):
-            target.emit("message", complete_request, namespace="/emo")
+            with mock.patch(
+                "supysonic.emo.ws._server_time_ms",
+                return_value=commit["payload"]["effectiveAtServerMs"],
+            ):
+                target.emit("message", complete_request, namespace="/emo")
 
         self.assertEqual(settled_before_push, [True])
         first_target_messages = self.get_messages(target)
@@ -759,7 +936,11 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         self.assertEqual(context["version"], 2)
         self.assertEqual(handoff["status"], "completed")
 
-        target.emit("message", complete_request, namespace="/emo")
+        with mock.patch(
+            "supysonic.emo.ws._server_time_ms",
+            return_value=commit["payload"]["effectiveAtServerMs"],
+        ):
+            target.emit("message", complete_request, namespace="/emo")
         replay_messages = self.get_messages(target)
         self.assertEqual(
             [message["action"] for message in replay_messages],
@@ -1558,6 +1739,76 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         self.assertEqual(
             [message["action"] for message in target_messages],
             ["playback.handoff.cancel", "playback.handoff.status"],
+        )
+
+    def test_late_complete_atomically_times_out_before_authority_switch(self):
+        source, target, controller = self.connect_handoff_devices()
+        start_ack = self.get_ack(
+            self.start_handoff(controller),
+            "handoff-start-1",
+        )
+        prepare = next(
+            message
+            for message in self.get_messages(target)
+            if message["action"] == "playback.prepare"
+        )
+        target.emit(
+            "message",
+            {
+                "type": "event",
+                "action": "playback.ready",
+                "requestId": "handoff-ready-before-late-complete",
+                "payload": {
+                    "playbackContextId": "context-handoff-1",
+                    "handoffId": start_ack["payload"]["handoffId"],
+                    "prepareId": prepare["payload"]["prepareId"],
+                    "ready": True,
+                },
+            },
+            namespace="/emo",
+        )
+        commit = next(
+            message
+            for message in self.get_messages(target)
+            if message["action"] == "player.play"
+        )
+        handoff = getPlaybackHandoff(start_ack["payload"]["handoffId"])
+        for client in (source, target, controller):
+            self.get_messages(client)
+
+        target_messages = self.complete_handoff(
+            target,
+            handoff["handoffId"],
+            commit,
+            "handoff-complete-after-deadline",
+            server_received_at_ms=handoff["completeExpiresAtMs"],
+        )
+
+        persisted = getPlaybackHandoff(handoff["handoffId"])
+        context = getPlaybackContextState("context-handoff-1")
+        self.assertEqual(persisted["status"], "timed_out")
+        self.assertEqual(persisted["errorCode"], "commit_timeout")
+        self.assertEqual(context["authorityClientId"], "source-1")
+        self.assertEqual(context["controlVersion"], 1)
+        self.assertTrue(
+            any(
+                message["action"] == "playback.handoff.cancel"
+                and message["payload"].get("errorCode") == "commit_timeout"
+                for message in target_messages
+            )
+        )
+        self.assertTrue(
+            any(
+                message["action"] == "playback.handoff.status"
+                and message["payload"]["status"] == "timedOut"
+                for message in target_messages
+            )
+        )
+        self.assertFalse(
+            any(
+                message["action"] == "playback.handoff.release"
+                for message in target_messages
+            )
         )
 
     def test_commit_timeout_cancel_push_failure_still_emits_status(self):
