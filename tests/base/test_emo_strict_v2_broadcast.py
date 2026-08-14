@@ -37,6 +37,7 @@ from supysonic.emo.ws_state import get_state
 from tests.base.test_emo_ws import (
     CAPABILITY_PLAYBACK_CONTEXT_V2,
     EmoWebSocketTestCase,
+    STRICT_V2_CAPABILITIES,
 )
 
 
@@ -403,6 +404,32 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         for client in (authority, participant, controller):
             self.get_messages(client)
         return start_ack
+
+    def emit_participant_registration(
+        self,
+        client,
+        request_id,
+        *,
+        supports_broadcast=False,
+    ):
+        capabilities = dict(STRICT_V2_CAPABILITIES)
+        capabilities["supportsBroadcast"] = supports_broadcast
+        client.emit(
+            "message",
+            {
+                "type": "device",
+                "action": "device.register",
+                "requestId": request_id,
+                "payload": {
+                    "clientId": "participant-1",
+                    "deviceName": "participant-1",
+                    "deviceSessionId": "device:participant-1",
+                    "roles": ["player"],
+                    "capabilities": capabilities,
+                },
+            },
+            namespace="/emo",
+        )
 
     def create_raced_handoff(
         self,
@@ -2386,14 +2413,21 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             self.get_messages(controller),
             "broadcast-stop-emit-failure-1",
         )
+        self.assertTrue(authority.is_connected(namespace="/emo"))
+        self.assertTrue(controller.is_connected(namespace="/emo"))
         self.assertEqual(self.get_messages(authority), [])
-        self.assertEqual(self.get_messages(participant), [])
+        self.assertFalse(participant.is_connected(namespace="/emo"))
+        self.assertIsNone(
+            get_state().get_sid_for_client(
+                "participant-1",
+                user_name="alice",
+            )
+        )
         persisted = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
         self.assertEqual(persisted["snapshot"]["broadcastRevision"], 2)
         self.assertTrue(persisted["participantStates"][0]["restorePending"])
 
         authority.disconnect(namespace="/emo")
-        participant.disconnect(namespace="/emo")
         reconnected_authority = self.connect_authenticated_client(
             "alice",
             "Alic3",
@@ -2437,6 +2471,351 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         self.assertNotEqual(
             ordinary_stop["payload"]["deliveryId"],
             persisted["participantStates"][0]["targetDeliveryId"],
+        )
+
+    def test_full_terminal_registration_enqueue_failure_disconnects_before_mapping(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.terminalize_broadcast_with_restore_pending(
+            authority,
+            participant,
+            controller,
+        )
+        participant.disconnect(namespace="/emo")
+        failed_client = self.connect_authenticated_client(
+            "alice",
+            "Alic3",
+            request_id="auth-full-terminal-enqueue-failure-1",
+        )
+        emitted = []
+        real_emit = emo_ws.socketio.emit
+
+        def fail_terminal_replay(event, message, *args, **kwargs):
+            emitted.append(message)
+            if message.get("action") == "broadcast.stop":
+                self.assertIsNone(
+                    get_state().get_sid_for_client(
+                        "participant-1",
+                        user_name="alice",
+                    )
+                )
+                self.assertIsNone(
+                    get_state().get_client(
+                        "participant-1",
+                        user_name="alice",
+                    )
+                )
+                raise RuntimeError("injected full terminal replay failure")
+            return real_emit(event, message, *args, **kwargs)
+
+        with mock.patch.object(
+            emo_ws.socketio,
+            "emit",
+            side_effect=fail_terminal_replay,
+        ):
+            self.emit_participant_registration(
+                failed_client,
+                "register-full-terminal-enqueue-failure-1",
+            )
+
+        self.assertFalse(failed_client.is_connected(namespace="/emo"))
+        self.assertEqual(
+            [message["action"] for message in emitted],
+            ["system.ack", "broadcast.stop"],
+        )
+        failed_stop = emitted[-1]
+        self.assertIsInstance(failed_stop.get("connectionNonce"), str)
+        self.assertTrue(failed_stop["connectionNonce"])
+        self.assertEqual(failed_stop["connectionEpoch"], 1)
+        self.assertIsNone(
+            get_state().get_sid_for_client(
+                "participant-1",
+                user_name="alice",
+            )
+        )
+        persisted = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        self.assertTrue(persisted["participantStates"][0]["restorePending"])
+        self.assertEqual(
+            persisted["participantStates"][0]["targetDeliveryId"],
+            failed_stop["payload"]["deliveryId"],
+        )
+
+        reconnected = self.connect_authenticated_client(
+            "alice",
+            "Alic3",
+            request_id="auth-full-terminal-retry-1",
+        )
+        messages = self.register_device(
+            reconnected,
+            "register-full-terminal-retry-1",
+            {
+                "clientId": "participant-1",
+                "deviceSessionId": "device:participant-1",
+                "roles": ["player"],
+                "capabilities": {
+                    CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                    "supportsBroadcast": False,
+                },
+            },
+        )
+        register_ack = self.get_ack(
+            messages,
+            "register-full-terminal-retry-1",
+        )
+        replay = self._push(messages, "broadcast.stop")
+        self.assertLess(messages.index(register_ack), messages.index(replay))
+        self.assertNotEqual(
+            replay["payload"]["deliveryId"],
+            failed_stop["payload"]["deliveryId"],
+        )
+        persisted = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        self.assertTrue(persisted["participantStates"][0]["restorePending"])
+        self.assertEqual(
+            persisted["participantStates"][0]["targetDeliveryId"],
+            replay["payload"]["deliveryId"],
+        )
+
+        self.send_broadcast_feedback(
+            reconnected,
+            start_ack["broadcastId"],
+            replay["payload"],
+            request_id="feedback-full-terminal-retry-1",
+            state="stopped",
+            restoreCompleted=True,
+        )
+        self._push(
+            self.get_messages(reconnected),
+            "broadcast.feedback",
+        )
+        persisted = emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        self.assertFalse(persisted["participantStates"][0]["restorePending"])
+
+    def test_terminal_replacement_enqueue_failure_preserves_old_mapping(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        self.terminalize_broadcast_with_restore_pending(
+            authority,
+            participant,
+            controller,
+        )
+        old_sid = get_state().get_sid_for_client(
+            "participant-1",
+            user_name="alice",
+        )
+        replacement = self.connect_authenticated_client(
+            "alice",
+            "Alic3",
+            request_id="auth-terminal-replacement-failure-1",
+        )
+        attempted = []
+        real_emit = emo_ws.socketio.emit
+
+        def fail_replacement_terminal(event, message, *args, **kwargs):
+            if message.get("action") == "broadcast.stop":
+                attempted.append(message)
+                self.assertEqual(
+                    get_state().get_sid_for_client(
+                        "participant-1",
+                        user_name="alice",
+                    ),
+                    old_sid,
+                )
+                raise RuntimeError("injected replacement terminal failure")
+            return real_emit(event, message, *args, **kwargs)
+
+        with mock.patch.object(
+            emo_ws.socketio,
+            "emit",
+            side_effect=fail_replacement_terminal,
+        ):
+            self.emit_participant_registration(
+                replacement,
+                "register-terminal-replacement-failure-1",
+            )
+
+        self.assertEqual(len(attempted), 1)
+        self.assertFalse(replacement.is_connected(namespace="/emo"))
+        self.assertTrue(participant.is_connected(namespace="/emo"))
+        self.assertEqual(
+            get_state().get_sid_for_client(
+                "participant-1",
+                user_name="alice",
+            ),
+            old_sid,
+        )
+        current_client = get_state().get_client(
+            "participant-1",
+            user_name="alice",
+        )
+        self.assertEqual(
+            current_client["deviceSessionId"],
+            "device:participant-1",
+        )
+
+    def test_compact_terminal_registration_enqueue_failure_disconnects_before_mapping(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.terminalize_broadcast_with_restore_pending(
+            authority,
+            participant,
+            controller,
+        )
+        participant.disconnect(namespace="/emo")
+        emo_ws.compactExpiredBroadcastStates(now_ms=9999999999999)
+        self.assertIsNone(
+            emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        )
+        failed_client = self.connect_authenticated_client(
+            "alice",
+            "Alic3",
+            request_id="auth-compact-terminal-enqueue-failure-1",
+        )
+        emitted = []
+        real_emit = emo_ws.socketio.emit
+
+        def fail_terminal_restore(event, message, *args, **kwargs):
+            emitted.append(message)
+            if message.get("action") == "broadcast.restore":
+                self.assertIsNone(
+                    get_state().get_sid_for_client(
+                        "participant-1",
+                        user_name="alice",
+                    )
+                )
+                raise RuntimeError("injected compact terminal replay failure")
+            return real_emit(event, message, *args, **kwargs)
+
+        with mock.patch.object(
+            emo_ws.socketio,
+            "emit",
+            side_effect=fail_terminal_restore,
+        ):
+            self.emit_participant_registration(
+                failed_client,
+                "register-compact-terminal-enqueue-failure-1",
+            )
+
+        self.assertFalse(failed_client.is_connected(namespace="/emo"))
+        self.assertEqual(
+            [message["action"] for message in emitted],
+            ["system.ack", "broadcast.restore"],
+        )
+        failed_restore = emitted[-1]
+        recovery = emo_ws.listTerminalRecoveries(
+            "alice",
+            "participant-1",
+            "device:participant-1",
+        )[0]
+        self.assertEqual(
+            recovery["currentDeliveryId"],
+            failed_restore["payload"]["deliveryId"],
+        )
+        self.assertIsNone(
+            get_state().get_sid_for_client(
+                "participant-1",
+                user_name="alice",
+            )
+        )
+
+        reconnected = self.connect_authenticated_client(
+            "alice",
+            "Alic3",
+            request_id="auth-compact-terminal-retry-1",
+        )
+        messages = self.register_device(
+            reconnected,
+            "register-compact-terminal-retry-1",
+            {
+                "clientId": "participant-1",
+                "deviceSessionId": "device:participant-1",
+                "roles": ["player"],
+                "capabilities": {
+                    CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                    "supportsBroadcast": False,
+                },
+            },
+        )
+        replay = self._push(messages, "broadcast.restore")
+        self.assertNotEqual(
+            replay["payload"]["deliveryId"],
+            failed_restore["payload"]["deliveryId"],
+        )
+        recovery = emo_ws.listTerminalRecoveries(
+            "alice",
+            "participant-1",
+            "device:participant-1",
+        )[0]
+        self.assertEqual(
+            recovery["currentDeliveryId"],
+            replay["payload"]["deliveryId"],
+        )
+
+    def test_failed_full_terminal_delivery_compacts_to_restore_replay(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        start_ack = self.terminalize_broadcast_with_restore_pending(
+            authority,
+            participant,
+            controller,
+        )
+        participant.disconnect(namespace="/emo")
+        failed_client = self.connect_authenticated_client(
+            "alice",
+            "Alic3",
+            request_id="auth-full-before-compaction-failure-1",
+        )
+        failed_delivery_ids = []
+        real_emit = emo_ws.socketio.emit
+
+        def fail_full_terminal(event, message, *args, **kwargs):
+            if message.get("action") == "broadcast.stop":
+                failed_delivery_ids.append(message["payload"]["deliveryId"])
+                raise RuntimeError("injected full replay before compaction")
+            return real_emit(event, message, *args, **kwargs)
+
+        with mock.patch.object(
+            emo_ws.socketio,
+            "emit",
+            side_effect=fail_full_terminal,
+        ):
+            self.emit_participant_registration(
+                failed_client,
+                "register-full-before-compaction-failure-1",
+            )
+
+        self.assertFalse(failed_client.is_connected(namespace="/emo"))
+        self.assertEqual(len(failed_delivery_ids), 1)
+        emo_ws.compactExpiredBroadcastStates(now_ms=9999999999999)
+        self.assertIsNone(
+            emo_ws.getPersistentBroadcastState(start_ack["broadcastId"])
+        )
+
+        reconnected = self.connect_authenticated_client(
+            "alice",
+            "Alic3",
+            request_id="auth-restore-after-full-failure-1",
+        )
+        messages = self.register_device(
+            reconnected,
+            "register-restore-after-full-failure-1",
+            {
+                "clientId": "participant-1",
+                "deviceSessionId": "device:participant-1",
+                "roles": ["player"],
+                "capabilities": {
+                    CAPABILITY_PLAYBACK_CONTEXT_V2: True,
+                    "supportsBroadcast": False,
+                },
+            },
+        )
+        restore = self._push(messages, "broadcast.restore")
+        self.assertNotEqual(
+            restore["payload"]["deliveryId"],
+            failed_delivery_ids[0],
+        )
+        self.assertEqual(
+            emo_ws.listTerminalRecoveries(
+                "alice",
+                "participant-1",
+                "device:participant-1",
+            )[0]["currentDeliveryId"],
+            restore["payload"]["deliveryId"],
         )
 
     def test_manual_stop_is_persistent_atomic_and_idempotent(self):

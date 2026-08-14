@@ -1081,9 +1081,11 @@ def _build_message(msg_type, action, payload=None, **extra):
     return message
 
 
-def _message_for_recipient(message, target_sid):
+def _message_for_recipient(message, target_sid, recipient_client=None):
     """Add strict-v2 connection provenance for one Socket.IO recipient."""
-    target_client = state.get_client_for_sid(target_sid)
+    target_client = recipient_client
+    if target_client is None:
+        target_client = state.get_client_for_sid(target_sid)
     strict_target = _is_strict_playback_context_v2(target_client)
     strict_request_reply = (
         has_request_context()
@@ -1152,13 +1154,18 @@ def _emit_message(
     target_sid=None,
     record_settlement=True,
     emit_reserved=False,
+    recipient_client=None,
 ):
     """Emit a message to one recipient with its strict-v2 provenance."""
     if target_sid is None:
         if not has_request_context():
             raise RuntimeError("A target Socket.IO sid is required outside a request")
         target_sid = request.sid
-    outgoing = _message_for_recipient(message, target_sid)
+    outgoing = _message_for_recipient(
+        message,
+        target_sid,
+        recipient_client=recipient_client,
+    )
     settled_request_id = (
         getattr(g, "emo_settled_request_id", None)
         if record_settlement and has_request_context()
@@ -1361,10 +1368,13 @@ def _effective_at_server_ms(protocol):
     return _server_time_ms() + _commit_lead_ms(protocol)
 
 
-def _send_ack(request_id=None, payload=None):
+def _send_ack(request_id=None, payload=None, recipient_client=None):
     if has_request_context() and getattr(g, "emo_suppress_success_ack", False):
         return
-    _emit_message(_build_message("system", "system.ack", payload, requestId=request_id))
+    _emit_message(
+        _build_message("system", "system.ack", payload, requestId=request_id),
+        recipient_client=recipient_client,
+    )
 
 
 def _live_context_cursor_fields(playback_context, user_name):
@@ -2106,7 +2116,7 @@ def _restorePersistedState(sid, session_id):
         _emit_message(_build_message("state", "playback.update", playback_state), sid)
 
 
-def _register_device(sid, user_name, payload):
+def _prepare_device_registration(user_name, payload):
     client_id = payload.get("clientId")
     if not isinstance(client_id, str) or not client_id:
         raise ValueError("clientId must be a non-empty string")
@@ -2185,8 +2195,15 @@ def _register_device(sid, user_name, payload):
     if not strict_v2:
         client_info["sessionId"] = device_session_id
 
-    registered_client = state.register_client(sid, client_id, client_info)
-    return registered_client
+    client_info["clientId"] = client_id
+    return client_id, client_info
+
+
+def _register_device(sid, user_name, payload, *, prepared=None):
+    if prepared is None:
+        prepared = _prepare_device_registration(user_name, payload)
+    client_id, client_info = prepared
+    return state.register_client(sid, client_id, client_info)
 
 
 def _route_command(sender, message):
@@ -3136,7 +3153,17 @@ def _prepare_strict_broadcast_participant_registration(client_info):
     )
 
 
-def _emit_strict_broadcast_participant_registration(replay):
+def _is_critical_broadcast_registration_replay(replay):
+    if replay is None or not replay.get("created"):
+        return False
+    delivery = replay.get("delivery") or {}
+    return delivery.get("action") in {"stop", "restore"}
+
+
+def _emit_strict_broadcast_participant_registration(
+    replay,
+    recipient_client=None,
+):
     if replay is None or not replay.get("created"):
         return
     delivery = replay["delivery"]
@@ -3147,6 +3174,7 @@ def _emit_strict_broadcast_participant_registration(replay):
             delivery["payload"],
         ),
         request.sid,
+        recipient_client=recipient_client,
     )
 
 
@@ -6199,6 +6227,8 @@ def _emit_r18_broadcast_projection(mutation: Dict[str, object]) -> None:
                 snapshot["broadcastRevision"],
                 sid,
             )
+            if action == "broadcast.stop":
+                _disconnect_strict_recipient(sid)
         else:
             emitted_sids.add(sid)
     owner_client_id = snapshot["ownerClientId"]
@@ -12806,21 +12836,30 @@ class EmoNamespace(Namespace):
             elif action == "device.register":
                 if not current_user_name:
                     raise PermissionError("Authenticate first")
+                registration_client_id, prepared_client = (
+                    _prepare_device_registration(
+                        current_user_name,
+                        payload,
+                    )
+                )
                 broadcast_participant_replay = None
                 broadcast_source_terminal_replays = []
                 registration_key = _physical_generation_key(
                     current_user_name,
-                    payload.get("clientId"),
+                    registration_client_id,
                 )
+
                 def resolve_replacement_handoffs():
                     return _active_handoffs_for_generation(
                         _current_stable_client_generation(
                             current_user_name,
-                            payload.get("clientId"),
+                            registration_client_id,
                         )
                     )
 
                 handoff_transitions = []
+                critical_replay_error = None
+                registration_ack_sent = False
                 with _handoff_lifecycle_scope(
                     resolve_replacement_handoffs,
                     base_keys=(
@@ -12830,7 +12869,7 @@ class EmoNamespace(Namespace):
                     ),
                 ):
                     previous_sid = state.get_sid_for_client(
-                        payload.get("clientId"),
+                        registration_client_id,
                         user_name=current_user_name,
                     )
                     previous_session = (
@@ -12844,7 +12883,48 @@ class EmoNamespace(Namespace):
                         if previous_session is not None
                         else None
                     )
-                    if previous_client is not None:
+                    if _is_strict_playback_context_v2(prepared_client):
+                        broadcast_participant_replay = (
+                            _prepare_strict_broadcast_participant_registration(
+                                prepared_client
+                            )
+                        )
+                        broadcast_source_terminal_replays = (
+                            _prepare_strict_broadcast_source_terminal_registration(
+                                prepared_client
+                            )
+                        )
+                    if _is_critical_broadcast_registration_replay(
+                        broadcast_participant_replay
+                    ):
+                        ack_payload = {
+                            "clientId": prepared_client["clientId"],
+                            "deviceSessionId": prepared_client[
+                                "deviceSessionId"
+                            ],
+                            "negotiatedCapabilities": dict(
+                                prepared_client.get("capabilities") or {}
+                            ),
+                            "strictV2": get_strict_v2_registration_metadata(
+                                session_info.get("connectionNonce")
+                                if session_info
+                                else None
+                            ),
+                        }
+                        _send_ack(
+                            request_id,
+                            ack_payload,
+                            recipient_client=prepared_client,
+                        )
+                        registration_ack_sent = True
+                        try:
+                            _emit_strict_broadcast_participant_registration(
+                                broadcast_participant_replay,
+                                recipient_client=prepared_client,
+                            )
+                        except Exception as exc:
+                            critical_replay_error = exc
+                    if critical_replay_error is None and previous_client is not None:
                         _follow, handoff_transitions = (
                             _mark_profile_connection_unavailable(
                                 previous_client,
@@ -12858,26 +12938,34 @@ class EmoNamespace(Namespace):
                             previous_session.get("connectionNonce"),
                             lifecycle_locked=True,
                         )
-                    current_client = _register_device(
+                    if critical_replay_error is None:
+                        current_client = _register_device(
+                            request.sid,
+                            current_user_name,
+                            payload,
+                            prepared=(
+                                registration_client_id,
+                                prepared_client,
+                            ),
+                        )
+                if critical_replay_error is not None:
+                    logger.error(
+                        "Failed to enqueue critical Broadcast terminal replay client=%s device=%s sid=%s",
+                        prepared_client["clientId"],
+                        prepared_client["deviceSessionId"],
                         request.sid,
-                        current_user_name,
-                        payload,
+                        exc_info=(
+                            type(critical_replay_error),
+                            critical_replay_error,
+                            critical_replay_error.__traceback__,
+                        ),
                     )
+                    _disconnect_strict_recipient(request.sid)
+                    return
                 _emit_handoff_terminal_outcomes(
                     handoff_transitions,
                     "playback.handoff.cancel",
                 )
-                if _is_strict_playback_context_v2(current_client):
-                    broadcast_participant_replay = (
-                        _prepare_strict_broadcast_participant_registration(
-                            current_client
-                        )
-                    )
-                    broadcast_source_terminal_replays = (
-                        _prepare_strict_broadcast_source_terminal_registration(
-                            current_client
-                        )
-                    )
                 _log_emo_event(
                     logging.INFO,
                     "device_register",
@@ -12889,27 +12977,37 @@ class EmoNamespace(Namespace):
                     client_request_id=request_id,
                     sid=request.sid,
                 )
-                ack_payload = {
-                    "clientId": current_client.get("clientId"),
-                    "deviceSessionId": current_client.get("deviceSessionId"),
-                }
-                if _is_strict_playback_context_v2(current_client):
-                    ack_payload["negotiatedCapabilities"] = dict(
-                        current_client.get("capabilities") or {}
+                if not registration_ack_sent:
+                    ack_payload = {
+                        "clientId": current_client.get("clientId"),
+                        "deviceSessionId": current_client.get(
+                            "deviceSessionId"
+                        ),
+                    }
+                    if _is_strict_playback_context_v2(current_client):
+                        ack_payload["negotiatedCapabilities"] = dict(
+                            current_client.get("capabilities") or {}
+                        )
+                        ack_payload[
+                            "strictV2"
+                        ] = get_strict_v2_registration_metadata(
+                            session_info.get("connectionNonce")
+                            if session_info
+                            else None
+                        )
+                    else:
+                        ack_payload["client"] = current_client
+                    _send_ack(request_id, ack_payload)
+                if not _is_critical_broadcast_registration_replay(
+                    broadcast_participant_replay
+                ):
+                    _run_post_commit_push(
+                        "broadcast.resync",
+                        request_id,
+                        lambda: _emit_strict_broadcast_participant_registration(
+                            broadcast_participant_replay
+                        ),
                     )
-                    ack_payload["strictV2"] = get_strict_v2_registration_metadata(
-                        session_info.get("connectionNonce") if session_info else None
-                    )
-                else:
-                    ack_payload["client"] = current_client
-                _send_ack(request_id, ack_payload)
-                _run_post_commit_push(
-                    "broadcast.resync",
-                    request_id,
-                    lambda: _emit_strict_broadcast_participant_registration(
-                        broadcast_participant_replay
-                    ),
-                )
                 _run_post_commit_push(
                     "broadcast.stop",
                     request_id,
