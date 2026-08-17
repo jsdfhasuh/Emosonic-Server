@@ -999,6 +999,7 @@ def _log_emo_event(level, event, **fields):
             "exception_type",
             "failed_sid_count",
             "recipient_count",
+            "reason",
             "result",
             "source_client_id",
             "user",
@@ -14612,6 +14613,20 @@ class EmoNamespace(Namespace):
                 if isinstance(playback_context_id, str) and playback_context_id
                 else None
             ) or {}
+            _log_emo_event(
+                logging.WARNING,
+                _get_action_event_name(action) or "playback_update",
+                result="conflict",
+                reason=str(exc),
+                **_build_action_log_context(
+                    action,
+                    request_id,
+                    current_user_name,
+                    current_client,
+                    payload,
+                    message,
+                ),
+            )
             _send_error(
                 "conflict",
                 str(exc),

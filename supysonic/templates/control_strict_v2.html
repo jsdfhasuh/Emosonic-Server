@@ -233,6 +233,7 @@
   const state = {
     client: null,
     devices: [],
+    devicesLoaded: false,
     bindings: [],
     selectedClientId: null,
     selectedContextId: null,
@@ -703,40 +704,41 @@
   }
 
   async function refreshBindings() {
-    if (refreshBindingsPromise) {
-      refreshBindingsQueued = true;
-      await refreshBindingsPromise;
-      if (refreshBindingsQueued) {
-        refreshBindingsQueued = false;
-        return refreshBindings();
-      }
-      return;
-    }
+    refreshBindingsQueued = true;
+    if (refreshBindingsPromise) return refreshBindingsPromise;
 
     const refresh = (async () => {
-      state.bindings = await state.client.fetchContextBindings();
-      const players = playerDevices();
-      const currentDevice = selectedDevice();
-      if (!players.length) {
-        await unsubscribeSelected(false);
+      while (refreshBindingsQueued) {
+        refreshBindingsQueued = false;
+        if (!state.devicesLoaded) {
+          renderDevices();
+          await renderContext();
+          continue;
+        }
+        const bindings = await state.client.fetchContextBindings();
+        if (refreshBindingsQueued) continue;
+        state.bindings = bindings;
+        const players = playerDevices();
+        const currentDevice = selectedDevice();
+        if (!players.length) {
+          await unsubscribeSelected(false);
+          renderDevices();
+          await renderContext();
+          continue;
+        }
+
+        if (!currentDevice) {
+          const preferred = players.find((device) => bindingFor(device.clientId)) || players[0];
+          await selectPlayer(preferred.clientId);
+        } else {
+          const binding = bindingFor(currentDevice.clientId);
+          if (binding && binding.playbackContextId !== state.selectedContextId) {
+            await selectPlayer(currentDevice.clientId);
+          }
+        }
         renderDevices();
         await renderContext();
-        return;
       }
-
-      if (!currentDevice) {
-        const preferred = players.find((device) => bindingFor(device.clientId)) || players[0];
-        await selectPlayer(preferred.clientId);
-      } else {
-        const binding = bindingFor(currentDevice.clientId);
-        if (binding && binding.playbackContextId !== state.selectedContextId) {
-          await selectPlayer(currentDevice.clientId);
-        } else if (!binding && state.selectedContextId) {
-          await unsubscribeSelected(true);
-        }
-      }
-      renderDevices();
-      await renderContext();
     })();
     refreshBindingsPromise = refresh;
     try {
@@ -1119,6 +1121,7 @@
     const action = message.action;
     if (action === 'device.list') {
       state.devices = message.payload.devices;
+      state.devicesLoaded = true;
       refreshBindings().catch((error) => showError(error.message));
     } else if (action === 'playback.context.bindings.changed') {
       refreshBindings().catch((error) => showError(error.message));
