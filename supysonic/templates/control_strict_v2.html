@@ -253,6 +253,8 @@
     handoff: null,
     logLines: [],
   };
+  let refreshBindingsPromise = null;
+  let refreshBindingsQueued = false;
   const capabilities = {
     playbackContextV2: true,
     playbackPrepare: false,
@@ -701,29 +703,47 @@
   }
 
   async function refreshBindings() {
-    state.bindings = await state.client.fetchContextBindings();
-    const players = playerDevices();
-    const currentDevice = selectedDevice();
-    if (!players.length) {
-      await unsubscribeSelected(false);
-      renderDevices();
-      await renderContext();
+    if (refreshBindingsPromise) {
+      refreshBindingsQueued = true;
+      await refreshBindingsPromise;
+      if (refreshBindingsQueued) {
+        refreshBindingsQueued = false;
+        return refreshBindings();
+      }
       return;
     }
 
-    if (!currentDevice) {
-      const preferred = players.find((device) => bindingFor(device.clientId)) || players[0];
-      await selectPlayer(preferred.clientId);
-    } else {
-      const binding = bindingFor(currentDevice.clientId);
-      if (binding && binding.playbackContextId !== state.selectedContextId) {
-        await selectPlayer(currentDevice.clientId);
-      } else if (!binding && state.selectedContextId) {
-        await unsubscribeSelected(true);
+    const refresh = (async () => {
+      state.bindings = await state.client.fetchContextBindings();
+      const players = playerDevices();
+      const currentDevice = selectedDevice();
+      if (!players.length) {
+        await unsubscribeSelected(false);
+        renderDevices();
+        await renderContext();
+        return;
       }
+
+      if (!currentDevice) {
+        const preferred = players.find((device) => bindingFor(device.clientId)) || players[0];
+        await selectPlayer(preferred.clientId);
+      } else {
+        const binding = bindingFor(currentDevice.clientId);
+        if (binding && binding.playbackContextId !== state.selectedContextId) {
+          await selectPlayer(currentDevice.clientId);
+        } else if (!binding && state.selectedContextId) {
+          await unsubscribeSelected(true);
+        }
+      }
+      renderDevices();
+      await renderContext();
+    })();
+    refreshBindingsPromise = refresh;
+    try {
+      return await refresh;
+    } finally {
+      if (refreshBindingsPromise === refresh) refreshBindingsPromise = null;
     }
-    renderDevices();
-    await renderContext();
   }
 
   async function unsubscribeSelected(keepClient = false) {

@@ -361,9 +361,19 @@ async function run() {
     const idleBinding = (await contextBindings(control))
       .find((candidate) => candidate.clientId === playerOneIdentity.clientId);
     assert.ok(idleBinding, `No startup idle Context for ${playerOneIdentity.clientId}`);
+    const selectedControlSnapshot = await acceptanceSnapshot(control);
     assert.equal(
-      (await acceptanceSnapshot(control)).selectedContextId,
+      selectedControlSnapshot.selectedContextId,
       idleBinding.playbackContextId,
+      JSON.stringify({
+        snapshot: selectedControlSnapshot,
+        idleBinding,
+        bindings: await contextBindings(control),
+        devices: await control.locator('#strict-device-list').textContent(),
+        contextError: await control.textContent('#strict-control-error'),
+        contextSummary: await control.textContent('#strict-selected-context'),
+        server: await acceptanceServerState(control),
+      }),
     );
     assert.equal(await control.locator('#strict-context-empty').isVisible(), false);
     assert.equal(await control.locator('#strict-context-active').isVisible(), true);
