@@ -121,6 +121,30 @@ class StrictV2VerificationScriptsTestCase(unittest.TestCase):
             commands["database_migrations"],
             ("sh", "tests/emo_migrations/run.sh"),
         )
+        self.assertEqual(
+            commands["net_suite"],
+            (sys.executable, "-m", "unittest", "tests.net.suite"),
+        )
+        self.assertEqual(
+            commands["coverage_full"],
+            ("coverage", "run", "-m", "unittest"),
+        )
+        self.assertEqual(
+            commands["coverage_net"],
+            ("coverage", "run", "-a", "-m", "unittest", "tests.net.suite"),
+        )
+        self.assertEqual(
+            commands["coverage_report"],
+            ("coverage", "report", "-m"),
+        )
+        self.assertEqual(
+            commands["build"],
+            (sys.executable, "-m", "build"),
+        )
+        self.assertEqual(
+            commands["diff_check"],
+            ("git", "diff", "--check"),
+        )
 
     def test_evidence_collector_rejects_premature_formal_readiness(self):
         contract_hash, descriptor, conformance, manifest = (

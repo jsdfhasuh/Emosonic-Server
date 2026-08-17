@@ -1,3 +1,4 @@
+import concurrent.futures
 import os
 import shutil
 import tempfile
@@ -9,6 +10,12 @@ from jsonschema import Draft202012Validator
 from supysonic import db
 from supysonic.db import release_database
 from supysonic.emo import ws as emo_ws
+from supysonic.emo.broadcast_store import (
+  abandonBroadcastRecovery,
+  broadcastRecoveryAbandonFingerprint,
+  createBroadcastState,
+  terminalBroadcastState,
+)
 from supysonic.emo.strict_v2_contract import validate_strict_output
 from supysonic.emo.strict_v2_safety import strict_v2_safety
 from supysonic.emo.protocol_metadata import (
@@ -684,6 +691,115 @@ class EmoWebSocketTestCase(unittest.TestCase):
       decommissioned_at_ms=1000,
     )
 
+  def _prepare_recovery_abandon(
+    self,
+    broadcast_id="broadcast-recovery-abandon",
+    client_id="participant-1",
+    device_session_id="device:participant-1",
+  ):
+    snapshot = {
+      "broadcastId": broadcast_id,
+      "userName": "alice",
+      "playbackContextId": "context-source",
+      "intentId": "intent-%s" % broadcast_id,
+      "ownerClientId": "controller-1",
+      "authorityClientId": "source-1",
+      "authorityDeviceSessionId": "device:source-1",
+      "lifecycleState": "active",
+      "broadcastRevision": 1,
+      "queueSongIds": ["song-1", "song-2"],
+      "currentIndex": 0,
+      "trackId": "song-1",
+      "positionMs": 1200,
+      "state": "playing",
+      "playbackRate": 1.0,
+      "sourceVersion": 2,
+      "sourceQueueRevision": 2,
+      "sourceControlVersion": 2,
+      "sourceEpoch": 1,
+      "serverUpdatedAtMs": 10000,
+      "participants": [client_id],
+    }
+    participant = {
+      "clientId": client_id,
+      "deviceSessionId": device_session_id,
+      "suspendedPlaybackContextId": "context-%s" % client_id,
+      "suspendedEpoch": 3,
+      "suspendedVersion": 7,
+      "suspendedQueueRevision": 5,
+      "suspendedControlVersion": 6,
+      "suspendedAppliedControlVersion": 6,
+    }
+    delivery = {
+      "deliveryId": "delivery-%s" % broadcast_id,
+      "clientId": client_id,
+      "deviceSessionId": device_session_id,
+      "action": "start",
+      "effectiveAtServerMs": 10300,
+      "serverTimeMs": 10000,
+      "deliveryPositionMs": 1500,
+      "feedbackDeadlineAtServerMs": 18300,
+      "payload": {
+        "broadcastId": broadcast_id,
+        "broadcastRevision": 1,
+        "deliveryId": "delivery-%s" % broadcast_id,
+        "currentIndex": 0,
+        "trackId": "song-1",
+        "state": "playing",
+        "positionMs": 1500,
+        "playbackRate": 1.0,
+      },
+      "connectionNonce": "nonce-%s" % broadcast_id,
+      "createdAtMs": 10000,
+    }
+    createBroadcastState(
+      snapshot,
+      [participant],
+      "fingerprint-%s" % broadcast_id,
+      {"broadcastId": broadcast_id, "accepted": True},
+      initial_deliveries=[delivery],
+    )
+    terminal = dict(snapshot)
+    terminal.update(
+      {
+        "lifecycleState": "stopped",
+        "broadcastRevision": 2,
+        "serverUpdatedAtMs": 20000,
+      }
+    )
+    terminal_delivery = dict(delivery)
+    terminal_delivery.update(
+      {
+        "deliveryId": "terminal-%s" % broadcast_id,
+        "action": "stop",
+        "effectiveAtServerMs": 20300,
+        "serverTimeMs": 20000,
+        "createdAtMs": 20000,
+      }
+    )
+    terminal_delivery["payload"] = dict(delivery["payload"])
+    terminal_delivery["payload"].update(
+      {
+        "broadcastRevision": 2,
+        "deliveryId": "terminal-%s" % broadcast_id,
+        "state": "stopped",
+      }
+    )
+    terminalBroadcastState(
+      broadcast_id,
+      terminal,
+      {"stopped": True},
+      [terminal_delivery],
+      expected_broadcast_revision=1,
+      terminal_at_ms=20000,
+    )
+    return broadcastRecoveryAbandonFingerprint(
+      "alice",
+      client_id,
+      device_session_id,
+      broadcast_id,
+    )
+
   def test_decommissioned_pair_is_rejected_before_registration_state(self):
     self._create_decommission_tombstone()
     client = self.connect_authenticated_client(
@@ -728,6 +844,168 @@ class EmoWebSocketTestCase(unittest.TestCase):
     )
     self.assertIsNotNone(
       self.get_ack(replacement_messages, "register-decommissioned-replacement")
+    )
+
+    other_user = self.connect_authenticated_client(
+      "bob",
+      "B0b",
+      "auth-decommissioned-other-user",
+    )
+    other_user_messages = self.register_device(
+      other_user,
+      "register-decommissioned-other-user",
+      {
+        "clientId": "decommissioned-player",
+        "deviceSessionId": "device:decommissioned-player",
+        "capabilities": {CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+      },
+    )
+    self.assertIsNotNone(
+      self.get_ack(other_user_messages, "register-decommissioned-other-user")
+    )
+
+  def test_production_abandon_revokes_online_generation_and_blocks_reconnect(self):
+    client = self.connect_device(
+      "alice",
+      "Alic3",
+      "abandon-online",
+      "device:abandon-online",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(client)
+    fingerprint = self._prepare_recovery_abandon(
+      broadcast_id="broadcast-production-abandon",
+      client_id="abandon-online",
+      device_session_id="device:abandon-online",
+    )
+
+    with self.app.app_context():
+      outcome = emo_ws.abandonBroadcastRecoveryAndDecommission(
+        "alice",
+        "abandon-online",
+        "device:abandon-online",
+        "broadcast-production-abandon",
+        request_fingerprint=fingerprint,
+        abandoned_at_ms=21000,
+      )
+
+    self.assertTrue(outcome["abandoned"])
+    self.assertTrue(outcome["onlineRevoked"])
+    self.assertFalse(client.is_connected(namespace="/emo"))
+    self.clients.remove(client)
+    self.assertIsNone(
+      get_state().get_sid_for_client("abandon-online", user_name="alice")
+    )
+
+    reconnect = self.connect_authenticated_client(
+      "alice",
+      "Alic3",
+      "auth-abandon-reconnect",
+    )
+    messages = self.register_device(
+      reconnect,
+      "register-abandon-reconnect",
+      {
+        "clientId": "abandon-online",
+        "deviceSessionId": "device:abandon-online",
+        "capabilities": {CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+      },
+    )
+    error = self.get_error(messages, "register-abandon-reconnect")
+    self.assertEqual(error["payload"]["code"], "forbidden")
+    self.assertIsNone(
+      get_state().get_client("abandon-online", user_name="alice")
+    )
+
+  def test_restart_sweep_revokes_persisted_decommission_and_blocks_reconnect(self):
+    client = self.connect_device(
+      "alice",
+      "Alic3",
+      "restart-decommissioned",
+      "device:restart-decommissioned",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(client)
+    fingerprint = self._prepare_recovery_abandon(
+      broadcast_id="broadcast-restart-decommission",
+      client_id="restart-decommissioned",
+      device_session_id="device:restart-decommissioned",
+    )
+
+    # Simulate a crash after the durable abandon commit and before live revoke.
+    abandonBroadcastRecovery(
+      "alice",
+      "restart-decommissioned",
+      "device:restart-decommissioned",
+      "broadcast-restart-decommission",
+      request_fingerprint=fingerprint,
+      abandoned_at_ms=22000,
+    )
+    self.assertIsNotNone(
+      get_state().get_sid_for_client(
+        "restart-decommissioned",
+        user_name="alice",
+      )
+    )
+
+    with self.app.app_context():
+      init_socketio(self.app)
+
+    client.disconnect(namespace="/emo")
+    self.clients.remove(client)
+    self.assertIsNone(
+      get_state().get_sid_for_client(
+        "restart-decommissioned",
+        user_name="alice",
+      )
+    )
+    reconnect = self.connect_authenticated_client(
+      "alice",
+      "Alic3",
+      "auth-restart-decommissioned",
+    )
+    messages = self.register_device(
+      reconnect,
+      "register-restart-decommissioned",
+      {
+        "clientId": "restart-decommissioned",
+        "deviceSessionId": "device:restart-decommissioned",
+        "capabilities": {CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+      },
+    )
+    error = self.get_error(messages, "register-restart-decommissioned")
+    self.assertEqual(error["payload"]["code"], "forbidden")
+
+  def test_repeated_production_abandon_is_idempotent_under_concurrency(self):
+    fingerprint = self._prepare_recovery_abandon(
+      broadcast_id="broadcast-concurrent-abandon",
+      client_id="concurrent-abandon",
+      device_session_id="device:concurrent-abandon",
+    )
+
+    def abandon():
+      return emo_ws.abandonBroadcastRecoveryAndDecommission(
+        "alice",
+        "concurrent-abandon",
+        "device:concurrent-abandon",
+        "broadcast-concurrent-abandon",
+        request_fingerprint=fingerprint,
+        abandoned_at_ms=23000,
+      )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+      outcomes = list(executor.map(lambda _index: abandon(), (1, 2)))
+
+    self.assertEqual(outcomes[0], outcomes[1])
+    self.assertEqual(
+      db.EmoBroadcastRecoveryAbandon.select().count(),
+      1,
+    )
+    self.assertEqual(
+      db.EmoPermanentDeviceDecommission.select().count(),
+      1,
     )
 
   def test_persisted_decommission_sweep_revokes_live_exact_generation(self):

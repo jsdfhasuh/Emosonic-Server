@@ -189,6 +189,11 @@ def _command_specs(repository: Path) -> List[Tuple[str, Sequence[str], Path]]:
             repository,
         ),
         (
+            "net_suite",
+            (python, "-m", "unittest", "tests.net.suite"),
+            repository,
+        ),
+        (
             "javascript",
             ("node", "--test", "tests/js/emo_strict_v2_client.test.js"),
             repository,
@@ -200,6 +205,20 @@ def _command_specs(repository: Path) -> List[Tuple[str, Sequence[str], Path]]:
         ),
         ("docs", ("make", "html"), repository / "docs"),
         ("full_unittest", (python, "-m", "unittest"), repository),
+        ("coverage_erase", ("coverage", "erase"), repository),
+        (
+            "coverage_full",
+            ("coverage", "run", "-m", "unittest"),
+            repository,
+        ),
+        (
+            "coverage_net",
+            ("coverage", "run", "-a", "-m", "unittest", "tests.net.suite"),
+            repository,
+        ),
+        ("coverage_report", ("coverage", "report", "-m"), repository),
+        ("build", (python, "-m", "build"), repository),
+        ("diff_check", ("git", "diff", "--check"), repository),
     ]
 
 

@@ -875,6 +875,30 @@ class EmoBroadcastStoreTestCase(unittest.TestCase):
             fingerprint,
         )
 
+    def test_recovery_abandon_is_idempotent_under_concurrency(self):
+        fingerprint = self._terminal_recovery_for_abandon()
+        barrier = threading.Barrier(2)
+
+        def abandon():
+            barrier.wait()
+            return abandonBroadcastRecovery(
+                "alice",
+                "participant-1",
+                "device:participant-1",
+                "broadcast-1",
+                request_fingerprint=fingerprint,
+                abandoned_at_ms=23000,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(lambda _index: abandon(), (1, 2)))
+
+        self.assertEqual(outcomes[0], outcomes[1])
+        self.assertEqual(db.EmoBroadcastRecoveryAbandon.select().count(), 1)
+        self.assertEqual(
+            db.EmoPermanentDeviceDecommission.select().count(), 1
+        )
+
     def test_feedback_settlement_failure_rolls_back_participant(self):
         self._create()
         payload = self._applied_feedback()

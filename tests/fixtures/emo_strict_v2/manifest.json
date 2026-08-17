@@ -1204,9 +1204,15 @@
       "testModules": ["tests.base.test_emo_broadcast_store", "tests.base.test_emo_ws", "tests.base.test_cli"],
       "testMethods": [
         "tests.base.test_emo_broadcast_store.EmoBroadcastStoreTestCase.test_full_recovery_abandon_is_atomic_and_replayable",
+        "tests.base.test_emo_broadcast_store.EmoBroadcastStoreTestCase.test_compact_recovery_abandon_removes_obligation_and_retains_tombstone",
+        "tests.base.test_emo_broadcast_store.EmoBroadcastStoreTestCase.test_recovery_abandon_rolls_back_all_durable_rows_on_decommission_failure",
+        "tests.base.test_emo_broadcast_store.EmoBroadcastStoreTestCase.test_recovery_abandon_is_idempotent_under_concurrency",
         "tests.base.test_emo_broadcast_store.EmoBroadcastStoreTestCase.test_recovery_abandon_fingerprint_and_pair_scope_fail_closed",
         "tests.base.test_emo_ws.EmoWebSocketTestCase.test_decommissioned_pair_is_rejected_before_registration_state",
         "tests.base.test_emo_ws.EmoWebSocketTestCase.test_persisted_decommission_sweep_revokes_live_exact_generation",
+        "tests.base.test_emo_ws.EmoWebSocketTestCase.test_production_abandon_revokes_online_generation_and_blocks_reconnect",
+        "tests.base.test_emo_ws.EmoWebSocketTestCase.test_restart_sweep_revokes_persisted_decommission_and_blocks_reconnect",
+        "tests.base.test_emo_ws.EmoWebSocketTestCase.test_repeated_production_abandon_is_idempotent_under_concurrency",
         "tests.base.test_cli.CLITestCase.test_emo_broadcast_abandon_is_a_management_entry_point"
       ]
     }
