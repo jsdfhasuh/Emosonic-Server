@@ -33,6 +33,7 @@ from .broadcast_store import (
     BroadcastNotFoundError,
     BroadcastResourceConflictError,
     BroadcastRevisionConflictError,
+    abandonBroadcastRecovery,
     buildTerminalBroadcastSnapshot,
     broadcastMutationLock,
     commitBroadcastRevisionInTransaction,
@@ -45,6 +46,8 @@ from .broadcast_store import (
     getBroadcastStopOutcome,
     getNonterminalBroadcastStateForContext,
     getBroadcastState as getPersistentBroadcastState,
+    isPermanentDeviceDecommissioned,
+    listPermanentDeviceDecommissions,
     listTerminalRecoveries,
     listFullTerminalBroadcastsForSource,
     settleBroadcastFeedback,
@@ -428,6 +431,226 @@ def _current_stable_client_generation(user_name, client_id):
     if not isinstance(device_session_id, str) or not device_session_id:
         return None
     return state.get_current_physical_generation(
+        user_name,
+        client_id,
+        device_session_id,
+    )
+
+
+def _require_device_pair_not_decommissioned(
+    user_name,
+    client_id,
+    device_session_id,
+):
+    if isPermanentDeviceDecommissioned(
+        user_name,
+        client_id,
+        device_session_id,
+    ):
+        raise PermissionError("Device pair is permanently decommissioned")
+
+
+def _revoke_decommissioned_pair_locked(
+    user_name,
+    client_id,
+    device_session_id,
+):
+    generation = state.get_current_physical_generation(
+        user_name,
+        client_id,
+        device_session_id,
+    )
+    if generation is None:
+        return {
+            "client": None,
+            "handoffTransitions": [],
+            "session": None,
+            "sid": None,
+        }
+    sid = generation["sid"]
+    session_info = state.get_session(sid)
+    client_info = state.get_client_for_sid(sid)
+    if session_info is None or client_info is None:
+        return {
+            "client": None,
+            "handoffTransitions": [],
+            "session": None,
+            "sid": None,
+        }
+
+    removed_session, removed_client = state.unregister_session(sid)
+    if removed_session is not None:
+        connection_nonce = removed_session.get("connectionNonce")
+        if connection_nonce:
+            strict_request_cache.clear_connection(connection_nonce)
+            state.clear_strict_feedback_connection(connection_nonce)
+            strict_v2_safety.clear_connection(connection_nonce)
+            with _source_terminal_replay_lock:
+                _source_terminal_replays.pop(connection_nonce, None)
+
+    handoff_transitions = []
+    try:
+        _follow, handoff_transitions = _mark_profile_connection_unavailable(
+            client_info,
+            session_info,
+        )
+    except Exception:
+        logger.exception(
+            "Unable to transition decommissioned device profile state"
+        )
+    try:
+        _settle_authority_connection_controls_unknown(
+            generation["userName"],
+            generation["clientId"],
+            generation["deviceSessionId"],
+            generation["connectionNonce"],
+            lifecycle_locked=True,
+        )
+    except Exception:
+        logger.exception(
+            "Unable to settle decommissioned authority controls"
+        )
+    return {
+        "client": removed_client,
+        "handoffTransitions": handoff_transitions,
+        "session": removed_session,
+        "sid": sid,
+    }
+
+
+def _finish_decommissioned_pair_revoke(revocation):
+    sid = revocation.get("sid")
+    if sid is None:
+        return False
+    _emit_handoff_terminal_outcomes(
+        revocation.get("handoffTransitions") or [],
+        "playback.handoff.cancel",
+    )
+    _disconnect_strict_recipient(sid)
+    client_info = revocation.get("client")
+    session_info = revocation.get("session")
+    user_name = (
+        client_info.get("userName")
+        if client_info is not None
+        else (
+            None
+            if session_info is None
+            else session_info.get("userName")
+        )
+    )
+    if user_name:
+        _broadcast_clients(user_name)
+    return True
+
+
+def _revoke_persisted_device_decommission(
+    user_name,
+    client_id,
+    device_session_id,
+):
+    lifecycle_key = _physical_generation_key(user_name, client_id)
+
+    def resolve_handoffs():
+        return _active_handoffs_for_generation(
+            state.get_current_physical_generation(
+                user_name,
+                client_id,
+                device_session_id,
+            )
+        )
+
+    with _handoff_lifecycle_scope(
+        resolve_handoffs,
+        base_keys=() if lifecycle_key is None else (lifecycle_key,),
+    ):
+        if not isPermanentDeviceDecommissioned(
+            user_name,
+            client_id,
+            device_session_id,
+        ):
+            return False
+        revocation = _revoke_decommissioned_pair_locked(
+            user_name,
+            client_id,
+            device_session_id,
+        )
+    return _finish_decommissioned_pair_revoke(revocation)
+
+
+def abandonBroadcastRecoveryAndDecommission(
+    user_name,
+    client_id,
+    device_session_id,
+    broadcast_id,
+    request_fingerprint=None,
+    abandoned_at_ms=None,
+):
+    lifecycle_key = _physical_generation_key(user_name, client_id)
+
+    def resolve_handoffs():
+        return _active_handoffs_for_generation(
+            state.get_current_physical_generation(
+                user_name,
+                client_id,
+                device_session_id,
+            )
+        )
+
+    with _handoff_lifecycle_scope(
+        resolve_handoffs,
+        base_keys=() if lifecycle_key is None else (lifecycle_key,),
+    ):
+        outcome = abandonBroadcastRecovery(
+            user_name,
+            client_id,
+            device_session_id,
+            broadcast_id,
+            request_fingerprint=request_fingerprint,
+            abandoned_at_ms=abandoned_at_ms,
+        )
+        revocation = _revoke_decommissioned_pair_locked(
+            user_name,
+            client_id,
+            device_session_id,
+        )
+    result = dict(outcome)
+    result["onlineRevoked"] = _finish_decommissioned_pair_revoke(
+        revocation
+    )
+    return result
+
+
+def _sweep_permanent_device_decommissions():
+    revoked = 0
+    for tombstone in listPermanentDeviceDecommissions():
+        if _revoke_persisted_device_decommission(
+            tombstone["userName"],
+            tombstone["clientId"],
+            tombstone["deviceSessionId"],
+        ):
+            revoked += 1
+    return revoked
+
+
+def _revoke_decommissioned_sid_if_needed(sid):
+    client_info = state.get_client_for_sid(sid)
+    if client_info is None:
+        return False
+    user_name = client_info.get("userName")
+    client_id = client_info.get("clientId")
+    device_session_id = client_info.get("deviceSessionId")
+    if not all(
+        isinstance(value, str) and value
+        for value in (user_name, client_id, device_session_id)
+    ):
+        return False
+    if not isPermanentDeviceDecommissioned(
+        user_name,
+        client_id,
+        device_session_id,
+    ):
+        return False
+    return _revoke_persisted_device_decommission(
         user_name,
         client_id,
         device_session_id,

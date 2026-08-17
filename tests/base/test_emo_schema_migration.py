@@ -22,6 +22,10 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
         "authority_client_id",
         "authority_device_session_id",
     )
+    DECOMMISSION_MODELS = (
+        db.EmoBroadcastRecoveryAbandon,
+        db.EmoPermanentDeviceDecommission,
+    )
     BROADCAST_MODELS = (
         db.EmoBroadcast,
         db.EmoBroadcastIntentOutcome,
@@ -31,7 +35,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
         db.EmoBroadcastDelivery,
         db.EmoBroadcastFeedbackSettlement,
         db.EmoBroadcastTerminalRecovery,
-    )
+    ) + DECOMMISSION_MODELS
     BROADCAST_TIME_FIELDS = {
         "emo_broadcast": ("created_at", "updated_at"),
         "emo_broadcast_intent_outcome": ("created_at", "updated_at"),
@@ -42,6 +46,14 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
         "emo_broadcast_feedback_settlement": ("created_at",),
         "emo_broadcast_terminal_recovery": ("created_at", "updated_at"),
     }
+    DECOMMISSION_TIME_FIELDS = {
+        "emo_broadcast_recovery_abandon": ("created_at", "updated_at"),
+        "emo_permanent_device_decommission": ("created_at", "updated_at"),
+    }
+    DECOMMISSION_INDEXES = (
+        "idx_emo_broadcast_abandon_time",
+        "idx_emo_permanent_decommission_time",
+    )
     CORE_MODELS = (
         db.EmoPlaybackContext,
         db.EmoPlaybackControlTransaction,
@@ -328,7 +340,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             self._assert_external_r11_transaction_schema()
             self._assert_external_r18_broadcast_schema()
             self._assert_external_core_schema_parity(provider)
-            self.assertEqual(db.Meta["schema_version"].value, "20260813")
+            self.assertEqual(db.Meta["schema_version"].value, "20260814")
             self._record_external_evidence(
                 provider,
                 "clean",
@@ -360,7 +372,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             self._assert_external_r11_transaction_schema()
             self._assert_external_r18_broadcast_schema()
             self._assert_external_core_schema_parity(provider)
-            self.assertEqual(db.Meta["schema_version"].value, "20260813")
+            self.assertEqual(db.Meta["schema_version"].value, "20260814")
             self._record_external_evidence(
                 provider,
                 "upgrade_from_20260708",
@@ -1272,7 +1284,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 },
             )
             self._assert_sqlite_core_schema_parity()
-            self.assertEqual(db.Meta["schema_version"].value, "20260813")
+            self.assertEqual(db.Meta["schema_version"].value, "20260814")
         finally:
             db.release_database()
             os.remove(path)
@@ -1326,6 +1338,9 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 handoff_lane_migration = (
                     root / "migration" / provider / "20260813.sql"
                 ).read_text("utf-8")
+                decommission_migration = (
+                    root / "migration" / provider / "20260814.sql"
+                ).read_text("utf-8")
                 for field_name in required_fields:
                     self.assertIn(field_name, base_schema)
                     self.assertIn(field_name, migration)
@@ -1333,31 +1348,44 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                     self.assertIn(field_name, base_schema)
                     self.assertIn(field_name, phase2a_migration)
                 timestamp_type = "TIMESTAMP" if provider == "postgres" else "DATETIME"
-                for sql_name, sql in (
-                    ("base schema", base_schema),
-                    ("broadcast migration", broadcast_migration),
+                for time_fields, migration_name, migration_sql in (
+                    (
+                        self.BROADCAST_TIME_FIELDS,
+                        "broadcast migration",
+                        broadcast_migration,
+                    ),
+                    (
+                        self.DECOMMISSION_TIME_FIELDS,
+                        "decommission migration",
+                        decommission_migration,
+                    ),
                 ):
-                    if provider == "postgres":
-                        self.assertNotIn(
-                            "DATETIME",
-                            self._sql_identifier_tokens(sql),
-                            "%s contains an independent DATETIME type token" % sql_name,
-                        )
-                    for table_name, field_names in self.BROADCAST_TIME_FIELDS.items():
-                        table_match = re.search(
-                            r"CREATE TABLE IF NOT EXISTS\s+%s\s*\((.*?)\);"
-                            % re.escape(table_name),
-                            sql,
-                            flags=re.DOTALL | re.IGNORECASE,
-                        )
-                        self.assertIsNotNone(table_match, table_name)
-                        table_sql = table_match.group(1)
-                        for field_name in field_names:
-                            self.assertRegex(
-                                table_sql,
-                                r"\b%s\s+%s\b"
-                                % (re.escape(field_name), timestamp_type),
+                    for sql_name, sql in (
+                        ("base schema", base_schema),
+                        (migration_name, migration_sql),
+                    ):
+                        if provider == "postgres":
+                            self.assertNotIn(
+                                "DATETIME",
+                                self._sql_identifier_tokens(sql),
+                                "%s contains an independent DATETIME type token"
+                                % sql_name,
                             )
+                        for table_name, field_names in time_fields.items():
+                            table_match = re.search(
+                                r"CREATE TABLE IF NOT EXISTS\s+%s\s*\((.*?)\);"
+                                % re.escape(table_name),
+                                sql,
+                                flags=re.DOTALL | re.IGNORECASE,
+                            )
+                            self.assertIsNotNone(table_match, table_name)
+                            table_sql = table_match.group(1)
+                            for field_name in field_names:
+                                self.assertRegex(
+                                    table_sql,
+                                    r"\b%s\s+%s\b"
+                                    % (re.escape(field_name), timestamp_type),
+                                )
                 self.assertIn("queue_revision", migration)
                 self.assertIn("control_version", migration)
                 self.assertIn("version", migration)
@@ -1456,10 +1484,18 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 ):
                     self.assertIn(table_name, base_schema)
                     self.assertIn(table_name, broadcast_migration)
+                for table_name in self.DECOMMISSION_TIME_FIELDS:
+                    self.assertIn(table_name, base_schema)
+                    self.assertIn(table_name, decommission_migration)
+                for index_name in self.DECOMMISSION_INDEXES:
+                    self.assertIn(index_name, base_schema)
+                    self.assertIn(index_name, decommission_migration)
                 for model in self.BROADCAST_MODELS:
                     for field in model._meta.sorted_fields:
                         self.assertIn(field.column_name, base_schema)
-                        if field.column_name in {
+                        if model in self.DECOMMISSION_MODELS:
+                            migration = decommission_migration
+                        elif field.column_name in {
                                 "applied_at_server_ms",
                                 "failed_error_message",
                                 "timed_out_broadcast_revision",
@@ -1565,7 +1601,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
 
             db.init_database(database_uri)
             initialized = True
-            self.assertEqual(db.Meta["schema_version"].value, "20260813")
+            self.assertEqual(db.Meta["schema_version"].value, "20260814")
             self._assert_sqlite_core_schema_parity()
             self.assertEqual(db.EmoFollowSafetyLease.select().count(), 0)
         finally:
@@ -1591,7 +1627,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
 
             db.init_database(database_uri)
             initialized = True
-            self.assertEqual(db.Meta["schema_version"].value, "20260813")
+            self.assertEqual(db.Meta["schema_version"].value, "20260814")
             self._assert_20260728_upgrade_rows()
             context_before = db.db.execute_sql(
                 "SELECT playback_context_id, lifecycle, epoch, version, "
@@ -1626,7 +1662,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
 
             db.init_database(database_uri)
             initialized = True
-            self.assertEqual(db.Meta["schema_version"].value, "20260813")
+            self.assertEqual(db.Meta["schema_version"].value, "20260814")
             self._assert_20260728_recovery_rows()
             replay = recoverPendingPlaybackControlsForStartup(1780000040000)
             self.assertFalse(replay["mutated"])

@@ -711,3 +711,42 @@ class EmoBroadcastTerminalRecovery(_Model):
             (('user_name', 'client_id', 'device_session_id'), True),
             (('terminal_at_server_ms',), False),
         )
+
+
+class EmoBroadcastRecoveryAbandon(_Model):
+    id = PrimaryKeyField()
+    user_name = CharField(64)
+    client_id = CharField(128)
+    device_session_id = CharField(128)
+    broadcast_id = CharField(128)
+    request_fingerprint = CharField(64)
+    terminal_broadcast_revision = IntegerField()
+    obligation_kind = CharField(16)
+    outcome_json = TextField()
+    abandoned_at_ms = BigIntegerField()
+    created_at = DateTimeField(default=now)
+    updated_at = DateTimeField(default=now)
+
+    class Meta:
+        indexes = (
+            (('user_name', 'client_id', 'device_session_id'), True),
+            (('broadcast_id', 'abandoned_at_ms'), False),
+        )
+
+
+class EmoPermanentDeviceDecommission(_Model):
+    id = PrimaryKeyField()
+    user_name = CharField(64)
+    client_id = CharField(128)
+    device_session_id = CharField(128)
+    broadcast_id = CharField(128)
+    abandon_request_fingerprint = CharField(64)
+    decommissioned_at_ms = BigIntegerField()
+    created_at = DateTimeField(default=now)
+    updated_at = DateTimeField(default=now)
+
+    class Meta:
+        indexes = (
+            (('user_name', 'client_id', 'device_session_id'), True),
+            (('user_name', 'decommissioned_at_ms'), False),
+        )

@@ -22,6 +22,7 @@ from .db_layer.emo import (
     EmoBroadcastFence,
     EmoBroadcastIntentOutcome,
     EmoBroadcastParticipant,
+    EmoBroadcastRecoveryAbandon,
     EmoBroadcastRevision,
     EmoBroadcastTerminalRecovery,
     EmoDevicePlaybackState,
@@ -35,6 +36,7 @@ from .db_layer.emo import (
     EmoPlaybackLocalIntent,
     EmoPlaybackPrepareTransaction,
     EmoPlaybackState,
+    EmoPermanentDeviceDecommission,
     EmoSessionQueue,
 )
 from .db_layer.library import (

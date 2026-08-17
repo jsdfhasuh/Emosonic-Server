@@ -15,6 +15,7 @@ from ..db import (
     EmoBroadcastFence,
     EmoBroadcastIntentOutcome,
     EmoBroadcastParticipant,
+    EmoBroadcastRecoveryAbandon,
     EmoBroadcastRevision,
     EmoBroadcastTerminalRecovery,
     EmoDevicePlaybackState,
@@ -22,6 +23,7 @@ from ..db import (
     EmoPlaybackControlTransaction,
     EmoPlaybackPrepareTransaction,
     EmoPlaybackContext,
+    EmoPermanentDeviceDecommission,
     close_connection,
     db,
     now,
@@ -59,6 +61,13 @@ class BroadcastIntentConflictError(BroadcastStoreError):
 
 
 class BroadcastResourceConflictError(BroadcastStoreError):
+    pass
+
+
+class PermanentDeviceDecommissionedError(
+    BroadcastResourceConflictError,
+    PermissionError,
+):
     pass
 
 
@@ -173,6 +182,51 @@ def _participant_expression(
         (EmoBroadcastParticipant.broadcast_id == broadcast_id)
         & (EmoBroadcastParticipant.client_id == client_id)
         & (EmoBroadcastParticipant.device_session_id == device_session_id)
+    )
+
+
+def _permanent_decommission_expression(
+    user_name: str,
+    client_id: str,
+    device_session_id: str,
+):
+    return (
+        (EmoPermanentDeviceDecommission.user_name == user_name)
+        & (EmoPermanentDeviceDecommission.client_id == client_id)
+        & (
+            EmoPermanentDeviceDecommission.device_session_id
+            == device_session_id
+        )
+    )
+
+
+def _recovery_abandon_expression(
+    user_name: str,
+    client_id: str,
+    device_session_id: str,
+):
+    return (
+        (EmoBroadcastRecoveryAbandon.user_name == user_name)
+        & (EmoBroadcastRecoveryAbandon.client_id == client_id)
+        & (
+            EmoBroadcastRecoveryAbandon.device_session_id
+            == device_session_id
+        )
+    )
+
+
+def _terminal_recovery_expression(
+    user_name: str,
+    client_id: str,
+    device_session_id: str,
+):
+    return (
+        (EmoBroadcastTerminalRecovery.user_name == user_name)
+        & (EmoBroadcastTerminalRecovery.client_id == client_id)
+        & (
+            EmoBroadcastTerminalRecovery.device_session_id
+            == device_session_id
+        )
     )
 
 
@@ -294,6 +348,63 @@ def _serialize_intent_record(
         "terminalBroadcastRevision": record.terminal_broadcast_revision,
         "stopAck": _load_json(record.stop_ack_json, None),
     }
+
+
+def _serialize_recovery_abandon_record(
+    record: EmoBroadcastRecoveryAbandon,
+) -> Dict[str, object]:
+    return _load_json(record.outcome_json, {})
+
+
+def _serialize_permanent_decommission_record(
+    record: EmoPermanentDeviceDecommission,
+) -> Dict[str, object]:
+    return {
+        "userName": record.user_name,
+        "clientId": record.client_id,
+        "deviceSessionId": record.device_session_id,
+        "broadcastId": record.broadcast_id,
+        "abandonRequestFingerprint": (
+            record.abandon_request_fingerprint
+        ),
+        "decommissionedAtMs": record.decommissioned_at_ms,
+    }
+
+
+def broadcastRecoveryAbandonFingerprint(
+    user_name: str,
+    client_id: str,
+    device_session_id: str,
+    broadcast_id: str,
+) -> str:
+    values = (user_name, client_id, device_session_id, broadcast_id)
+    if not all(isinstance(value, str) and value.strip() for value in values):
+        raise ValueError("Recovery abandon identifiers must be non-empty strings")
+    material = {
+        "action": "broadcast.recovery.abandon",
+        "broadcastId": broadcast_id,
+        "clientId": client_id,
+        "deviceSessionId": device_session_id,
+        "userName": user_name,
+    }
+    return hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
+
+
+def _raise_if_permanently_decommissioned(
+    user_name: str,
+    client_id: str,
+    device_session_id: str,
+) -> None:
+    if EmoPermanentDeviceDecommission.select().where(
+        _permanent_decommission_expression(
+            user_name,
+            client_id,
+            device_session_id,
+        )
+    ).exists():
+        raise PermanentDeviceDecommissionedError(
+            "Device pair is permanently decommissioned"
+        )
 
 
 def _normalize_participant(
@@ -503,6 +614,14 @@ def _start_participant_is_available(
         client_id,
         str(participant["deviceSessionId"]),
     )
+    if EmoPermanentDeviceDecommission.select().where(
+        _permanent_decommission_expression(
+            user_name,
+            client_id,
+            str(participant["deviceSessionId"]),
+        )
+    ).exists():
+        return False
     try:
         requireFollowSafetyLeaseResourceAvailable(
             playback_context_id=context_id,
@@ -760,6 +879,19 @@ def createBroadcastState(
                                 existing_intent
                             ),
                         }
+
+                    _raise_if_permanently_decommissioned(
+                        user_name,
+                        authority_client_id,
+                        authority_device_session_id,
+                    )
+                    if not skip_unavailable_participants:
+                        for participant in participant_payloads:
+                            _raise_if_permanently_decommissioned(
+                                user_name,
+                                str(participant["clientId"]),
+                                str(participant["deviceSessionId"]),
+                            )
 
                     intent_count = (
                         EmoBroadcastIntentOutcome.select()
@@ -2324,6 +2456,11 @@ def createBroadcastRegistrationReplay(
 ) -> Optional[Dict[str, object]]:
     open_connection(reuse=True)
     try:
+        _raise_if_permanently_decommissioned(
+            user_name,
+            client_id,
+            device_session_id,
+        )
         candidate_id = None
         participants = (
             EmoBroadcastParticipant.select()
@@ -2374,6 +2511,11 @@ def createBroadcastRegistrationReplay(
                 ((user_name, client_id, device_session_id),)
             ), broadcastResourceLock((resource_key,)):
                 with broadcastTransaction():
+                    _raise_if_permanently_decommissioned(
+                        user_name,
+                        client_id,
+                        device_session_id,
+                    )
                     recovery = EmoBroadcastTerminalRecovery.get_or_none(
                         (EmoBroadcastTerminalRecovery.user_name == user_name)
                         & (EmoBroadcastTerminalRecovery.client_id == client_id)
@@ -2447,6 +2589,11 @@ def createBroadcastRegistrationReplay(
                     }
         with broadcastMutationLock(candidate_id):
             with broadcastTransaction():
+                _raise_if_permanently_decommissioned(
+                    user_name,
+                    client_id,
+                    device_session_id,
+                )
                 broadcast = EmoBroadcast.get_or_none(
                     EmoBroadcast.broadcast_id == candidate_id
                 )
@@ -3177,5 +3324,420 @@ def listFullTerminalBroadcastsForSource(
             & (EmoBroadcast.lifecycle_state == "stopped")
         )
         return [_serialize_broadcast_record(record) for record in records]
+    finally:
+        close_connection()
+
+
+def getPermanentDeviceDecommission(
+    user_name: str,
+    client_id: str,
+    device_session_id: str,
+) -> Optional[Dict[str, object]]:
+    open_connection(reuse=True)
+    try:
+        record = EmoPermanentDeviceDecommission.get_or_none(
+            _permanent_decommission_expression(
+                user_name,
+                client_id,
+                device_session_id,
+            )
+        )
+        if record is None:
+            return None
+        return _serialize_permanent_decommission_record(record)
+    finally:
+        close_connection()
+
+
+def isPermanentDeviceDecommissioned(
+    user_name: str,
+    client_id: str,
+    device_session_id: str,
+) -> bool:
+    return (
+        getPermanentDeviceDecommission(
+            user_name,
+            client_id,
+            device_session_id,
+        )
+        is not None
+    )
+
+
+def listPermanentDeviceDecommissions(
+    user_name: Optional[str] = None,
+) -> List[Dict[str, object]]:
+    open_connection(reuse=True)
+    try:
+        query = EmoPermanentDeviceDecommission.select()
+        if user_name is not None:
+            query = query.where(
+                EmoPermanentDeviceDecommission.user_name == user_name
+            )
+        query = query.order_by(
+            EmoPermanentDeviceDecommission.decommissioned_at_ms,
+            EmoPermanentDeviceDecommission.user_name,
+            EmoPermanentDeviceDecommission.client_id,
+            EmoPermanentDeviceDecommission.device_session_id,
+        )
+        return [
+            _serialize_permanent_decommission_record(record)
+            for record in query
+        ]
+    finally:
+        close_connection()
+
+
+def _validate_recovery_abandon_fences(
+    broadcast_id: str,
+    user_name: str,
+    client_id: str,
+    device_session_id: str,
+    suspended_playback_context_id: str,
+) -> None:
+    rows = list(
+        EmoBroadcastFence.select().where(
+            (EmoBroadcastFence.broadcast_id == broadcast_id)
+            & (EmoBroadcastFence.role == "ordinary")
+            & (EmoBroadcastFence.client_id == client_id)
+            & (
+                EmoBroadcastFence.device_session_id
+                == device_session_id
+            )
+        )
+    )
+    expected = {
+        broadcastContextResourceKey(
+            user_name,
+            suspended_playback_context_id,
+        ): 0,
+        broadcastPairResourceKey(
+            user_name,
+            client_id,
+            device_session_id,
+        ): 1,
+    }
+    if len(rows) != len(expected):
+        raise BroadcastResourceConflictError(
+            "Recovery abandon requires both ordinary restore fences"
+        )
+    for row in rows:
+        if (
+            row.resource_key not in expected
+            or row.user_name != user_name
+            or row.phase != "restorePending"
+            or row.playback_context_id
+            != suspended_playback_context_id
+            or row.recovery_slot_reserved
+            != expected[row.resource_key]
+        ):
+            raise BroadcastResourceConflictError(
+                "Recovery abandon fence or recovery slot changed"
+            )
+
+
+def _replay_recovery_abandon(
+    record: EmoBroadcastRecoveryAbandon,
+    tombstone: Optional[EmoPermanentDeviceDecommission],
+    broadcast_id: str,
+    request_fingerprint: str,
+) -> Dict[str, object]:
+    if (
+        record.broadcast_id != broadcast_id
+        or record.request_fingerprint != request_fingerprint
+    ):
+        raise BroadcastResourceConflictError(
+            "Recovery abandon fingerprint conflicts with durable outcome"
+        )
+    if (
+        tombstone is None
+        or tombstone.broadcast_id != record.broadcast_id
+        or tombstone.abandon_request_fingerprint
+        != record.request_fingerprint
+    ):
+        raise BroadcastResourceConflictError(
+            "Recovery abandon durable outcome is incomplete"
+        )
+    return _serialize_recovery_abandon_record(record)
+
+
+def abandonBroadcastRecovery(
+    user_name: str,
+    client_id: str,
+    device_session_id: str,
+    broadcast_id: str,
+    request_fingerprint: Optional[str] = None,
+    abandoned_at_ms: Optional[int] = None,
+) -> Dict[str, object]:
+    canonical_fingerprint = broadcastRecoveryAbandonFingerprint(
+        user_name,
+        client_id,
+        device_session_id,
+        broadcast_id,
+    )
+    if request_fingerprint is None:
+        request_fingerprint = canonical_fingerprint
+    if not isinstance(request_fingerprint, str) or not request_fingerprint:
+        raise ValueError("request_fingerprint must be a non-empty string")
+    if abandoned_at_ms is None:
+        abandoned_at_ms = int(time.time() * 1000)
+    if type(abandoned_at_ms) is not int or abandoned_at_ms < 0:
+        raise ValueError("abandoned_at_ms must be a non-negative integer")
+
+    open_connection(reuse=True)
+    try:
+        record_hint = EmoBroadcast.get_or_none(
+            EmoBroadcast.broadcast_id == broadcast_id
+        )
+        participant_hint = EmoBroadcastParticipant.get_or_none(
+            _participant_expression(
+                broadcast_id,
+                client_id,
+                device_session_id,
+            )
+        )
+        recovery_hint = EmoBroadcastTerminalRecovery.get_or_none(
+            _terminal_recovery_expression(
+                user_name,
+                client_id,
+                device_session_id,
+            )
+        )
+        context_ids = set()
+        if record_hint is not None:
+            context_ids.add(record_hint.playback_context_id)
+        if participant_hint is not None:
+            context_ids.add(
+                participant_hint.suspended_playback_context_id
+            )
+        if recovery_hint is not None:
+            context_ids.update(
+                (
+                    recovery_hint.playback_context_id,
+                    recovery_hint.suspended_playback_context_id,
+                )
+            )
+        resource_keys = set(_broadcast_resource_keys(broadcast_id))
+        resource_keys.update(
+            (
+                broadcastPairResourceKey(
+                    user_name,
+                    client_id,
+                    device_session_id,
+                ),
+                broadcastUserRecoveryResourceKey(user_name),
+            )
+        )
+        resource_keys.update(
+            broadcastContextResourceKey(user_name, context_id)
+            for context_id in context_ids
+        )
+        authority_pairs = ((user_name, client_id, device_session_id),)
+
+        with strictPlaybackContextLockSet(
+            context_ids
+        ), strictAuthorityPairLockSet(
+            authority_pairs
+        ), broadcastResourceLock(
+            resource_keys
+        ):
+            try:
+                with broadcastTransaction():
+                    existing = EmoBroadcastRecoveryAbandon.get_or_none(
+                        _recovery_abandon_expression(
+                            user_name,
+                            client_id,
+                            device_session_id,
+                        )
+                    )
+                    tombstone = EmoPermanentDeviceDecommission.get_or_none(
+                        _permanent_decommission_expression(
+                            user_name,
+                            client_id,
+                            device_session_id,
+                        )
+                    )
+                    if existing is not None:
+                        return _replay_recovery_abandon(
+                            existing,
+                            tombstone,
+                            broadcast_id,
+                            request_fingerprint,
+                        )
+                    if tombstone is not None:
+                        raise BroadcastResourceConflictError(
+                            "Device pair is already permanently decommissioned"
+                        )
+
+                    record = EmoBroadcast.get_or_none(
+                        EmoBroadcast.broadcast_id == broadcast_id
+                    )
+                    participant = EmoBroadcastParticipant.get_or_none(
+                        _participant_expression(
+                            broadcast_id,
+                            client_id,
+                            device_session_id,
+                        )
+                    )
+                    recovery = EmoBroadcastTerminalRecovery.get_or_none(
+                        _terminal_recovery_expression(
+                            user_name,
+                            client_id,
+                            device_session_id,
+                        )
+                    )
+                    intent = EmoBroadcastIntentOutcome.get_or_none(
+                        EmoBroadcastIntentOutcome.broadcast_id
+                        == broadcast_id
+                    )
+
+                    if record is not None:
+                        if record.user_name != user_name:
+                            raise BroadcastNotFoundError(broadcast_id)
+                        if record.lifecycle_state != "stopped":
+                            raise BroadcastResourceConflictError(
+                                "Recovery abandon requires a terminal Broadcast"
+                            )
+                        if (
+                            participant is None
+                            or participant.user_name != user_name
+                            or participant.restore_pending != 1
+                            or participant.terminal_confirmed == 1
+                        ):
+                            raise BroadcastResourceConflictError(
+                                "Exact pair does not have a full restore obligation"
+                            )
+                        if recovery is not None:
+                            raise BroadcastResourceConflictError(
+                                "Recovery obligation cannot be both full and compact"
+                            )
+                        terminal_revision = record.broadcast_revision
+                        if (
+                            participant.target_broadcast_revision
+                            != terminal_revision
+                        ):
+                            raise BroadcastResourceConflictError(
+                                "Full recovery terminal revision changed"
+                            )
+                        suspended_context_id = (
+                            participant.suspended_playback_context_id
+                        )
+                        obligation_kind = "full"
+                    else:
+                        if participant is not None:
+                            raise BroadcastResourceConflictError(
+                                "Full recovery Broadcast record is missing"
+                            )
+                        if recovery is None:
+                            raise BroadcastNotFoundError(broadcast_id)
+                        if recovery.broadcast_id != broadcast_id:
+                            raise BroadcastResourceConflictError(
+                                "Exact pair recovery belongs to another Broadcast"
+                            )
+                        terminal_revision = (
+                            recovery.terminal_broadcast_revision
+                        )
+                        suspended_context_id = (
+                            recovery.suspended_playback_context_id
+                        )
+                        obligation_kind = "compact"
+
+                    if (
+                        intent is None
+                        or intent.user_name != user_name
+                        or intent.terminal_broadcast_revision
+                        != terminal_revision
+                    ):
+                        raise BroadcastResourceConflictError(
+                            "Recovery abandon terminal outcome changed"
+                        )
+                    _validate_recovery_abandon_fences(
+                        broadcast_id,
+                        user_name,
+                        client_id,
+                        device_session_id,
+                        suspended_context_id,
+                    )
+
+                    outcome = {
+                        "abandoned": True,
+                        "abandonedAtMs": abandoned_at_ms,
+                        "broadcastId": broadcast_id,
+                        "clientId": client_id,
+                        "deviceSessionId": device_session_id,
+                        "obligationKind": obligation_kind,
+                        "requestFingerprint": request_fingerprint,
+                        "terminalBroadcastRevision": terminal_revision,
+                        "userName": user_name,
+                    }
+                    EmoBroadcastRecoveryAbandon.create(
+                        user_name=user_name,
+                        client_id=client_id,
+                        device_session_id=device_session_id,
+                        broadcast_id=broadcast_id,
+                        request_fingerprint=request_fingerprint,
+                        terminal_broadcast_revision=terminal_revision,
+                        obligation_kind=obligation_kind,
+                        outcome_json=_canonical_json(outcome),
+                        abandoned_at_ms=abandoned_at_ms,
+                    )
+                    EmoPermanentDeviceDecommission.create(
+                        user_name=user_name,
+                        client_id=client_id,
+                        device_session_id=device_session_id,
+                        broadcast_id=broadcast_id,
+                        abandon_request_fingerprint=request_fingerprint,
+                        decommissioned_at_ms=abandoned_at_ms,
+                    )
+                    EmoBroadcastDelivery.delete().where(
+                        (EmoBroadcastDelivery.broadcast_id == broadcast_id)
+                        & (EmoBroadcastDelivery.client_id == client_id)
+                        & (
+                            EmoBroadcastDelivery.device_session_id
+                            == device_session_id
+                        )
+                    ).execute()
+                    EmoBroadcastFeedbackSettlement.delete().where(
+                        (
+                            EmoBroadcastFeedbackSettlement.broadcast_id
+                            == broadcast_id
+                        )
+                        & (
+                            EmoBroadcastFeedbackSettlement.client_id
+                            == client_id
+                        )
+                        & (
+                            EmoBroadcastFeedbackSettlement.device_session_id
+                            == device_session_id
+                        )
+                    ).execute()
+                    EmoBroadcastParticipant.delete().where(
+                        _participant_expression(
+                            broadcast_id,
+                            client_id,
+                            device_session_id,
+                        )
+                    ).execute()
+                    EmoBroadcastTerminalRecovery.delete().where(
+                        _terminal_recovery_expression(
+                            user_name,
+                            client_id,
+                            device_session_id,
+                        )
+                    ).execute()
+                    EmoBroadcastFence.delete().where(
+                        (EmoBroadcastFence.broadcast_id == broadcast_id)
+                        & (EmoBroadcastFence.role == "ordinary")
+                        & (EmoBroadcastFence.client_id == client_id)
+                        & (
+                            EmoBroadcastFence.device_session_id
+                            == device_session_id
+                        )
+                    ).execute()
+                    return outcome
+            except IntegrityError as exc:
+                raise BroadcastResourceConflictError(
+                    "Recovery abandon durable outcome already exists"
+                ) from exc
     finally:
         close_connection()
