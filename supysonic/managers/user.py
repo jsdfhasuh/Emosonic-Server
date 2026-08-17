@@ -11,7 +11,7 @@ import random
 import string
 import uuid
 
-from ..db import User
+from ..db import User, db
 
 
 class UserManager:
@@ -37,14 +37,16 @@ class UserManager:
     @staticmethod
     def delete(uid):
         user = UserManager.get(uid)
-        UserManager._delete_emo_security_records(user.name)
-        user.delete_instance(recursive=True)
+        with db.atomic():
+            UserManager._delete_emo_security_records(user.name)
+            user.delete_instance(recursive=True)
 
     @staticmethod
     def delete_by_name(name):
         user = User.get(name=name)
-        UserManager._delete_emo_security_records(user.name)
-        user.delete_instance(recursive=True)
+        with db.atomic():
+            UserManager._delete_emo_security_records(user.name)
+            user.delete_instance(recursive=True)
 
     @staticmethod
     def _delete_emo_security_records(user_name):

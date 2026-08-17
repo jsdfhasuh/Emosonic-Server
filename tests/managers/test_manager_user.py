@@ -11,6 +11,7 @@ from supysonic.managers.user import UserManager
 
 import unittest
 import uuid
+from unittest import mock
 
 
 class UserManagerTestCase(unittest.TestCase):
@@ -135,6 +136,40 @@ class UserManagerTestCase(unittest.TestCase):
 
         # Delete non-existent user
         self.assertRaises(db.User.DoesNotExist, UserManager.delete_by_name, "null")
+
+    def test_delete_rolls_back_emo_security_records_when_user_delete_fails(self):
+        UserManager.add("alice", "ALICE")
+        db.EmoBroadcastRecoveryAbandon.create(
+            user_name="alice",
+            client_id="player-1",
+            device_session_id="device:player-1",
+            broadcast_id="broadcast-1",
+            request_fingerprint="a" * 64,
+            terminal_broadcast_revision=3,
+            obligation_kind="compact",
+            outcome_json="{}",
+            abandoned_at_ms=1000,
+        )
+        db.EmoPermanentDeviceDecommission.create(
+            user_name="alice",
+            client_id="player-1",
+            device_session_id="device:player-1",
+            broadcast_id="broadcast-1",
+            abandon_request_fingerprint="a" * 64,
+            decommissioned_at_ms=1000,
+        )
+
+        with mock.patch.object(
+            db.User,
+            "delete_instance",
+            side_effect=RuntimeError("user delete failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "user delete failed"):
+                UserManager.delete_by_name("alice")
+
+        self.assertTrue(db.User.select().where(db.User.name == "alice").exists())
+        self.assertEqual(db.EmoBroadcastRecoveryAbandon.select().count(), 1)
+        self.assertEqual(db.EmoPermanentDeviceDecommission.select().count(), 1)
 
     def test_try_auth(self):
         self.create_data()

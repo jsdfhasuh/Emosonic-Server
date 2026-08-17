@@ -2,6 +2,7 @@ import concurrent.futures
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -917,6 +918,181 @@ class EmoWebSocketTestCase(unittest.TestCase):
     self.assertIsNone(
       get_state().get_client("abandon-online", user_name="alice")
     )
+
+  def test_register_waits_for_concurrent_decommission_before_mapping_swap(self):
+    client = self.connect_device(
+      "alice",
+      "Alic3",
+      "concurrent-register",
+      "device:concurrent-register",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(client)
+    fingerprint = self._prepare_recovery_abandon(
+      broadcast_id="broadcast-concurrent-register",
+      client_id="concurrent-register",
+      device_session_id="device:concurrent-register",
+    )
+    replacement = self.connect_authenticated_client(
+      "alice",
+      "Alic3",
+      "auth-concurrent-register",
+    )
+
+    decommission_started = threading.Event()
+    registration_started = threading.Event()
+    release_decommission = threading.Event()
+    original_abandon = emo_ws.abandonBroadcastRecovery
+    original_prepare = emo_ws._prepare_device_registration
+
+    def blocking_abandon(*args, **kwargs):
+      decommission_started.set()
+      if not release_decommission.wait(5):
+        raise AssertionError("decommission did not receive its release")
+      return original_abandon(*args, **kwargs)
+
+    def record_registration_start(*args, **kwargs):
+      registration_started.set()
+      return original_prepare(*args, **kwargs)
+
+    def run_decommission():
+      with self.app.app_context():
+        return emo_ws.abandonBroadcastRecoveryAndDecommission(
+          "alice",
+          "concurrent-register",
+          "device:concurrent-register",
+          "broadcast-concurrent-register",
+          request_fingerprint=fingerprint,
+          abandoned_at_ms=24000,
+        )
+
+    with mock.patch.object(
+      emo_ws,
+      "abandonBroadcastRecovery",
+      side_effect=blocking_abandon,
+    ), mock.patch.object(
+      emo_ws,
+      "_prepare_device_registration",
+      side_effect=record_registration_start,
+    ):
+      with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        decommission_future = executor.submit(run_decommission)
+        self.assertTrue(decommission_started.wait(5))
+        registration_future = executor.submit(
+          self.register_device,
+          replacement,
+          "register-concurrent-register",
+          {
+            "clientId": "concurrent-register",
+            "deviceSessionId": "device:concurrent-register",
+            "capabilities": {CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+          },
+        )
+        self.assertTrue(registration_started.wait(5))
+        self.assertFalse(registration_future.done())
+        release_decommission.set()
+        outcome = decommission_future.result(timeout=5)
+        registration_messages = registration_future.result(timeout=5)
+
+    self.assertTrue(outcome["abandoned"])
+    self.assertTrue(outcome["onlineRevoked"])
+    error = self.get_error(registration_messages, "register-concurrent-register")
+    self.assertEqual(error["payload"]["code"], "forbidden")
+    self.assertIsNone(
+      get_state().get_sid_for_client(
+        "concurrent-register",
+        user_name="alice",
+      )
+    )
+    self.clients.remove(client)
+
+  def test_register_first_then_decommission_revokes_replacement_generation_once(self):
+    client = self.connect_device(
+      "alice",
+      "Alic3",
+      "register-first",
+      "device:register-first",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(client)
+    fingerprint = self._prepare_recovery_abandon(
+      broadcast_id="broadcast-register-first",
+      client_id="register-first",
+      device_session_id="device:register-first",
+    )
+    replacement = self.connect_authenticated_client(
+      "alice",
+      "Alic3",
+      "auth-register-first",
+    )
+
+    registration_swapped = threading.Event()
+    release_registration = threading.Event()
+    decommission_call_started = threading.Event()
+    original_register = emo_ws._register_device
+
+    def blocking_register(*args, **kwargs):
+      result = original_register(*args, **kwargs)
+      registration_swapped.set()
+      if not release_registration.wait(5):
+        raise AssertionError("registration did not receive its release")
+      return result
+
+    def run_decommission():
+      decommission_call_started.set()
+      with self.app.app_context():
+        return emo_ws.abandonBroadcastRecoveryAndDecommission(
+          "alice",
+          "register-first",
+          "device:register-first",
+          "broadcast-register-first",
+          request_fingerprint=fingerprint,
+          abandoned_at_ms=25000,
+        )
+
+    with mock.patch.object(
+      emo_ws,
+      "_register_device",
+      side_effect=blocking_register,
+    ), mock.patch.object(
+      emo_ws,
+      "_emit_strict_broadcast_participant_registration",
+      return_value=None,
+    ):
+      with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        registration_future = executor.submit(
+          self.register_device,
+          replacement,
+          "register-register-first",
+          {
+            "clientId": "register-first",
+            "deviceSessionId": "device:register-first",
+            "capabilities": {CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+          },
+        )
+        self.assertTrue(registration_swapped.wait(5))
+        decommission_future = executor.submit(run_decommission)
+        self.assertTrue(decommission_call_started.wait(5))
+        self.assertFalse(decommission_future.done())
+        self.assertIsNone(
+          db.EmoPermanentDeviceDecommission.select().first()
+        )
+        release_registration.set()
+        registration_messages = registration_future.result(timeout=5)
+        outcome = decommission_future.result(timeout=5)
+
+    self.assertIsNotNone(
+      self.get_ack(registration_messages, "register-register-first")
+    )
+    self.assertTrue(outcome["abandoned"])
+    self.assertTrue(outcome["onlineRevoked"])
+    self.assertIsNone(
+      get_state().get_sid_for_client("register-first", user_name="alice")
+    )
+    self.clients.remove(client)
+    self.clients.remove(replacement)
 
   def test_restart_sweep_revokes_persisted_decommission_and_blocks_reconnect(self):
     client = self.connect_device(
