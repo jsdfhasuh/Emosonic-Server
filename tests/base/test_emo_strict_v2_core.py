@@ -719,7 +719,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(error["payload"]["code"], "not_supported")
         self.assertIsNone(get_state().get_client("phone-1"))
 
-    def test_runtime_readiness_ignores_local_evidence_switch(self):
+    def test_runtime_readiness_fails_closed_without_conformance_evidence(self):
         client = self.connect()
         self.authenticate(client)
         self.app.testing = False
@@ -735,20 +735,19 @@ class StrictV2CoreTestCase(unittest.TestCase):
         )
 
         try:
-            accepted = self.register(
+            rejected = self.register(
                 client,
-                "register-local-evidence-ignored",
+                "register-local-evidence-rejected",
                 self.strict_registration_payload(),
             )
-            ack = next(
+            error = next(
                 message
-                for message in accepted
-                if message.get("requestId")
-                == "register-local-evidence-ignored"
+                for message in rejected
+                if message.get("requestId") == "register-local-evidence-rejected"
             )
-            self.assertEqual(ack["action"], "system.ack")
-            negotiated = ack["payload"]["negotiatedCapabilities"]
-            self.assertTrue(all(negotiated.values()))
+            self.assertEqual(error["action"], "system.error")
+            self.assertEqual(error["payload"]["code"], "not_supported")
+            self.assertIsNone(get_state().get_client("phone-1"))
         finally:
             self.app.testing = True
 

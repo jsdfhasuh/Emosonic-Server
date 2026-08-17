@@ -289,14 +289,13 @@ class StrictV2SafetyTestCase(unittest.TestCase):
             ready,
         )
 
-    def test_multi_process_check_ignores_deprecated_local_evidence_switch(self):
+    def test_multi_process_check_respects_explicit_local_evidence_gate(self):
         config = {
             "emo_strict_v2_core_enabled": True,
             "emo_development_mode": False,
             "emo_strict_v2_allow_local_test_evidence": True,
         }
-        with self.assertRaises(RuntimeError):
-            validate_strict_v2_worker_count(2, config)
+        validate_strict_v2_worker_count(2, config)
 
         config["emo_development_mode"] = True
         with self.assertRaises(RuntimeError):

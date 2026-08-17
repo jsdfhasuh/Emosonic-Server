@@ -1,5 +1,8 @@
 from typing import Dict, Mapping, Optional, Sequence
 
+from .strict_v2_conformance import (
+    get_code_conformance_readiness as get_manifest_code_conformance_readiness,
+)
 from .strict_v2_contract import STRICT_CAPABILITIES
 
 
@@ -64,10 +67,12 @@ def get_deployment_readiness(webapp_config: Mapping[str, object]) -> Dict[str, b
 def get_code_conformance_readiness(
     allow_local_test_evidence: bool = False,
 ) -> Dict[str, bool]:
-    """Return implementation support without metadata or evidence gates."""
-    readiness = dict(PROFILE_IMPLEMENTATION_READY)
-    readiness["broadcast"] = bool(BROADCAST_IMPLEMENTATION_READY)
-    return readiness
+    """Return packaged conformance, with an explicit local test escape hatch."""
+    if allow_local_test_evidence:
+        readiness = dict(PROFILE_IMPLEMENTATION_READY)
+        readiness["broadcast"] = bool(BROADCAST_IMPLEMENTATION_READY)
+        return readiness
+    return get_manifest_code_conformance_readiness(False)
 
 
 def get_effective_profile_readiness(
@@ -75,6 +80,8 @@ def get_effective_profile_readiness(
     code_readiness: Optional[Mapping[str, bool]] = None,
     allow_local_test_evidence: Optional[bool] = None,
 ) -> Dict[str, bool]:
+    if allow_local_test_evidence is None:
+        allow_local_test_evidence = is_local_test_evidence_allowed(webapp_config)
     if code_readiness is None:
         code = get_code_conformance_readiness(bool(allow_local_test_evidence))
     else:

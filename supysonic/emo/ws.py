@@ -2383,6 +2383,10 @@ def _prepare_device_registration(user_name, payload):
             capabilities,
             roles,
             current_app.config["WEBAPP"],
+            allow_local_test_evidence=is_local_test_evidence_allowed(
+                current_app.config["WEBAPP"],
+                current_app.testing,
+            ),
         )
     else:
         if device_name is None:

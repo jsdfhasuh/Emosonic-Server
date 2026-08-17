@@ -108,7 +108,7 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
         )
         self.assertTrue(is_local_test_evidence_allowed({}, app_testing=True))
 
-    def test_evidence_switch_does_not_change_runtime_readiness(self):
+    def test_explicit_local_test_gate_can_enable_local_runtime_readiness(self):
         deployment = dict(
             self.deployment_enabled,
             emo_development_mode=True,
@@ -136,6 +136,18 @@ class StrictV2ReadinessTestCase(unittest.TestCase):
         self.assertTrue(negotiated["playbackPrepare"])
         self.assertTrue(negotiated["effectiveAtPlayback"])
         self.assertTrue(negotiated["supportsBroadcast"])
+
+    def test_packaged_conformance_manifest_gates_production_readiness(self):
+        self.assertEqual(
+            get_effective_profile_readiness(self.deployment_enabled),
+            {"core": False, "follow": False, "handoff": False, "broadcast": False},
+        )
+        with self.assertRaises(CoreProfileNotReady):
+            negotiate_capabilities(
+                self.capabilities,
+                ["player"],
+                self.deployment_enabled,
+            )
 
     def test_core_not_ready_fails_closed(self):
         with self.assertRaises(CoreProfileNotReady):
