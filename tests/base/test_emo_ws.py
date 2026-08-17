@@ -6,6 +6,7 @@ from unittest import mock
 
 from jsonschema import Draft202012Validator
 
+from supysonic import db
 from supysonic.db import release_database
 from supysonic.emo import ws as emo_ws
 from supysonic.emo.strict_v2_contract import validate_strict_output
@@ -237,6 +238,10 @@ class EmoWebSocketTestCase(unittest.TestCase):
       side_effect=record("durable-broadcast-recovery", []),
     ), mock.patch.object(
       emo_ws,
+      "_sweep_permanent_device_decommissions",
+      side_effect=record("decommission-sweep", 0),
+    ), mock.patch.object(
+      emo_ws,
       "get_strict_v2_metadata",
       side_effect=record(
         "metadata",
@@ -267,6 +272,7 @@ class EmoWebSocketTestCase(unittest.TestCase):
         "handoff-recovery",
         "memory-broadcast-recovery",
         "durable-broadcast-recovery",
+        "decommission-sweep",
         "metadata",
         "watchdog-start",
         "gate-complete",
@@ -663,6 +669,94 @@ class EmoWebSocketTestCase(unittest.TestCase):
     device = next(device for device in device_list["payload"]["devices"] if device["clientId"] == "player-1")
     self.assertEqual(device["alias"], alias)
     self.assertEqual(device["sessionId"], "sess-main")
+
+  def _create_decommission_tombstone(
+    self,
+    client_id="decommissioned-player",
+    device_session_id="device:decommissioned-player",
+  ):
+    return db.EmoPermanentDeviceDecommission.create(
+      user_name="alice",
+      client_id=client_id,
+      device_session_id=device_session_id,
+      broadcast_id="broadcast-decommissioned",
+      abandon_request_fingerprint="f" * 64,
+      decommissioned_at_ms=1000,
+    )
+
+  def test_decommissioned_pair_is_rejected_before_registration_state(self):
+    self._create_decommission_tombstone()
+    client = self.connect_authenticated_client(
+      "alice",
+      "Alic3",
+      "auth-decommissioned-player",
+    )
+
+    messages = self.register_device(
+      client,
+      "register-decommissioned-player",
+      {
+        "clientId": "decommissioned-player",
+        "deviceSessionId": "device:decommissioned-player",
+        "capabilities": {CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+      },
+    )
+
+    error = self.get_error(messages, "register-decommissioned-player")
+    self.assertEqual(error["payload"]["code"], "forbidden")
+    self.assertIsNone(
+      get_state().get_client(
+        "decommissioned-player",
+        user_name="alice",
+      )
+    )
+    self.assertIsNone(
+      get_state().get_sid_for_client(
+        "decommissioned-player",
+        user_name="alice",
+      )
+    )
+
+    replacement_messages = self.register_device(
+      client,
+      "register-decommissioned-replacement",
+      {
+        "clientId": "decommissioned-player",
+        "deviceSessionId": "device:replacement",
+        "capabilities": {CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+      },
+    )
+    self.assertIsNotNone(
+      self.get_ack(replacement_messages, "register-decommissioned-replacement")
+    )
+
+  def test_persisted_decommission_sweep_revokes_live_exact_generation(self):
+    client = self.connect_device(
+      "alice",
+      "Alic3",
+      "decommissioned-live",
+      "device:decommissioned-live",
+      ["player"],
+      capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+    )
+    self.get_messages(client)
+    self._create_decommission_tombstone(
+      "decommissioned-live",
+      "device:decommissioned-live",
+    )
+
+    with self.app.app_context():
+      revoked = emo_ws._sweep_permanent_device_decommissions()
+
+    self.assertEqual(revoked, 1)
+    self.assertIsNone(
+      get_state().get_client("decommissioned-live", user_name="alice")
+    )
+    self.assertIsNone(
+      get_state().get_sid_for_client("decommissioned-live", user_name="alice")
+    )
+    self.assertFalse(client.is_connected(namespace="/emo"))
+    self.clients.remove(client)
 
   def test_device_register_accepts_device_session_id(self):
     client = self.connect_authenticated_client("alice", "Alic3", "auth-player-1")

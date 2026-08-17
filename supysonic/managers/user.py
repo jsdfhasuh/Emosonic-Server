@@ -37,12 +37,24 @@ class UserManager:
     @staticmethod
     def delete(uid):
         user = UserManager.get(uid)
+        UserManager._delete_emo_security_records(user.name)
         user.delete_instance(recursive=True)
 
     @staticmethod
     def delete_by_name(name):
         user = User.get(name=name)
+        UserManager._delete_emo_security_records(user.name)
         user.delete_instance(recursive=True)
+
+    @staticmethod
+    def _delete_emo_security_records(user_name):
+        # These durable tables intentionally use a stable username instead of
+        # a User foreign key, so account deletion must clean them explicitly.
+        from ..emo.broadcast_store import (
+            deleteBroadcastRecoveryDecommissionRecordsForUser,
+        )
+
+        return deleteBroadcastRecoveryDecommissionRecordsForUser(user_name)
 
     @staticmethod
     def try_auth(name, password):

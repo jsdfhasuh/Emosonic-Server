@@ -538,7 +538,7 @@ def _finish_decommissioned_pair_revoke(revocation):
             else session_info.get("userName")
         )
     )
-    if user_name:
+    if user_name and has_app_context():
         _broadcast_clients(user_name)
     return True
 
@@ -1203,6 +1203,12 @@ def init_socketio(app):
             logger.warning(
                 "Marked %d persistent strict Emo broadcasts stopped after restart",
                 len(stopped_persistent_broadcasts),
+            )
+        revoked_decommissioned_pairs = _sweep_permanent_device_decommissions()
+        if revoked_decommissioned_pairs:
+            logger.warning(
+                "Revoked %d permanently decommissioned device pairs after restart",
+                revoked_decommissioned_pairs,
             )
         metadata = get_strict_v2_metadata()
         logger.warning(
@@ -9904,6 +9910,12 @@ def _control_watchdog_sweep_later(generation: int) -> None:
         if not _control_watchdog_is_active(None, generation):
             return
         try:
+            _sweep_permanent_device_decommissions()
+        except Exception:
+            logger.exception(
+                "Strict permanent device decommission sweep failed"
+            )
+        try:
             _sweep_expired_control_transactions()
         except Exception:
             logger.exception("Strict playback control watchdog sweep failed")
@@ -12872,6 +12884,10 @@ class EmoNamespace(Namespace):
         session_info = state.get_session(request.sid)
         current_user_name = None if session_info is None else session_info.get("userName")
         current_client = state.get_client_for_sid(request.sid)
+        if current_client is not None and _revoke_decommissioned_sid_if_needed(
+            request.sid
+        ):
+            return
         unregistered_strict_business = (
             current_client is None
             and action in ACTION_SCHEMAS
@@ -13091,6 +13107,11 @@ class EmoNamespace(Namespace):
                         else (registration_key,)
                     ),
                 ):
+                    _require_device_pair_not_decommissioned(
+                        current_user_name,
+                        prepared_client["clientId"],
+                        prepared_client["deviceSessionId"],
+                    )
                     previous_sid = state.get_sid_for_client(
                         registration_client_id,
                         user_name=current_user_name,

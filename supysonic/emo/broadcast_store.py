@@ -3388,6 +3388,40 @@ def listPermanentDeviceDecommissions(
         close_connection()
 
 
+def deleteBroadcastRecoveryDecommissionRecordsForUser(
+    user_name: str,
+) -> Dict[str, int]:
+    """Delete account-owned recovery security records during user removal."""
+    if not isinstance(user_name, str) or not user_name.strip():
+        raise ValueError("user_name must be a non-empty string")
+
+    connection_was_closed = db.is_closed()
+    if connection_was_closed:
+        open_connection(reuse=True)
+    try:
+        with broadcastResourceLock((broadcastUserRecoveryResourceKey(user_name),)):
+            with broadcastTransaction():
+                abandon_count = (
+                    EmoBroadcastRecoveryAbandon.delete()
+                    .where(EmoBroadcastRecoveryAbandon.user_name == user_name)
+                    .execute()
+                )
+                decommission_count = (
+                    EmoPermanentDeviceDecommission.delete()
+                    .where(
+                        EmoPermanentDeviceDecommission.user_name == user_name
+                    )
+                    .execute()
+                )
+        return {
+            "abandonOutcomes": abandon_count,
+            "permanentDecommissions": decommission_count,
+        }
+    finally:
+        if connection_was_closed:
+            close_connection()
+
+
 def _validate_recovery_abandon_fences(
     broadcast_id: str,
     user_name: str,
@@ -3479,6 +3513,10 @@ def abandonBroadcastRecovery(
         request_fingerprint = canonical_fingerprint
     if not isinstance(request_fingerprint, str) or not request_fingerprint:
         raise ValueError("request_fingerprint must be a non-empty string")
+    if request_fingerprint != canonical_fingerprint:
+        raise BroadcastResourceConflictError(
+            "Recovery abandon fingerprint does not match the exact pair request"
+        )
     if abandoned_at_ms is None:
         abandoned_at_ms = int(time.time() * 1000)
     if type(abandoned_at_ms) is not int or abandoned_at_ms < 0:

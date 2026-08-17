@@ -15,7 +15,14 @@ from click.testing import CliRunner
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from supysonic.db import Folder, User, init_database, release_database
+from supysonic.db import (
+    EmoBroadcastRecoveryAbandon,
+    EmoPermanentDeviceDecommission,
+    Folder,
+    User,
+    init_database,
+    release_database,
+)
 from supysonic.cli import cli
 
 from ..testbase import TestConfig
@@ -168,6 +175,51 @@ class CLITestCase(unittest.TestCase):
         self.__invoke("user delete bob", True)
 
         self.assertEqual(User.select().count(), 0)
+
+    def test_user_delete_removes_emo_decommission_security_records(self):
+        self.__invoke("user add -p Alic3 alice")
+        EmoBroadcastRecoveryAbandon.create(
+            user_name="alice",
+            client_id="player-1",
+            device_session_id="device:player-1",
+            broadcast_id="broadcast-1",
+            request_fingerprint="a" * 64,
+            terminal_broadcast_revision=3,
+            obligation_kind="compact",
+            outcome_json="{}",
+            abandoned_at_ms=1000,
+        )
+        EmoPermanentDeviceDecommission.create(
+            user_name="alice",
+            client_id="player-1",
+            device_session_id="device:player-1",
+            broadcast_id="broadcast-1",
+            abandon_request_fingerprint="a" * 64,
+            decommissioned_at_ms=1000,
+        )
+
+        self.__invoke("user delete alice")
+
+        self.assertEqual(EmoBroadcastRecoveryAbandon.select().count(), 0)
+        self.assertEqual(EmoPermanentDeviceDecommission.select().count(), 0)
+
+    def test_emo_broadcast_abandon_is_a_management_entry_point(self):
+        with patch(
+            "supysonic.emo.ws.abandonBroadcastRecoveryAndDecommission",
+            return_value={"abandoned": True, "onlineRevoked": False},
+        ) as abandon:
+            result = self.__invoke(
+                "emo broadcast-abandon alice player-1 device:player-1 broadcast-1"
+            )
+
+        abandon.assert_called_once_with(
+            "alice",
+            "player-1",
+            "device:player-1",
+            "broadcast-1",
+            request_fingerprint=None,
+        )
+        self.assertIn("Recovery abandoned for alice/player-1/device:player-1", result.output)
 
     def test_user_list(self):
         self.__invoke("user add -p Alic3 alice")

@@ -16,6 +16,8 @@ from supysonic.emo.broadcast_store import (
     BroadcastFeedbackSequenceConflictError,
     BroadcastLimitError,
     BroadcastResourceConflictError,
+    abandonBroadcastRecovery,
+    broadcastRecoveryAbandonFingerprint,
     buildTerminalBroadcastSnapshot,
     commitBroadcastRevision,
     compactExpiredBroadcastStates,
@@ -25,6 +27,7 @@ from supysonic.emo.broadcast_store import (
     getBroadcastFenceForPair,
     getBroadcastIntentOutcome,
     getBroadcastState,
+    getPermanentDeviceDecommission,
     listTerminalRecoveries,
     saveBroadcastFeedbackSettlement,
     settleBroadcastFeedback,
@@ -734,6 +737,143 @@ class EmoBroadcastStoreTestCase(unittest.TestCase):
         self.assertEqual(persisted["lifecycleState"], "stopped")
         self.assertTrue(persisted["participantStates"][0]["restorePending"])
         self.assertEqual(listTerminalRecoveries("alice"), [])
+
+    def _terminal_recovery_for_abandon(self):
+        self._create()
+        terminal = self._snapshot(
+            revision=2,
+            lifecycle="stopped",
+            updated_at_ms=20000,
+        )
+        terminalBroadcastState(
+            "broadcast-1",
+            terminal,
+            {"stopped": True},
+            [self._delivery("terminal-delivery", 2, "stop", 20000)],
+            expected_broadcast_revision=1,
+            terminal_at_ms=20000,
+        )
+        return broadcastRecoveryAbandonFingerprint(
+            "alice",
+            "participant-1",
+            "device:participant-1",
+            "broadcast-1",
+        )
+
+    def test_full_recovery_abandon_is_atomic_and_replayable(self):
+        fingerprint = self._terminal_recovery_for_abandon()
+
+        outcome = abandonBroadcastRecovery(
+            "alice",
+            "participant-1",
+            "device:participant-1",
+            "broadcast-1",
+            request_fingerprint=fingerprint,
+            abandoned_at_ms=21000,
+        )
+
+        self.assertTrue(outcome["abandoned"])
+        self.assertEqual(outcome["obligationKind"], "full")
+        self.assertIsNotNone(
+            getPermanentDeviceDecommission(
+                "alice",
+                "participant-1",
+                "device:participant-1",
+            )
+        )
+        persisted = getBroadcastState("broadcast-1")
+        self.assertEqual(persisted["lifecycleState"], "stopped")
+        self.assertEqual(persisted["participantStates"], [])
+        self.assertEqual(listTerminalRecoveries("alice"), [])
+        self.assertEqual(db.EmoBroadcastParticipant.select().count(), 0)
+        self.assertEqual(db.EmoBroadcastFence.select().count(), 0)
+
+        replay = abandonBroadcastRecovery(
+            "alice",
+            "participant-1",
+            "device:participant-1",
+            "broadcast-1",
+            request_fingerprint=fingerprint,
+            abandoned_at_ms=22000,
+        )
+        self.assertEqual(replay, outcome)
+        with self.assertRaises(BroadcastResourceConflictError):
+            abandonBroadcastRecovery(
+                "alice",
+                "participant-1",
+                "device:participant-1",
+                "broadcast-1",
+                request_fingerprint="different-fingerprint",
+            )
+
+    def test_compact_recovery_abandon_removes_obligation_and_retains_tombstone(self):
+        fingerprint = self._terminal_recovery_for_abandon()
+        compactExpiredBroadcastStates(now_ms=9999999999999)
+        self.assertIsNone(getBroadcastState("broadcast-1"))
+        self.assertEqual(len(listTerminalRecoveries("alice")), 1)
+
+        outcome = abandonBroadcastRecovery(
+            "alice",
+            "participant-1",
+            "device:participant-1",
+            "broadcast-1",
+            request_fingerprint=fingerprint,
+            abandoned_at_ms=22000,
+        )
+        self.assertEqual(outcome["obligationKind"], "compact")
+        self.assertEqual(listTerminalRecoveries("alice"), [])
+
+        compactExpiredBroadcastStates(now_ms=9999999999999)
+        self.assertIsNotNone(
+            getPermanentDeviceDecommission(
+                "alice",
+                "participant-1",
+                "device:participant-1",
+            )
+        )
+
+    def test_recovery_abandon_rolls_back_all_durable_rows_on_decommission_failure(self):
+        self._terminal_recovery_for_abandon()
+        with mock.patch.object(
+            db.EmoPermanentDeviceDecommission,
+            "create",
+            side_effect=RuntimeError("decommission write failed"),
+        ):
+            with self.assertRaises(RuntimeError):
+                abandonBroadcastRecovery(
+                    "alice",
+                    "participant-1",
+                    "device:participant-1",
+                    "broadcast-1",
+                )
+
+        persisted = getBroadcastState("broadcast-1")
+        self.assertEqual(persisted["lifecycleState"], "stopped")
+        self.assertTrue(persisted["participantStates"][0]["restorePending"])
+        self.assertEqual(db.EmoBroadcastRecoveryAbandon.select().count(), 0)
+        self.assertEqual(db.EmoPermanentDeviceDecommission.select().count(), 0)
+        self.assertEqual(len(listTerminalRecoveries("alice")), 0)
+
+    def test_recovery_abandon_fingerprint_and_pair_scope_fail_closed(self):
+        fingerprint = self._terminal_recovery_for_abandon()
+        with self.assertRaises(BroadcastResourceConflictError):
+            abandonBroadcastRecovery(
+                "alice",
+                "participant-1",
+                "device:participant-1",
+                "broadcast-1",
+                request_fingerprint="not-canonical",
+            )
+
+        self.assertEqual(
+            broadcastRecoveryAbandonFingerprint(
+                "alice",
+                "participant-1",
+                "device:participant-1",
+                "broadcast-1",
+            ),
+            fingerprint,
+        )
 
     def test_feedback_settlement_failure_rolls_back_participant(self):
         self._create()

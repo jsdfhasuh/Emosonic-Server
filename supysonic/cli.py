@@ -315,6 +315,54 @@ def metadata_enrich(config, limit, track_ids, force, failed_only, dry_run, provi
         raise ClickException(str(summary.get("error") or "LLM quota exhausted."))
 
 
+@cli.group("emo")
+def emo():
+    """Emosonic strict-v2 management commands"""
+    pass
+
+
+@emo.command("broadcast-abandon")
+@click.argument("user_name")
+@click.argument("client_id")
+@click.argument("device_session_id")
+@click.argument("broadcast_id")
+@click.option(
+    "--request-fingerprint",
+    default=None,
+    help="Canonical recovery-abandon fingerprint for an idempotent replay.",
+)
+def emo_broadcast_abandon(
+    user_name,
+    client_id,
+    device_session_id,
+    broadcast_id,
+    request_fingerprint,
+):
+    """Atomically abandon recovery and decommission one exact device pair."""
+    from .emo.broadcast_store import BroadcastStoreError
+    from .emo.ws import abandonBroadcastRecoveryAndDecommission
+
+    try:
+        outcome = abandonBroadcastRecoveryAndDecommission(
+            user_name,
+            client_id,
+            device_session_id,
+            broadcast_id,
+            request_fingerprint=request_fingerprint,
+        )
+    except (BroadcastStoreError, PermissionError, ValueError) as exc:
+        raise ClickException(str(exc)) from exc
+
+    click.echo(
+        "Recovery abandoned for {user}/{client}/{device}; online revoked: {revoked}".format(
+            user=user_name,
+            client=client_id,
+            device=device_session_id,
+            revoked=bool(outcome.get("onlineRevoked")),
+        )
+    )
+
+
 @cli.group("user")
 def user():
     """User management commands"""
