@@ -80,10 +80,10 @@ def _validate_metadata(
 
     requirements = manifest.get("requirements")
     expected_requirements = {
-        "REQ-%03d" % number for number in range(1, 46)
+        "REQ-%03d" % number for number in range(1, 91)
     }
     if not isinstance(requirements, dict) or set(requirements) != expected_requirements:
-        raise EvidenceError("Executable manifest must map REQ-001 through REQ-045")
+        raise EvidenceError("Executable manifest must map REQ-001 through REQ-090")
 
     profiles = conformance.get("profiles")
     if not isinstance(profiles, dict) or set(profiles) != set(PROFILES):
@@ -246,7 +246,7 @@ def _write_summary(
         encoding="utf-8",
     )
     lines = [
-        "# EmoSonic strict-v2 r11 automated evidence",
+        "# EmoSonic strict-v2 r18 automated evidence",
         "",
         "- Server build commit: `%s`" % identity["serverBuildCommit"],
         "- Protocol version: `%s`" % identity["protocolVersion"],
@@ -291,7 +291,7 @@ def main() -> int:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=Path("docs/verification/emosonic_strict_v2_r11"),
+        default=Path("docs/verification/emosonic_strict_v2_r18"),
     )
     parser.add_argument(
         "--server-build-commit",
@@ -334,7 +334,7 @@ def main() -> int:
         _write_summary(output_directory, identity, results)
         return 0 if all(result["exitCode"] == 0 for result in results) else 1
     except (EvidenceError, OSError, subprocess.CalledProcessError) as exc:
-        print("Strict-v2 r11 evidence collection failed: %s" % exc, file=sys.stderr)
+        print("Strict-v2 r18 evidence collection failed: %s" % exc, file=sys.stderr)
         return 1
 
 

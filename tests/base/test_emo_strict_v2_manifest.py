@@ -101,6 +101,10 @@ class StrictV2ManifestTestCase(unittest.TestCase):
             requirements,
             {"REQ-%03d" % number for number in range(1, 91)},
         )
+        self.assertEqual(
+            set(self.manifest["requirements"]),
+            {"REQ-%03d" % number for number in range(1, 91)},
+        )
 
     def test_historical_realtime_goals_are_marked_superseded(self):
         repository_root = Path(__file__).resolve().parents[2]

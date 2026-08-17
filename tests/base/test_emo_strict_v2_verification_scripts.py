@@ -66,7 +66,7 @@ class StrictV2VerificationScriptsTestCase(unittest.TestCase):
         self.assertEqual(identity["serverBuildCommit"], build_commit)
         self.assertEqual(identity["protocolVersion"], "2.8.0")
         self.assertEqual(identity["contractSha256"], STRICT_V2_CONTRACT_SHA256)
-        self.assertEqual(len(identity["requirements"]), 45)
+        self.assertEqual(len(identity["requirements"]), 90)
         self.assertFalse(any(identity["readiness"].values()))
 
     def test_evidence_collector_rejects_dirty_or_mismatched_build(self):
@@ -177,7 +177,7 @@ class StrictV2VerificationScriptsTestCase(unittest.TestCase):
         self.assertIn("Overall result: **PASS**", markdown)
         self.assertIn("Android/Windows acceptance", markdown)
 
-    def test_ears_runner_uses_complete_r11_requirement_inventory(self):
+    def test_ears_runner_uses_complete_r18_requirement_inventory(self):
         methods = verify_emo_strict_v2_ears._mapped_test_methods()
 
         self.assertIn(
@@ -195,12 +195,17 @@ class StrictV2VerificationScriptsTestCase(unittest.TestCase):
             "test_remote_control_persists_pending_deadline_and_watchdog_settles_unknown",
             methods,
         )
+        self.assertIn(
+            "tests.base.test_cli.CLITestCase."
+            "test_emo_broadcast_abandon_is_a_management_entry_point",
+            methods,
+        )
 
-    def test_ears_runner_rejects_pre_r11_requirement_inventory(self):
+    def test_ears_runner_rejects_pre_r18_requirement_inventory(self):
         manifest = json.loads(
             verify_emo_strict_v2_ears.MANIFEST_PATH.read_text(encoding="utf-8")
         )
-        manifest["requirements"].pop("REQ-045")
+        manifest["requirements"].pop("REQ-090")
 
         with tempfile.TemporaryDirectory() as directory:
             manifest_path = Path(directory) / "manifest.json"
@@ -209,7 +214,7 @@ class StrictV2VerificationScriptsTestCase(unittest.TestCase):
                 verify_emo_strict_v2_ears,
                 "MANIFEST_PATH",
                 manifest_path,
-        ), self.assertRaisesRegex(ValueError, "REQ-001 through REQ-045"):
+        ), self.assertRaisesRegex(ValueError, "REQ-001 through REQ-090"):
                 verify_emo_strict_v2_ears._mapped_test_methods()
 
     def test_packaging_verifier_is_bound_to_r18_protocol_identity(self):
