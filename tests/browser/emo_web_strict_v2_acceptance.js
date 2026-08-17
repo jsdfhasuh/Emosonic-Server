@@ -490,10 +490,21 @@ async function run() {
     ), null, { timeout: 15000 });
     await playerTwo.locator('#strict-follow-refresh').click();
     await startFollowTo(playerTwo, sourceContextId);
-    await playerTwo.waitForFunction((contextId) => (
-      window.__emoStrictV2Acceptance.snapshot().followingContextId === contextId
-      && !document.querySelector('#strict-player-audio').paused
-    ), sourceContextId, { timeout: 15000 });
+    try {
+      await playerTwo.waitForFunction((contextId) => (
+        window.__emoStrictV2Acceptance.snapshot().followingContextId === contextId
+        && !document.querySelector('#strict-player-audio').paused
+      ), sourceContextId, { timeout: 15000 });
+    } catch (error) {
+      throw new Error(`Follow did not activate: ${JSON.stringify({
+        playerTwo: await acceptanceSnapshot(playerTwo),
+        playerError: await playerTwo.textContent('#strict-player-error'),
+        followState: await playerTwo.textContent('#strict-follow-state'),
+        control: await acceptanceSnapshot(control),
+        controlError: await control.textContent('#strict-control-error'),
+        server: await acceptanceServerState(control),
+      })}`);
+    }
     await playerTwo.waitForTimeout(600);
     const followStartPosition = await playerTwo.evaluate(() => {
       const audioElement = document.querySelector('#strict-player-audio');
@@ -673,9 +684,23 @@ async function run() {
 
     logStep('verify hidden target rejects Handoff before committing');
     await clickEnabled(control, '[data-control="player.play"]');
-    await control.waitForFunction(() => (
-      document.querySelector('#strict-selected-state')?.textContent === 'playing'
-    ), null, { timeout: 15000 });
+    try {
+      await control.waitForFunction(() => (
+        (() => {
+          const snapshot = window.__emoStrictV2Acceptance.snapshot();
+          const source = snapshot.authorityDeviceState;
+          return document.querySelector('#strict-selected-state')?.textContent === 'playing'
+            && source?.state === 'playing'
+            && source.appliedControlVersion === snapshot.controlVersion;
+        })()
+      ), null, { timeout: 15000 });
+    } catch (error) {
+      throw new Error(`Source did not settle before hidden Handoff: ${JSON.stringify({
+        control: await acceptanceSnapshot(control),
+        controlError: await control.textContent('#strict-control-error'),
+        controlLog: await control.textContent('#strict-control-log'),
+      })}`);
+    }
     await playerTwo.evaluate(() => {
       Object.defineProperty(document, 'visibilityState', {
         configurable: true,

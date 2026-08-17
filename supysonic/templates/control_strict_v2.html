@@ -1265,6 +1265,9 @@
             authorityClientId: state.context?.authorityClientId || null,
             authorityDeviceSessionId: state.context?.authorityDeviceSessionId || null,
             controlVersion: state.context?.controlVersion ?? null,
+            authorityDeviceState: state.deviceStates.find((deviceState) => (
+              deviceState.clientId === state.context?.authorityClientId
+            )) || null,
             broadcastId: state.activeBroadcast?.broadcastId || null,
             broadcastState: state.activeBroadcast?.state || null,
             broadcastRevision: state.activeBroadcast?.broadcastRevision ?? null,
