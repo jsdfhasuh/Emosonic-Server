@@ -516,7 +516,15 @@
       return;
     }
     const closingId = state.contextId;
-    await state.client.request('playback.context.close', { playbackContextId: closingId });
+    const cursor = state.client.cursor(closingId);
+    if (!cursor || !Number.isInteger(cursor.epoch) || !Number.isInteger(cursor.version)) {
+      throw new Error('PlaybackContext cursor is not ready for close');
+    }
+    await state.client.request('playback.context.close', {
+      playbackContextId: closingId,
+      expectedEpoch: cursor.epoch,
+      baseVersion: cursor.version,
+    });
     state.client.forgetSubscription(closingId);
     setContextId(null);
     state.queue = [];

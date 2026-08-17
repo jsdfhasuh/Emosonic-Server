@@ -531,6 +531,7 @@
     )).forEach((device) => {
       const option = document.createElement('option');
       option.value = device.clientId;
+      option.dataset.deviceSessionId = device.deviceSessionId;
       option.textContent = `${displayName(device)} · ${device.clientId}`;
       select.append(option);
     });
@@ -1064,11 +1065,16 @@
 
   async function startHandoff() {
     if (!state.selectedContextId || !state.context) throw new Error('请先选择 source Context');
-    const targetClientId = document.getElementById('strict-handoff-target').value;
-    if (!targetClientId) throw new Error('请选择具备完整 Handoff capability 的目标 player');
+    const targetOption = document.getElementById('strict-handoff-target').selectedOptions[0];
+    const targetClientId = targetOption?.value;
+    const targetDeviceSessionId = targetOption?.dataset.deviceSessionId;
+    if (!targetClientId || !targetDeviceSessionId) {
+      throw new Error('请选择具备完整 Handoff capability 的目标 player');
+    }
     const response = await state.client.request('playback.handoff.start', {
       playbackContextId: state.selectedContextId,
       targetClientId,
+      targetDeviceSessionId,
       baseControlVersion: state.context.controlVersion,
     });
     state.handoff = {

@@ -403,6 +403,11 @@ async function run() {
     await selectControlPlayer(control, playerOneIdentity.clientId);
 
     logStep('verify Handoff rejects target without a user gesture');
+    await playerOne.locator('#strict-play').click();
+    await playerOne.waitForFunction(() => !document.querySelector('#strict-player-audio').paused);
+    await control.waitForFunction(() => (
+      document.querySelector('#strict-selected-state')?.textContent === 'playing'
+    ), null, { timeout: 15000 });
     const noGesturePrior = (await acceptanceSnapshot(control)).handoffId;
     await startHandoffTo(control, playerTwoIdentity.clientId);
     const noGesture = await waitHandoff(control, 'failed', noGesturePrior);
@@ -480,6 +485,9 @@ async function run() {
     logStep('verify player-owned Follow continuity and source network loss cleanup');
     await playerOne.locator('#strict-play').click();
     await playerOne.waitForFunction(() => !document.querySelector('#strict-player-audio').paused);
+    await control.waitForFunction(() => (
+      document.querySelector('#strict-selected-state')?.textContent === 'playing'
+    ), null, { timeout: 15000 });
     await playerTwo.locator('#strict-follow-refresh').click();
     await startFollowTo(playerTwo, sourceContextId);
     await playerTwo.waitForFunction((contextId) => (
@@ -664,6 +672,10 @@ async function run() {
     completedSteps.push('close-and-new-context-id');
 
     logStep('verify hidden target rejects Handoff before committing');
+    await clickEnabled(control, '[data-control="player.play"]');
+    await control.waitForFunction(() => (
+      document.querySelector('#strict-selected-state')?.textContent === 'playing'
+    ), null, { timeout: 15000 });
     await playerTwo.evaluate(() => {
       Object.defineProperty(document, 'visibilityState', {
         configurable: true,
