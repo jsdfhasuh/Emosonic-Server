@@ -110,6 +110,7 @@ from .ws_store import (
     PlaybackContextCloseConflictError,
     PlaybackContextClosedError,
     PlaybackContextEnsureConflictError,
+    PlaybackContextHandoffBarrierError,
     PlaybackContextIntentConflictError,
     PlaybackContextQueueRequiredError,
     PlaybackContextRestoreInProgressError,
@@ -154,6 +155,7 @@ from .ws_store import (
     markStrictPlaybackHandoffCommitEnqueued,
     markPlaybackControlTransactionExecutionEligible,
     mutateStrictPlaybackContextControl,
+    requirePlaybackHandoffTargetResourceAvailable,
     mutateStrictPlaybackContextQueue,
     recoverPendingPlaybackControlsForStartup,
     saveDevicePlaybackState,
@@ -3246,6 +3248,15 @@ def _resolve_strict_broadcast_start_participants(
             if explicit:
                 skipped_client_ids.add(client_id)
             continue
+        try:
+            requirePlaybackHandoffTargetResourceAvailable(
+                playback_context_id=suspended_context_id,
+                user_name=current_user_name,
+                client_id=client_id,
+                device_session_id=device_session_id,
+            )
+        except PlaybackContextHandoffBarrierError as exc:
+            raise BroadcastConflictError(str(exc)) from exc
         device_state = getDevicePlaybackState(suspended_context_id, client_id)
         applied_control_version = (
             0

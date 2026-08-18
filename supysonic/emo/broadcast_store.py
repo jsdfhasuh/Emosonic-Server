@@ -31,7 +31,9 @@ from ..db import (
 )
 from .ws_store import (
     PlaybackContextFollowBarrierError,
+    PlaybackContextHandoffBarrierError,
     requireFollowSafetyLeaseResourceAvailable,
+    requirePlaybackHandoffTargetResourceAvailable,
     strictAuthorityPairLockSet,
     strictPlaybackContextLockSet,
 )
@@ -631,6 +633,15 @@ def _start_participant_is_available(
         )
     except PlaybackContextFollowBarrierError:
         return False
+    try:
+        requirePlaybackHandoffTargetResourceAvailable(
+            playback_context_id=context_id,
+            user_name=user_name,
+            client_id=client_id,
+            device_session_id=str(participant["deviceSessionId"]),
+        )
+    except PlaybackContextHandoffBarrierError:
+        return False
     if (
         EmoBroadcastFence.select()
         .where(EmoBroadcastFence.resource_key.in_((context_key, pair_key)))
@@ -921,6 +932,12 @@ def createBroadcastState(
                     requireFollowSafetyLeaseResourceAvailable(
                         playback_context_id=playback_context_id,
                     )
+                    requirePlaybackHandoffTargetResourceAvailable(
+                        playback_context_id=playback_context_id,
+                        user_name=user_name,
+                        client_id=authority_client_id,
+                        device_session_id=authority_device_session_id,
+                    )
                     selected_participants = list(participant_payloads)
                     if skip_unavailable_participants:
                         selected_participants = []
@@ -961,6 +978,14 @@ def createBroadcastState(
                         selected_participants = selected_participants[:available_slots]
                     for participant in selected_participants:
                         requireFollowSafetyLeaseResourceAvailable(
+                            playback_context_id=str(
+                                participant["suspendedPlaybackContextId"]
+                            ),
+                            user_name=user_name,
+                            client_id=str(participant["clientId"]),
+                            device_session_id=str(participant["deviceSessionId"]),
+                        )
+                        requirePlaybackHandoffTargetResourceAvailable(
                             playback_context_id=str(
                                 participant["suspendedPlaybackContextId"]
                             ),

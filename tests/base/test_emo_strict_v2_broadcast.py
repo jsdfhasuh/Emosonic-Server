@@ -3859,6 +3859,74 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         )
         self.assertEqual(unchanged_source["authorityClientId"], "other-source")
 
+    def test_cross_profile_occupancy_matrix_preserves_source_and_blocks_target(self):
+        authority, _participant, controller = self.connect_broadcast_devices()
+
+        source_generation = get_state().get_current_physical_generation(
+            "alice",
+            "authority-1",
+            "device:authority-1",
+        )
+        source_context = getPlaybackContextState("context-broadcast-source")
+        db.EmoPlaybackHandoff.create(
+            handoff_id="handoff-source-only-matrix",
+            playback_context_id="context-broadcast-source",
+            user_name="alice",
+            source_client_id=source_generation["clientId"],
+            source_device_session_id=source_generation["deviceSessionId"],
+            source_connection_nonce=source_generation["connectionNonce"],
+            source_connection_epoch=source_generation["connectionEpoch"],
+            target_client_id="unselected-target",
+            target_device_session_id="device:unselected-target",
+            target_connection_nonce="unselected-target-nonce",
+            target_connection_epoch=1,
+            status="preparing",
+            base_control_version=source_context["controlVersion"],
+            context_epoch=source_context["epoch"],
+            provisional_control_version=source_context["controlVersion"] + 1,
+            snapshot_json=json.dumps({
+                "completeExpiresAtMs": int(time.time() * 1000) + 10000,
+            }),
+        )
+
+        accepted = self.get_ack(
+            self.start_strict_broadcast(
+                controller,
+                participants=["participant-1"],
+                request_id="broadcast-source-handoff-source-matrix",
+                intent_id="broadcast-source-handoff-source-matrix",
+            ),
+            "broadcast-source-handoff-source-matrix",
+        )
+        self.assertEqual(accepted["payload"]["participants"], ["participant-1"])
+        self.assertEqual(
+            getPlaybackContextState("context-broadcast-source")["authorityClientId"],
+            "authority-1",
+        )
+        db.EmoPlaybackHandoff.update(status="failed").where(
+            db.EmoPlaybackHandoff.handoff_id == "handoff-source-only-matrix"
+        ).execute()
+
+    def test_broadcast_start_rejects_handoff_target_before_persisting_rows(self):
+        _authority, _participant, controller = self.connect_broadcast_devices()
+        self.create_raced_handoff("handoff-participant-target-matrix")
+        before = getPlaybackContextState("context-participant-original")
+
+        messages = self.start_strict_broadcast(
+            controller,
+            request_id="broadcast-handoff-target-matrix",
+            intent_id="broadcast-handoff-target-matrix",
+            participants=["participant-1"],
+        )
+        error = self.get_error(messages, "broadcast-handoff-target-matrix")
+        self.assertEqual(error["payload"]["code"], "conflict")
+        self.assertEqual(
+            getPlaybackContextState("context-participant-original"),
+            before,
+        )
+        self.assertEqual(db.EmoBroadcast.select().count(), 0)
+        self.assertEqual(db.EmoBroadcastFence.select().count(), 0)
+
     def test_restore_pending_ensure_is_cached_without_side_effects(self):
         authority, participant, controller = self.connect_broadcast_devices()
         start_ack = self.get_ack(

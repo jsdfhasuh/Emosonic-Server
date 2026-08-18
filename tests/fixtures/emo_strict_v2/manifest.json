@@ -828,12 +828,14 @@
       ]
     },
     "REQ-041": {
-      "profiles": ["core"],
-      "testModules": ["tests.base.test_emo_strict_v2_core"],
+      "profiles": ["core", "broadcast"],
+      "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_strict_v2_broadcast"],
       "testMethods": [
         "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_authority_disconnect_settles_pending_unknown_without_playback_update",
         "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_socket_replacement_settles_old_pending_and_never_replays_command",
-        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_restart_marks_pending_unknown_without_replaying_to_reconnected_player"
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_restart_marks_pending_unknown_without_replaying_to_reconnected_player",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_cross_profile_occupancy_matrix_preserves_source_and_blocks_target",
+        "tests.base.test_emo_strict_v2_broadcast.StrictV2BroadcastTestCase.test_broadcast_start_rejects_handoff_target_before_persisting_rows"
       ]
     },
     "REQ-042": {

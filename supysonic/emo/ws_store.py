@@ -998,6 +998,35 @@ def requirePlaybackHandoffResourceAvailable(
             _raise_handoff_fence(record)
 
 
+def requirePlaybackHandoffTargetResourceAvailable(
+    playback_context_id=None,
+    user_name=None,
+    client_id=None,
+    device_session_id=None,
+):
+    """Reject resources occupied by a Handoff target overlay.
+
+    A normal Context may remain the source of both Follow and Broadcast while
+    a Handoff is active.  Only the target pair and its standby Context are
+    mutually exclusive with a Broadcast ordinary participant/source pair.
+    """
+    records = _active_handoff_records(user_name=user_name)
+    for record in records:
+        snapshot = _handoff_snapshot(record)
+        if (
+            playback_context_id is not None
+            and snapshot.get("targetStandbyPlaybackContextId")
+            == playback_context_id
+        ):
+            _raise_handoff_fence(record, playback_context_id)
+        if (
+            user_name is not None
+            and record.target_client_id == client_id
+            and record.target_device_session_id == device_session_id
+        ):
+            _raise_handoff_fence(record)
+
+
 def requireFollowSafetyLeaseResourceAvailable(
     playback_context_id=None,
     user_name=None,
