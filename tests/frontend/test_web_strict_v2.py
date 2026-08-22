@@ -101,7 +101,6 @@ class WebStrictV2FrontendTestCase(FrontendTestBase):
             "playback.handoff.complete",
             "const handoffCommit = message.action === 'player.play' && payload.handoffId",
             "const hasIdleStandby = Boolean(",
-            "safePlay('播放失败').then(() => reportFeedback())",
             "feedbackMutation: Promise.resolve()",
             "state.controlLeases.delete(leaseKey)",
             "contextSnapshots: new Map()",
@@ -129,6 +128,25 @@ class WebStrictV2FrontendTestCase(FrontendTestBase):
             self.assertIn(profile, response.data)
         self.assertIn("stopFollow('source offline')", response.data)
         self.assertIn("broadcast.status", response.data)
+
+    def test_strict_player_loads_primary_track_and_syncs_first_queue_item(self):
+        self.set_protocol("strict_v2")
+
+        response = self.client.get("/player")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("const contextAlreadyExists = Boolean(state.contextId)", response.data)
+        self.assertIn("if (contextAlreadyExists) await syncAuthorityQueue()", response.data)
+        self.assertNotIn("if (state.queue.length > 1) await syncAuthorityQueue()", response.data)
+        self.assertIn("const currentTrackId = state.queue[state.index]", response.data)
+        self.assertIn(
+            "runQueueMutation(() => playIndex(state.index, positionMs, true, false))",
+            response.data,
+        )
+        self.assertNotIn(
+            "safePlay('播放失败').then(() => reportFeedback())",
+            response.data,
+        )
 
     def test_strict_control_uses_context_cursor_and_disables_unsupported_operations(self):
         self.set_protocol("strict_v2")

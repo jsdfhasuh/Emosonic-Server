@@ -1230,12 +1230,13 @@
   async function addTrack(track) {
     if (state.followingContextId || state.broadcastExecution) throw new Error('Follow/Broadcast 活动时不能修改 authority 队列');
     if (state.queue.includes(track.id)) throw new Error('strict-v2 队列不支持重复曲目');
+    const contextAlreadyExists = Boolean(state.contextId);
     state.trackMeta[track.id] = track;
     state.queue.push(track.id);
     if (state.queue.length === 1) state.index = 0;
     renderQueue();
     await ensureContext();
-    if (state.queue.length > 1) await syncAuthorityQueue();
+    if (contextAlreadyExists) await syncAuthorityQueue();
   }
 
   async function resetDevice() {
@@ -1296,7 +1297,14 @@
     });
     document.getElementById('strict-play').addEventListener('click', () => {
       state.userGestureSeen = true;
-      safePlay('播放失败').then(() => reportFeedback());
+      const currentTrackId = state.queue[state.index];
+      if (!currentTrackId) {
+        showError('media_unavailable: missing track');
+        return;
+      }
+      const positionMs = audio.dataset.trackId === currentTrackId ? currentPositionMs() : 0;
+      runQueueMutation(() => playIndex(state.index, positionMs, true, false))
+        .catch((error) => showError(error.message));
     });
     document.getElementById('strict-pause').addEventListener('click', () => { audio.pause(); state.playbackState = 'paused'; reportFeedback(); });
     document.getElementById('strict-next').addEventListener('click', () => {
