@@ -122,6 +122,7 @@
   const audio = document.getElementById('strict-player-audio');
   const api = window.EmoStrictV2;
   const META_BATCH_SIZE = 50;
+  const FOLLOW_LEASE_PHASES = new Set(['active', 'reconnectGrace', 'cleanupRequired']);
   const clientId = api.stableIdentity(localStorage, 'emosonic.webPlayer.clientId.v2', 'web-player-');
   const deviceSessionId = api.stableIdentity(localStorage, 'emosonic.webPlayer.deviceSessionId.v2', 'web-player-device:');
   const ownerToken = api.stableIdentity(sessionStorage, 'emosonic.webPlayer.ownerToken.v2', 'web-player-tab:');
@@ -152,6 +153,8 @@
     bindings: [],
     userGestureSeen: false,
     followingContextId: null,
+    followLeasePhase: null,
+    followLeaseKnown: false,
     followTimer: null,
     activeBroadcastId: persistedBroadcastRecovery?.broadcastId || null,
     broadcastContextId: persistedBroadcastRecovery?.playbackContextId || null,
@@ -209,18 +212,32 @@
   function clearError() { document.getElementById('strict-player-error').classList.add('d-none'); }
   function updateCapabilityUi() {
     const ready = state.client && state.client.state === 'ready';
-    const followEnabled = ready && state.client.capability('supportsFollow');
-    document.getElementById('strict-follow-start').disabled = !followEnabled;
-    document.getElementById('strict-follow-stop').disabled = !followEnabled || !state.followingContextId;
+    const followEnabled = ready
+      && state.followLeaseKnown
+      && state.client.capability('supportsFollow');
+    document.getElementById('strict-follow-start').disabled = !followEnabled || Boolean(state.followingContextId);
+    document.getElementById('strict-follow-stop').disabled = !ready || !state.followingContextId;
   }
   function clearTransientFollow(reason) {
     const sourcePlaybackContextId = state.followingContextId;
     if (!sourcePlaybackContextId) return;
     if (state.client) state.client.forgetSubscription(sourcePlaybackContextId);
     state.followingContextId = null;
+    state.followLeasePhase = null;
     clearInterval(state.followTimer);
     state.followTimer = null;
     text('strict-follow-state', reason ? `stopped: ${reason}` : 'solo');
+    updateCapabilityUi();
+  }
+  function suspendTransientFollow(reason) {
+    const sourcePlaybackContextId = state.followingContextId;
+    if (!sourcePlaybackContextId) return;
+    if (state.client) state.client.forgetSubscription(sourcePlaybackContextId);
+    clearInterval(state.followTimer);
+    state.followTimer = null;
+    audio.pause();
+    state.playbackState = 'paused';
+    text('strict-follow-state', `recovery pending: ${reason || state.followLeasePhase || 'connection lost'}`);
     updateCapabilityUi();
   }
   function clearPendingPrepare(reason) {
@@ -541,7 +558,7 @@
     if (!state.contextId) return;
     try {
       const response = await state.client.subscribe(state.contextId);
-      applyContext(response.payload.playbackContext);
+      if (!state.followingContextId) await applyContext(response.payload.playbackContext);
     } catch (error) {
       if (['not_found', 'context_closed'].includes(error.code)) {
         setContextId(null);
@@ -678,6 +695,46 @@
     });
   }
 
+  async function restoreFollowLease() {
+    const url = new URL(bootstrap.followLeaseUrl, window.location.origin);
+    url.searchParams.set('clientId', clientId);
+    url.searchParams.set('deviceSessionId', deviceSessionId);
+    const response = await fetch(url, {
+      credentials: 'same-origin',
+      cache: 'no-store',
+    });
+    if (!response.ok) throw new Error(`Follow 状态恢复失败 (${response.status})`);
+    const payload = await response.json();
+    const lease = payload?.lease;
+    if (lease === null) {
+      state.followLeaseKnown = true;
+      if (state.followingContextId) clearTransientFollow('server lease cleared');
+      else updateCapabilityUi();
+      return null;
+    }
+    if (
+      !lease
+      || typeof lease.sourcePlaybackContextId !== 'string'
+      || !lease.sourcePlaybackContextId
+      || typeof lease.suspendedPlaybackContextId !== 'string'
+      || !lease.suspendedPlaybackContextId
+      || !FOLLOW_LEASE_PHASES.has(lease.phase)
+    ) throw new Error('Follow 状态响应无效');
+    state.followLeaseKnown = true;
+    state.followingContextId = lease.sourcePlaybackContextId;
+    state.followLeasePhase = lease.phase;
+    clearInterval(state.followTimer);
+    state.followTimer = null;
+    audio.pause();
+    state.playbackState = 'paused';
+    const label = lease.phase === 'cleanupRequired'
+      ? `cleanup required: ${lease.sourcePlaybackContextId}`
+      : `recovery pending (${lease.phase}): ${lease.sourcePlaybackContextId}`;
+    text('strict-follow-state', label);
+    updateCapabilityUi();
+    return lease;
+  }
+
   async function startFollow() {
     if (!state.client.capability('supportsFollow')) throw new Error('capability_required: supportsFollow');
     if (!state.userGestureSeen) throw new Error('请先点击本页播放按钮以授权媒体播放');
@@ -685,11 +742,15 @@
     if (!sourcePlaybackContextId) throw new Error('请选择 Follow 播放源');
     await state.client.request('follow.start', { sourcePlaybackContextId, deviceSessionId });
     state.followingContextId = sourcePlaybackContextId;
+    state.followLeasePhase = 'active';
     try {
       await state.client.subscribe(sourcePlaybackContextId);
     } catch (error) {
-      await state.client.request('follow.stop', { sourcePlaybackContextId }).catch(() => {});
-      clearTransientFollow('subscribe failed');
+      try {
+        await stopFollow('subscribe failed');
+      } catch (stopError) {
+        log(`Follow cleanup failed: ${stopError.message}`, 'error');
+      }
       throw error;
     }
     text('strict-follow-state', `following ${sourcePlaybackContextId}`);
@@ -703,7 +764,12 @@
   async function stopFollow(reason) {
     const sourcePlaybackContextId = state.followingContextId;
     if (!sourcePlaybackContextId) return;
-    await state.client.request('follow.stop', { sourcePlaybackContextId }).catch((error) => log(error.message, 'error'));
+    try {
+      await state.client.request('follow.stop', { sourcePlaybackContextId });
+    } catch (error) {
+      suspendTransientFollow('stop failed');
+      throw error;
+    }
     await state.client.unsubscribe(sourcePlaybackContextId).catch(() => {});
     clearTransientFollow(reason);
     if (state.contextId) {
@@ -1219,7 +1285,9 @@
     } else if (action === 'playback.context.closed') {
       state.client.forgetSubscription(message.payload.playbackContextId);
       if (message.payload.playbackContextId === state.contextId) setContextId(null);
-      if (message.payload.playbackContextId === state.followingContextId) stopFollow('source closed');
+      if (message.payload.playbackContextId === state.followingContextId) {
+        stopFollow('source closed').catch((error) => showError(error.message));
+      }
     } else if (action.startsWith('broadcast.')) {
       applyBroadcast(message).catch((error) => showError(error.message));
     } else if (action === 'system.error') {
@@ -1381,7 +1449,8 @@
       onState(connectionState, detail) {
         text('strict-connection-state', connectionState);
         if (['disconnected', 'offline', 'protocol_error'].includes(connectionState)) {
-          clearTransientFollow('connection lost');
+          state.followLeaseKnown = false;
+          suspendTransientFollow('connection lost');
           clearPendingPrepare('connection lost');
           if (state.broadcastExecution) {
             audio.pause();
@@ -1400,7 +1469,14 @@
       onEvent,
       onDebug(summary) { log(JSON.stringify(summary), 'debug'); },
       onReady() {
-        restoreContext()
+        restoreFollowLease()
+          .catch((error) => {
+            state.followLeaseKnown = false;
+            updateCapabilityUi();
+            showError(error.message);
+            return null;
+          })
+          .then(restoreContext)
           .then(ensureContext)
           .then(refreshBindings)
           .then(reportDeviceVolume)
@@ -1445,6 +1521,8 @@
             connectionState: state.client.state,
             contextId: state.contextId,
             followingContextId: state.followingContextId,
+            followLeasePhase: state.followLeasePhase,
+            followLeaseKnown: state.followLeaseKnown,
             activeBroadcastId: state.activeBroadcastId,
             playbackState: state.playbackState,
             userGestureSeen: state.userGestureSeen,

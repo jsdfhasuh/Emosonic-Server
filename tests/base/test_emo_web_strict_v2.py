@@ -592,6 +592,102 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
         closeStrictPlaybackContextState("ctx-alice", "alice")
         self.assertEqual(self.http.get("/emo/web-context-bindings").json, {"bindings": []})
 
+    def test_follow_lease_status_is_exact_user_scoped_minimal_and_no_store(self):
+        lease = {
+            "sourcePlaybackContextId": "ctx-source",
+            "suspendedPlaybackContextId": "ctx-suspended",
+            "phase": "cleanupRequired",
+            "followerConnectionNonce": "secret-follower-nonce",
+            "sourceConnectionNonce": "secret-source-nonce",
+            "leaseFingerprint": "secret-fingerprint",
+        }
+        unauthenticated = self.http.get(
+            "/emo/web-follow-lease",
+            query_string={
+                "clientId": "web-player-follower",
+                "deviceSessionId": "web-player-device:follower",
+            },
+        )
+        self.assertEqual(unauthenticated.status_code, 302)
+
+        self.login()
+        with mock.patch(
+            "supysonic.frontend.getFollowSafetyLeaseForFollower",
+            return_value=lease,
+        ) as get_lease:
+            response = self.http.get(
+                "/emo/web-follow-lease",
+                query_string={
+                    "clientId": "web-player-follower",
+                    "deviceSessionId": "web-player-device:follower",
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertEqual(response.headers["Pragma"], "no-cache")
+        self.assertEqual(
+            response.json,
+            {
+                "lease": {
+                    "sourcePlaybackContextId": "ctx-source",
+                    "suspendedPlaybackContextId": "ctx-suspended",
+                    "phase": "cleanupRequired",
+                }
+            },
+        )
+        get_lease.assert_called_once_with(
+            "alice",
+            "web-player-follower",
+            "web-player-device:follower",
+        )
+        serialized = json.dumps(response.json)
+        self.assertNotIn("ConnectionNonce", serialized)
+        self.assertNotIn("Fingerprint", serialized)
+
+        with mock.patch(
+            "supysonic.frontend.getFollowSafetyLeaseForFollower",
+            return_value=None,
+        ):
+            missing = self.http.get(
+                "/emo/web-follow-lease",
+                query_string={
+                    "clientId": "web-player-follower",
+                    "deviceSessionId": "web-player-device:follower",
+                },
+            )
+        self.assertEqual(missing.json, {"lease": None})
+
+    def test_follow_lease_status_rejects_ambiguous_device_identity(self):
+        self.login()
+        invalid_queries = (
+            {},
+            {"clientId": "web-player-follower"},
+            {"clientId": "", "deviceSessionId": "device-1"},
+            {"clientId": "client-1", "deviceSessionId": ""},
+            {"clientId": "x" * 129, "deviceSessionId": "device-1"},
+            {
+                "clientId": "client-1",
+                "deviceSessionId": "device-1",
+                "unexpected": "value",
+            },
+            [
+                ("clientId", "client-1"),
+                ("clientId", "client-2"),
+                ("deviceSessionId", "device-1"),
+            ],
+        )
+        with mock.patch(
+            "supysonic.frontend.getFollowSafetyLeaseForFollower"
+        ) as get_lease:
+            for query in invalid_queries:
+                with self.subTest(query=query):
+                    response = self.http.get(
+                        "/emo/web-follow-lease",
+                        query_string=query,
+                    )
+                    self.assertEqual(response.status_code, 400)
+        get_lease.assert_not_called()
+
     def test_acceptance_state_is_default_off_and_reports_non_secret_liveness(self):
         createStrictPlaybackContextState(
             "ctx-alice",
@@ -1053,6 +1149,23 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
             start_ack["payload"]["suspendedPlaybackContextId"],
             "ctx-suspended",
         )
+        lease_status = self.http.get(
+            "/emo/web-follow-lease",
+            query_string={
+                "clientId": "web-player-follower",
+                "deviceSessionId": "web-player-device:follower",
+            },
+        )
+        self.assertEqual(
+            lease_status.json,
+            {
+                "lease": {
+                    "sourcePlaybackContextId": "ctx-source",
+                    "suspendedPlaybackContextId": "ctx-suspended",
+                    "phase": "active",
+                }
+            },
+        )
         self.assertEqual(
             {
                 "suspendedAuthorityClientId": start_ack["payload"][
@@ -1117,6 +1230,16 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
         )
         self.assertEqual(stop_ack["payload"], {"action": "follow.stop"})
         self.assertIsNone(get_state().get_follow_relationship("web-player-follower"))
+        self.assertEqual(
+            self.http.get(
+                "/emo/web-follow-lease",
+                query_string={
+                    "clientId": "web-player-follower",
+                    "deviceSessionId": "web-player-device:follower",
+                },
+            ).json,
+            {"lease": None},
+        )
         for message in start_messages + [status_response, stop_ack]:
             self.assert_no_session_fields(message)
 

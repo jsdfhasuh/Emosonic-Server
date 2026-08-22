@@ -148,6 +148,47 @@ class WebStrictV2FrontendTestCase(FrontendTestBase):
             response.data,
         )
 
+    def test_strict_player_recovers_durable_follow_before_context_and_stops_reliably(self):
+        self.set_protocol("strict_v2")
+        response = self.client.get("/player")
+
+        self.assertEqual(response.status_code, 200)
+        for evidence in (
+            "followLeaseUrl",
+            "async function restoreFollowLease()",
+            "FOLLOW_LEASE_PHASES.has(lease.phase)",
+            "lease.phase === 'cleanupRequired'",
+            "state.followLeaseKnown = true",
+            "state.followLeaseKnown = false",
+            "suspendTransientFollow('connection lost')",
+            "await state.client.request('follow.stop', { sourcePlaybackContextId });",
+            "suspendTransientFollow('stop failed')",
+            "if (!state.followingContextId) await applyContext(response.payload.playbackContext)",
+        ):
+            self.assertIn(evidence, response.data)
+        self.assertNotIn(
+            "state.client.request('follow.stop', { sourcePlaybackContextId }).catch",
+            response.data,
+        )
+        ready = response.data[response.data.index("onReady() {") :]
+        self.assertLess(
+            ready.index("restoreFollowLease()"),
+            ready.index(".then(restoreContext)"),
+        )
+        self.assertLess(
+            ready.index(".catch((error) =>"),
+            ready.index(".then(restoreContext)"),
+        )
+        self.assertIn("return null;", ready[: ready.index(".then(restoreContext)")])
+        self.assertIn(
+            "document.getElementById('strict-follow-stop').disabled = !ready || !state.followingContextId",
+            response.data,
+        )
+        self.assertIn(
+            "&& state.followLeaseKnown",
+            response.data,
+        )
+
     def test_strict_control_uses_context_cursor_and_disables_unsupported_operations(self):
         self.set_protocol("strict_v2")
         response = self.client.get("/control")

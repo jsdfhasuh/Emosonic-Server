@@ -59,6 +59,7 @@ from ..emo.browser_auth import (
     BrowserOneTimePasswordRateLimited,
     browser_one_time_passwords,
 )
+from ..emo.follow_store import getFollowSafetyLeaseForFollower
 from ..emo.ws_store import listUserPlaybackContexts
 from ..home_smart_cards import build_home_smart_cards
 from ..managers.user import UserManager
@@ -230,6 +231,7 @@ def _emo_browser_bootstrap() -> Dict[str, object]:
         "userName": request.user.name,
         "authPasswordUrl": url_for("frontend.emo_browser_auth_password"),
         "contextBindingsUrl": url_for("frontend.emo_web_context_bindings"),
+        "followLeaseUrl": url_for("frontend.emo_web_follow_lease"),
         "csrfToken": csrf_token,
         "protocol": _emo_web_protocol(),
         "strictV2Profiles": {
@@ -374,6 +376,52 @@ def emo_web_context_bindings() -> Response:
         )
     bindings.sort(key=lambda item: item["clientId"])
     return _no_store(jsonify({"bindings": bindings}))
+
+
+def _emo_web_exact_identifier(field_name: str) -> str:
+    values = request.args.getlist(field_name)
+    if len(values) != 1 or not values[0] or len(values[0]) > 128:
+        abort(400, description="Invalid %s" % field_name)
+    return values[0]
+
+
+@frontend.route("/emo/web-follow-lease")
+@login_only
+def emo_web_follow_lease() -> Response:
+    if set(request.args) != {"clientId", "deviceSessionId"}:
+        abort(400, description="Follow lease query requires an exact device pair")
+    client_id = _emo_web_exact_identifier("clientId")
+    device_session_id = _emo_web_exact_identifier("deviceSessionId")
+    lease = getFollowSafetyLeaseForFollower(
+        request.user.name,
+        client_id,
+        device_session_id,
+    )
+    if lease is None:
+        return _no_store(jsonify({"lease": None}))
+
+    source_context_id = lease.get("sourcePlaybackContextId")
+    suspended_context_id = lease.get("suspendedPlaybackContextId")
+    phase = lease.get("phase")
+    if (
+        not isinstance(source_context_id, str)
+        or not source_context_id
+        or not isinstance(suspended_context_id, str)
+        or not suspended_context_id
+        or phase not in {"active", "reconnectGrace", "cleanupRequired"}
+    ):
+        abort(500, description="Follow safety lease is invalid")
+    return _no_store(
+        jsonify(
+            {
+                "lease": {
+                    "sourcePlaybackContextId": source_context_id,
+                    "suspendedPlaybackContextId": suspended_context_id,
+                    "phase": phase,
+                }
+            }
+        )
+    )
 
 
 @frontend.route("/emo/web-strict-v2-acceptance-state")

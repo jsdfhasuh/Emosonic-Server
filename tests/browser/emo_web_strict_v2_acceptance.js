@@ -12,6 +12,7 @@ const ROOT = path.resolve(__dirname, '..', '..');
 const PORT = Number(process.env.EMO_BROWSER_PORT || 5081);
 const BASE_URL = `http://127.0.0.1:${PORT}`;
 const PYTHON = process.env.PYTHON || 'python';
+const FOLLOW_RECOVERY_ONLY = process.env.EMO_BROWSER_FOLLOW_RECOVERY_ONLY === '1';
 const TEST_SERVER_BUILD_COMMIT = 'e'.repeat(40);
 const STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'emosonic-web-strict-v2-'));
 const serverLogs = [];
@@ -260,6 +261,72 @@ async function contextBindings(page) {
   });
 }
 
+async function followLease(page) {
+  return page.evaluate(async () => {
+    const acceptance = window.__emoStrictV2Acceptance;
+    const query = new URLSearchParams({
+      clientId: acceptance.clientId,
+      deviceSessionId: acceptance.deviceSessionId,
+    });
+    const response = await fetch(`/emo/web-follow-lease?${query.toString()}`, {
+      credentials: 'same-origin',
+      cache: 'no-store',
+    });
+    if (!response.ok) throw new Error(`Follow lease query failed (${response.status})`);
+    return (await response.json()).lease;
+  });
+}
+
+async function verifyFollowReloadCleanup(player, sourceContextId, restartServerForRecovery) {
+  await player.locator('#strict-follow-refresh').click();
+  await startFollowTo(player, sourceContextId);
+  await player.waitForFunction((contextId) => (
+    window.__emoStrictV2Acceptance.snapshot().followingContextId === contextId
+    && !document.querySelector('#strict-player-audio').paused
+  ), sourceContextId, { timeout: 15000 });
+  const leaseBeforeReload = await followLease(player);
+  assert.equal(leaseBeforeReload.sourcePlaybackContextId, sourceContextId);
+  assert.equal(leaseBeforeReload.phase, 'active');
+
+  await restartServerForRecovery();
+  await player.reload({ waitUntil: 'domcontentloaded' });
+  await waitReady(player, '#strict-connection-state');
+  await player.waitForFunction((contextId) => {
+    const acceptance = window.__emoStrictV2Acceptance.snapshot();
+    const stop = document.querySelector('#strict-follow-stop');
+    const audioElement = document.querySelector('#strict-player-audio');
+    return acceptance.followingContextId === contextId
+      && acceptance.followLeaseKnown
+      && stop
+      && !stop.disabled
+      && audioElement.paused;
+  }, sourceContextId, { timeout: 15000 });
+  const recoveredFollow = await acceptanceSnapshot(player);
+  assert.equal(recoveredFollow.followLeasePhase, 'reconnectGrace');
+  assert.match(
+    await player.textContent('#strict-follow-state'),
+    /recovery pending|cleanup required/,
+  );
+  await clickEnabled(player, '#strict-follow-stop');
+  await player.waitForFunction(() => (
+    window.__emoStrictV2Acceptance.snapshot().followingContextId === null
+  ), null, { timeout: 15000 });
+  await player.waitForFunction(async () => {
+    const acceptance = window.__emoStrictV2Acceptance;
+    const query = new URLSearchParams({
+      clientId: acceptance.clientId,
+      deviceSessionId: acceptance.deviceSessionId,
+    });
+    const response = await fetch(`/emo/web-follow-lease?${query.toString()}`, {
+      credentials: 'same-origin',
+      cache: 'no-store',
+    });
+    return response.ok && (await response.json()).lease === null;
+  }, null, { timeout: 15000 });
+  assert.equal(await followLease(player), null);
+  return recoveredFollow;
+}
+
 async function acceptanceServerState(page) {
   return page.evaluate(async () => {
     const response = await fetch('/emo/web-strict-v2-acceptance-state', {
@@ -435,6 +502,42 @@ async function run() {
       playerTwo.waitForFunction(() => !document.querySelector('#strict-player-audio').paused),
     ]);
     completedSteps.push('local-audio-user-gesture');
+
+    if (FOLLOW_RECOVERY_ONLY) {
+      logStep('restart server, reload follower, and verify durable Follow cleanup');
+      const recoveredFollow = await verifyFollowReloadCleanup(
+        playerTwo,
+        sourceContextId,
+        async () => {
+          await stopServer(server);
+          await Promise.all([
+            playerOne.waitForFunction(() => (
+              window.__emoStrictV2Acceptance.snapshot().connectionState !== 'ready'
+            )),
+            playerTwo.waitForFunction(() => (
+              window.__emoStrictV2Acceptance.snapshot().connectionState !== 'ready'
+            )),
+          ]);
+          await playerTwo.evaluate(() => (
+            window.__emoStrictV2Acceptance.disconnectTransport()
+          ));
+          server = startServer();
+          await waitForServer();
+          await waitReady(playerOne, '#strict-connection-state');
+          await playerOne.waitForFunction((contextId) => (
+            window.__emoStrictV2Acceptance.snapshot().contextId === contextId
+          ), sourceContextId);
+        },
+      );
+      assert.deepEqual(pageErrors, []);
+      process.stdout.write(`FOLLOW_RECOVERY_ACCEPTANCE_RESULT=${JSON.stringify({
+        sourceContextId,
+        recoveredPhase: recoveredFollow.followLeasePhase,
+        audioResumedAutomatically: false,
+        leaseCleared: true,
+      })}\n`);
+      return;
+    }
 
     logStep('verify remote control and stale cursor refresh/retry');
     await selectControlPlayer(control, playerOneIdentity.clientId);
