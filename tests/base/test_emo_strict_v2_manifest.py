@@ -106,6 +106,51 @@ class StrictV2ManifestTestCase(unittest.TestCase):
             {"REQ-%03d" % number for number in range(1, 91)},
         )
 
+    def test_legacy_context_candidate_errata_is_reflected_in_contract(self):
+        repository_root = Path(__file__).resolve().parents[2]
+        contract_root = self.contract_path.parent / "emosonic_strict_v2_contract"
+        sources = {
+            contract_root
+            / "phase-1-core"
+            / "07-server-device-context-and-status.md": (
+                "authority_device_session_id IS NULL",
+                "不构成 strict-v2 active Context 候选",
+                "不参与多个候选 conflict",
+            ),
+            contract_root
+            / "phase-3-conformance"
+            / "11a-common-and-core-requirements.md": (
+                "authority_device_session_id IS NULL",
+                "不得参与返回、重绑或多个候选 conflict",
+                "多个有效非空候选",
+            ),
+            contract_root
+            / "phase-3-conformance"
+            / "13-integration-acceptance.md": (
+                "authority_device_session_id IS NULL",
+                "legacy active 行",
+                "不创建、重绑或修改 Context",
+            ),
+        }
+        for source, expected_fragments in sources.items():
+            content = source.read_text(encoding="utf-8")
+            with self.subTest(source=str(source.relative_to(repository_root))):
+                for fragment in expected_fragments:
+                    self.assertIn(fragment, content)
+
+        errata_path = (
+            repository_root
+            / "ref"
+            / "2026-09-02-strict-v2-legacy-context-candidate-errata.md"
+        )
+        self.assertTrue(errata_path.is_file())
+        errata = errata_path.read_text(encoding="utf-8")
+        for source in sources:
+            relative_source = str(source.relative_to(repository_root)).replace(
+                "\\", "/"
+            )
+            self.assertIn(relative_source, errata)
+
     def test_historical_realtime_goals_are_marked_superseded(self):
         repository_root = Path(__file__).resolve().parents[2]
         historical_goals = (

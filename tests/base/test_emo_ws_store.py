@@ -6350,6 +6350,64 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 "idle",
             )
 
+    def test_ensure_ignores_legacy_null_rows_but_fails_on_real_candidates(self):
+        createStrictPlaybackContextState(
+            "legacy-null-context",
+            "alice",
+            "player-1",
+            None,
+            ["legacy-song"],
+            0,
+            0,
+            "paused",
+        )
+        for context_id, device_session_id in (
+            ("context-old-1", "device:old-1"),
+            ("context-old-2", "device:old-2"),
+        ):
+            createStrictPlaybackContextState(
+                context_id,
+                "alice",
+                "player-1",
+                device_session_id,
+                ["song-1"],
+                0,
+                0,
+                "paused",
+            )
+
+        with self.assertRaises(PlaybackContextEnsureConflictError):
+            ensureStrictPlaybackContextState(
+                "alice",
+                "player-1",
+                "device:current",
+                [],
+                None,
+                0,
+                "idle",
+            )
+
+        self.assertEqual(
+            listActivePlaybackContextBindings(
+                "alice",
+                "player-1",
+                "device:current",
+            ),
+            [],
+        )
+        contexts = listUserPlaybackContexts("alice")
+        self.assertEqual(
+            {context["playbackContextId"] for context in contexts},
+            {
+                "legacy-null-context",
+                "context-old-1",
+                "context-old-2",
+            },
+        )
+        self.assertTrue(
+            all(context["lifecycle"] == "active" for context in contexts)
+        )
+
     def test_ensure_returns_exact_pair_when_legacy_active_contexts_remain(self):
         for context_id in (
             "device:player-1",

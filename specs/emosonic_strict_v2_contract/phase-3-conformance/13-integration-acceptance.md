@@ -59,6 +59,9 @@
    binding，status 中 queueSongIds 为空、state idle、currentIndex/trackId 均省略；
 22. 同 client/device 重复 ensure 返回同一 Context 且 cursor 不变；相同 stable clientId 以新
    deviceSession 重连时，旧 session 已离线后 ensure 重绑同一 Context ID，并只按矩阵递增 cursor；
+22a. 仅存在一个或多个 `authority_device_session_id IS NULL` 的 legacy active 行时，ensure 创建并返回
+   绑定当前 exact pair 的新 Context，且 legacy active 行保持不变；legacy active 行与两个有效非空
+   exact-pair 候选并存时，ensure 返回 conflict，并且不创建、重绑或修改 Context；
 23. 已有 canonical queue-backed Context 时，ensure 携带不同本地队列不得无版本覆盖；response 返回
    canonical，authority 只有使用最新 cursors 的显式 queue.context.sync 才能替换；
 24. idle Context 上直接发送 player.play、pause、seek、next、prev 或 queue.playItem 均返回

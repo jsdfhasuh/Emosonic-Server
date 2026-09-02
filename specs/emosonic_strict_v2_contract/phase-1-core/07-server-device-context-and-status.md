@@ -291,6 +291,13 @@ Context：
 
 服务端必须在 `(authenticated user, stable clientId)` 原子临界区内执行：
 
+下列决策中的 strict-v2 active Context 候选必须同时具有非空 `authorityClientId` 与
+`authorityDeviceSessionId`，从而形成完整的 exact authority pair。历史迁移遗留的
+`authority_device_session_id IS NULL` active 行不构成 strict-v2 active Context 候选：不得把它作为
+当前 Context 返回或重绑，也不参与多个候选 conflict。服务端不得仅因 ensure 而删除、关闭、回填或
+修改这些 legacy 行。完成该过滤后，零个候选按第 3 项创建，一个候选按第 1/2 项返回或重绑，多个
+有效非空候选按第 4 项 fail-closed。
+
 1. 当前 clientId/deviceSessionId 已绑定唯一 active Context：
    - canonical Context 为 idle 且请求携带非空队列时，以请求快照初始化同一个 Context，递增
      version、queueRevision、controlVersion 后返回；
@@ -302,7 +309,7 @@ Context：
    使用请求快照初始化，否则保留旧 canonical queue；cursor 按第 4.5 节组合规则递增后返回；
 3. 没有 active Context：由服务端生成不可复用的 playbackContextId，按请求快照直接创建
    queue-backed 或 idle Context；
-4. 存在多个候选、旧 deviceSession 仍在线、当前连接不是 player、`canPlay:false` 或请求
+4. 存在多个有效非空候选、旧 deviceSession 仍在线、当前连接不是 player、`canPlay:false` 或请求
    deviceSessionId 不匹配时 fail-closed，不得创建第二个 Context。
 
 ensure 成功后当前 Socket 自动订阅该 Context。新建或重绑必须在 direct response 结算后按第 6.1.2

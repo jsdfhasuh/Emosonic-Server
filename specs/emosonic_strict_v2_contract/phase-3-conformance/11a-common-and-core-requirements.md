@@ -141,6 +141,11 @@ active/terminal replay，不得用启动 ensure 穿透 suspended/restore 屏障�
 旧 Context，或按该快照创建/初始化 Context。服务端不得要求设备先实际发声或由 controller 创建
 Context，也不得产生第二个 active Context。
 
+当服务端为 ensure 计算候选时，active 行必须具有完整、非空的 authority client/device exact pair。
+`authority_device_session_id IS NULL` 的 legacy active 行不构成 strict-v2 候选，不得参与返回、重绑或多个候选 conflict，
+也不得仅因 ensure 而被删除、关闭、回填或修改。过滤后没有候选时必须创建新 Context；只有一个有效
+候选时按上述规则返回或重绑；存在多个有效非空候选时必须 fail-closed，且不得创建、重绑或修改 Context。
+
 **REQ-028 — Idle Context closed shape**
 当 Context 队列为空时，服务端必须输出 `queueSongIds:[]`、`state:"idle"`、`positionMs:0`，并省略
 currentIndex/trackId；当队列非空时必须输出合法 currentIndex 与匹配 trackId，且 state 不得为 idle。
