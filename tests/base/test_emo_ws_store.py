@@ -6401,6 +6401,76 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         self.assertEqual(canonical["queueSongIds"], ["song-1"])
         self.assertEqual(canonical["positionMs"], 250)
 
+    def test_ensure_recreates_context_when_only_legacy_active_rows_remain(self):
+        legacy_context_ids = (
+            "device:player-1",
+            "player-1",
+        )
+        for context_id in legacy_context_ids:
+            createStrictPlaybackContextState(
+                context_id,
+                "alice",
+                "player-1",
+                None,
+                ["legacy-song"],
+                0,
+                0,
+                "paused",
+            )
+        createStrictPlaybackContextState(
+            "playback:closed-canonical",
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["old-song"],
+            0,
+            250,
+            "playing",
+        )
+        closeStrictPlaybackContextState(
+            "playback:closed-canonical",
+            "alice",
+        )
+
+        result = ensureStrictPlaybackContextState(
+            "alice",
+            "player-1",
+            "device:player-1",
+            ["song-1"],
+            0,
+            500,
+            "playing",
+        )
+
+        recreated, mutated = result
+        self.assertTrue(mutated)
+        self.assertTrue(result.binding_mutated)
+        self.assertTrue(recreated["playbackContextId"].startswith("playback:"))
+        self.assertNotIn(recreated["playbackContextId"], legacy_context_ids)
+        self.assertNotEqual(
+            recreated["playbackContextId"],
+            "playback:closed-canonical",
+        )
+        self.assertEqual(
+            recreated["authorityDeviceSessionId"],
+            "device:player-1",
+        )
+        self.assertEqual(recreated["queueSongIds"], ["song-1"])
+        self.assertEqual(
+            listActivePlaybackContextBindings(
+                "alice",
+                "player-1",
+                "device:player-1",
+            ),
+            [
+                {
+                    "playbackContextId": recreated["playbackContextId"],
+                    "authorityClientId": "player-1",
+                    "authorityDeviceSessionId": "device:player-1",
+                }
+            ],
+        )
+
     def test_queue_sync_crosses_idle_boundary_with_closed_snapshot(self):
         createStrictPlaybackContextState(
             "context-1",

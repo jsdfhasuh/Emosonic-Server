@@ -5041,6 +5041,7 @@ def _active_context_records_for_stable_client(user_name, client_id):
             (EmoPlaybackContext.user_name == user_name)
             & (EmoPlaybackContext.lifecycle == "active")
             & (EmoPlaybackContext.authority_client_id == client_id)
+            & EmoPlaybackContext.authority_device_session_id.is_null(False)
         )
         .order_by(EmoPlaybackContext.playback_context_id)
         .limit(3)
