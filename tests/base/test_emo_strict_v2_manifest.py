@@ -18,8 +18,8 @@ class StrictV2ManifestTestCase(unittest.TestCase):
         )
         cls.manifest = json.loads(cls.manifest_path.read_text(encoding="utf-8"))
 
-    def test_manifest_tracks_r18_without_runtime_metadata_pinning(self):
-        self.assertEqual(self.manifest["protocolVersion"], "2.8.0")
+    def test_manifest_tracks_r19_without_runtime_metadata_pinning(self):
+        self.assertEqual(self.manifest["protocolVersion"], "2.9.0")
         self.assertIsInstance(self.manifest.get("contractSha256"), str)
 
     def test_manifest_covers_every_strict_client_action(self):
@@ -75,7 +75,7 @@ class StrictV2ManifestTestCase(unittest.TestCase):
                 self.assertEqual(validator.required, required)
                 self.assertEqual(validator.optional, optional)
 
-    def test_authoritative_contract_covers_every_r18_requirement(self):
+    def test_authoritative_contract_covers_every_r19_requirement(self):
         entry = self.contract_path.read_text(encoding="utf-8")
         authoritative_sources = (
             "emosonic_strict_v2_contract/phase-3-conformance/"

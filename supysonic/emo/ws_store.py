@@ -123,6 +123,12 @@ class PlaybackControlTransactionConflictError(Exception):
     pass
 
 
+class PlaybackPassiveAppliedVersionConflictError(
+    PlaybackControlTransactionConflictError
+):
+    pass
+
+
 class PlaybackControlReconciliationConflictError(Exception):
     pass
 
@@ -3852,23 +3858,9 @@ def applyStrictPlaybackUpdate(
                         "appliedControlVersion exceeds canonical controlVersion"
                     )
                 if last_applied is not None and applied < last_applied:
-                    canonical = _settle_stale_playback_correction(
-                        record,
-                        existing,
-                        existing_json,
-                        connection_nonce,
-                        request_fingerprint,
-                        incoming_client_seq,
+                    raise PlaybackPassiveAppliedVersionConflictError(
+                        "Passive playback appliedControlVersion is stale"
                     )
-                    return {
-                        "playbackContext": current,
-                        "deviceState": _device_playback_state_payload(existing),
-                        "canonicalUpdate": canonical,
-                        "created": False,
-                        "sourceOnly": True,
-                        "dependencySettlements": [],
-                        "terminalControlVersions": [],
-                    }
                 if last_applied is not None and applied != last_applied:
                     raise PlaybackControlTransactionConflictError(
                         "Passive update cannot advance appliedControlVersion"

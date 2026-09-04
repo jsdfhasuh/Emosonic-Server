@@ -1,11 +1,12 @@
 # 阶段 3：Broadcast 实现要求
 
-> [返回 r18 权威入口](../../emosonic_strict_v2_socketio_server_contract.md)
-> 文档修订：`2026-08-01-r18`；协议版本：`2.8.0`
+> [返回 r19 权威入口](../../emosonic_strict_v2_socketio_server_contract.md)
+> 文档修订：`2026-09-04-r19`；协议版本：`2.9.0`
 > 覆盖范围：原契约第 7 节 REQ-039—REQ-067、REQ-088—REQ-090。本文件是完整契约的一个规范分卷，不能脱离入口列出的公共规则单独解释。
 **REQ-039 — Source-derived Broadcast projection**
 当服务端创建或更新 Broadcast 时，必须把 source PlaybackContext 作为唯一播放事实源；start 播放字段
-只能从状态为 playing 的已结算 source Context/DevicePlaybackState 派生，paused/stopped 不得 start。
+只能从状态为 playing、`clientSeq>=1` 且 applied==control 的当前 authority exact-pair
+DevicePlaybackState 派生，Context/Queue snapshot 或内部 baseline 不能替代；paused/stopped 不得 start。
 start 必须用持久化 intentId 跨连接重放首次 broadcastId，且每个 source Context 最多一个非终态
 Broadcast。Broadcast control 必须在 source Context 事务中创建普通 control transaction；
 BroadcastSnapshot 的 source cursors 在 active/waitingForSource 期间必须精确等于 source Context，
@@ -52,8 +53,9 @@ recovery/fence，不得相互清理。
 **REQ-043 — Source reconnect follows actual state**
 当 active Broadcast 的 source authority 断线时，服务端必须进入 waitingForSource、保持 source Context
 cursors 不变并用 `broadcast.waiting` 暂停 ordinary mirrors。相同 client/device 重连后必须等待新连接的合法 playback.update
-与 Context 对账；无论实际 playing/paused/stopped 都用唯一 `broadcast.resume` 携带实际 state，不要求
-手工 broadcast.play。不同 deviceSession 不继承，30 秒超时后 terminal stopped 且不可复活。
+与 Context 对账；该真实状态必须来自当前 physical nonce/epoch、`clientSeq>=1` 且 applied==control。
+无论实际 playing/paused/stopped 都用唯一 `broadcast.resume` 携带实际 state，不要求手工 broadcast.play。
+不同 deviceSession 不继承，30 秒超时后 terminal stopped 且不可复活。
 
 **REQ-044 — Broadcast terminal idempotency**
 当服务端接受 broadcast.stop 时，必须只物化一个 terminal snapshot，并向 source 与每个 ordinary
@@ -92,7 +94,9 @@ follow.stop、handoff.cancel 与 matching raced ready/prepared negative cleanup 
 当 authority state=playing 时，客户端必须至少每 1000ms 发送 passive playback.update。Broadcast start
 以及需要 playing anchor 的 control 只能使用 serverUpdatedAtMs 与 positionSampledAtServerMs
 都不超过 2000ms 的 DevicePlaybackState；位置必须从采样时间投影，不得从接收时间投影；
-状态过期返回 conflict，不生成 Broadcast target。
+状态过期返回 conflict，不生成 Broadcast target。该 DevicePlaybackState 必须属于当前 authority exact
+pair/physical nonce/epoch、`clientSeq>=1` 且 applied==control；`clientSeq=0` baseline 与任一 Context/Queue
+snapshot 都不能满足 freshness 或 readiness。
 
 **REQ-049 — Participant outcome and deadline**
 当服务端分发 Broadcast target 时，participantStates 必须从 pending 开始，并以最早未确认 target

@@ -21,6 +21,7 @@ from ..db import (
     EmoPlaybackControlTransaction,
     User,
     close_connection,
+    connection_scope,
     open_connection,
 )
 from ..logging_utils import format_log_event
@@ -119,6 +120,7 @@ from .ws_store import (
     PlaybackHandoffTargetConflictError,
     PlaybackContextStaleVersionError,
     PlaybackControlTransactionConflictError,
+    PlaybackPassiveAppliedVersionConflictError,
     PlaybackClientSequenceConflictError,
     PlaybackLocalIntentConflictError,
     closeStrictPlaybackContextState,
@@ -204,6 +206,7 @@ strict_request_cache = StrictRequestCache()
 _control_watchdog_lock = threading.RLock()
 _control_watchdog_generation = 0
 _control_watchdog_tokens = {}
+_CONTROL_WATCHDOG_DB_BACKOFF_SECONDS = (1, 2, 4, 8, 16, 30)
 _source_terminal_replay_lock = threading.RLock()
 _source_terminal_replays = {}
 _ordinary_control_dispatch_barriers_guard = threading.Lock()
@@ -9920,39 +9923,97 @@ def _sweep_expired_control_transactions(
     )
 
 
+def _is_database_connection_exhausted(error: BaseException) -> bool:
+    pending = [error]
+    visited = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        if current.args and current.args[0] == 1040:
+            return True
+        for nested in (current.__cause__, current.__context__):
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+    return False
+
+
+def _run_control_watchdog_sweep_step(callback, failure_message):
+    try:
+        return callback()
+    except Exception as exc:
+        if _is_database_connection_exhausted(exc):
+            raise
+        logger.exception(failure_message)
+        return None
+
+
+def _sweep_broadcast_authority_disconnects() -> None:
+    terminal_broadcasts = sweepBroadcastAuthorityDisconnectDeadlines()
+    for terminal_broadcast in terminal_broadcasts:
+        _emit_r18_broadcast_projection(terminal_broadcast)
+
+
+def _run_control_watchdog_sweep_round() -> None:
+    with connection_scope(reuse=True):
+        _run_control_watchdog_sweep_step(
+            _sweep_permanent_device_decommissions,
+            "Strict permanent device decommission sweep failed",
+        )
+        _run_control_watchdog_sweep_step(
+            _sweep_expired_control_transactions,
+            "Strict playback control watchdog sweep failed",
+        )
+        _run_control_watchdog_sweep_step(
+            sweepBroadcastFeedbackDeadlines,
+            "Strict Broadcast feedback deadline sweep failed",
+        )
+        _run_control_watchdog_sweep_step(
+            _sweep_broadcast_authority_disconnects,
+            "Strict Broadcast source timeout sweep failed",
+        )
+        _run_control_watchdog_sweep_step(
+            _sweep_follow_safety_leases,
+            "Strict Follow safety lease sweep failed",
+        )
+        _run_control_watchdog_sweep_step(
+            compactExpiredBroadcastStates,
+            "Strict Broadcast terminal compaction failed",
+        )
+
+
 def _control_watchdog_sweep_later(generation: int) -> None:
+    delay_seconds = 1
+    backoff_index = 0
     while _control_watchdog_is_active(None, generation):
-        socketio.sleep(1)
+        socketio.sleep(delay_seconds)
         if not _control_watchdog_is_active(None, generation):
             return
         try:
-            _sweep_permanent_device_decommissions()
-        except Exception:
-            logger.exception(
-                "Strict permanent device decommission sweep failed"
+            _run_control_watchdog_sweep_round()
+        except Exception as exc:
+            if not _is_database_connection_exhausted(exc):
+                logger.exception("Strict control watchdog sweep round failed")
+                delay_seconds = 1
+                backoff_index = 0
+                continue
+            delay_seconds = _CONTROL_WATCHDOG_DB_BACKOFF_SECONDS[
+                min(
+                    backoff_index,
+                    len(_CONTROL_WATCHDOG_DB_BACKOFF_SECONDS) - 1,
+                )
+            ]
+            backoff_index += 1
+            logger.warning(
+                "Strict control watchdog database connection exhausted; "
+                "retrying full sweep in %s seconds",
+                delay_seconds,
             )
-        try:
-            _sweep_expired_control_transactions()
-        except Exception:
-            logger.exception("Strict playback control watchdog sweep failed")
-        try:
-            sweepBroadcastFeedbackDeadlines()
-        except Exception:
-            logger.exception("Strict Broadcast feedback deadline sweep failed")
-        try:
-            terminal_broadcasts = sweepBroadcastAuthorityDisconnectDeadlines()
-            for terminal_broadcast in terminal_broadcasts:
-                _emit_r18_broadcast_projection(terminal_broadcast)
-        except Exception:
-            logger.exception("Strict Broadcast source timeout sweep failed")
-        try:
-            _sweep_follow_safety_leases()
-        except Exception:
-            logger.exception("Strict Follow safety lease sweep failed")
-        try:
-            compactExpiredBroadcastStates()
-        except Exception:
-            logger.exception("Strict Broadcast terminal compaction failed")
+            continue
+        delay_seconds = 1
+        backoff_index = 0
 
 
 def _matching_control_generation_sid(
@@ -14603,6 +14664,40 @@ class EmoNamespace(Namespace):
                 "queue_required",
                 str(exc),
                 request_id,
+                **_live_context_cursor_fields(
+                    playback_context,
+                    current_user_name,
+                ),
+            )
+        except PlaybackPassiveAppliedVersionConflictError as exc:
+            playback_context_id = payload.get("playbackContextId")
+            playback_context = (
+                getPlaybackContextStateForUser(
+                    playback_context_id,
+                    current_user_name,
+                )
+                if isinstance(playback_context_id, str) and playback_context_id
+                else None
+            ) or {}
+            _log_emo_event(
+                logging.WARNING,
+                _get_action_event_name(action) or "playback_update",
+                result="conflict",
+                reason=str(exc),
+                **_build_action_log_context(
+                    action,
+                    request_id,
+                    current_user_name,
+                    current_client,
+                    payload,
+                    message,
+                ),
+            )
+            _send_error(
+                "conflict",
+                str(exc),
+                request_id,
+                retryable=True,
                 **_live_context_cursor_fields(
                     playback_context,
                     current_user_name,

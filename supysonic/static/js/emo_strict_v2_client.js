@@ -471,7 +471,7 @@
       if (
         !versionMatch
         || Number(versionMatch[1]) !== 2
-        || Number(versionMatch[2]) < 8
+        || Number(versionMatch[2]) < 9
       ) {
         throw new StrictProtocolError(`Unsupported strict-v2 protocol version: ${String(version)}`);
       }

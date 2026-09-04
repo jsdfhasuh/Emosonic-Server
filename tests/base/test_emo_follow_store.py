@@ -286,6 +286,38 @@ class EmoFollowStoreTestCase(unittest.TestCase):
                 )
                 self.assertEqual(db.EmoFollowSafetyLease.select().count(), 0)
 
+    def test_create_rejects_internal_baseline_for_source_and_suspended(self):
+        for context_id, client_id in (
+            ("context-source", "source-1"),
+            ("context-suspended", "follower-1"),
+        ):
+            with self.subTest(context_id=context_id):
+                query = db.EmoDevicePlaybackState.update(client_seq=0).where(
+                    (
+                        db.EmoDevicePlaybackState.playback_context_id
+                        == context_id
+                    )
+                    & (db.EmoDevicePlaybackState.owner_client_id == client_id)
+                )
+                query.execute()
+
+                with self.assertRaises(FollowSafetyLeaseConflictError) as conflict:
+                    self._create_lease()
+
+                self.assertEqual(
+                    conflict.exception.playback_context_id,
+                    context_id,
+                )
+                self.assertEqual(db.EmoFollowSafetyLease.select().count(), 0)
+                query = db.EmoDevicePlaybackState.update(client_seq=1).where(
+                    (
+                        db.EmoDevicePlaybackState.playback_context_id
+                        == context_id
+                    )
+                    & (db.EmoDevicePlaybackState.owner_client_id == client_id)
+                )
+                query.execute()
+
     def test_durable_start_replay_precedes_live_context_validation(self):
         first, created = self._create_lease()
         self.assertTrue(created)

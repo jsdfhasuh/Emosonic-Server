@@ -1212,6 +1212,71 @@ class StrictV2CoreTestCase(unittest.TestCase):
             10,
         )
 
+    def test_stale_passive_applied_version_returns_retryable_conflict(self):
+        client = self.ready_strict_client()
+        self.create_context(client)
+        updated = emo_store.mutateStrictPlaybackContextQueue(
+            "context-1",
+            "alice",
+            "phone-1",
+            "device:phone-1",
+            ["song-1", "song-2"],
+            0,
+            1200,
+            1,
+            1,
+            position_sampled_at_server_ms=1,
+        )
+        before_context = emo_ws.getPlaybackContextState("context-1")
+        before_feedback = emo_ws.getDevicePlaybackState("context-1", "phone-1")
+
+        response = self.emit_strict(
+            client,
+            "event",
+            "playback.update",
+            "playback-update-stale-applied",
+            {
+                "playbackContextId": "context-1",
+                "deviceSessionId": "device:phone-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "positionMs": 1200,
+                "clientSeq": 1,
+                "trackId": "song-2",
+            },
+        )
+
+        self.assertEqual(len(response), 1)
+        self.assertEqual(response[0]["action"], "system.error")
+        self.assertEqual(response[0]["payload"]["action"], "playback.update")
+        self.assertEqual(response[0]["payload"]["code"], "conflict")
+        self.assertTrue(response[0]["payload"]["retryable"])
+        self.assertEqual(
+            response[0]["payload"]["currentEpoch"],
+            updated["epoch"],
+        )
+        self.assertEqual(
+            response[0]["payload"]["currentControlVersion"],
+            updated["controlVersion"],
+        )
+        self.assertEqual(
+            response[0]["payload"]["currentQueueRevision"],
+            updated["queueRevision"],
+        )
+        self.assertEqual(
+            response[0]["payload"]["currentVersion"],
+            updated["version"],
+        )
+        self.assertEqual(
+            emo_ws.getPlaybackContextState("context-1"),
+            before_context,
+        )
+        self.assertEqual(
+            emo_ws.getDevicePlaybackState("context-1", "phone-1"),
+            before_feedback,
+        )
+
     def test_playback_update_same_sequence_and_content_is_idempotent(self):
         client = self.ready_strict_client()
         self.create_context(client, state="stopped", position_ms=0)
@@ -3781,7 +3846,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
             )
         )
 
-    def test_stale_applied_update_returns_passive_correction_only_to_source(self):
+    def test_stale_passive_update_returns_conflict_only_to_source(self):
         player = self.ready_strict_client()
         self.create_context(player)
         self.emit_strict(
@@ -3845,7 +3910,9 @@ class StrictV2CoreTestCase(unittest.TestCase):
         )
         self.messages(controller)
 
-        correction = self.emit_strict(
+        before_context = getPlaybackContextState("context-1")
+        before_device = emo_ws.getDevicePlaybackState("context-1", "phone-1")
+        rejection = self.emit_strict(
             player,
             "event",
             "playback.update",
@@ -3861,10 +3928,15 @@ class StrictV2CoreTestCase(unittest.TestCase):
                 "clientSeq": 3,
             },
         )
-        self.assertEqual([message["action"] for message in correction], ["playback.update"])
-        self.assertEqual(correction[0]["payload"]["origin"], "passive")
-        self.assertEqual(correction[0]["payload"]["appliedControlVersion"], 2)
-        self.assertEqual(correction[0]["payload"]["state"], "paused")
+        self.assertEqual([message["action"] for message in rejection], ["system.error"])
+        self.assertEqual(rejection[0]["payload"]["action"], "playback.update")
+        self.assertEqual(rejection[0]["payload"]["code"], "conflict")
+        self.assertTrue(rejection[0]["payload"]["retryable"])
+        self.assertEqual(getPlaybackContextState("context-1"), before_context)
+        self.assertEqual(
+            emo_ws.getDevicePlaybackState("context-1", "phone-1"),
+            before_device,
+        )
         self.assertEqual(self.messages(controller), [])
 
     def test_local_user_update_allocates_server_version_and_supersedes_pending(self):
@@ -5076,6 +5148,11 @@ class StrictV2CoreTestCase(unittest.TestCase):
         self.assertEqual(status_device["volume"], 40)
         self.assertIs(status_device["muted"], True)
 
+        context_before_stale = getPlaybackContextState("context-1")
+        device_before_stale = emo_ws.getDevicePlaybackState(
+            "context-1",
+            "phone-1",
+        )
         stale = self.emit_strict(
             client,
             "event",
@@ -5096,19 +5173,21 @@ class StrictV2CoreTestCase(unittest.TestCase):
         )
         self.assertEqual(
             [message["action"] for message in stale],
-            ["playback.update"],
+            ["system.error"],
         )
-        correction = stale[0]["payload"]
-        self.assertEqual(correction["clientSeq"], 2)
-        self.assertEqual(correction["appliedControlVersion"], 2)
-        self.assertEqual(correction["trackId"], "song-1")
-        corrected_device = emo_ws.getDevicePlaybackState(
-            "context-1",
-            "phone-1",
+        conflict = stale[0]["payload"]
+        self.assertEqual(conflict["action"], "playback.update")
+        self.assertEqual(conflict["code"], "conflict")
+        self.assertTrue(conflict["retryable"])
+        self.assertEqual(conflict["currentControlVersion"], 2)
+        self.assertEqual(
+            getPlaybackContextState("context-1"),
+            context_before_stale,
         )
-        self.assertEqual(corrected_device["clientSeq"], 2)
-        self.assertEqual(corrected_device["appliedControlVersion"], 2)
-        self.assertEqual(corrected_device["positionMs"], 500)
+        self.assertEqual(
+            emo_ws.getDevicePlaybackState("context-1", "phone-1"),
+            device_before_stale,
+        )
 
         passive = self.emit_strict(
             client,
@@ -5125,7 +5204,7 @@ class StrictV2CoreTestCase(unittest.TestCase):
                 "positionMs": 600,
                 "positionSampledAtServerMs": 300,
                 "playbackRate": 1.25,
-                "clientSeq": 3,
+                "clientSeq": 2,
             },
         )
         self.assertEqual(

@@ -1945,7 +1945,13 @@ def _validate_output_error(payload: object) -> str:
         _output_error("system.error code is not part of strict-v2")
     _output_string(error["message"], "system.error payload.message", 512)
     retryable = _output_bool(error["retryable"], "system.error payload.retryable")
-    if retryable != (code in _RETRYABLE_ERROR_CODES):
+    variable_playback_conflict = (
+        request_action == "playback.update" and code == "conflict"
+    )
+    if (
+        not variable_playback_conflict
+        and retryable != (code in _RETRYABLE_ERROR_CODES)
+    ):
         _output_error("system.error retryable does not match code")
     if "playbackContextId" in error:
         _output_string(error["playbackContextId"], "system.error playbackContextId")

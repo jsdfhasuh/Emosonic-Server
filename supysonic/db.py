@@ -54,6 +54,7 @@ from .db_layer.playlists import Playlist, SharedTrackLink
 from .db_layer.review_tasks import AlbumReviewTask, ReviewTask
 from .db_layer.runtime import (
     close_connection,
+    connection_scope,
     init_database,
     open_connection,
     release_database,

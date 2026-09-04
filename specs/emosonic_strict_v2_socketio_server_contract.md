@@ -1,22 +1,26 @@
 # EmoSonic strict-v2 Socket.IO 服务端契约
 
-> 文档状态：Approved r18 authoritative contract
+> 文档状态：Approved r19 authoritative contract
 > 契约冻结状态：Frozen
 > 实现状态：Contract defined / implementation pending
-> 文档修订：2026-08-01-r18
-> 协议版本：`2.8.0`
+> 文档修订：2026-09-04-r19
+> 协议版本：`2.9.0`
 > 读者：EmoSonic 服务端与 Flutter 工程师
 > 范围：PlaybackContext v2 strict-v2。定义客户端与服务端应发送、应接受的协议契约；不保留 `2.3.x` 客户端 shape 或旧 `sessionId` 协议兼容，也不授予 production rollout 权限。
 
 ## 权威性与阅读规则
 
-本路径是 r18 契约的唯一当前权威入口。服务端实现、注册 metadata、测试和变更说明必须以本入口及
-下方全部分卷为准。`2026-08-01-r18 / 2.8.0` 已 Contract Frozen，但契约冻结不表示服务端或 Flutter
+本路径是 r19 契约的唯一当前权威入口。服务端实现、注册 metadata、测试和变更说明必须以本入口及
+下方全部分卷为准。`2026-09-04-r19 / 2.9.0` 已 Contract Frozen，但契约冻结不表示服务端或 Flutter
 已经完成实现，也不表示任何 optional profile ready；具体 capability 仍须按本文 readiness 条件开放。
 
-完整 r18 规范按文件编号 `01` 至 `14`（含 `06a`—`06d`、`11a`—`11c`）由下方 19 个分卷共同组成；分卷只是为了
+完整 r19 规范按文件编号 `01` 至 `14`（含 `06a`—`06d`、`11a`—`11c`）由下方 19 个分卷共同组成；分卷只是为了
 按任务读取、降低上下文消耗，不改变 action、字段、错误码、状态机、章节编号或优先级。单个分卷不能
 被声明为一份独立或替代协议。
+
+r19 沿用未被本轮修改的 r18 分卷正文；这些分卷头部保留其最后一次本地修订身份。凡旧正文把
+`2.8.0` 描述为当前协商门槛时，均由本入口、11a 与 13 的 r19 `2.9.0` 门槛取代；其余 wire shape、
+字段和状态机继续有效。
 
 当注册 metadata Goal、服务端变更说明、实现代码、测试名称、历史草案或任一分卷之外的材料与本契约
 冲突时，应把冲突视为 conformance 缺陷并修正文档或实现。历史 `*change*.md`、带时间后缀的副本以及
@@ -28,19 +32,19 @@
 
 ## 冻结状态、pre-freeze 兼容与后续纪律
 
-本次继续使用 `2.8.0` 是 r18 首次冻结前闭合 wire shape 的单次例外。冻结前构建的旧 `2.8.0` 调试
-服务端与 Flutter 不保证兼容本最终契约；双方必须按最终 r18 成组升级，不支持新旧 pre-freeze
-`2.8.0` 混跑。冻结后发现服务端、Flutter、validator、fixture 或测试与本契约不一致时，默认修正实现
-适配本 r18，不得反向静默修改契约迁就旧实现。
+本次升级到 `2.9.0`，用于冻结 r18 之后发现的 playback feedback 结算、真实设备状态 readiness 与
+watchdog 数据库连接生命周期行为。r18 `2.8.0` 与 r19 `2.9.0` 不保证混跑；双方必须按最终 r19
+成组升级。冻结后发现服务端、Flutter、validator、fixture 或测试与本契约不一致时，默认修正实现
+适配本 r19，不得反向静默修改契约迁就旧实现。
 
-纯错字、链接、示例或不改变行为的文字澄清使用 r18 errata。冻结后新增 action、字段、状态、错误码、
-持久化义务或改变客户端行为，必须进入 r19 并重新评估 `protocolVersion`；不得继续静默改变
-`2.8.0` wire shape。本次冻结不修改协议版本协商，也不改变显式调试环境中 profile implementation
-readiness 默认 `true` 的便利行为；生产 readiness 仍必须 fail-closed。
+纯错字、链接、示例或不改变行为的文字澄清使用 r19 errata。冻结后新增 action、字段、状态、错误码、
+持久化义务或改变客户端行为，必须进入后续修订并重新评估 `protocolVersion`；不得继续静默改变
+`2.9.0` 行为。本次仍不授予 production readiness；显式个人实验室 profile 与生产 fail-closed 规则
+保持不变。
 
-## r18 范围摘要
+## r19 范围摘要
 
-本 r18 使用 strict-v2 `2.8.0` 单一 shape。Core 固定 exact authority pair Context snapshot、四 cursor
+本 r19 使用 strict-v2 `2.9.0` 单一 shape。Core 固定 exact authority pair Context snapshot、四 cursor
 error、Core prepare、device volume、带 dependency/execution timeout 的 routed control、requester exact-pair
 settlement、transitive cascade、terminal-gap reconciliation、安全 close 与 distinct/no-repeat queue 边界。
 Follow 固定 composite capability、current-physical source fact、prewrite/frozen baseline ACK、persistent
@@ -53,6 +57,11 @@ feedback、crash-safe restore、action-aware restorePending write gate、termina
 full-to-compact recovery。管理端 abandon 必须绑定 permanent exact-pair decommission。本轮不保留
 `2.5.0/r12`、`2.6.0/r13`、`2.7.0/r14` Broadcast shape、旧 `sessionId` 或其他兼容分支。只有双方 schema/
 state implementation、自动化与 Android+Windows 真机证据全部满足本文时才可标记 implementation ready。
+
+r19 进一步规定：rejected stale passive 不产生 canonical playback.update；Context/Queue snapshot 不得
+结算 playback feedback；`clientSeq=0` 内部 baseline 不得输出或满足 profile readiness；Follow 与
+Broadcast 只接受当前物理连接的真实 DevicePlaybackState；后台 watchdog 每轮共享一个 owner-aware
+数据库连接，并在 MariaDB 1040 时按有界序列退避整轮。
 
 ## 按任务最小读取集
 
@@ -104,7 +113,7 @@ state implementation、自动化与 Android+Windows 真机证据全部满足本�
 
 ## 维护约束
 
-- Frozen r18 的 wire shape 不再就地修改；行为变化进入 r19 并重新评估协议版本，纯文字修正走 r18 errata。
+- Frozen r19 的 wire shape 与行为不再就地修改；后续行为变化进入新修订并重新评估协议版本，纯文字修正走 r19 errata。
 - 新规则应放入其所属原章节；只有出现新的独立协议域时才新增分卷。
 - 分卷重命名或移动时必须同步更新本清单和仓库引用。
 - 服务端工程师只需要接收本入口及 `emosonic_strict_v2_contract/` 目录；历史草案不应交付。

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect offline automated evidence for one committed strict-v2 r18 build."""
+"""Collect offline automated evidence for one committed strict-v2 r19 build."""
 
 import argparse
 import hashlib
@@ -14,9 +14,9 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 FROZEN_CONTRACT_SHA256 = (
-    "116a36e2359b2f6c525f340187c7daa6fd0e476241c0b190f1145b88b0e6e46f"
+    "eb29368b2ba618e4b43da37b9f12b230772682d233314f927f3ee51c0eb730a1"
 )
-FROZEN_PROTOCOL_VERSION = "2.8.0"
+FROZEN_PROTOCOL_VERSION = "2.9.0"
 PROFILES = ("core", "follow", "handoff", "broadcast")
 class EvidenceError(RuntimeError):
     """Raised when evidence cannot be bound safely to one build."""
@@ -66,9 +66,9 @@ def _validate_metadata(
     manifest: Mapping[str, object],
 ) -> Dict[str, object]:
     if contract_hash != FROZEN_CONTRACT_SHA256:
-        raise EvidenceError("Contract SHA-256 does not match frozen r18")
+        raise EvidenceError("Contract SHA-256 does not match frozen r19")
     if descriptor.get("protocolVersion") != FROZEN_PROTOCOL_VERSION:
-        raise EvidenceError("Registration descriptor is not protocol 2.8.0")
+        raise EvidenceError("Registration descriptor is not protocol 2.9.0")
     for label, value in (
         ("conformance", conformance.get("contractSha256")),
         ("manifest", manifest.get("contractSha256")),
@@ -76,7 +76,7 @@ def _validate_metadata(
         if value != FROZEN_CONTRACT_SHA256:
             raise EvidenceError("%s is bound to a different contract" % label)
     if manifest.get("protocolVersion") != FROZEN_PROTOCOL_VERSION:
-        raise EvidenceError("Executable manifest is not protocol 2.8.0")
+        raise EvidenceError("Executable manifest is not protocol 2.9.0")
 
     requirements = manifest.get("requirements")
     expected_requirements = {
@@ -265,7 +265,7 @@ def _write_summary(
         encoding="utf-8",
     )
     lines = [
-        "# EmoSonic strict-v2 r18 automated evidence",
+        "# EmoSonic strict-v2 r19 automated evidence",
         "",
         "- Server build commit: `%s`" % identity["serverBuildCommit"],
         "- Protocol version: `%s`" % identity["protocolVersion"],
@@ -310,7 +310,7 @@ def main() -> int:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=Path("docs/verification/emosonic_strict_v2_r18"),
+        default=Path("docs/verification/emosonic_strict_v2_r19"),
     )
     parser.add_argument(
         "--server-build-commit",
@@ -353,7 +353,7 @@ def main() -> int:
         _write_summary(output_directory, identity, results)
         return 0 if all(result["exitCode"] == 0 for result in results) else 1
     except (EvidenceError, OSError, subprocess.CalledProcessError) as exc:
-        print("Strict-v2 r18 evidence collection failed: %s" % exc, file=sys.stderr)
+        print("Strict-v2 r19 evidence collection failed: %s" % exc, file=sys.stderr)
         return 1
 
 

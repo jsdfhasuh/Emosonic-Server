@@ -700,7 +700,7 @@ test('unsubscribe failures and terminal Context events always clear local subscr
   assert.equal(client.subscriptions.has('ctx-released'), false);
 });
 
-test('registration metadata uses 2.8 and treats schemaHash as optional observation', () => {
+test('registration metadata uses 2.9 and treats schemaHash as optional observation', () => {
   const client = new StrictV2Client({
     registration: {
       clientId: 'web-player-1',
@@ -716,7 +716,7 @@ test('registration metadata uses 2.8 and treats schemaHash as optional observati
       deviceSessionId: 'web-player-device:1',
       negotiatedCapabilities: HANDOFF_CAPABILITIES,
       strictV2: {
-        protocolVersion: '2.8.0',
+        protocolVersion: '2.9.0',
         schemaHash: SCHEMA_HASH,
         serverBuildCommit: BUILD_COMMIT,
         connectionNonce: 'nonce-1',
@@ -731,7 +731,7 @@ test('registration metadata uses 2.8 and treats schemaHash as optional observati
   unpaired.payload.negotiatedCapabilities.effectiveAtPlayback = false;
   assert.doesNotThrow(() => client._acceptRegistration(unpaired));
   const lowerMinor = JSON.parse(JSON.stringify(message));
-  lowerMinor.payload.strictV2.protocolVersion = '2.7.0';
+  lowerMinor.payload.strictV2.protocolVersion = '2.8.0';
   assert.throws(() => client._acceptRegistration(lowerMinor), /Unsupported/);
   const wrongMajor = JSON.parse(JSON.stringify(message));
   wrongMajor.payload.strictV2.protocolVersion = '3.0.0';
@@ -774,7 +774,7 @@ test('registration requires the fixed remote volume capability field', () => {
       deviceSessionId: 'web-player-device:1',
       negotiatedCapabilities: REMOTE_VOLUME_CAPABILITIES,
       strictV2: {
-        protocolVersion: '2.8.0',
+        protocolVersion: '2.9.0',
         schemaHash: SCHEMA_HASH,
         serverBuildCommit: BUILD_COMMIT,
         connectionNonce: 'nonce-1',
@@ -860,7 +860,7 @@ test('bootstrap fetches a fresh browser OTP and reaches ready with exact registr
       deviceSessionId: 'web-player-device:1',
       negotiatedCapabilities: PLAYER_CAPABILITIES,
       strictV2: {
-        protocolVersion: '2.8.0',
+        protocolVersion: '2.9.0',
         schemaHash: SCHEMA_HASH,
         serverBuildCommit: BUILD_COMMIT,
         connectionNonce: 'nonce-1',
@@ -943,7 +943,7 @@ test('bootstrap fetches a fresh browser OTP and reaches ready with exact registr
       deviceSessionId: 'web-player-device:1',
       negotiatedCapabilities: PLAYER_CAPABILITIES,
       strictV2: {
-        protocolVersion: '2.8.0',
+        protocolVersion: '2.9.0',
         schemaHash: 'c'.repeat(64),
         serverBuildCommit: 'd'.repeat(40),
         connectionNonce: 'nonce-2',

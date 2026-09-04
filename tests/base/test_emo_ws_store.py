@@ -27,6 +27,7 @@ from supysonic.emo.ws_store import (
     PlaybackContextStaleVersionError,
     PlaybackControlTransactionConflictError,
     PlaybackControlReconciliationConflictError,
+    PlaybackPassiveAppliedVersionConflictError,
     PlaybackHandoffTargetConflictError,
     PlaybackLocalIntentConflictError,
     PlaybackPrepareAlreadyActiveError,
@@ -6164,7 +6165,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             before_device,
         )
 
-    def test_stale_applied_feedback_returns_source_only_correction_without_mutation(self):
+    def test_stale_passive_applied_version_raises_conflict_without_mutation(self):
         createStrictPlaybackContextState(
             "context-1",
             "alice",
@@ -6227,27 +6228,32 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             },
             1075,
         )
-        correction = applyStrictPlaybackUpdate(
-            "context-1",
-            "alice",
-            "player-1",
-            "device:player-1",
-            "nonce-1",
-            {
-                "playbackContextId": "context-1",
-                "deviceSessionId": "device:player-1",
-                "origin": "passive",
-                "appliedControlVersion": 1,
-                "state": "playing",
-                "trackId": "song-1",
-                "positionMs": 0,
-                "clientSeq": 3,
-            },
-            1100,
+        before_context = getPlaybackContextState("context-1")
+        before_device = getDevicePlaybackState("context-1", "player-1")
+        with self.assertRaises(PlaybackPassiveAppliedVersionConflictError):
+            applyStrictPlaybackUpdate(
+                "context-1",
+                "alice",
+                "player-1",
+                "device:player-1",
+                "nonce-1",
+                {
+                    "playbackContextId": "context-1",
+                    "deviceSessionId": "device:player-1",
+                    "origin": "passive",
+                    "appliedControlVersion": 1,
+                    "state": "playing",
+                    "trackId": "song-1",
+                    "positionMs": 0,
+                    "clientSeq": 3,
+                },
+                1100,
+            )
+        self.assertEqual(getPlaybackContextState("context-1"), before_context)
+        self.assertEqual(
+            getDevicePlaybackState("context-1", "player-1"),
+            before_device,
         )
-        self.assertTrue(correction["sourceOnly"])
-        self.assertEqual(correction["canonicalUpdate"]["positionMs"], 100)
-        self.assertEqual(correction["canonicalUpdate"]["state"], "paused")
 
     def test_ensure_creates_idle_initializes_same_context_and_rebinds(self):
         idle_result = ensureStrictPlaybackContextState(
@@ -6980,53 +6986,30 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             "playbackRate": 1.0,
             "clientSeq": 1,
         }
-        stale = applyStrictPlaybackUpdate(
-            "context-1",
-            "alice",
-            "player-1",
-            "device:player-1",
-            "nonce-1",
-            stale_payload,
-            1300,
-        )
-        self.assertFalse(stale["created"])
-        self.assertEqual(stale["canonicalUpdate"]["clientSeq"], 1)
-        self.assertEqual(
-            stale["canonicalUpdate"]["appliedControlVersion"],
-            2,
-        )
-        self.assertEqual(
-            getDevicePlaybackState("context-1", "player-1")["clientSeq"],
-            0,
-        )
-        self.assertEqual(getDevicePlaybackStates("context-1"), [])
-
-        replay = applyStrictPlaybackUpdate(
-            "context-1",
-            "alice",
-            "player-1",
-            "device:player-1",
-            "nonce-1",
-            stale_payload,
-            1300,
-        )
-        self.assertFalse(replay["created"])
-        self.assertEqual(
-            replay["canonicalUpdate"],
-            stale["canonicalUpdate"],
-        )
-        conflicting_stale = dict(stale_payload)
-        conflicting_stale["positionMs"] = 1
-        with self.assertRaises(PlaybackClientSequenceConflictError):
-            applyStrictPlaybackUpdate(
-                "context-1",
-                "alice",
-                "player-1",
-                "device:player-1",
-                "nonce-1",
-                conflicting_stale,
-                1350,
+        baseline_before = getDevicePlaybackState("context-1", "player-1")
+        context_before = getPlaybackContextState("context-1")
+        for position_ms in (0, 1):
+            conflicting_stale = dict(stale_payload)
+            conflicting_stale["positionMs"] = position_ms
+            with self.assertRaises(PlaybackPassiveAppliedVersionConflictError):
+                applyStrictPlaybackUpdate(
+                    "context-1",
+                    "alice",
+                    "player-1",
+                    "device:player-1",
+                    "nonce-1",
+                    conflicting_stale,
+                    1300,
+                )
+            self.assertEqual(
+                getPlaybackContextState("context-1"),
+                context_before,
             )
+            self.assertEqual(
+                getDevicePlaybackState("context-1", "player-1"),
+                baseline_before,
+            )
+            self.assertEqual(getDevicePlaybackStates("context-1"), [])
 
         accepted = applyStrictPlaybackUpdate(
             "context-1",
@@ -7044,7 +7027,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                 "positionMs": 50,
                 "positionSampledAtServerMs": 1400,
                 "playbackRate": 1.0,
-                "clientSeq": 2,
+                "clientSeq": 1,
             },
             1500,
         )
@@ -7055,7 +7038,7 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         )
         self.assertEqual(
             getDevicePlaybackStates("context-1")[0]["clientSeq"],
-            2,
+            1,
         )
 
     def test_queue_sync_preserves_pending_gap_and_rejects_control_change(self):

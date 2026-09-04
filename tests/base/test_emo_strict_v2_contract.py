@@ -1059,7 +1059,7 @@ class StrictV2ContractTestCase(unittest.TestCase):
 
     def test_registration_schema_hash_is_optional_and_non_gating(self):
         metadata = {
-            "protocolVersion": "2.8.0",
+            "protocolVersion": "2.9.0",
             "serverBuildCommit": "unknown",
             "connectionNonce": "nonce-1",
             "connectionEpoch": 1,

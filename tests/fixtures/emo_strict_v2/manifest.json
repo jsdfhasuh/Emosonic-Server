@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "protocolVersion": "2.8.0",
-  "contractSha256": "116a36e2359b2f6c525f340187c7daa6fd0e476241c0b190f1145b88b0e6e46f",
+  "protocolVersion": "2.9.0",
+  "contractSha256": "eb29368b2ba618e4b43da37b9f12b230772682d233314f927f3ee51c0eb730a1",
   "sharedErrorConditionFields": [
     "playbackContextId",
     "currentControlVersion",
@@ -775,8 +775,9 @@
       "profiles": ["core"],
       "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
       "testMethods": [
-        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_stale_applied_update_returns_passive_correction_only_to_source",
-        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_stale_applied_feedback_returns_source_only_correction_without_mutation"
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_stale_passive_applied_version_returns_retryable_conflict",
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_stale_passive_update_returns_conflict_only_to_source",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_stale_passive_applied_version_raises_conflict_without_mutation"
       ]
     },
     "REQ-035": {
@@ -842,8 +843,8 @@
       "profiles": ["core"],
       "testModules": ["tests.base.test_emo_strict_v2_core", "tests.base.test_emo_ws_store"],
       "testMethods": [
-        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_stale_applied_update_returns_passive_correction_only_to_source",
-        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_stale_applied_feedback_returns_source_only_correction_without_mutation"
+        "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_stale_passive_update_returns_conflict_only_to_source",
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_stale_passive_applied_version_raises_conflict_without_mutation"
       ]
     },
     "REQ-043": {
@@ -1053,8 +1054,12 @@
     },
     "REQ-071": {
       "profiles": ["core"],
-      "testModules": ["tests.base.test_emo_ws_store", "tests.base.test_emo_strict_v2_core"],
+      "testModules": ["tests.base.test_db_layer_contract", "tests.base.test_emo_control_watchdog", "tests.base.test_emo_ws_store", "tests.base.test_emo_strict_v2_core"],
       "testMethods": [
+        "tests.base.test_db_layer_contract.DbLayerContractTestCase.test_connection_scope_closes_only_the_owned_connection",
+        "tests.base.test_db_layer_contract.DbLayerContractTestCase.test_connection_scope_does_not_close_a_borrowed_connection",
+        "tests.base.test_emo_control_watchdog.EmoControlWatchdogTestCase.test_sweep_round_shares_one_connection_and_keeps_non_db_failures_local",
+        "tests.base.test_emo_control_watchdog.EmoControlWatchdogTestCase.test_connection_exhaustion_backoff_caps_and_resets_after_success",
         "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_execution_eligibility_is_atomic_idempotent_and_starts_watchdog",
         "tests.base.test_emo_strict_v2_core.StrictV2CoreTestCase.test_strict_control_orders_emit_eligibility_watchdog_and_ack"
       ]
@@ -1093,17 +1098,19 @@
     },
     "REQ-076": {
       "profiles": ["follow"],
-      "testModules": ["tests.base.test_emo_strict_v2_follow"],
+      "testModules": ["tests.base.test_emo_strict_v2_follow", "tests.base.test_emo_follow_store"],
       "testMethods": [
         "tests.base.test_emo_strict_v2_follow.StrictV2FollowTestCase.test_follow_composite_capabilities_fail_closed",
-        "tests.base.test_emo_strict_v2_follow.StrictV2FollowTestCase.test_source_capability_and_self_follow_fail_without_side_effects"
+        "tests.base.test_emo_strict_v2_follow.StrictV2FollowTestCase.test_source_capability_and_self_follow_fail_without_side_effects",
+        "tests.base.test_emo_follow_store.EmoFollowStoreTestCase.test_create_rejects_internal_baseline_for_source_and_suspended"
       ]
     },
     "REQ-077": {
       "profiles": ["follow"],
-      "testModules": ["tests.base.test_emo_strict_v2_follow"],
+      "testModules": ["tests.base.test_emo_strict_v2_follow", "tests.base.test_emo_follow_store"],
       "testMethods": [
-        "tests.base.test_emo_strict_v2_follow.StrictV2FollowTestCase.test_follow_start_commit_and_live_state_lock_boundaries"
+        "tests.base.test_emo_strict_v2_follow.StrictV2FollowTestCase.test_follow_start_commit_and_live_state_lock_boundaries",
+        "tests.base.test_emo_follow_store.EmoFollowStoreTestCase.test_create_rejects_internal_baseline_for_source_and_suspended"
       ]
     },
     "REQ-078": {

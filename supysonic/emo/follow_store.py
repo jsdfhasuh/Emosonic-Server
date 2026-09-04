@@ -1295,6 +1295,7 @@ def createFollowSafetyLease(
                     source_device.device_session_id
                     != source_authority_device_session_id
                     or source_device.context_epoch != source_record.epoch
+                    or source_device.client_seq < 1
                     or source_device.applied_control_version
                     != source_record.control_version
                     or source_playback.get("_connectionNonce")
@@ -1308,6 +1309,7 @@ def createFollowSafetyLease(
                     suspended_device.device_session_id
                     != suspended_authority_device_session_id
                     or suspended_device.context_epoch != suspended_record.epoch
+                    or suspended_device.client_seq < 1
                     or suspended_device.applied_control_version
                     != suspended_record.control_version
                     or suspended_playback.get("_connectionNonce")

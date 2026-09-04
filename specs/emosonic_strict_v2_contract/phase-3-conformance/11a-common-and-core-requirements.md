@@ -1,7 +1,7 @@
 # 阶段 3：公共与 Core 实现要求
 
-> [返回 r18 权威入口](../../emosonic_strict_v2_socketio_server_contract.md)
-> 文档修订：`2026-08-01-r18`；协议版本：`2.8.0`
+> [返回 r19 权威入口](../../emosonic_strict_v2_socketio_server_contract.md)
+> 文档修订：`2026-09-04-r19`；协议版本：`2.9.0`
 > 覆盖范围：原契约第 7 节 REQ-001—REQ-038、REQ-068—REQ-087。本文件是完整契约的一个规范分卷，不能脱离入口列出的公共规则单独解释。
 ## 7. 服务端与 Flutter 实现要求（EARS）
 
@@ -16,8 +16,8 @@
 `not_supported`，不得静默转 legacy。
 
 **REQ-003 — 主版本兼容**
-当服务端声称实现本 r18 契约时，`protocolVersion` 必须是 major `2`、minor `>=8`。服务端不得按客户端
-差异返回非空-only 与 idle 两套 Context schema，也不得把 `2.5.x` 或更早 shape 当作本文完成。当 wire
+当服务端声称实现本 r19 契约时，`protocolVersion` 必须是 major `2`、minor `>=9`。服务端不得按客户端
+差异返回非空-only 与 idle 两套 Context schema，也不得把 `2.8.x` 或更早 shape 当作本文完成。当 wire
 shape 再次变化时必须同步更新 protocolVersion 和本文。
 
 **REQ-004 — 收件人 provenance**
@@ -46,10 +46,10 @@ cursor；资源解析必须先限定 authenticated user，跨用户与不存在�
 `targetClientId/targetDeviceSessionId` exact pair，并且只在 authenticated user 域解析；当服务端向目标 Socket 或其他 context 成员推送 Handoff 消息时，服务端
 不得在 envelope 或 payload 中复制该字段。
 
-**REQ-010 — 2.8.x cursor 契约**
+**REQ-010 — 2.9.x cursor 契约**
 当客户端发送第 5.2 节定义的控制或队列请求时，服务端必须继续接受其
 `baseControlVersion` / `baseQueueRevision` 前置条件；服务端不得因为 accepted push 只使用
-`controlVersion` / `queueRevision`，就在 `2.8.x` 内删除请求字段。
+`controlVersion` / `queueRevision`，就在 `2.9.x` 内删除请求字段。
 
 **REQ-011 — 唯一结算**
 当服务端成功处理 strict request 时，服务端必须使用第 4.3 节为该 action 指定的唯一结算
@@ -186,10 +186,17 @@ status deviceStates 和 playback.update 中同时表达两个值。服务端必�
 校验实际 track/state/position，不得要求 pending 期间实际 track 永远等于主 Context 最新控制目标。
 
 **REQ-034 — Applied monotonicity**
-当 playback.update 的 appliedControlVersion 低于该 device 的 lastAppliedControlVersion 时，服务端
-必须忽略其状态副作用并记录迟到反馈；等值允许 passive 事实、匹配 pending command 的 failed 结果
-或相同 terminal 幂等重放；高值必须由按序 remote committed 或 localUser transaction 证明。高于
-canonical controlVersion 的 feedback 必须返回 bad_request。
+当 passive playback.update 的 appliedControlVersion 低于该 device 的 lastAppliedControlVersion 时，
+服务端必须返回 correlated `system.error(code="conflict")`，其 `payload.action` 为 `playback.update`、
+`retryable=true` 并携带当前 Context 四 cursor；不得修改 DevicePlaybackState、clientSeq settlement、
+Context/cursor，也不得广播或用入站 clientSeq 合成 canonical playback.update。等值允许 passive 事实、
+匹配 pending command 的 failed 结果或相同 terminal 幂等重放；高值必须由按序 remote committed 或
+localUser transaction 证明。高于 canonical controlVersion 的 feedback 必须返回 bad_request。
+Flutter 收到该 retryable conflict 后必须保留 dirty playback，读取当前代次 status，并以新的 clientSeq
+重发；只有 connection generation、Context/device identity、origin/transaction、clientSeq、applied cursor
+及全部播放事实都与 pending submission 完整匹配的 canonical playback.update 才能结算该 outbox。
+Context/Queue snapshot 只能结算自身 lane，不得结算 playback dirty。`clientSeq=0` 仅允许服务端内部
+baseline，不得输出到 deviceStates/canonical update，也不得满足 Follow/Broadcast readiness。
 
 **REQ-035 — Local user control allocation**
 当当前 authority 发送合法 localUser committed playback.update 时，服务端必须在 Context 串行区从
@@ -235,7 +242,10 @@ queue.playItem/player.next/player.prev，依赖链允许传递。Windows 必须�
 当 routed control 等待 dependency 或 effective-at 时，服务端与 Windows 都必须从 execution eligibility
 而不是 accepted/routed 时刻开始 timeout。watchdog 必须等于 eligibleAt + executionTimeoutMs + 2000；
 依赖等待不消耗 timeout，effective-at 后超过 1000ms 才 eligible 的命令必须以 effective_at_missed
-失败。
+失败。服务端 watchdog 的每轮六项 sweep 必须在同一 owner-aware 数据库 connection scope 内执行，
+嵌套 store 调用只能借用且不得提前关闭该连接；非 1040 单项异常记录后继续同轮。异常链中出现
+MariaDB/MySQL 1040 时必须立即中止整轮、只记录一次合并 warning，并按 `1/2/4/8/16/30` 秒退避；
+成功完成一轮后退避复位为 1 秒。
 
 **REQ-072 — Server-only control settlement cascade**
 当 authority disconnect、Socket replacement、restart 或 watchdog 使 pending control 结果不可证明时，
@@ -266,15 +276,19 @@ Follow/Broadcast fact。
 **REQ-076 — Follow capability and current source fact**
 当 follower 协商 supportsFollow=true 时，必须同时具备 player、playbackContextV2、effectiveAtPlayback、
 canPlay/canPause/canSeek 和完整 0.5..2.0 rate 能力。source 不要求 supportsFollow，但必须是当前在线
-authority exact pair、通过 clock gate，并提供当前 physical nonce/epoch、settled track/rate fact；playing
-fact 两个时间都必须 <=2000ms，paused/stopped 不使用进度 freshness，idle start queue_required，self
-follow conflict。
+authority exact pair、通过 clock gate，并提供当前 physical nonce/epoch 的真实 DevicePlaybackState；该
+状态必须 `clientSeq>=1`、`appliedControlVersion==controlVersion` 且 track/rate 已结算，Context/Queue
+snapshot 或内部 `clientSeq=0` baseline 不得替代。playing fact 两个时间都必须 <=2000ms，paused/stopped
+不使用进度 freshness，idle start queue_required，self-follow conflict。
 
 **REQ-077 — Crash-safe Follow baseline acquisition**
 当 Flutter 开始 Follow 时，必须在发送 start 前验证 suspended Context/command lane/lease/overlay 并
-持久化 acquiring FollowRecoveryRecord。服务端必须原子冻结 exact authority/cursor/applied baseline、
-建立 relationship/subscription/SafetyLease/fence，并在 start ACK 返回完整 baseline；Flutter 只有逐字段
-匹配并把 record 持久化为 active 后才可触碰音频，任一步失败都必须 fail-closed stop/stopPending。
+从当前连接代次的 status 中取得 suspended authority exact pair 的真实 DevicePlaybackState；该状态必须
+`clientSeq>=1` 且 applied==control，不能以 Context snapshot 的 applied cursor 替代。随后 Flutter 必须
+持久化 acquiring FollowRecoveryRecord。服务端必须以同一真实状态门槛原子冻结 exact authority/cursor/
+applied baseline、建立 relationship/subscription/SafetyLease/fence，并在 start ACK 返回完整 baseline；
+Flutter 只有逐字段匹配并把 record 持久化为 active 后才可触碰音频，任一步失败都必须 fail-closed
+stop/stopPending。
 
 **REQ-078 — Persistent FollowSafetyLease and occupancy fence**
 当 Follow relationship 非终态或 cleanupRequired 时，服务端必须持久化 exact-pair SafetyLease，并阻止
