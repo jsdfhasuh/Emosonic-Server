@@ -27,6 +27,11 @@ Practical guide for coding agents working in `supysonic`.
 - CI tests: coverage + unittest.
 - Docs build: Sphinx via `docs/Makefile`.
 - Core stack includes Flask and Peewee.
+- Docker test container: `test_supysonic` (already deployed).
+- The local Docker CLI is already connected to Unraid's Docker daemon. Access
+  server logs directly with `docker logs test_supysonic`; no SSH step is required.
+  Use `docker logs --tail <N> test_supysonic` when a bounded log sample is
+  sufficient.
 
 Evidence files:
 - `.github/workflows/tests.yaml`
