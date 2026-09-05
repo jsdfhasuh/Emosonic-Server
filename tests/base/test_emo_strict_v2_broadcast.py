@@ -4331,6 +4331,7 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
                 "playbackContextId": "context-broadcast-source",
                 "prepareId": prepare_id,
                 "handoffId": "raced-ready-handoff",
+                "deviceSessionId": "device:participant-1",
                 "ready": ready,
             }
             if error_code is not None:
@@ -4394,6 +4395,55 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         handoff = getPlaybackHandoff("raced-ready-handoff")
         self.assertEqual(handoff["status"], "failed")
         self.assertEqual(handoff["errorCode"], "restore_in_progress")
+        self.assertEqual(
+            getPlaybackContextState("context-broadcast-source"),
+            before,
+        )
+        self.assertEqual(
+            db.EmoBroadcastFence.select()
+            .where(
+                (db.EmoBroadcastFence.client_id == "participant-1")
+                & (db.EmoBroadcastFence.phase == "restorePending")
+            )
+            .count(),
+            restore_fence_count,
+        )
+
+        failed_handoff = self.create_raced_handoff(
+            "raced-commit-failed-handoff",
+            status="committing",
+            prepare_id="raced-commit-failed-prepare",
+        )
+        participant.emit(
+            "message",
+            {
+                "type": "command",
+                "action": "playback.handoff.cancel",
+                "requestId": "restore-handoff-commit-failed-allowed",
+                "payload": {
+                    "playbackContextId": "context-broadcast-source",
+                    "handoffId": failed_handoff["handoffId"],
+                    "reason": "commit_failed",
+                    "errorCode": "commit_failed",
+                    "errorMessage": "commit_failed",
+                },
+            },
+            namespace="/emo",
+        )
+        failed_messages = self.get_messages(participant)
+        self.get_ack(
+            failed_messages,
+            "restore-handoff-commit-failed-allowed",
+        )
+        failed_status = self._push(
+            failed_messages,
+            "playback.handoff.status",
+        )
+        self.assertEqual(failed_status["payload"]["status"], "failed")
+        self.assertEqual(failed_status["payload"]["errorCode"], "commit_failed")
+        persisted_failure = getPlaybackHandoff(failed_handoff["handoffId"])
+        self.assertEqual(persisted_failure["status"], "failed")
+        self.assertEqual(persisted_failure["errorCode"], "commit_failed")
         self.assertEqual(
             getPlaybackContextState("context-broadcast-source"),
             before,

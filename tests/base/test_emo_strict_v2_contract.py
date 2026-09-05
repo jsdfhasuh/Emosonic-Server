@@ -438,6 +438,8 @@ class StrictV2ContractTestCase(unittest.TestCase):
             "payload": {
                 "playbackContextId": "context-1",
                 "prepareId": "prepare-1",
+                "handoffId": "handoff-1",
+                "deviceSessionId": "device:target-1",
                 "ready": False,
             },
         }
@@ -448,6 +450,82 @@ class StrictV2ContractTestCase(unittest.TestCase):
         request["payload"]["errorCode"] = "INVALID-CODE"
         with self.assertRaisesRegex(StrictRequestValidationError, "invalid format"):
             validate_strict_request(request)
+
+    def test_ready_requires_complete_flutter_handoff_identity(self):
+        request = {
+            "type": "event",
+            "action": "playback.ready",
+            "requestId": "ready-complete-identity",
+            "payload": {
+                "playbackContextId": "context-1",
+                "prepareId": "prepare-1",
+                "handoffId": "handoff-1",
+                "deviceSessionId": "device:target-1",
+                "ready": True,
+            },
+        }
+
+        self.assertEqual(validate_strict_request(request), request)
+        for field_name in ("handoffId", "deviceSessionId"):
+            with self.subTest(field_name=field_name):
+                invalid = dict(request)
+                invalid["payload"] = dict(request["payload"])
+                invalid["payload"].pop(field_name)
+                with self.assertRaisesRegex(
+                    StrictRequestValidationError,
+                    field_name,
+                ):
+                    validate_strict_request(invalid)
+
+    def test_validates_handoff_cancel_failure_conditions(self):
+        plain = {
+            "type": "command",
+            "action": "playback.handoff.cancel",
+            "requestId": "cancel-plain",
+            "payload": {
+                "playbackContextId": "context-1",
+                "handoffId": "handoff-1",
+                "reason": "user_cancelled",
+            },
+        }
+        failed = {
+            "type": "command",
+            "action": "playback.handoff.cancel",
+            "requestId": "cancel-commit-failed",
+            "payload": {
+                "playbackContextId": "context-1",
+                "handoffId": "handoff-1",
+                "reason": "commit_failed",
+                "errorCode": "commit_failed",
+                "errorMessage": "commit_failed",
+            },
+        }
+
+        self.assertEqual(validate_strict_request(plain), plain)
+        self.assertEqual(validate_strict_request(failed), failed)
+
+        invalid_payloads = (
+            ({"reason": "commit_failed"}, "paired"),
+            ({"errorCode": "commit_failed"}, "paired"),
+            ({"errorMessage": "commit failed"}, "requires errorCode"),
+            (
+                {"reason": "prepare_failed", "errorCode": "prepare_failed"},
+                "only supports commit_failed",
+            ),
+        )
+        for fields, message in invalid_payloads:
+            with self.subTest(fields=fields):
+                invalid = dict(plain)
+                invalid["payload"] = {
+                    "playbackContextId": "context-1",
+                    "handoffId": "handoff-1",
+                    **fields,
+                }
+                with self.assertRaisesRegex(
+                    StrictRequestValidationError,
+                    message,
+                ):
+                    validate_strict_request(invalid)
 
     def test_unknown_action_is_correlated_not_supported(self):
         request = {

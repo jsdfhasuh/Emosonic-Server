@@ -75,6 +75,35 @@ class StrictV2ManifestTestCase(unittest.TestCase):
                 self.assertEqual(validator.required, required)
                 self.assertEqual(validator.optional, optional)
 
+    def test_handoff_wire_shapes_match_flutter_contract(self):
+        ready_schema = self.manifest["actions"]["playback.ready"]["payloadSchema"]
+        self.assertEqual(
+            ready_schema["required"],
+            [
+                "playbackContextId:string",
+                "prepareId:string",
+                "handoffId:string",
+                "deviceSessionId:string",
+                "ready:bool",
+            ],
+        )
+        self.assertEqual(
+            ready_schema["optional"],
+            ["errorCode:string", "errorMessage:string"],
+        )
+
+        cancel_schema = self.manifest["actions"]["playback.handoff.cancel"][
+            "payloadSchema"
+        ]
+        self.assertEqual(
+            cancel_schema["required"],
+            ["playbackContextId:string", "handoffId:string"],
+        )
+        self.assertEqual(
+            cancel_schema["optional"],
+            ["reason:string", "errorCode:string", "errorMessage:string"],
+        )
+
     def test_authoritative_contract_covers_every_r19_requirement(self):
         entry = self.contract_path.read_text(encoding="utf-8")
         authoritative_sources = (

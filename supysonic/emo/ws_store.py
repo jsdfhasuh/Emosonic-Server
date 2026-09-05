@@ -7175,11 +7175,14 @@ def terminateStrictPlaybackHandoff(
         raise ValueError("allowRestorePendingCleanup must be a boolean")
     if allow_restore_pending_cleanup and not (
         status == "cancelled"
-        or (status == "failed" and error_code == "restore_in_progress")
+        or (
+            status == "failed"
+            and error_code in {"restore_in_progress", "commit_failed"}
+        )
     ):
         raise ValueError(
             "Restore-pending Handoff cleanup only permits cancel or "
-            "restore_in_progress failure"
+            "restore_in_progress/commit_failed failure"
         )
     open_connection(reuse=True)
     try:

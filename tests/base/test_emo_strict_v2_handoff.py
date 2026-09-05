@@ -307,6 +307,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
                     "playbackContextId": "context-handoff-1",
                     "handoffId": start_ack["payload"]["handoffId"],
                     "prepareId": start_ack["payload"]["prepareId"],
+                    "deviceSessionId": "device:target-1",
                     "ready": True,
                 },
             },
@@ -521,6 +522,53 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         self.assertEqual(self.get_messages(source), [])
         self.assertEqual(getPlaybackContextState("context-handoff-1"), replayed_context)
 
+    def test_ready_rejects_payload_device_outside_frozen_current_target(self):
+        source, target, controller = self.connect_handoff_devices()
+        start_ack = self.get_ack(
+            self.start_handoff(controller),
+            "handoff-start-1",
+        )
+        self.get_messages(target)
+        self.get_messages(source)
+        self.get_messages(controller)
+
+        target.emit(
+            "message",
+            {
+                "type": "event",
+                "action": "playback.ready",
+                "requestId": "handoff-ready-wrong-device",
+                "payload": {
+                    "playbackContextId": "context-handoff-1",
+                    "handoffId": start_ack["payload"]["handoffId"],
+                    "prepareId": start_ack["payload"]["prepareId"],
+                    "deviceSessionId": "device:not-the-frozen-target",
+                    "ready": True,
+                },
+            },
+            namespace="/emo",
+        )
+
+        error = self.get_error(
+            self.get_messages(target),
+            "handoff-ready-wrong-device",
+        )
+        self.assertEqual(error["payload"]["code"], "forbidden")
+        self.assertEqual(
+            getPlaybackHandoff(start_ack["payload"]["handoffId"])["status"],
+            "preparing",
+        )
+        self.assertEqual(
+            get_state().get_prepare(start_ack["payload"]["prepareId"])["status"],
+            "preparing",
+        )
+        self.assertEqual(
+            getPlaybackContextState("context-handoff-1")["authorityClientId"],
+            "source-1",
+        )
+        self.assertEqual(self.get_messages(source), [])
+        self.assertEqual(self.get_messages(controller), [])
+
     def test_complete_requires_current_target_clock_gate_without_mutation(self):
         source, target, controller = self.connect_handoff_devices()
         start_ack = self.get_ack(
@@ -542,6 +590,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
                     "playbackContextId": "context-handoff-1",
                     "handoffId": start_ack["payload"]["handoffId"],
                     "prepareId": prepare["payload"]["prepareId"],
+                    "deviceSessionId": "device:target-1",
                     "ready": True,
                 },
             },
@@ -855,6 +904,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
                     "playbackContextId": "context-handoff-1",
                     "handoffId": start_ack["payload"]["handoffId"],
                     "prepareId": prepare["payload"]["prepareId"],
+                    "deviceSessionId": "device:target-1",
                     "ready": True,
                 },
             },
@@ -1049,6 +1099,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
                         "playbackContextId": "context-handoff-1",
                         "handoffId": start_ack["payload"]["handoffId"],
                         "prepareId": prepare["payload"]["prepareId"],
+                        "deviceSessionId": "device:target-1",
                         "ready": True,
                     },
                 },
@@ -1209,6 +1260,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
                 "playbackContextId": "context-handoff-1",
                 "handoffId": start_ack["payload"]["handoffId"],
                 "prepareId": prepare["payload"]["prepareId"],
+                "deviceSessionId": "device:target-1",
                 "ready": True,
             },
         }
@@ -1406,6 +1458,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
                     "playbackContextId": "context-handoff-1",
                     "handoffId": start_ack["payload"]["handoffId"],
                     "prepareId": start_ack["payload"]["prepareId"],
+                    "deviceSessionId": "device:target-1",
                     "ready": False,
                     "errorCode": "decoder_unavailable",
                     "errorMessage": "Decoder unavailable",
@@ -1455,6 +1508,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
                 "playbackContextId": "context-handoff-1",
                 "handoffId": start_ack["payload"]["handoffId"],
                 "prepareId": start_ack["payload"]["prepareId"],
+                "deviceSessionId": "device:target-1",
                 "ready": False,
                 "errorCode": "decoder_unavailable",
                 "errorMessage": "Decoder unavailable",
@@ -1572,6 +1626,141 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         self.assertEqual(
             getPlaybackHandoff(start_ack["payload"]["handoffId"])["status"],
             "cancelled",
+        )
+
+    def test_target_commit_failed_cancel_is_failed_idempotent_and_terminal(self):
+        source, target, controller = self.connect_handoff_devices()
+        start_ack = self.get_ack(
+            self.start_handoff(controller),
+            "handoff-start-1",
+        )
+        prepare = next(
+            message
+            for message in self.get_messages(target)
+            if message["action"] == "playback.prepare"
+        )
+        ready_request = {
+            "type": "event",
+            "action": "playback.ready",
+            "requestId": "handoff-ready-before-client-commit-failure",
+            "payload": {
+                "playbackContextId": "context-handoff-1",
+                "handoffId": start_ack["payload"]["handoffId"],
+                "prepareId": prepare["payload"]["prepareId"],
+                "deviceSessionId": "device:target-1",
+                "ready": True,
+            },
+        }
+        target.emit("message", ready_request, namespace="/emo")
+        ready_messages = self.get_messages(target)
+        commit = next(
+            message
+            for message in ready_messages
+            if message["action"] == "player.play"
+        )
+        for client in (source, controller):
+            self.get_messages(client)
+
+        cancel_request = {
+            "type": "command",
+            "action": "playback.handoff.cancel",
+            "requestId": "handoff-cancel-commit-failed",
+            "payload": {
+                "playbackContextId": "context-handoff-1",
+                "handoffId": start_ack["payload"]["handoffId"],
+                "reason": "commit_failed",
+                "errorCode": "commit_failed",
+                "errorMessage": "commit_failed",
+            },
+        }
+        controller_spoof = dict(cancel_request)
+        controller_spoof["requestId"] = "handoff-cancel-commit-failed-controller"
+        controller.emit("message", controller_spoof, namespace="/emo")
+        spoof_error = self.get_error(
+            self.get_messages(controller),
+            "handoff-cancel-commit-failed-controller",
+        )
+        self.assertEqual(spoof_error["payload"]["code"], "forbidden")
+        self.assertEqual(
+            getPlaybackHandoff(start_ack["payload"]["handoffId"])["status"],
+            "committed",
+        )
+
+        target.emit("message", cancel_request, namespace="/emo")
+        target_messages = self.get_messages(target)
+        self.get_ack(target_messages, "handoff-cancel-commit-failed")
+        cancel_push = next(
+            message
+            for message in target_messages
+            if message["action"] == "playback.handoff.cancel"
+        )
+        status_push = next(
+            message
+            for message in target_messages
+            if message["action"] == "playback.handoff.status"
+        )
+        self.assertEqual(
+            cancel_push["payload"],
+            {
+                "playbackContextId": "context-handoff-1",
+                "handoffId": start_ack["payload"]["handoffId"],
+                "reason": "commit_failed",
+                "controlVersion": 1,
+                "errorCode": "commit_failed",
+                "errorMessage": "commit_failed",
+            },
+        )
+        self.assertEqual(status_push["payload"]["status"], "failed")
+        self.assertEqual(status_push["payload"]["errorCode"], "commit_failed")
+        handoff = getPlaybackHandoff(start_ack["payload"]["handoffId"])
+        context = getPlaybackContextState("context-handoff-1")
+        self.assertEqual(handoff["status"], "failed")
+        self.assertEqual(handoff["errorCode"], "commit_failed")
+        self.assertEqual(handoff["errorMessage"], "commit_failed")
+        self.assertEqual(context["authorityClientId"], "source-1")
+        self.assertEqual(context["controlVersion"], 1)
+        self.assertEqual(getActivePlaybackHandoffs("context-handoff-1"), [])
+
+        retry_request = dict(cancel_request)
+        retry_request["requestId"] = "handoff-cancel-commit-failed-retry"
+        target.emit("message", retry_request, namespace="/emo")
+        retry_messages = self.get_messages(target)
+        self.get_ack(retry_messages, "handoff-cancel-commit-failed-retry")
+        self.assertEqual(
+            [message["action"] for message in retry_messages],
+            ["system.ack"],
+        )
+
+        late_ready = dict(ready_request)
+        late_ready["requestId"] = "handoff-ready-after-client-commit-failure"
+        target.emit("message", late_ready, namespace="/emo")
+        late_ready_messages = self.get_messages(target)
+        self.assertEqual(
+            [message["action"] for message in late_ready_messages],
+            ["playback.handoff.status"],
+        )
+        self.assertEqual(late_ready_messages[0]["payload"]["status"], "failed")
+
+        late_complete_messages = self.complete_handoff(
+            target,
+            start_ack["payload"]["handoffId"],
+            commit,
+            "handoff-complete-after-client-commit-failure",
+        )
+        late_complete_error = self.get_error(
+            late_complete_messages,
+            "handoff-complete-after-client-commit-failure",
+        )
+        self.assertEqual(late_complete_error["payload"]["code"], "conflict")
+        self.assertFalse(
+            any(
+                message["action"] == "playback.handoff.release"
+                for message in late_complete_messages
+            )
+        )
+        self.assertEqual(
+            getPlaybackContextState("context-handoff-1"),
+            context,
         )
 
     def test_cancel_push_failures_keep_single_ack_settlement(self):
@@ -1712,6 +1901,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
                     "playbackContextId": "context-handoff-1",
                     "handoffId": start_ack["payload"]["handoffId"],
                     "prepareId": start_ack["payload"]["prepareId"],
+                    "deviceSessionId": "device:target-1",
                     "ready": True,
                 },
             },
@@ -1762,6 +1952,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
                     "playbackContextId": "context-handoff-1",
                     "handoffId": start_ack["payload"]["handoffId"],
                     "prepareId": prepare["payload"]["prepareId"],
+                    "deviceSessionId": "device:target-1",
                     "ready": True,
                 },
             },
@@ -1828,6 +2019,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
                     "playbackContextId": "context-handoff-1",
                     "handoffId": start_ack["payload"]["handoffId"],
                     "prepareId": start_ack["payload"]["prepareId"],
+                    "deviceSessionId": "device:target-1",
                     "ready": True,
                 },
             },
@@ -1876,6 +2068,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
                     "playbackContextId": "context-handoff-1",
                     "handoffId": start_ack["payload"]["handoffId"],
                     "prepareId": start_ack["payload"]["prepareId"],
+                    "deviceSessionId": "device:target-1",
                     "ready": True,
                 },
             },

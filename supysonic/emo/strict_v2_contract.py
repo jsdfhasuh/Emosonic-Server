@@ -159,8 +159,14 @@ ACTION_SCHEMAS = {
     ),
     "playback.ready": ActionSchema(
         "event",
-        ("playbackContextId", "prepareId", "ready"),
-        ("handoffId", "errorCode", "errorMessage"),
+        (
+            "playbackContextId",
+            "prepareId",
+            "handoffId",
+            "deviceSessionId",
+            "ready",
+        ),
+        ("errorCode", "errorMessage"),
     ),
     "playback.handoff.complete": ActionSchema(
         "event",
@@ -179,7 +185,9 @@ ACTION_SCHEMAS = {
         ),
     ),
     "playback.handoff.cancel": ActionSchema(
-        "command", ("playbackContextId", "handoffId"), ("reason",)
+        "command",
+        ("playbackContextId", "handoffId"),
+        ("reason", "errorCode", "errorMessage"),
     ),
     "broadcast.start": ActionSchema(
         "command",
@@ -652,6 +660,23 @@ def _validate_action_combinations(action: str, payload: Dict[str, object]) -> No
             raise StrictRequestValidationError("ready:false requires errorCode")
         elif re.fullmatch(r"[a-z][a-z0-9_]{0,63}", payload["errorCode"]) is None:
             raise StrictRequestValidationError("errorCode has an invalid format")
+    if action == "playback.handoff.cancel":
+        reason = payload.get("reason")
+        error_code = payload.get("errorCode")
+        if error_code is not None and re.fullmatch(
+            r"[a-z][a-z0-9_]{0,63}", error_code
+        ) is None:
+            raise StrictRequestValidationError("errorCode has an invalid format")
+        if (reason == "commit_failed") != (error_code == "commit_failed"):
+            raise StrictRequestValidationError(
+                "commit_failed reason and errorCode must be paired"
+            )
+        if error_code is not None and error_code != "commit_failed":
+            raise StrictRequestValidationError(
+                "playback.handoff.cancel errorCode only supports commit_failed"
+            )
+        if "errorMessage" in payload and error_code is None:
+            raise StrictRequestValidationError("errorMessage requires errorCode")
     if action == "playback.handoff.complete" and payload["state"] != "playing":
         raise StrictRequestValidationError(
             "playback.handoff.complete state must be playing"

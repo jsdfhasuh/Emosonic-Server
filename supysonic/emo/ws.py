@@ -9004,6 +9004,18 @@ def _handle_playback_ready(
     if current_client is None:
         raise PermissionError("Register the device before sending playback ready")
 
+    strict_v2 = _is_strict_playback_context_v2(current_client)
+    payload_device_session_id = payload.get("deviceSessionId")
+    if strict_v2:
+        if not isinstance(payload_device_session_id, str) or not payload_device_session_id:
+            raise ValueError(
+                "Strict playback.ready requires a non-empty deviceSessionId"
+            )
+        if payload_device_session_id != current_client.get("deviceSessionId"):
+            raise PermissionError(
+                "playback.ready deviceSessionId must match the current physical device"
+            )
+
     prepare_id = payload.get("prepareId")
     if not isinstance(prepare_id, str) or not prepare_id:
         raise ValueError("playback.ready requires a non-empty prepareId")
@@ -9018,7 +9030,6 @@ def _handle_playback_ready(
         raise PermissionError("playback.ready clientId must match the current device")
 
     prepare = state.get_prepare(prepare_id)
-    strict_v2 = _is_strict_playback_context_v2(current_client)
     allow_restore_pending_cleanup = (
         strict_v2
         and ready is False
@@ -9050,6 +9061,10 @@ def _handle_playback_ready(
                 raise PermissionError(
                     "playback.ready device does not match handoff target"
                 )
+            if payload_device_session_id != handoff.get("targetDeviceSessionId"):
+                raise PermissionError(
+                    "playback.ready payload device does not match frozen target"
+                )
             if not _handoff_lifecycle_locked:
                 with _locked_handoff_lifecycle(handoff_id):
                     return _handle_playback_ready(
@@ -9070,6 +9085,10 @@ def _handle_playback_ready(
                 in HANDOFF_NONTERMINAL_STATUSES,
                 )
             )
+            if payload_device_session_id != target_generation["deviceSessionId"]:
+                raise PermissionError(
+                    "playback.ready payload device does not match current target generation"
+                )
             _require_broadcast_pair_action_allowed(
                 handoff["userName"],
                 target_generation["clientId"],
@@ -9129,10 +9148,7 @@ def _handle_playback_ready(
         ):
             raise ValueError("playback.ready playbackContextId does not match prepare")
         payload_handoff_id = payload.get("handoffId")
-        if (
-            payload_handoff_id is not None
-            and payload_handoff_id != commit_payload.get("handoffId")
-        ):
+        if payload_handoff_id != commit_payload.get("handoffId"):
             raise ValueError("playback.ready handoffId does not match prepare")
         if current_client_id != commit_payload.get("targetClientId"):
             raise PermissionError("playback.ready sender is not the handoff target")
@@ -9140,9 +9156,17 @@ def _handle_playback_ready(
             "targetDeviceSessionId"
         ):
             raise PermissionError("playback.ready device does not match handoff target")
+        if payload_device_session_id != commit_payload.get("targetDeviceSessionId"):
+            raise PermissionError(
+                "playback.ready payload device does not match frozen prepare target"
+            )
         handoff = getPlaybackHandoff(commit_payload.get("handoffId"))
         if handoff is None:
             raise LookupError("Playback handoff not found")
+        if payload_device_session_id != handoff.get("targetDeviceSessionId"):
+            raise PermissionError(
+                "playback.ready payload device does not match frozen handoff target"
+            )
         if not _handoff_lifecycle_locked:
             with _locked_handoff_lifecycle(handoff["handoffId"]):
                 return _handle_playback_ready(
@@ -9163,6 +9187,10 @@ def _handle_playback_ready(
             in ("preparing", "ready", "committed", "committing"),
             )
         )
+        if payload_device_session_id != target_generation["deviceSessionId"]:
+            raise PermissionError(
+                "playback.ready payload device does not match current target generation"
+            )
         _require_broadcast_pair_action_allowed(
             handoff["userName"],
             target_generation["clientId"],
@@ -12694,8 +12722,49 @@ def _handle_handoff_cancel(
             raise LookupError("Playback handoff not found")
         if payload.get("playbackContextId") != handoff.get("playbackContextId"):
             raise ValueError("playback.handoff.cancel playbackContextId does not match")
+        reason = payload.get("reason") or "cancelled"
+        error_code = payload.get("errorCode")
+        error_message = payload.get("errorMessage")
+        commit_failed = reason == "commit_failed"
+        if commit_failed != (error_code == "commit_failed"):
+            raise ValueError(
+                "commit_failed reason and errorCode must be paired"
+            )
+        if not commit_failed and (
+            error_code is not None or error_message is not None
+        ):
+            raise ValueError(
+                "playback.handoff.cancel error fields require commit_failed"
+            )
+        sender_role = None
+        if current_client.get("clientId") == handoff.get("sourceClientId"):
+            sender_role = "source"
+        elif current_client.get("clientId") == handoff.get("targetClientId"):
+            sender_role = "target"
+        if commit_failed and sender_role != "target":
+            raise PermissionError(
+                "Only the frozen handoff target can report commit_failed"
+            )
+        sender_generation = None
+        if commit_failed:
+            sender_generation = _current_handoff_generation(
+                handoff,
+                "target",
+                expected_sid=request_sid,
+            )
+            if sender_generation is None:
+                raise PermissionError(
+                    "Playback handoff commit failure sender generation changed"
+                )
         status = handoff.get("status")
-        if status == "cancelled":
+        if status == "cancelled" and not commit_failed:
+            _send_ack(request_id)
+            return handoff
+        if (
+            status == "failed"
+            and commit_failed
+            and handoff.get("errorCode") == "commit_failed"
+        ):
             _send_ack(request_id)
             return handoff
         if status in {"completed", "failed", "timed_out"}:
@@ -12709,13 +12778,7 @@ def _handle_handoff_cancel(
             handoff.get("originClientId"),
         ):
             raise PermissionError("Only handoff members can cancel handoff")
-        sender_role = None
-        if current_client.get("clientId") == handoff.get("sourceClientId"):
-            sender_role = "source"
-        elif current_client.get("clientId") == handoff.get("targetClientId"):
-            sender_role = "target"
-        sender_generation = None
-        if sender_role is not None:
+        if sender_role is not None and sender_generation is None:
             sender_generation = _current_handoff_generation(
                 handoff,
                 sender_role,
@@ -12725,11 +12788,14 @@ def _handle_handoff_cancel(
                 raise PermissionError(
                     "Playback handoff cancel sender generation changed"
                 )
+        terminal_status = "failed" if commit_failed else "cancelled"
         terminal_result = terminateStrictPlaybackHandoff(
             handoff.get("playbackContextId"),
             handoff_id,
             current_user_name,
-            "cancelled",
+            terminal_status,
+            error_code=error_code if commit_failed else None,
+            error_message=error_message if commit_failed else None,
             expected_generation_role=sender_role,
             expected_device_session_id=(
                 None
@@ -12751,21 +12817,25 @@ def _handle_handoff_cancel(
         if terminal_result is None:
             raise LookupError("Playback handoff not found")
         handoff, transitioned = terminal_result
-        if handoff.get("status") != "cancelled":
+        if handoff.get("status") != terminal_status:
             raise ControlConflictError(
                 "Playback handoff is already terminal",
                 current_control_version=handoff.get("controlVersion"),
             )
-        state.update_playback_handoff(handoff_id, status="cancelled")
+        state.update_playback_handoff(
+            handoff_id,
+            status=terminal_status,
+            error_code=error_code if commit_failed else None,
+            error_message=error_message if commit_failed else None,
+        )
         if handoff.get("prepareId"):
             state.finish_prepare_if_preparing(
                 handoff["prepareId"],
-                "cancelled",
+                terminal_status,
             )
         _send_ack(request_id)
         if not transitioned:
             return handoff
-        reason = payload.get("reason") or "cancelled"
         _run_post_commit_push(
             "playback.handoff.cancel",
             request_id,

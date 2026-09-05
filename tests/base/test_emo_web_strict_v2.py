@@ -1299,6 +1299,7 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
             "playbackContextId": "ctx-handoff",
             "prepareId": prepare_id,
             "handoffId": handoff_id,
+            "deviceSessionId": "web-player-device:target",
             "ready": True,
         }
         target.emit("message", ready, namespace="/emo")
