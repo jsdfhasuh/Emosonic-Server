@@ -97,6 +97,34 @@ function readyClient(options = {}) {
   return { client, socket };
 }
 
+test('effective-at clock uses current physical ping RTT and bounded fresh samples', async (t) => {
+  let now = 1000;
+  const { client, socket } = readyClient({ monotonicNow: () => now });
+  t.after(() => client._onDisconnect('test'));
+  async function ping(rtt = 20, drift = 0) {
+    const midpoint = now + rtt / 2;
+    const promise = client.request('system.ping', {});
+    const request = socket.sent.at(-1);
+    now += rtt;
+    client._onMessage({ type: 'system', action: 'system.pong', requestId: request.requestId,
+      payload: { serverTimeMs: 1780000000000 + midpoint + drift },
+      connectionNonce: 'nonce-1', connectionEpoch: 1 });
+    await promise;
+  }
+  assert.equal(client.isClockSynchronized(), false);
+  await ping(); await ping(); assert.equal(client.isClockSynchronized(), false);
+  await ping(); assert.equal(client.isClockSynchronized(), true);
+  assert.equal(client.serverNowMs(), 1780000000000 + now);
+  await ping(102); assert.equal(client.isClockSynchronized(), false);
+  for (let i = 0; i < 6; i += 1) await ping();
+  assert.equal(client.clockSamples.length, 5); assert.equal(client.isClockSynchronized(), true);
+  await ping(20, 51); assert.equal(client.isClockSynchronized(), false);
+  for (let i = 0; i < 5; i += 1) await ping();
+  now += 15001; assert.equal(client.isClockSynchronized(), false);
+  client._onDisconnect('new generation');
+  assert.equal(client.clockSamples.length, 0); assert.equal(client.isClockSynchronized(), false);
+});
+
 function ack(request, extra = {}) {
   return {
     type: 'system',

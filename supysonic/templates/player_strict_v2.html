@@ -163,7 +163,10 @@
       persistedBroadcastRecovery?.lastAppliedBroadcastRevision || 0,
     broadcastExecution: persistedBroadcastRecovery,
     broadcastApplying: false,
+    broadcastRestorePending: Boolean(persistedBroadcastRecovery),
     pendingPrepare: null,
+    handoffPlayPending: null,
+    handoffPrepareFingerprints: new Map(),
     processedCommands: new Set(),
     contextSnapshots: new Map(),
     appliedControlVersions: new Map(),
@@ -242,11 +245,14 @@
   }
   function clearPendingPrepare(reason) {
     if (!state.pendingPrepare) return;
-    const standbyContextId = state.pendingPrepare.standbyContextId;
+    const prepared = state.pendingPrepare;
+    const standbyContextId = prepared.standbyContextId;
+    prepared.invalidated = true;
+    for (const cleanup of prepared.cleanups || []) cleanup();
+    if (prepared.ownsMedia) audio.pause();
     state.pendingPrepare = null;
-    audio.pause();
-    state.playbackState = standbyContextId ? 'idle' : 'paused';
-    if (!state.contextId || standbyContextId) {
+    if (prepared.ownsMedia) state.playbackState = standbyContextId ? 'idle' : 'paused';
+    if (prepared.ownsMedia && (!state.contextId || standbyContextId)) {
       state.queue = [];
       state.index = 0;
       audio.removeAttribute('src');
@@ -255,6 +261,7 @@
       renderQueue();
     }
     text('strict-handoff-state', reason || 'no handoff');
+    updateHandoffUi();
   }
   function setContextId(value) {
     state.contextId = value || null;
@@ -264,7 +271,7 @@
     else localStorage.removeItem('emosonic.webPlayer.playbackContextId.v2');
   }
   function activeFeedbackContextId() {
-    if (state.broadcastExecution || state.broadcastApplying) return null;
+    if (state.broadcastExecution || state.broadcastApplying || state.pendingPrepare || state.handoffPlayPending) return null;
     return state.followingContextId || state.contextId;
   }
   function alreadyProcessed(action, payload) {
@@ -292,6 +299,7 @@
       item.append(document.createTextNode(`${index + 1}. ${label}`));
       const play = document.createElement('button');
       play.className = 'btn btn-sm btn-outline-primary';
+      play.disabled = Boolean(state.pendingPrepare || state.handoffPlayPending);
       play.textContent = '播放';
       play.addEventListener('click', () => {
         state.userGestureSeen = true;
@@ -304,14 +312,17 @@
     text('strict-now-playing', state.trackMeta[currentId]?.label || currentId);
   }
 
-  async function ensureMeta(trackIds) {
+  async function ensureMeta(trackIds, isCurrent = () => true) {
     const missing = Array.from(new Set(trackIds.filter((id) => id && !state.trackMeta[id])));
     for (let offset = 0; offset < missing.length; offset += META_BATCH_SIZE) {
       const params = new URLSearchParams();
       missing.slice(offset, offset + META_BATCH_SIZE).forEach((id) => params.append('ids', id));
       const response = await fetch(`${root.dataset.metaUrl}?${params}`, { credentials: 'same-origin' });
+      if (!isCurrent()) return;
       if (!response.ok) throw new Error(`曲目元数据加载失败 (${response.status})`);
-      Object.assign(state.trackMeta, await response.json());
+      const metadata = await response.json();
+      if (!isCurrent()) return;
+      Object.assign(state.trackMeta, metadata);
     }
   }
 
@@ -370,6 +381,7 @@
   }
 
   async function playIndex(index, positionMs, autoplay, syncContext = true, sendUpdate = true) {
+    if (state.pendingPrepare || state.handoffPlayPending) return false;
     if (!state.queue.length) return false;
     state.index = Math.max(0, Math.min(index, state.queue.length - 1));
     loadRequiredCurrent(positionMs);
@@ -385,6 +397,7 @@
   }
 
   async function sendFeedback(playbackContextId = null, terminal = null) {
+    if (state.pendingPrepare || state.handoffPlayPending) return;
     if (typeof playbackContextId !== 'string') {
       playbackContextId = activeFeedbackContextId();
     }
@@ -574,6 +587,7 @@
     deviceStates = [],
     requirePlaybackRestore = false,
   ) {
+    if (state.pendingPrepare || state.handoffPlayPending) return;
     if (!context || typeof context.playbackContextId !== 'string') return;
     const incomingCurrent = state.client.isCurrentContextSnapshot(context);
     const canonicalContext = state.client.cursor(context.playbackContextId);
@@ -607,6 +621,7 @@
     ) return;
     if (snapshot) state.contextSnapshots.set(context.playbackContextId, snapshot);
     await ensureMeta(context.queueSongIds);
+    if (state.pendingPrepare || state.handoffPlayPending) return;
     if ((follow ? state.followingContextId : state.contextId) !== expectedContextId) return;
     if (snapshot) {
       const latestSnapshot = state.contextSnapshots.get(context.playbackContextId);
@@ -798,6 +813,7 @@
       await commitHandoff(payload);
       return;
     }
+    if (state.pendingPrepare || state.handoffPlayPending) return;
     const commandControlVersion = payload.controlVersion;
     const leaseKey = `${payload.playbackContextId}\u0000${commandControlVersion}`;
     const lease = Symbol(leaseKey);
@@ -916,10 +932,128 @@
     }
   }
 
+  function currentHandoff(prepared) {
+    return state.pendingPrepare === prepared && !prepared.invalidated
+      && state.client.state === 'ready' && state.client.socket?.connected
+      && state.client.socket === prepared.socket
+      && state.client.bootstrapGeneration === prepared.generation
+      && state.client.connectionNonce === prepared.nonce
+      && state.client.connectionEpoch === prepared.connectionEpoch
+      && state.client.registration.clientId === clientId
+      && state.client.registration.deviceSessionId === prepared.deviceSessionId;
+  }
+
+  function updateHandoffUi() {
+    for (const id of ['strict-play', 'strict-pause', 'strict-next', 'strict-prev',
+      'strict-progress', 'strict-clear-queue', 'strict-follow-start', 'strict-reset-device']) {
+      document.getElementById(id).disabled = Boolean(state.pendingPrepare || state.handoffPlayPending);
+    }
+    if (!state.pendingPrepare && !state.handoffPlayPending) updateCapabilityUi();
+  }
+
+  function handoffReadyPayload(prepared, ready, errorCode) {
+    if (prepared.deviceSessionId !== deviceSessionId
+      || state.client.registration.deviceSessionId !== deviceSessionId) {
+      throw new api.StrictProtocolError('playback.prepare target identity mismatch');
+    }
+    return {
+      playbackContextId: prepared.playbackContextId, prepareId: prepared.prepareId,
+      handoffId: prepared.handoffId, deviceSessionId, ready,
+      ...(ready ? {} : { errorCode }),
+    };
+  }
+
+  async function sendHandoffReady(prepared, ready, errorCode) {
+    if (!currentHandoff(prepared)) return;
+    if (prepared.readySent === ready) return;
+    prepared.readySent = ready;
+    log(`handoff_ready handoffId=${prepared.handoffId} ready=${ready} code=${errorCode || 'none'}`);
+    await state.client.request('playback.ready', handoffReadyPayload(prepared, ready, errorCode));
+  }
+
+  function waitForHandoff(prepared, delay, media = false) {
+    return new Promise((resolve, reject) => {
+      const finish = (error) => {
+        clearTimeout(timer);
+        audio.removeEventListener('canplay', onMedia);
+        audio.removeEventListener('error', onError);
+        prepared.cleanups.delete(cancel);
+        if (error) reject(error); else resolve();
+      };
+      const cancel = () => finish();
+      const onMedia = () => finish();
+      const onError = () => finish(new Error('media_load_failed'));
+      const timer = setTimeout(() => finish(media ? new Error('media_load_failed') : null), delay);
+      prepared.cleanups.add(cancel);
+      if (media) {
+        audio.addEventListener('canplay', onMedia);
+        audio.addEventListener('error', onError);
+      }
+    });
+  }
+
+  async function failHandoffCommit(prepared) {
+    if (!currentHandoff(prepared)) return;
+    clearPendingPrepare('commit_failed');
+    log(`handoff_commit_failed handoffId=${prepared.handoffId}`, 'warning');
+    await state.client.request('playback.handoff.cancel', {
+      playbackContextId: prepared.playbackContextId, handoffId: prepared.handoffId,
+      reason: 'commit_failed', errorCode: 'commit_failed',
+      errorMessage: 'Target could not apply the prepared playback.',
+    }).catch(() => log(`handoff_cleanup_unconfirmed handoffId=${prepared.handoffId}`, 'warning'));
+  }
+
+  async function failHandoffPrepare(prepared, errorCode) {
+    if (!currentHandoff(prepared)) return;
+    const sent = sendHandoffReady(prepared, false, errorCode);
+    clearPendingPrepare(errorCode);
+    await sent.catch(() => log(`handoff_ready_unconfirmed handoffId=${prepared.handoffId}`, 'warning'));
+  }
+
+  function handoffMediaMatches(prepared) {
+    const trackId = prepared.queueSongIds[prepared.currentIndex];
+    const expectedUrl = state.trackMeta[trackId]?.streamUrl;
+    return state.index === prepared.currentIndex
+      && api.stableStringify(state.queue) === api.stableStringify(prepared.queueSongIds)
+      && audio.dataset.trackId === trackId && audio.readyState >= 2
+      && expectedUrl && audio.currentSrc === new URL(expectedUrl, window.location.href).href;
+  }
+
+  function handoffSourceMatches(prepared) {
+    const context = state.client.cursor(prepared.playbackContextId);
+    if (!context) return true;
+    const expected = {
+      epoch: prepared.sourceEpoch, version: prepared.sourceVersion,
+      queueRevision: prepared.sourceQueueRevision, controlVersion: prepared.controlVersion,
+      authorityClientId: prepared.sourceClientId,
+    };
+    return Object.entries(expected).every(([key, value]) => context[key] === undefined || context[key] === value);
+  }
+
   async function handlePrepare(payload) {
-    if (alreadyProcessed('playback.prepare', payload)) return;
     if (!state.client.capability('playbackPrepare') || !state.client.capability('effectiveAtPlayback')) return;
-    if (payload.deviceSessionId !== deviceSessionId) throw new api.StrictProtocolError('playback.prepare target identity mismatch');
+    handoffReadyPayload(payload, true);
+    if (!Array.isArray(payload.queueSongIds) || !payload.queueSongIds.length
+      || new Set(payload.queueSongIds).size !== payload.queueSongIds.length
+      || !Number.isInteger(payload.currentIndex) || payload.currentIndex < 0
+      || payload.currentIndex >= payload.queueSongIds.length
+      || (payload.trackId && payload.trackId !== payload.queueSongIds[payload.currentIndex])
+      || payload.sourceClientId !== payload.authorityClientId
+      || !['controlVersion', 'sourceEpoch', 'sourceVersion', 'sourceQueueRevision'].every((key) => Number.isInteger(payload[key]) && payload[key] > 0)) {
+      throw new api.StrictProtocolError('Invalid frozen Handoff prepare');
+    }
+    const key = `${payload.playbackContextId}\u0000${payload.handoffId}`;
+    const fingerprint = api.stableStringify(payload);
+    const previous = state.handoffPrepareFingerprints.get(key);
+    if (previous) {
+      if (previous !== fingerprint) throw new api.StrictProtocolError('Conflicting frozen Handoff prepare');
+      return;
+    }
+    state.handoffPrepareFingerprints.set(key, fingerprint);
+    if (state.handoffPrepareFingerprints.size > 200) {
+      state.handoffPrepareFingerprints.delete(state.handoffPrepareFingerprints.keys().next().value);
+    }
+    if (state.pendingPrepare) clearPendingPrepare('replaced');
     const hasIdleStandby = Boolean(
       state.contextId
       && state.contextId !== payload.playbackContextId
@@ -928,6 +1062,18 @@
       && currentPositionMs() === 0
       && !audio.dataset.trackId
     );
+    const prepared = {
+      ...payload, queueSongIds: payload.queueSongIds.slice(), standbyContextId: hasIdleStandby ? state.contextId : null,
+      socket: state.client.socket, nonce: state.client.connectionNonce,
+      connectionEpoch: state.client.connectionEpoch, generation: state.client.bootstrapGeneration,
+      cleanups: new Set(), readySent: null, phase: 'preparing',
+    };
+    state.pendingPrepare = prepared;
+    updateHandoffUi();
+    if (state.broadcastRestorePending) {
+      await failHandoffPrepare(prepared, 'restore_in_progress');
+      return;
+    }
     if (
       state.followingContextId
       || state.activeBroadcastId
@@ -937,109 +1083,132 @@
         && !hasIdleStandby
       )
     ) {
-      await state.client.request('playback.ready', {
-        playbackContextId: payload.playbackContextId,
-        prepareId: payload.prepareId,
-        handoffId: payload.handoffId,
-        ready: false,
-        errorCode: 'target_busy',
-      });
+      await failHandoffPrepare(prepared, 'target_busy');
       return;
     }
     const canSchedule = state.userGestureSeen && document.visibilityState === 'visible';
     if (!canSchedule) {
-      await state.client.request('playback.ready', {
-        playbackContextId: payload.playbackContextId,
-        prepareId: payload.prepareId,
-        handoffId: payload.handoffId,
-        ready: false,
-        errorCode: state.userGestureSeen ? 'page_hidden' : 'autoplay_blocked',
-      });
+      await failHandoffPrepare(prepared, state.userGestureSeen ? 'page_hidden' : 'autoplay_blocked');
       return;
     }
     try {
-      await ensureMeta(payload.queueSongIds);
-      state.pendingPrepare = {
-        ...payload,
-        queueSongIds: payload.queueSongIds.slice(),
-        standbyContextId: hasIdleStandby ? state.contextId : null,
-      };
+      const deadline = setTimeout(() => {
+        failHandoffPrepare(prepared, 'media_load_failed');
+      }, 8000);
+      prepared.cleanups.add(() => clearTimeout(deadline));
+      if (state.handoffPlayPending) await state.handoffPlayPending;
+      if (!currentHandoff(prepared)) return;
+      await ensureMeta(payload.queueSongIds, () => currentHandoff(prepared));
+      if (!currentHandoff(prepared)) return;
+      if (state.broadcastRestorePending) { await failHandoffPrepare(prepared, 'restore_in_progress'); return; }
+      prepared.ownsMedia = true;
       state.queue = payload.queueSongIds.slice();
       state.index = payload.currentIndex;
-      loadRequiredCurrent(payload.positionMs);
-      const expectedTrackId = state.queue[state.index];
-      await new Promise((resolve, reject) => {
-        if (audio.readyState >= 2 && audio.dataset.trackId === expectedTrackId) { resolve(); return; }
-        const timer = setTimeout(() => reject(new Error('media_load_timeout')), 8000);
-        audio.addEventListener('canplay', () => {
-          clearTimeout(timer);
-          if (audio.dataset.trackId === expectedTrackId) resolve();
-          else reject(new Error('media_load_mismatch'));
-        }, { once: true });
-        audio.addEventListener('error', () => { clearTimeout(timer); reject(new Error('media_load_failed')); }, { once: true });
-      });
-      await state.client.request('playback.ready', {
-        playbackContextId: payload.playbackContextId,
-        prepareId: payload.prepareId,
-        handoffId: payload.handoffId,
-        ready: true,
-      });
-      text('strict-handoff-state', 'ready');
+      const trackId = state.queue[state.index];
+      if (!state.trackMeta[trackId]?.streamUrl) throw new Error('media_load_failed');
+      audio.pause();
+      audio.src = state.trackMeta[trackId].streamUrl;
+      audio.dataset.trackId = trackId;
+      if (!handoffMediaMatches(prepared)) await waitForHandoff(prepared, 8000, true);
+      if (!currentHandoff(prepared)) return;
+      if (!handoffMediaMatches(prepared)) throw new Error('media_load_failed');
+      audio.currentTime = payload.positionMs / 1000;
+      audio.playbackRate = payload.playbackRate;
+      if (audio.playbackRate !== payload.playbackRate) throw new Error('media_load_failed');
+      clearTimeout(deadline);
+      prepared.phase = 'ready';
+      renderQueue();
+      await sendHandoffReady(prepared, true);
+      if (currentHandoff(prepared) && prepared.phase === 'ready') text('strict-handoff-state', 'ready');
     } catch (error) {
-      if (state.pendingPrepare?.handoffId === payload.handoffId) {
-        clearPendingPrepare('media_load_failed');
-      }
-      await state.client.request('playback.ready', {
-        playbackContextId: payload.playbackContextId,
-        prepareId: payload.prepareId,
-        handoffId: payload.handoffId,
-        ready: false,
-        errorCode: 'media_load_failed',
-        errorMessage: error.message,
-      });
+      if (prepared.readySent === true) {
+        if (currentHandoff(prepared)) clearPendingPrepare('ready unconfirmed');
+      } else await failHandoffPrepare(prepared, 'media_load_failed');
     }
   }
 
   async function commitHandoff(payload) {
     const prepared = state.pendingPrepare;
-    if (
-      !prepared
+    if (!prepared || !currentHandoff(prepared)
       || prepared.playbackContextId !== payload.playbackContextId
-      || prepared.handoffId !== payload.handoffId
-      || prepared.sourceClientId !== payload.sourceClientId
-      || prepared.controlVersion > payload.controlVersion
-    ) {
-      throw new api.StrictProtocolError('handoff commit does not match accepted prepare');
+      || prepared.handoffId !== payload.handoffId) return;
+    if (prepared.commit) {
+      if (api.stableStringify(prepared.commit) !== api.stableStringify(payload)) await failHandoffCommit(prepared);
+      return;
     }
-    if (document.visibilityState !== 'visible' || !state.userGestureSeen) return;
-    const delay = Math.max(0, payload.effectiveAtServerMs - state.client.serverNowMs());
-    await new Promise((resolve) => setTimeout(resolve, delay));
     try {
-      loadRequiredCurrent(payload.positionMs);
-    } catch (error) {
-      clearPendingPrepare('media_load_failed');
-      throw error;
-    }
-    const started = await safePlay('handoff commit autoplay_blocked');
-    if (!started) return;
-    const actualStartServerMs = state.client.serverNowMs();
-    if (window.__emoStrictV2Acceptance) {
-      window.__emoStrictV2Acceptance.handoffSamples.push({
-        handoffId: payload.handoffId,
-        effectiveAtServerMs: payload.effectiveAtServerMs,
-        actualStartServerMs,
-        absoluteErrorMs: Math.abs(actualStartServerMs - payload.effectiveAtServerMs),
+      if (prepared.phase !== 'ready' || prepared.readySent !== true
+        || prepared.sourceClientId !== payload.sourceClientId
+        || payload.controlVersion !== prepared.controlVersion + 1
+        || payload.playbackRate !== prepared.playbackRate
+        || !Number.isFinite(payload.playbackRate) || payload.playbackRate < .5 || payload.playbackRate > 2
+        || !['serverTimeMs', 'effectiveAtServerMs', 'positionMs'].every((key) => Number.isInteger(payload[key]) && payload[key] >= 0)
+        || payload.effectiveAtServerMs - payload.serverTimeMs < 250
+        || payload.serverTimeMs > state.client.serverNowMs() + 50
+        || !state.client.isClockSynchronized() || !handoffSourceMatches(prepared)) throw new Error('invalid_commit');
+      prepared.commit = { ...payload };
+      prepared.phase = 'committing';
+      const deadline = setTimeout(() => { failHandoffCommit(prepared); }, 5000);
+      prepared.cleanups.add(() => clearTimeout(deadline));
+      while (currentHandoff(prepared) && state.client.serverNowMs() < payload.effectiveAtServerMs) {
+        await waitForHandoff(prepared, Math.ceil(payload.effectiveAtServerMs - state.client.serverNowMs()));
+      }
+      if (!currentHandoff(prepared)) return;
+      if (state.broadcastRestorePending || document.visibilityState !== 'visible'
+        || !state.userGestureSeen || !state.client.isClockSynchronized()
+        || !handoffMediaMatches(prepared) || !handoffSourceMatches(prepared)) throw new Error('execution_unavailable');
+      const lateMs = Math.max(0, state.client.serverNowMs() - payload.effectiveAtServerMs);
+      const positionMs = payload.positionMs + Math.floor(lateMs * payload.playbackRate);
+      if (lateMs > 1000 || (durationMs() > 0 && positionMs >= durationMs())) throw new Error('effective_at_missed');
+      audio.currentTime = positionMs / 1000;
+      audio.playbackRate = payload.playbackRate;
+      // Keep a pending play isolated until it settles, even after cancellation.
+      const playing = audio.play().finally(() => {
+        if (!currentHandoff(prepared)) audio.pause();
       });
+      state.handoffPlayPending = playing.catch(() => {});
+      try { await playing; } finally { state.handoffPlayPending = null; updateHandoffUi(); }
+      if (!currentHandoff(prepared)) return;
+      const sampledPositionMs = currentPositionMs();
+      const sampledAt = Math.round(state.client.serverNowMs());
+      const actualRate = audio.playbackRate;
+      const expectedPosition = payload.positionMs + Math.floor(Math.max(0, sampledAt - payload.effectiveAtServerMs) * actualRate);
+      if (!handoffMediaMatches(prepared) || !handoffSourceMatches(prepared) || audio.paused || audio.ended || audio.seeking
+        || actualRate !== payload.playbackRate || !state.client.isClockSynchronized()
+        || sampledAt < payload.effectiveAtServerMs || sampledAt - payload.effectiveAtServerMs > 1000
+        || Math.abs(sampledPositionMs - Math.min(expectedPosition, durationMs() || Infinity)) > 1000
+        || (durationMs() > 0 && sampledPositionMs >= durationMs())) throw new Error('invalid_actual_proof');
+      prepared.proofSent = true;
+      state.playbackState = 'playing';
+      const clientSeq = state.client.nextClientSeq();
+      log(`handoff_complete_proof handoffId=${payload.handoffId} deviceSessionId=${deviceSessionId} queueIndex=${state.index} trackId=${audio.dataset.trackId} positionMs=${sampledPositionMs} sampledAt=${sampledAt} rate=${actualRate} provisional=${payload.controlVersion} clientSeq=${clientSeq}`);
+      if (window.__emoStrictV2Acceptance) window.__emoStrictV2Acceptance.handoffSamples.push({
+        handoffId: payload.handoffId, effectiveAtServerMs: payload.effectiveAtServerMs,
+        actualStartServerMs: sampledAt, absoluteErrorMs: Math.abs(sampledAt - payload.effectiveAtServerMs),
+      });
+      await state.client.request('playback.handoff.complete', {
+        playbackContextId: payload.playbackContextId, handoffId: payload.handoffId, deviceSessionId,
+        queueIndex: state.index, trackId: audio.dataset.trackId, state: 'playing',
+        positionMs: sampledPositionMs, positionSampledAtServerMs: sampledAt, playbackRate: actualRate,
+        appliedControlVersion: payload.controlVersion, clientSeq,
+      });
+      // Confirmation is applied only by onEvent's canonical identity checks.
+    } catch (_error) {
+      await failHandoffCommit(prepared);
     }
-    await state.client.request('playback.handoff.complete', {
-      playbackContextId: payload.playbackContextId,
-      handoffId: payload.handoffId,
-      positionMs: currentPositionMs(),
-    });
+  }
+
+  function confirmHandoff(prepared) {
+    if (!currentHandoff(prepared) || !prepared.proofSent) return;
+    for (const cleanup of prepared.cleanups) cleanup();
     state.pendingPrepare = null;
-    setContextId(payload.playbackContextId);
-    state.client.rememberSubscription(payload.playbackContextId);
+    state.appliedControlVersions.set(prepared.playbackContextId, prepared.commit.controlVersion);
+    setContextId(prepared.playbackContextId);
+    state.client.rememberSubscription(prepared.playbackContextId);
     text('strict-handoff-state', 'completed');
+    log(`handoff_completed handoffId=${prepared.handoffId}`);
+    updateHandoffUi();
+    renderQueue();
   }
 
   async function sendBroadcastFeedback(snapshot, terminal, failure = null) {
@@ -1117,6 +1286,14 @@
       state.broadcastCursor = { broadcastId: snapshot.broadcastId, revision };
     }
     const executesAudio = typeof snapshot.deliveryId === 'string';
+    if (terminal && executesAudio) {
+      state.broadcastRestorePending = true;
+      if (state.pendingPrepare) {
+        const prepared = state.pendingPrepare;
+        if (prepared.phase === 'committing') await failHandoffCommit(prepared);
+        else await failHandoffPrepare(prepared, 'restore_in_progress');
+      }
+    }
     if (!executesAudio) {
       state.activeBroadcastId = terminal ? null : snapshot.broadcastId;
       state.broadcastContextId = terminal ? null : snapshot.playbackContextId;
@@ -1171,6 +1348,7 @@
         if (!terminalConfirmed) return;
         localStorage.removeItem('emosonic.webPlayer.broadcastRecovery.v2');
         state.broadcastExecution = null;
+        state.broadcastRestorePending = false;
         state.activeBroadcastId = null;
         state.broadcastContextId = null;
         text('strict-broadcast-state', 'no broadcast');
@@ -1178,6 +1356,7 @@
       }
 
       state.activeBroadcastId = snapshot.broadcastId;
+      state.broadcastRestorePending = false;
       state.broadcastContextId = snapshot.playbackContextId;
       state.broadcastExecution = {
         broadcastId: snapshot.broadcastId,
@@ -1228,6 +1407,21 @@
       refreshBindings().catch((error) => showError(error.message));
     } else if (action === 'playback.context.status') {
       const context = message.payload.playbackContext;
+      const prepared = state.pendingPrepare;
+      if (prepared && context.playbackContextId === prepared.playbackContextId) {
+        if (prepared.proofSent && context.authorityClientId === clientId
+          && context.authorityDeviceSessionId === deviceSessionId
+          && context.epoch === prepared.sourceEpoch + 1
+          && context.version === prepared.sourceVersion + 1
+          && context.queueRevision === prepared.sourceQueueRevision
+          && context.controlVersion === prepared.commit.controlVersion) {
+          confirmHandoff(prepared);
+        } else {
+          if (!handoffSourceMatches(prepared)
+            || context.authorityDeviceSessionId !== prepared.authorityDeviceSessionId) clearPendingPrepare('source changed');
+          return;
+        }
+      }
       if (context.playbackContextId === state.followingContextId) applyContext(context, true, message.payload.deviceStates).catch((error) => showError(error.message));
       else if (
         !state.followingContextId
@@ -1265,9 +1459,7 @@
         .catch((error) => showError(error.message));
     } else if (action === 'playback.handoff.release') {
       if (alreadyProcessed(action, message.payload)) return;
-      if (state.pendingPrepare && state.pendingPrepare.handoffId === message.payload.handoffId) {
-        state.pendingPrepare = null;
-      }
+      if (state.pendingPrepare?.handoffId === message.payload.handoffId) clearPendingPrepare('released');
       const releasedContextId = message.payload.playbackContextId;
       state.client.forgetSubscription(releasedContextId);
       if (
@@ -1278,11 +1470,23 @@
       state.playbackState = 'paused';
       text('strict-handoff-state', `released to ${message.payload.newAuthorityClientId}`);
     } else if (action === 'playback.handoff.status') {
-      text('strict-handoff-state', message.payload.status);
-      if (['failed', 'cancelled', 'timedOut'].includes(message.payload.status)) {
-        clearPendingPrepare(message.payload.status);
+      const prepared = state.pendingPrepare;
+      const status = message.payload;
+      if (prepared && prepared.handoffId === status.handoffId
+        && prepared.playbackContextId === status.playbackContextId) {
+        if (status.status === 'completed') {
+          if (status.newAuthorityClientId === clientId
+            && status.newAuthorityDeviceSessionId === deviceSessionId
+            && status.controlVersion === prepared.commit?.controlVersion) confirmHandoff(prepared);
+        } else if (['failed', 'cancelled', 'timedOut'].includes(status.status)) {
+          clearPendingPrepare(status.status);
+        } else text('strict-handoff-state', status.status);
       }
+    } else if (action === 'playback.handoff.cancel') {
+      if (state.pendingPrepare?.handoffId === message.payload.handoffId
+        && state.pendingPrepare.playbackContextId === message.payload.playbackContextId) clearPendingPrepare(message.payload.reason);
     } else if (action === 'playback.context.closed') {
+      if (state.pendingPrepare?.playbackContextId === message.payload.playbackContextId) clearPendingPrepare('context closed');
       state.client.forgetSubscription(message.payload.playbackContextId);
       if (message.payload.playbackContextId === state.contextId) setContextId(null);
       if (message.payload.playbackContextId === state.followingContextId) {
@@ -1296,6 +1500,7 @@
   }
 
   async function addTrack(track) {
+    if (state.pendingPrepare || state.handoffPlayPending) throw new Error('Handoff in progress');
     if (state.followingContextId || state.broadcastExecution) throw new Error('Follow/Broadcast 活动时不能修改 authority 队列');
     if (state.queue.includes(track.id)) throw new Error('strict-v2 队列不支持重复曲目');
     const contextAlreadyExists = Boolean(state.contextId);
@@ -1329,7 +1534,12 @@
   }
 
   function runQueueMutation(operation) {
-    const pending = state.queueMutation.then(operation, operation);
+    if (state.pendingPrepare || state.handoffPlayPending) return Promise.reject(new Error('Handoff in progress'));
+    const execute = () => {
+      if (state.pendingPrepare || state.handoffPlayPending) throw new Error('Handoff in progress');
+      return operation();
+    };
+    const pending = state.queueMutation.then(execute, execute);
     state.queueMutation = pending.catch(() => {});
     return pending;
   }
@@ -1364,6 +1574,7 @@
       if (event.key === 'Enter') search().catch((error) => showError(error.message));
     });
     document.getElementById('strict-play').addEventListener('click', () => {
+      if (state.pendingPrepare || state.handoffPlayPending) return;
       state.userGestureSeen = true;
       const currentTrackId = state.queue[state.index];
       if (!currentTrackId) {
@@ -1374,12 +1585,14 @@
       runQueueMutation(() => playIndex(state.index, positionMs, true, false))
         .catch((error) => showError(error.message));
     });
-    document.getElementById('strict-pause').addEventListener('click', () => { audio.pause(); state.playbackState = 'paused'; reportFeedback(); });
+    document.getElementById('strict-pause').addEventListener('click', () => { if (state.pendingPrepare || state.handoffPlayPending) return; audio.pause(); state.playbackState = 'paused'; reportFeedback(); });
     document.getElementById('strict-next').addEventListener('click', () => {
+      if (state.pendingPrepare || state.handoffPlayPending) return;
       state.userGestureSeen = true;
       playIndex((state.index + 1) % state.queue.length, 0, true).catch((error) => showError(error.message));
     });
     document.getElementById('strict-prev').addEventListener('click', () => {
+      if (state.pendingPrepare || state.handoffPlayPending) return;
       state.userGestureSeen = true;
       playIndex((state.index - 1 + state.queue.length) % state.queue.length, 0, true).catch((error) => showError(error.message));
     });
@@ -1391,6 +1604,7 @@
       if (activeFeedbackContextId()) reportFeedback();
     });
     document.getElementById('strict-progress').addEventListener('change', (event) => {
+      if (state.pendingPrepare || state.handoffPlayPending) return;
       const target = (Number(event.target.value) / 1000) * durationMs();
       try { audio.currentTime = target / 1000; } catch (error) { /* ignored */ }
       reportFeedback();
@@ -1412,6 +1626,12 @@
     audio.addEventListener('play', () => { state.playbackState = 'playing'; reportFeedback(); });
     audio.addEventListener('pause', () => { if (!audio.ended) { state.playbackState = 'paused'; reportFeedback(); } });
     audio.addEventListener('ended', () => {
+      if (state.pendingPrepare) {
+        if (state.pendingPrepare.phase === 'committing') failHandoffCommit(state.pendingPrepare);
+        else failHandoffPrepare(state.pendingPrepare, 'media_load_failed');
+        return;
+      }
+      if (state.handoffPlayPending) return;
       playIndex((state.index + 1) % state.queue.length, 0, true).catch((error) => showError(error.message));
     });
     audio.addEventListener('timeupdate', () => {
@@ -1452,6 +1672,8 @@
           state.followLeaseKnown = false;
           suspendTransientFollow('connection lost');
           clearPendingPrepare('connection lost');
+          state.processedCommands.clear();
+          state.handoffPrepareFingerprints.clear();
           if (state.broadcastExecution) {
             audio.pause();
             state.playbackState = 'paused';

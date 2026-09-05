@@ -213,6 +213,7 @@
       this.protocolFailed = false;
       this.serverClockOffsetMs = 0;
       this.serverClockSample = null;
+      this.clockSamples = [];
       this.monotonicNow = this.options.monotonicNow || (() => (
         typeof performance !== 'undefined' && typeof performance.now === 'function'
           ? performance.now()
@@ -386,6 +387,8 @@
       this.connectionNonce = null;
       this.connectionEpoch = null;
       this.clientSeq = 0;
+      this.clockSamples = [];
+      this.serverClockSample = null;
       for (const pending of this.pending.values()) {
         clearTimeout(pending.timer);
         pending.reject(new Error(`Socket disconnected: ${reason || 'unknown'}`));
@@ -537,8 +540,8 @@
         if (typeof message.action !== 'string' || !message.action) {
           throw new StrictProtocolError('Strict output action is missing');
         }
-        this._updateServerClock(message);
         this._assertProvenance(message);
+        this._updateServerClock(message);
         const contextAccepted = this._ingestContext(message);
         this._ingestSubscriptionLifecycle(message);
         if (message.requestId) {
@@ -554,6 +557,18 @@
 
     _updateServerClock(message) {
       const serverTimeMs = Number(message.payload && message.payload.serverTimeMs);
+      const pending = this.pending.get(message.requestId);
+      if (message.action === 'system.pong' && pending?.action === 'system.ping') {
+        if (!Number.isInteger(message.payload?.serverTimeMs) || serverTimeMs < 0) return;
+        const receivedAt = this.monotonicNow();
+        const rtt = Math.max(0, receivedAt - pending.sentMonotonicMs);
+        const sample = { at: receivedAt, rtt, offset: serverTimeMs - (receivedAt - rtt / 2) };
+        this.clockSamples.push(sample);
+        this.clockSamples = this.clockSamples.slice(-5);
+        this.serverClockSample = { serverTimeMs: serverTimeMs + rtt / 2, monotonicMs: receivedAt };
+        return;
+      }
+      if (this.clockSamples.length) return;
       if (Number.isFinite(serverTimeMs)) {
         this.serverClockOffsetMs = serverTimeMs - Date.now();
         this.serverClockSample = {
@@ -576,6 +591,14 @@
           + Math.max(0, this.monotonicNow() - this.serverClockSample.monotonicMs);
       }
       return Date.now() + this.serverClockOffsetMs;
+    }
+
+    isClockSynchronized() {
+      if (this.clockSamples.length < 3) return false;
+      const latest = this.clockSamples[this.clockSamples.length - 1];
+      const offsets = this.clockSamples.map((sample) => sample.offset);
+      return this.monotonicNow() - latest.at <= 15000
+        && Math.max(latest.rtt / 2, Math.max(...offsets) - Math.min(...offsets)) <= 50;
     }
 
     _startHeartbeat() {
@@ -734,6 +757,12 @@
           && (
             !message.payload
             || message.payload.handoffId !== pending.payload.handoffId
+            || !['completed', 'failed', 'cancelled', 'timedOut'].includes(message.payload.status)
+            || (message.payload.status === 'completed' && (
+              message.payload.newAuthorityClientId !== this.registration.clientId
+              || message.payload.newAuthorityDeviceSessionId !== pending.payload.deviceSessionId
+              || message.payload.controlVersion !== pending.payload.appliedControlVersion
+            ))
           )
         ) {
           continue;
@@ -772,6 +801,8 @@
     }
 
     _ingestContext(message) {
+      // Handoff N+1 belongs to its provisional lane until canonical completion.
+      if (message.action === 'player.play' && message.payload?.handoffId) return true;
       let context = null;
       let completeSnapshot = false;
       if (message.action === 'playback.context.ensure') {
@@ -941,6 +972,7 @@
         resolve: resolvePromise,
         reject: rejectPromise,
         timer,
+        sentMonotonicMs: this.monotonicNow(),
       });
       this._debug('request_sent', {
         requestId: envelope.requestId,

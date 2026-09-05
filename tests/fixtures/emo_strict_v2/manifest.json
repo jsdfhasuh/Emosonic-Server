@@ -1162,10 +1162,11 @@
     },
     "REQ-084": {
       "profiles": ["handoff"],
-      "testModules": ["tests.base.test_emo_ws_store"],
+      "testModules": ["tests.base.test_emo_ws_store", "tests.base.test_emo_web_handoff_wire"],
       "testMethods": [
         "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_handoff_complete_accepts_exact_time_and_position_boundaries",
-        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_handoff_complete_rejects_just_over_proof_boundaries_without_writes"
+        "tests.base.test_emo_ws_store.EmoWebSocketStoreTestCase.test_handoff_complete_rejects_just_over_proof_boundaries_without_writes",
+        "tests.base.test_emo_web_handoff_wire.WebHandoffWireTestCase.test_actual_complete_and_all_required_field_rejections"
       ]
     },
     "REQ-085": {
@@ -1178,10 +1179,14 @@
     },
     "REQ-086": {
       "profiles": ["handoff"],
-      "testModules": ["tests.base.test_emo_strict_v2_handoff"],
+      "testModules": ["tests.base.test_emo_strict_v2_handoff", "tests.base.test_emo_web_handoff_wire"],
       "testMethods": [
         "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_target_disconnect_fails_handoff_without_switching_authority",
-        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_restart_fails_nonterminal_handoff_with_server_restart"
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_restart_fails_nonterminal_handoff_with_server_restart",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_active_handoff_retry_with_different_target_device_is_rejected_without_mutation",
+        "tests.base.test_emo_strict_v2_handoff.StrictV2HandoffTestCase.test_active_handoff_retry_with_different_base_control_version_is_rejected_without_mutation",
+        "tests.base.test_emo_web_handoff_wire.WebHandoffWireTestCase.test_actual_page_ready_branches_use_complete_workspace_contract",
+        "tests.base.test_emo_web_handoff_wire.WebHandoffWireTestCase.test_actual_page_handoff_lifecycle_regressions"
       ]
     },
     "REQ-087": {

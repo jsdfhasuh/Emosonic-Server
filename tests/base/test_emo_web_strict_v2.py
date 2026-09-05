@@ -27,6 +27,7 @@ from supysonic.managers.user import UserManager
 from supysonic.web import create_application
 
 from tests.testbase import TestConfig
+from tests.base.test_emo_web_handoff_wire import capture_page_messages
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1286,7 +1287,6 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
         )
         self.assertEqual(start_ack["action"], "system.ack", start_ack)
         handoff_id = start_ack["payload"]["handoffId"]
-        prepare_id = start_ack["payload"]["prepareId"]
         prepare = next(
             message
             for message in self.messages(target)
@@ -1294,14 +1294,12 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
         )
         self.assertEqual(prepare["payload"]["deviceSessionId"], "web-player-device:target")
 
-        ready = self.fixture_message("playback.ready")
-        ready["payload"] = {
-            "playbackContextId": "ctx-handoff",
-            "prepareId": prepare_id,
-            "handoffId": handoff_id,
-            "deviceSessionId": "web-player-device:target",
-            "ready": True,
-        }
+        ready = next(
+            message for message in capture_page_messages(
+                prepare=prepare["payload"],
+                options={"now": prepare["payload"]["positionSampledAtServerMs"]},
+            ) if message["action"] == "playback.ready"
+        )
         target.emit("message", ready, namespace="/emo")
         target_ready_messages = self.messages(target)
         commit = next(
@@ -1317,23 +1315,12 @@ class EmoWebStrictV2TestCase(unittest.TestCase):
         self.assertEqual(commit["payload"]["sourceClientId"], "web-player-source")
         self.assertGreater(commit["payload"]["effectiveAtServerMs"], 0)
 
-        complete = self.fixture_message("playback.handoff.complete")
-        current_context = getPlaybackContextState("ctx-handoff")
-        complete["payload"] = {
-            "playbackContextId": "ctx-handoff",
-            "handoffId": handoff_id,
-            "deviceSessionId": "web-player-device:target",
-            "queueIndex": current_context["currentIndex"],
-            "trackId": current_context["trackId"],
-            "state": "playing",
-            "positionMs": commit["payload"]["positionMs"],
-            "positionSampledAtServerMs": commit["payload"][
-                "effectiveAtServerMs"
-            ],
-            "playbackRate": commit["payload"]["playbackRate"],
-            "appliedControlVersion": commit["payload"]["controlVersion"],
-            "clientSeq": 1,
-        }
+        complete = next(
+            message for message in capture_page_messages(
+                prepare=prepare["payload"], commit=commit["payload"],
+                options={"now": commit["payload"]["serverTimeMs"]},
+            ) if message["action"] == "playback.handoff.complete"
+        )
         with mock.patch(
             "supysonic.emo.ws._server_time_ms",
             return_value=commit["payload"]["effectiveAtServerMs"],

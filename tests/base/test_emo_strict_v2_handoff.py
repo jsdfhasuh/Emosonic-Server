@@ -137,6 +137,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         request_id: str = "handoff-start-1",
         target_client_id: str = "target-1",
         target_device_session_id: str = None,
+        base_control_version: int = 1,
     ) -> List[Dict[str, object]]:
         if target_device_session_id is None:
             target_device_session_id = "device:%s" % target_client_id
@@ -150,7 +151,7 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
                     "playbackContextId": "context-handoff-1",
                     "targetClientId": target_client_id,
                     "targetDeviceSessionId": target_device_session_id,
-                    "baseControlVersion": 1,
+                    "baseControlVersion": base_control_version,
                 },
             },
             namespace="/emo",
@@ -1032,6 +1033,256 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         self.assertEqual(
             retry_ack["payload"]["prepareId"],
             first_prepare["payload"]["prepareId"],
+        )
+        self.assertEqual(self.get_messages(target), [])
+
+    def test_active_handoff_retry_with_different_target_device_is_rejected_without_mutation(self):
+        source, target, controller = self.connect_handoff_devices()
+        first_ack = self.get_ack(
+            self.start_handoff(controller, "handoff-start-first"),
+            "handoff-start-first",
+        )
+        self.get_messages(target)
+        handoff_id = first_ack["payload"]["handoffId"]
+        prepare_id = first_ack["payload"]["prepareId"]
+        before_context = getPlaybackContextState("context-handoff-1")
+        before_handoff = getPlaybackHandoff(handoff_id)
+        before_prepare = get_state().get_prepare(prepare_id)
+        before_handoffs = getActivePlaybackHandoffs("context-handoff-1")
+
+        with mock.patch.object(
+            emo_ws,
+            "_rebuild_handoff_prepare_if_missing",
+            wraps=emo_ws._rebuild_handoff_prepare_if_missing,
+        ) as rebuild_prepare, mock.patch.object(
+            emo_ws,
+            "_expire_stale_handoff",
+            wraps=emo_ws._expire_stale_handoff,
+        ) as expire_handoff:
+            retry_messages = self.start_handoff(
+                controller,
+                "handoff-start-different-device",
+                target_device_session_id="device:target-2",
+            )
+
+        error = self.get_error(retry_messages, "handoff-start-different-device")
+        self.assertEqual(error["payload"]["code"], "conflict")
+        self.assertEqual(
+            {
+                field_name: error["payload"][field_name]
+                for field_name in (
+                    "playbackContextId",
+                    "currentEpoch",
+                    "currentVersion",
+                    "currentQueueRevision",
+                    "currentControlVersion",
+                )
+            },
+            {
+                "playbackContextId": "context-handoff-1",
+                "currentEpoch": before_context["epoch"],
+                "currentVersion": before_context["version"],
+                "currentQueueRevision": before_context["queueRevision"],
+                "currentControlVersion": before_context["controlVersion"],
+            },
+        )
+        self.assertEqual(getPlaybackContextState("context-handoff-1"), before_context)
+        self.assertEqual(getPlaybackHandoff(handoff_id), before_handoff)
+        self.assertEqual(get_state().get_prepare(prepare_id), before_prepare)
+        self.assertEqual(
+            getActivePlaybackHandoffs("context-handoff-1"),
+            before_handoffs,
+        )
+        rebuild_prepare.assert_not_called()
+        expire_handoff.assert_not_called()
+        self.assertEqual(self.get_messages(source), [])
+        self.assertEqual(self.get_messages(target), [])
+        self.assertEqual(self.get_messages(controller), [])
+
+    def test_active_handoff_retry_with_different_base_control_version_is_rejected_without_mutation(self):
+        source, target, controller = self.connect_handoff_devices()
+        first_ack = self.get_ack(
+            self.start_handoff(controller, "handoff-start-first"),
+            "handoff-start-first",
+        )
+        self.get_messages(target)
+        handoff_id = first_ack["payload"]["handoffId"]
+        prepare_id = first_ack["payload"]["prepareId"]
+        before_context = getPlaybackContextState("context-handoff-1")
+        before_handoff = getPlaybackHandoff(handoff_id)
+        before_prepare = get_state().get_prepare(prepare_id)
+        before_handoffs = getActivePlaybackHandoffs("context-handoff-1")
+
+        with mock.patch.object(
+            emo_ws,
+            "_rebuild_handoff_prepare_if_missing",
+            wraps=emo_ws._rebuild_handoff_prepare_if_missing,
+        ) as rebuild_prepare, mock.patch.object(
+            emo_ws,
+            "_expire_stale_handoff",
+            wraps=emo_ws._expire_stale_handoff,
+        ) as expire_handoff:
+            retry_messages = self.start_handoff(
+                controller,
+                "handoff-start-different-base",
+                base_control_version=2,
+            )
+
+        error = self.get_error(retry_messages, "handoff-start-different-base")
+        self.assertEqual(error["payload"]["code"], "conflict")
+        self.assertEqual(getPlaybackContextState("context-handoff-1"), before_context)
+        self.assertEqual(getPlaybackHandoff(handoff_id), before_handoff)
+        self.assertEqual(get_state().get_prepare(prepare_id), before_prepare)
+        self.assertEqual(getActivePlaybackHandoffs("context-handoff-1"), before_handoffs)
+        rebuild_prepare.assert_not_called()
+        expire_handoff.assert_not_called()
+        self.assertEqual(self.get_messages(source), [])
+        self.assertEqual(self.get_messages(target), [])
+        self.assertEqual(self.get_messages(controller), [])
+
+    def test_active_handoff_retry_from_wrong_user_is_rejected_without_mutation(self):
+        source, target, controller = self.connect_handoff_devices()
+        first_ack = self.get_ack(
+            self.start_handoff(controller, "handoff-start-first"),
+            "handoff-start-first",
+        )
+        for client in (source, target, controller):
+            self.get_messages(client)
+
+        bob_controller = self.connect_device(
+            "bob",
+            "B0b",
+            "bob-controller-1",
+            "device:bob-controller-1",
+            ["controller"],
+            capabilities={CAPABILITY_PLAYBACK_CONTEXT_V2: True},
+        )
+        self.get_messages(bob_controller)
+        before_context = getPlaybackContextState("context-handoff-1")
+        before_handoff = getPlaybackHandoff(first_ack["payload"]["handoffId"])
+        before_prepare = get_state().get_prepare(first_ack["payload"]["prepareId"])
+        before_handoffs = getActivePlaybackHandoffs("context-handoff-1")
+
+        bob_controller.emit(
+            "message",
+            {
+                "type": "command",
+                "action": "playback.handoff.start",
+                "requestId": "handoff-start-wrong-user",
+                "payload": {
+                    "playbackContextId": "context-handoff-1",
+                    "targetClientId": "target-1",
+                    "targetDeviceSessionId": "device:target-1",
+                    "baseControlVersion": 1,
+                },
+            },
+            namespace="/emo",
+        )
+        error = self.get_error(
+            self.get_messages(bob_controller),
+            "handoff-start-wrong-user",
+        )
+        self.assertEqual(error["payload"]["code"], "not_found")
+        self.assertEqual(getPlaybackContextState("context-handoff-1"), before_context)
+        self.assertEqual(
+            getPlaybackHandoff(first_ack["payload"]["handoffId"]),
+            before_handoff,
+        )
+        self.assertEqual(
+            get_state().get_prepare(first_ack["payload"]["prepareId"]),
+            before_prepare,
+        )
+        self.assertEqual(getActivePlaybackHandoffs("context-handoff-1"), before_handoffs)
+        self.assertEqual(self.get_messages(source), [])
+        self.assertEqual(self.get_messages(target), [])
+        self.assertEqual(self.get_messages(controller), [])
+
+    def test_active_handoff_retry_from_stale_requester_generation_is_rejected_without_mutation(self):
+        source, target, controller = self.connect_handoff_devices()
+        first_ack = self.get_ack(
+            self.start_handoff(controller, "handoff-start-first"),
+            "handoff-start-first",
+        )
+        for client in (source, target, controller):
+            self.get_messages(client)
+        before_context = getPlaybackContextState("context-handoff-1")
+        before_handoff = getPlaybackHandoff(first_ack["payload"]["handoffId"])
+        before_prepare = get_state().get_prepare(first_ack["payload"]["prepareId"])
+        before_handoffs = getActivePlaybackHandoffs("context-handoff-1")
+        stale_client = {
+            "userName": "alice",
+            "clientId": "controller-1",
+            "deviceSessionId": "device:controller-old",
+        }
+        controller_sid = get_state().get_sid_for_client(
+            "controller-1",
+            user_name="alice",
+        )
+        registered_controller = get_state().get_client_for_sid(controller_sid)
+        client_lookups = iter((registered_controller, stale_client))
+
+        def resolve_requester_client(_sid):
+            return next(client_lookups, stale_client)
+
+        with mock.patch.object(
+            get_state(),
+            "get_client_for_sid",
+            side_effect=resolve_requester_client,
+        ), mock.patch.object(
+            emo_ws,
+            "_expire_stale_handoff",
+            wraps=emo_ws._expire_stale_handoff,
+        ) as expire_handoff:
+            retry_messages = self.start_handoff(
+                controller,
+                "handoff-start-stale-requester",
+            )
+
+        error = self.get_error(retry_messages, "handoff-start-stale-requester")
+        self.assertEqual(error["payload"]["code"], "forbidden")
+        self.assertEqual(getPlaybackContextState("context-handoff-1"), before_context)
+        self.assertEqual(
+            getPlaybackHandoff(first_ack["payload"]["handoffId"]),
+            before_handoff,
+        )
+        self.assertEqual(
+            get_state().get_prepare(first_ack["payload"]["prepareId"]),
+            before_prepare,
+        )
+        self.assertEqual(getActivePlaybackHandoffs("context-handoff-1"), before_handoffs)
+        expire_handoff.assert_not_called()
+        self.assertEqual(self.get_messages(source), [])
+        self.assertEqual(self.get_messages(target), [])
+
+    def test_equivalent_retry_after_source_progress_reuses_active_handoff(self):
+        source, target, controller = self.connect_handoff_devices()
+        first_ack = self.get_ack(
+            self.start_handoff(controller, "handoff-start-first"),
+            "handoff-start-first",
+        )
+        self.get_messages(target)
+
+        progress_messages = self.report_strict_playback_context(
+            source,
+            "handoff-source-progress",
+            "context-handoff-1",
+            "device:source-1",
+            state="playing",
+            position_ms=1500,
+            client_seq=2,
+        )
+        self.assertFalse(
+            any(message["action"] == "system.error" for message in progress_messages)
+        )
+        self.get_messages(controller)
+
+        retry_ack = self.get_ack(
+            self.start_handoff(controller, "handoff-start-after-progress"),
+            "handoff-start-after-progress",
+        )
+        self.assertEqual(
+            retry_ack["payload"]["handoffId"],
+            first_ack["payload"]["handoffId"],
         )
         self.assertEqual(self.get_messages(target), [])
 

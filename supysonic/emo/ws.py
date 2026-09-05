@@ -970,9 +970,21 @@ class QueueConflictError(Exception):
 
 
 class ControlConflictError(Exception):
-    def __init__(self, message, current_control_version=None):
+    def __init__(
+        self,
+        message,
+        current_control_version=None,
+        playback_context_id=None,
+        current_epoch=None,
+        current_version=None,
+        current_queue_revision=None,
+    ):
         super().__init__(message)
         self.current_control_version = current_control_version
+        self.playback_context_id = playback_context_id
+        self.current_epoch = current_epoch
+        self.current_version = current_version
+        self.current_queue_revision = current_queue_revision
 
 
 class PlaybackAuthorityOfflineError(Exception):
@@ -11188,6 +11200,29 @@ def _ensure_handoff_for_user(handoff, user_name):
         raise PermissionError("Playback handoff belongs to another user")
 
 
+def _handoff_start_matches_frozen_request(
+    handoff: Dict[str, object],
+    user_name: str,
+    playback_context_id: str,
+    source_client_id: str,
+    target_client_id: str,
+    target_device_session_id: str,
+    origin_client_id: str,
+    base_control_version: int,
+) -> bool:
+    return all(
+        (
+            handoff.get("userName") == user_name,
+            handoff.get("playbackContextId") == playback_context_id,
+            handoff.get("sourceClientId") == source_client_id,
+            handoff.get("targetClientId") == target_client_id,
+            handoff.get("targetDeviceSessionId") == target_device_session_id,
+            handoff.get("originClientId") == origin_client_id,
+            handoff.get("baseControlVersion") == base_control_version,
+        )
+    )
+
+
 def _send_handoff_start_ack(
     request_id,
     handoff,
@@ -11929,6 +11964,17 @@ def _handle_handoff_start(
                 "Playback handoff requestId already belongs to another target device",
                 current_control_version=context.get("controlVersion", 0),
             )
+        if strict_v2:
+            existing_base_control_version = payload.get("baseControlVersion")
+            if existing_base_control_version is None:
+                existing_base_control_version = context.get("controlVersion", 0)
+            if existing_handoff.get("baseControlVersion") != (
+                existing_base_control_version
+            ):
+                raise ControlConflictError(
+                    "Playback handoff requestId already belongs to another control baseline",
+                    current_control_version=context.get("controlVersion", 0),
+                )
         expired_handoff = _expire_stale_handoff(existing_handoff)
         if expired_handoff is not None:
             existing_handoff = expired_handoff
@@ -11960,13 +12006,31 @@ def _handle_handoff_start(
 
     for active_handoff in getActivePlaybackHandoffs(playback_context_id):
         _ensure_handoff_for_user(active_handoff, current_user_name)
-        if _expire_stale_handoff(active_handoff) is not None:
-            continue
-        if strict_v2 and (
-            active_handoff.get("sourceClientId") == source_client_id
-            and active_handoff.get("targetClientId") == target_client_id
-            and active_handoff.get("originClientId") == origin_client_id
-        ):
+        requested_target_device_session_id = payload.get("targetDeviceSessionId")
+        requested_base_control_version = payload.get("baseControlVersion")
+        if requested_base_control_version is None:
+            requested_base_control_version = context.get("controlVersion", 0)
+        if strict_v2:
+            if not _handoff_start_matches_frozen_request(
+                active_handoff,
+                current_user_name,
+                playback_context_id,
+                source_client_id,
+                target_client_id,
+                requested_target_device_session_id,
+                origin_client_id,
+                requested_base_control_version,
+            ):
+                raise ControlConflictError(
+                    "Playback handoff already in progress",
+                    current_control_version=context.get("controlVersion", 0),
+                    playback_context_id=context.get("playbackContextId"),
+                    current_epoch=context.get("epoch"),
+                    current_version=context.get("version"),
+                    current_queue_revision=context.get("queueRevision"),
+                )
+            if _expire_stale_handoff(active_handoff) is not None:
+                continue
             active_handoff = _rebuild_handoff_prepare_if_missing(
                 active_handoff,
                 context,
@@ -11980,9 +12044,15 @@ def _handle_handoff_start(
                 strict_v2=True,
             )
             return active_handoff
+        if _expire_stale_handoff(active_handoff) is not None:
+            continue
         raise ControlConflictError(
             "Playback handoff already in progress",
             current_control_version=context.get("controlVersion", 0),
+            playback_context_id=context.get("playbackContextId"),
+            current_epoch=context.get("epoch"),
+            current_version=context.get("version"),
+            current_queue_revision=context.get("queueRevision"),
         )
 
     if context.get("authorityClientId") != source_client_id:
@@ -14883,6 +14953,14 @@ class EmoNamespace(Namespace):
                 ),
             )
             error_payload = {"code": "conflict", "message": str(exc)}
+            if exc.playback_context_id is not None:
+                error_payload["playbackContextId"] = exc.playback_context_id
+            if exc.current_epoch is not None:
+                error_payload["currentEpoch"] = exc.current_epoch
+            if exc.current_version is not None:
+                error_payload["currentVersion"] = exc.current_version
+            if exc.current_queue_revision is not None:
+                error_payload["currentQueueRevision"] = exc.current_queue_revision
             if exc.current_control_version is not None:
                 error_payload["currentControlVersion"] = exc.current_control_version
             _emit_message(
