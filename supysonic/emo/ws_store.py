@@ -289,6 +289,7 @@ class PlaybackHandoffCompleteResult(tuple):
         affected_authority_pairs: Iterable[AuthorityPair],
         retired_context: Optional[Dict[str, object]] = None,
         terminalized: bool = False,
+        transferred_follow_leases: Iterable[Dict[str, object]] = (),
     ):
         result = super().__new__(
             cls,
@@ -308,6 +309,7 @@ class PlaybackHandoffCompleteResult(tuple):
             None if retired_context is None else dict(retired_context)
         )
         result.terminalized = bool(terminalized)
+        result.transferred_follow_leases = tuple(transferred_follow_leases)
         return result
 
 
@@ -7143,6 +7145,12 @@ def _completeStrictPlaybackHandoffLocked(
             handoff_record.updated_at = now()
             handoff_record.save()
             handoff_payload = serializePlaybackHandoff(handoff_record)
+            from .follow_store import transferFollowSourceForHandoffInTransaction
+
+            transferred_follow_leases = transferFollowSourceForHandoffInTransaction(
+                handoff_record,
+                server_received_at_ms,
+            )
             return PlaybackHandoffCompleteResult(
                 context_payload,
                 handoff_payload,
@@ -7150,6 +7158,7 @@ def _completeStrictPlaybackHandoffLocked(
                 True,
                 authority_pairs,
                 retired_context=retired_context,
+                transferred_follow_leases=transferred_follow_leases,
             )
     finally:
         close_connection()

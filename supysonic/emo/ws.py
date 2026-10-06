@@ -12484,7 +12484,10 @@ def _handle_handoff_complete(
         _ensure_playback_context_for_user(playback_context, current_user_name)
         _ensure_playback_context_active(playback_context)
         target_device_session_id = handoff.get("targetDeviceSessionId")
-        if target_device_session_id != current_client.get("deviceSessionId"):
+        if (
+            target_device_session_id != current_client.get("deviceSessionId")
+            or target_device_session_id != payload.get("deviceSessionId")
+        ):
             raise PermissionError(
                 "playback.handoff.complete device does not match handoff target"
             )
@@ -12604,6 +12607,11 @@ def _handle_handoff_complete(
                 "affectedAuthorityPairs": result.affected_authority_pairs,
             }
         state.restore_playback_context(playback_context_id, updated_context)
+        for lease in result.transferred_follow_leases:
+            state.transfer_follow_relationship_source(
+                lease,
+                completed_handoff["sourceClientId"],
+            )
         if device_state is not None:
             state.record_device_playback_state(
                 playback_context_id,

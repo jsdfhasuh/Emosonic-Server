@@ -943,6 +943,63 @@ def refreshFollowSourceGeneration(
     return refreshed
 
 
+def transferFollowSourceForHandoffInTransaction(
+    handoff: EmoPlaybackHandoff,
+    server_time_ms: int,
+) -> List[Dict[str, object]]:
+    """Move only the frozen source generation's leases at canonical completion.
+
+    The caller holds the source Context lock and the Handoff authority-pair
+    transaction. Every ordinary lease mutation takes that same Context lock;
+    do not acquire follower locks here in a different order.
+    """
+    if not db.in_transaction():
+        raise RuntimeError(
+            "Follow source transfer requires an active database transaction"
+        )
+    if handoff.status != "completed":
+        raise ValueError("Follow source transfer requires a completed Handoff")
+    records = (
+        EmoFollowSafetyLease.select()
+        .where(
+            (EmoFollowSafetyLease.user_name == handoff.user_name)
+            & (
+                EmoFollowSafetyLease.source_playback_context_id
+                == handoff.playback_context_id
+            )
+            & (
+                EmoFollowSafetyLease.source_authority_client_id
+                == handoff.source_client_id
+            )
+            & (
+                EmoFollowSafetyLease.source_authority_device_session_id
+                == handoff.source_device_session_id
+            )
+            & (
+                EmoFollowSafetyLease.source_connection_nonce
+                == handoff.source_connection_nonce
+            )
+            & (
+                EmoFollowSafetyLease.source_connection_epoch
+                == handoff.source_connection_epoch
+            )
+            & (EmoFollowSafetyLease.phase.in_(("active", "reconnectGrace")))
+        )
+        .order_by(EmoFollowSafetyLease.id)
+    )
+    transferred = []
+    for record in records:
+        record.source_authority_client_id = handoff.target_client_id
+        record.source_authority_device_session_id = handoff.target_device_session_id
+        record.source_connection_nonce = handoff.target_connection_nonce
+        record.source_connection_epoch = handoff.target_connection_epoch
+        record.source_recovery_deadline_at_ms = None
+        _refresh_lease_fingerprint(record)
+        _save_lease(record, server_time_ms)
+        transferred.append(serializeFollowSafetyLease(record))
+    return transferred
+
+
 def markFollowSourceContextsClosed(
     playback_context_ids: Iterable[str],
     server_time_ms: int,

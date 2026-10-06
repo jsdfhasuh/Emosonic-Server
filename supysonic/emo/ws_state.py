@@ -3141,6 +3141,27 @@ class WebSocketState:
             self._follow_relationships[follower_client_id] = relationship
         return dict(relationship)
 
+    def transfer_follow_relationship_source(
+        self,
+        lease: Dict[str, object],
+        previous_source_client_id: str,
+    ) -> None:
+        """Refresh an existing projection without recreating stopped Follow."""
+        with self._lock:
+            relationship = self._follow_relationships.get(lease["followerClientId"])
+            if relationship is None or any(
+                relationship.get(key) != expected
+                for key, expected in (
+                    ("userName", lease["userName"]),
+                    ("followerSessionId", lease["followerDeviceSessionId"]),
+                    ("sourcePlaybackContextId", lease["sourcePlaybackContextId"]),
+                    ("sourceClientId", previous_source_client_id),
+                )
+            ):
+                return
+            relationship["sourceClientId"] = lease["sourceAuthorityClientId"]
+            relationship["updatedAtMs"] = lease["updatedAtMs"]
+
     def stop_follow_relationship(self, follower_client_id, now=None):
         now_ms = _timestamp_ms(now)
         with self._lock:
