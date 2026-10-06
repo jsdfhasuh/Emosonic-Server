@@ -138,6 +138,7 @@ from .ws_store import (
     getDevicePlaybackState,
     getPlaybackContextState,
     getPlaybackContextStateForUser,
+    getPlaybackContextWithDeviceStates,
     getPlaybackContextCloseTombstone,
     getPlaybackControlTransaction,
     getPlaybackHandoff,
@@ -170,6 +171,7 @@ from .ws_store import (
     serializePlaybackContextV2,
     settlePlaybackPrepareTransaction,
     settlePlaybackControlTransaction,
+    strictPlaybackContextLockSet,
     applyStrictPlaybackUpdate,
     terminateStrictPlaybackHandoff,
     updatePlaybackContextState,
@@ -9509,21 +9511,62 @@ def _normalize_v2_playback_update_payload(
 
 def _build_playback_context_status_payload(playback_context):
     playback_context_id = playback_context.get("playbackContextId")
-    persisted_device_states = getDevicePlaybackStates(playback_context_id)
-    runtime_device_states = state.list_device_playback_states(playback_context_id)
-    device_states = []
-    device_states_by_client_id = {}
-    for device_state in persisted_device_states + runtime_device_states:
-        client_id = (
-            device_state.get("clientId")
-            or device_state.get("sourceClientId")
-            or device_state.get("ownerClientId")
+    user_name = playback_context.get("userName")
+    with strictPlaybackContextLockSet((playback_context_id,)):
+        snapshot = getPlaybackContextWithDeviceStates(
+            playback_context_id, user_name=user_name,
         )
-        if not client_id:
-            device_states.append(device_state)
-            continue
-        device_states_by_client_id[client_id] = device_state
-    device_states.extend(device_states_by_client_id.values())
+        if snapshot is None:
+            raise LookupError("Playback context not found")
+        playback_context = snapshot["playbackContext"]
+        _ensure_playback_context_for_user(playback_context, user_name)
+        _ensure_playback_context_active(playback_context)
+        device_states_by_client_id = {
+            item["sourceClientId"]: item for item in snapshot["deviceStates"]
+        }
+        for device_state in state.list_device_playback_states(playback_context_id):
+            client_id = (
+                device_state.get("clientId")
+                or device_state.get("sourceClientId")
+                or device_state.get("ownerClientId")
+            )
+            device_session_id = device_state.get("deviceSessionId")
+            context_epoch = device_state.get("contextEpoch", device_state.get("epoch"))
+            generation = state.get_current_physical_generation(
+                user_name, client_id, device_session_id,
+            )
+            runtime_nonce = device_state.get(
+                "_connectionNonce", device_state.get("connectionNonce"),
+            )
+            runtime_connection_epoch = device_state.get(
+                "_connectionEpoch", device_state.get("connectionEpoch"),
+            )
+            if (
+                generation is None
+                or device_state.get("userName", user_name) != user_name
+                or type(context_epoch) is not int
+                or context_epoch != playback_context["epoch"]
+                or runtime_nonce != generation["connectionNonce"]
+                or type(runtime_connection_epoch) is not int
+                or runtime_connection_epoch != generation["connectionEpoch"]
+            ):
+                continue
+            previous = device_states_by_client_id.get(client_id)
+            if (
+                previous is not None
+                and previous.get("deviceSessionId") == device_session_id
+                and previous.get("_connectionNonce", previous.get("connectionNonce")) == runtime_nonce
+                and previous.get("_connectionEpoch", previous.get("connectionEpoch")) == runtime_connection_epoch
+            ):
+                def sequence(value):
+                    return tuple(
+                        value.get(key) if type(value.get(key)) is int else 0
+                        for key in ("appliedControlVersion", "clientSeq")
+                    )
+                if sequence(device_state) < sequence(previous):
+                    continue
+            device_states_by_client_id[client_id] = device_state
+        device_states = list(device_states_by_client_id.values())
     serialized_device_states = [
         serializeDevicePlaybackStateV2(device_state)
         for device_state in device_states

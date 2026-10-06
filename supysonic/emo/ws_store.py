@@ -10,7 +10,7 @@ from functools import wraps
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 from uuid import uuid4
 
-from peewee import IntegrityError, SqliteDatabase, fn
+from peewee import IntegrityError, JOIN, SqliteDatabase, fn
 
 from ..db import (
     EmoBroadcastFence,
@@ -7641,29 +7641,45 @@ def getDevicePlaybackStates(playback_context_id):
         close_connection()
 
 
-def getPlaybackContextWithDeviceStates(playback_context_id):
-    open_connection(reuse=True)
-    try:
-        context_record = EmoPlaybackContext.get_or_none(
-            EmoPlaybackContext.playback_context_id == playback_context_id
-        )
-        if context_record is None:
-            return None
-        device_records = EmoDevicePlaybackState.select().where(
-            (EmoDevicePlaybackState.playback_context_id == playback_context_id)
-            & (EmoDevicePlaybackState.context_epoch == context_record.epoch)
-            & (EmoDevicePlaybackState.applied_control_version >= 1)
-            & (EmoDevicePlaybackState.client_seq >= 1)
-        )
-        return {
-            "playbackContext": _playback_context_payload(context_record),
-            "deviceStates": [
-                _device_playback_state_payload(record)
-                for record in device_records
-            ],
-        }
-    finally:
-        close_connection()
+def getPlaybackContextWithDeviceStates(playback_context_id, user_name=None):
+    # One joined SELECT gives a statement-consistent durable snapshot on every
+    # backend, including PostgreSQL READ COMMITTED. The Context lock also
+    # coordinates this read with strict writers in the supported single process.
+    with _strict_playback_context_lock(playback_context_id):
+        open_connection(reuse=True)
+        try:
+            with db.atomic():
+                query = (
+                    EmoPlaybackContext.select(EmoPlaybackContext, EmoDevicePlaybackState)
+                    .join(
+                        EmoDevicePlaybackState, JOIN.LEFT_OUTER,
+                        on=(
+                            (EmoDevicePlaybackState.playback_context_id == EmoPlaybackContext.playback_context_id)
+                            & (EmoDevicePlaybackState.user_name == EmoPlaybackContext.user_name)
+                            & (EmoDevicePlaybackState.context_epoch == EmoPlaybackContext.epoch)
+                            & (EmoDevicePlaybackState.applied_control_version >= 1)
+                            & (EmoDevicePlaybackState.client_seq >= 1)
+                        ),
+                        attr="snapshot_device",
+                    )
+                    .where(EmoPlaybackContext.playback_context_id == playback_context_id)
+                )
+                if user_name is not None:
+                    query = query.where(EmoPlaybackContext.user_name == user_name)
+                records = list(query)
+                if not records:
+                    return None
+                return {
+                    "playbackContext": _playback_context_payload(records[0]),
+                    "deviceStates": [
+                        _device_playback_state_payload(record.snapshot_device)
+                        for record in records
+                        if getattr(record, "snapshot_device", None) is not None
+                        and record.snapshot_device.id is not None
+                    ],
+                }
+        finally:
+            close_connection()
 
 
 def saveDevicePlaybackState(
