@@ -11859,6 +11859,21 @@ def _handle_handoff_start(
         if not _has_role(current_client, "controller"):
             raise PermissionError("Playback handoff requires the controller role")
 
+    def context_conflict(message: str) -> ControlConflictError:
+        fields = {
+            "current_control_version": context.get("controlVersion", 0),
+        }
+        if strict_v2:
+            # This Context was loaded and authorized above. Never derive
+            # conflict cursors from the incoming request payload.
+            fields.update(
+                playback_context_id=context["playbackContextId"],
+                current_epoch=context["epoch"],
+                current_version=context["version"],
+                current_queue_revision=context["queueRevision"],
+            )
+        return ControlConflictError(message, **fields)
+
     origin_client_id = current_client.get("clientId")
     requested_source_client_id = payload.get("sourceClientId")
     source_client_id = requested_source_client_id or context.get("authorityClientId")
@@ -11940,29 +11955,25 @@ def _handle_handoff_start(
     if existing_handoff is not None:
         _ensure_handoff_for_user(existing_handoff, current_user_name)
         if existing_handoff.get("playbackContextId") != playback_context_id:
-            raise ControlConflictError(
-                "Playback handoff requestId already belongs to another context",
-                current_control_version=context.get("controlVersion", 0),
+            raise context_conflict(
+                "Playback handoff requestId already belongs to another context"
             )
         if (
             requested_source_client_id is not None
             and existing_handoff.get("sourceClientId") != requested_source_client_id
         ):
-            raise ControlConflictError(
-                "Playback handoff requestId already belongs to another source",
-                current_control_version=context.get("controlVersion", 0),
+            raise context_conflict(
+                "Playback handoff requestId already belongs to another source"
             )
         if existing_handoff.get("targetClientId") != target_client_id:
-            raise ControlConflictError(
-                "Playback handoff requestId already belongs to another target",
-                current_control_version=context.get("controlVersion", 0),
+            raise context_conflict(
+                "Playback handoff requestId already belongs to another target"
             )
         if strict_v2 and existing_handoff.get(
             "targetDeviceSessionId"
         ) != payload.get("targetDeviceSessionId"):
-            raise ControlConflictError(
-                "Playback handoff requestId already belongs to another target device",
-                current_control_version=context.get("controlVersion", 0),
+            raise context_conflict(
+                "Playback handoff requestId already belongs to another target device"
             )
         if strict_v2:
             existing_base_control_version = payload.get("baseControlVersion")
@@ -11971,9 +11982,8 @@ def _handle_handoff_start(
             if existing_handoff.get("baseControlVersion") != (
                 existing_base_control_version
             ):
-                raise ControlConflictError(
-                    "Playback handoff requestId already belongs to another control baseline",
-                    current_control_version=context.get("controlVersion", 0),
+                raise context_conflict(
+                    "Playback handoff requestId already belongs to another control baseline"
                 )
         expired_handoff = _expire_stale_handoff(existing_handoff)
         if expired_handoff is not None:
@@ -11992,9 +12002,8 @@ def _handle_handoff_start(
                     strict_v2=strict_v2,
                 )
             except PlaybackAuthorityMismatchError:
-                raise ControlConflictError(
-                    "Playback handoff already in progress",
-                    current_control_version=context.get("controlVersion", 0),
+                raise context_conflict(
+                    "Playback handoff already in progress"
                 )
         _send_handoff_start_ack(
             request_id,
@@ -12102,10 +12111,7 @@ def _handle_handoff_start(
         except EffectiveAtEligibilityError as exc:
             if exc.reason == "capability_required":
                 raise CapabilityRequiredError(str(exc)) from exc
-            raise ControlConflictError(
-                str(exc),
-                current_control_version=context.get("controlVersion", 0),
-            ) from exc
+            raise context_conflict(str(exc)) from exc
         if (
             source_client.get("deviceSessionId")
             != context.get("authorityDeviceSessionId")
@@ -12129,10 +12135,7 @@ def _handle_handoff_start(
                 ),
             )
         except EffectiveAtEligibilityError as exc:
-            raise ControlConflictError(
-                str(exc),
-                current_control_version=context.get("controlVersion", 0),
-            ) from exc
+            raise context_conflict(str(exc)) from exc
 
     requested_target_device_session_id = payload.get("targetDeviceSessionId")
     if strict_v2 and (
@@ -12197,10 +12200,7 @@ def _handle_handoff_start(
                 ),
             )
         except EffectiveAtEligibilityError as exc:
-            raise ControlConflictError(
-                str(exc),
-                current_control_version=context.get("controlVersion", 0),
-            ) from exc
+            raise context_conflict(str(exc)) from exc
     elif not (
         _client_supports(target_client, CAPABILITY_EFFECTIVE_AT)
         and _client_supports(target_client, CAPABILITY_PLAYBACK_PREPARE)
@@ -12213,9 +12213,8 @@ def _handle_handoff_start(
     if base_control_version is None:
         base_control_version = context.get("controlVersion", 0)
     if base_control_version != context.get("controlVersion", 0):
-        raise ControlConflictError(
-            "Playback control version conflict",
-            current_control_version=context.get("controlVersion", 0),
+        raise context_conflict(
+            "Playback control version conflict"
         )
 
     handoff_id = payload.get("handoffId") or _new_handoff_id()
@@ -12276,9 +12275,8 @@ def _handle_handoff_start(
             ),
         )
     except PlaybackAuthorityMismatchError:
-        raise ControlConflictError(
-            "Playback handoff already in progress",
-            current_control_version=context.get("controlVersion", 0),
+        raise context_conflict(
+            "Playback handoff already in progress"
         )
     try:
         persisted_handoff, _created = createStrictPlaybackHandoff(

@@ -6963,10 +6963,22 @@ def _completeStrictPlaybackHandoffLocked(
                     == target_client_id
                 )
             )
+            retired_target_generation = bool(
+                target_record is not None
+                and target_record.user_name == user_name
+                and target_record.is_authority == 0
+                and target_record.context_epoch < context_record.epoch
+            )
+            # A stable client may return after a cold restart. Its old device
+            # row is fenced by the older Context epoch; all current frozen
+            # Handoff generations and completion proof were checked above.
             if target_record is not None and (
                 target_record.user_name != user_name
-                or target_record.device_session_id
-                != target_device_session_id
+                or (
+                    target_record.device_session_id
+                    != target_device_session_id
+                    and not retired_target_generation
+                )
             ):
                 raise PlaybackHandoffTargetConflictError(
                     "Playback handoff target DevicePlaybackState conflicts"
