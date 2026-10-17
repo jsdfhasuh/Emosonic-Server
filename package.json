@@ -1,0 +1,10 @@
+{
+  "name": "supysonic-browser-acceptance",
+  "private": true,
+  "scripts": {
+    "test:emo-browser": "node tests/browser/emo_web_strict_v2_acceptance.js"
+  },
+  "devDependencies": {
+    "playwright": "1.55.1"
+  }
+}

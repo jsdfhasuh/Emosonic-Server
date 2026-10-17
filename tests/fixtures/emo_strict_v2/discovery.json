@@ -1,0 +1,121 @@
+{
+  "request": {
+    "type": "state",
+    "action": "playback.context.list",
+    "requestId": "context-list-1",
+    "payload": {
+      "authorityClientId": "player-1",
+      "authorityDeviceSessionId": "device:player-1"
+    }
+  },
+  "responses": {
+    "empty": {
+      "type": "state",
+      "action": "playback.context.list",
+      "requestId": "context-list-empty-1",
+      "connectionNonce": "nonce-1",
+      "connectionEpoch": 1,
+      "timestamp": 1000.0,
+      "payload": {"contexts": []}
+    },
+    "single": {
+      "type": "state",
+      "action": "playback.context.list",
+      "requestId": "context-list-1",
+      "connectionNonce": "nonce-1",
+      "connectionEpoch": 1,
+      "timestamp": 1000.0,
+      "payload": {
+        "contexts": [
+          {
+            "playbackContextId": "context-1",
+            "authorityClientId": "player-1",
+            "authorityDeviceSessionId": "device:player-1"
+          }
+        ]
+      }
+    },
+    "multiple": {
+      "type": "state",
+      "action": "playback.context.list",
+      "requestId": "context-list-multiple-1",
+      "connectionNonce": "nonce-1",
+      "connectionEpoch": 1,
+      "timestamp": 1000.0,
+      "payload": {
+        "contexts": [
+          {
+            "playbackContextId": "context-1",
+            "authorityClientId": "player-1",
+            "authorityDeviceSessionId": "device:player-1"
+          },
+          {
+            "playbackContextId": "context-2",
+            "authorityClientId": "player-1",
+            "authorityDeviceSessionId": "device:player-1"
+          }
+        ]
+      }
+    }
+  },
+  "bindingEvent": {
+    "type": "event",
+    "action": "playback.context.bindings.changed",
+    "connectionNonce": "nonce-1",
+    "connectionEpoch": 1,
+    "timestamp": 1000.0,
+    "payload": {
+      "authorityClientId": "player-1",
+      "authorityDeviceSessionId": "device:player-1"
+    }
+  },
+  "ordering": {
+    "discoveryGenerationIsWireField": false,
+    "clientRule": "Increment a local discoveryGeneration when playback.context.bindings.changed invalidates an authority pair; discard any list response whose request generation is older than the current generation.",
+    "scenarios": [
+      {
+        "name": "event_before_stale_list_response",
+        "timeline": [
+          {
+            "delivery": "list_request_sent",
+            "messageRef": "request",
+            "requestGeneration": 1
+          },
+          {
+            "delivery": "binding_event_received",
+            "messageRef": "bindingEvent",
+            "generationAfter": 2
+          },
+          {
+            "delivery": "list_response_received",
+            "messageRef": "responses.single",
+            "requestGeneration": 1,
+            "expectedDisposition": "discard"
+          }
+        ]
+      },
+      {
+        "name": "list_response_before_binding_event",
+        "timeline": [
+          {
+            "delivery": "list_request_sent",
+            "messageRef": "request",
+            "requestGeneration": 1
+          },
+          {
+            "delivery": "list_response_received",
+            "messageRef": "responses.single",
+            "requestGeneration": 1,
+            "expectedDisposition": "accept_until_invalidated"
+          },
+          {
+            "delivery": "binding_event_received",
+            "messageRef": "bindingEvent",
+            "generationAfter": 2,
+            "expectedDisposition": "invalidate_and_requery"
+          }
+        ]
+      }
+    ]
+  }
+}

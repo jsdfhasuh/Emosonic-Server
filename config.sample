@@ -51,10 +51,79 @@ log_rotate = yes
 ; Enable the emosonic websocket endpoint at /emo/ws. Default: on
 ;emo_ws_enabled = on
 
+; Exact comma-separated origins allowed to open the Emo Socket.IO endpoint.
+; Empty means same-origin only. A wildcard is rejected outside explicit
+; development mode. Default: empty
+;emo_allowed_origins = https://music.example
+;emo_development_mode = off
+
+; Socket.IO heartbeat and per-connection pending emit limits.
+; Defaults: ping interval 25s, ping timeout 20s, 100 pending emits.
+;emo_socketio_ping_interval = 25
+;emo_socketio_ping_timeout = 20
+;emo_socketio_max_pending_emits_per_connection = 100
+
+; Emo connection limits. Defaults: 10 unauthenticated connections per IP and
+; 20 authenticated connections per user.
+;emo_unauthenticated_connections_per_ip = 10
+;emo_authenticated_connections_per_user = 20
+
+; Strict-v2 action limits. Higher values are ignored unless the load-test
+; evidence setting names reviewed evidence. Lower positive values are allowed.
+;emo_strict_requests_per_connection_per_minute = 120
+;emo_strict_controls_per_connection_per_second = 20
+;emo_strict_creates_per_connection_per_minute = 10
+;emo_strict_handoff_starts_per_connection_per_minute = 10
+;emo_strict_broadcast_starts_per_connection_per_minute = 10
+;emo_strict_rate_limit_load_test_evidence =
+
+; Seconds allowed for in-flight strict-v2 requests to settle during graceful
+; shutdown before remaining Socket.IO connections are closed. Default: 5
+;emo_strict_shutdown_grace_seconds = 5
+
 ; Seconds before a registered Emo Socket.IO client is considered offline if it
 ; sends no business message or system.ping. Set to 0 to disable stale cleanup.
 ; Default: 90
 ;emo_client_timeout = 90
+
+; Strict-v2 profiles require both packaged conformance readiness and an explicit
+; deployment switch. Keep these disabled until the matching freeze evidence exists.
+;emo_strict_v2_core_enabled = off
+;emo_strict_v2_follow_enabled = off
+;emo_strict_v2_handoff_enabled = off
+;emo_strict_v2_broadcast_enabled = off
+
+; Development/test deployments may explicitly accept packaged
+; local-test-only conformance evidence for external client integration.
+; This switch is ignored unless emo_development_mode is also on. Never enable
+; either setting in production. Default: off
+;emo_strict_v2_allow_local_test_evidence = off
+
+; Select the browser implementation rendered by both /player and /control.
+; Allowed values: legacy, strict_v2. There is no automatic fallback.
+; Default: legacy
+;emo_web_realtime_protocol = legacy
+
+; Lifetime of the same-origin, session-bound browser Socket.IO password.
+; The credential is one-time use and is never written to browser storage.
+; Default: 60 seconds
+;emo_browser_otp_ttl_seconds = 60
+
+; Browser password issuance limits. A session may hold a small number of
+; outstanding one-time passwords so player and control tabs can bootstrap
+; concurrently. Defaults: 12 issues/minute/session, 4 outstanding/session,
+; and 10000 outstanding credentials globally.
+; The global capacity also bounds active per-session rate-limit windows.
+;emo_browser_otp_issues_per_session_per_minute = 12
+;emo_browser_otp_outstanding_per_session = 4
+;emo_browser_otp_global_capacity = 10000
+
+; Optional strict-v2 browser profiles remain disabled until their browser
+; acceptance evidence has been reviewed. These gates do not override the
+; corresponding server readiness settings.
+;emo_web_strict_v2_follow_enabled = off
+;emo_web_strict_v2_handoff_enabled = off
+;emo_web_strict_v2_broadcast_enabled = off
 
 ; Directory used by /emo/upload_log and /emo/logs for uploaded diagnostic files.
 ; Default: ./logs

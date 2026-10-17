@@ -50,6 +50,11 @@ nosetests.xml
 coverage.xml
 *,cover
 
+# Node browser-acceptance dependencies and output
+node_modules/
+test-results/
+playwright-report/
+
 # Translations
 *.mo
 *.pot
@@ -73,5 +78,6 @@ target/
 
 #logs
 logs/
+test_logs/
 =1.0.0
 session.json

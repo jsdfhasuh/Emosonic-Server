@@ -1,0 +1,357 @@
+{
+  "manifestVersion": 2,
+  "contractRevision": "2026-07-12-r5",
+  "protocolVersion": "2.1.0",
+  "schemaHash": null,
+  "generatedAt": "2026-07-12",
+  "server": {
+    "repository": "external-server",
+    "commit": "a4515553ddb3b682a2f7a0cdf41194051df64f76",
+    "commitSource": "device.register.payload.strictV2.serverBuildCommit",
+    "strictV2Implemented": false
+  },
+  "r5Profile": {
+    "registrationAckRequiredPayloadFields": [
+      "action",
+      "clientId",
+      "deviceSessionId",
+      "negotiatedCapabilities",
+      "strictV2"
+    ],
+    "negotiatedCapabilityFields": [
+      "playbackContextV2",
+      "playbackPrepare",
+      "effectiveAtPlayback",
+      "canPlay",
+      "canPause",
+      "canSeek",
+      "canSetVolume",
+      "supportsFollow",
+      "supportsBroadcast"
+    ],
+    "strictV2MetadataFields": [
+      "protocolVersion",
+      "schemaHash",
+      "serverBuildCommit",
+      "connectionNonce",
+      "connectionEpoch"
+    ],
+    "conditionalBaseControlVersionTriggers": {
+      "queue.context.sync": ["currentIndex", "trackId", "positionMs", "state"],
+      "broadcast.queue.sync": ["currentIndex", "trackId", "positionMs", "state"]
+    },
+    "eventConfirmations": {
+      "playback.update": ["playback.update"],
+      "playback.ready": ["playback.handoff.status"],
+      "playback.handoff.complete": ["playback.handoff.status", "playback.context.status"]
+    },
+    "connectionNonceMinEntropyBits": 128,
+    "connectionEpoch": 1,
+    "handoffErrorCodePattern": "^[a-z][a-z0-9_]{0,63}$",
+    "handoffStandardErrorCodes": [
+      "prepare_failed",
+      "prepare_timeout",
+      "commit_timeout",
+      "target_disconnected",
+      "source_disconnected",
+      "server_restart"
+    ],
+    "broadcastParticipantRequiredFields": [
+      "broadcastId",
+      "clientId",
+      "state",
+      "positionMs",
+      "online"
+    ],
+    "broadcastParticipantPairedOptionalFields": ["clientSeq", "serverUpdatedAtMs"],
+    "maxEnvelopeBytes": 262144,
+    "transportOversizeBehavior": "disconnect_message_too_big",
+    "businessOversizeErrorCode": "bad_request",
+    "preserveOrderFields": ["queueSongIds"],
+    "sortedSetFields": ["roles", "participants", "skippedClientIds", "devices"]
+  },
+  "productionActions": [
+    "device.register",
+    "device.list",
+    "playback.context.create",
+    "playback.context.status",
+    "playback.context.subscribe",
+    "playback.context.unsubscribe",
+    "playback.context.close",
+    "queue.context.sync",
+    "playback.update",
+    "playback.ready",
+    "player.play",
+    "player.pause",
+    "player.seek",
+    "player.next",
+    "player.prev",
+    "queue.playItem",
+    "playback.handoff.start",
+    "playback.handoff.cancel",
+    "playback.handoff.complete",
+    "follow.start",
+    "follow.stop",
+    "broadcast.start",
+    "broadcast.play",
+    "broadcast.pause",
+    "broadcast.seek",
+    "broadcast.playItem",
+    "broadcast.queue.sync",
+    "broadcast.status",
+    "broadcast.stop",
+    "system.ack",
+    "system.error"
+  ],
+  "actions": {
+    "device.register": {
+      "status": "targetDocOnly",
+      "requiredPayloadFields": ["clientId", "deviceSessionId", "deviceName", "roles", "capabilities"],
+      "optionalPayloadFields": ["alias"],
+      "forbiddenPayloadFields": ["sessionId"],
+      "fixtures": []
+    },
+    "device.list": {
+      "status": "pendingServer",
+      "requiredPayloadFields": [],
+      "optionalPayloadFields": [],
+      "forbiddenPayloadFields": ["sessionId"],
+      "fixtures": []
+    },
+    "playback.context.create": {
+      "status": "targetDocOnly",
+      "requiredPayloadFields": ["playbackContextId", "deviceSessionId", "queueSongIds", "currentIndex", "positionMs", "state"],
+      "optionalPayloadFields": [],
+      "forbiddenPayloadFields": ["sessionId", "targetClientId"],
+      "fixtures": [
+        {
+          "path": "playback_context/create_request.json",
+          "sha256": "5a9f4b15e54b6409fb40a78cb83a000d7bbba037fcd7e9e32ae93229507f6737"
+        },
+        {
+          "path": "playback_context/create_response.json",
+          "sha256": "80aabdf47937c2f4e558371d75fa30739ede28c79bafc3336250548525fffdd8"
+        }
+      ]
+    },
+    "playback.context.status": {
+      "status": "targetDocOnly",
+      "requiredPayloadFields": ["playbackContextId"],
+      "optionalPayloadFields": [],
+      "forbiddenPayloadFields": ["sessionId"],
+      "fixtures": [
+        {
+          "path": "playback_context/status_response.json",
+          "sha256": "28f86a6fecee6c8fd9d7b2692620e99f33879d0d5629259b6fcc43c9851d7b49"
+        }
+      ]
+    },
+    "playback.context.subscribe": {
+      "status": "targetDocOnly",
+      "requiredPayloadFields": ["playbackContextId"],
+      "optionalPayloadFields": [],
+      "forbiddenPayloadFields": ["sessionId"],
+      "fixtures": [
+        {
+          "path": "playback_context/subscribe_request.json",
+          "sha256": "2205b410b34bb760e4973089844ce700e3f65c87fd73ed7cb285d5d0195a765c"
+        }
+      ]
+    },
+    "playback.context.unsubscribe": {
+      "status": "targetDocOnly",
+      "requiredPayloadFields": ["playbackContextId"],
+      "optionalPayloadFields": [],
+      "forbiddenPayloadFields": ["sessionId"],
+      "fixtures": []
+    },
+    "playback.context.close": {
+      "status": "pendingServer",
+      "requiredPayloadFields": ["playbackContextId"],
+      "optionalPayloadFields": [],
+      "forbiddenPayloadFields": ["sessionId"],
+      "fixtures": []
+    },
+    "queue.context.sync": {
+      "status": "targetDocOnly",
+      "requiredPayloadFields": ["playbackContextId", "deviceSessionId", "queueSongIds", "currentIndex", "positionMs", "baseQueueRevision"],
+      "optionalPayloadFields": ["baseControlVersion"],
+      "forbiddenPayloadFields": ["sessionId", "targetClientId"],
+      "fixtures": [
+        {
+          "path": "queue_context/sync_request.json",
+          "sha256": "608bb7a339be2f586d7f0bc730e90c20a889aa59b3c37b3701b99ad492c0f51a"
+        }
+      ]
+    },
+    "playback.update": {
+      "status": "pendingServer",
+      "requiredPayloadFields": ["playbackContextId", "deviceSessionId", "state", "positionMs", "clientSeq"],
+      "optionalPayloadFields": ["trackId", "volume", "muted"],
+      "forbiddenPayloadFields": ["sessionId", "queueSongIds", "currentIndex"],
+      "fixtures": [
+        {
+          "path": "playback_update/authority_request.json",
+          "sha256": "856659eab5dffa3bd99cdd91e70f8b577fd3553ded914e1018a2d6cba3e4b6c3"
+        }
+      ]
+    },
+    "playback.ready": {
+      "status": "pendingServer",
+      "requiredPayloadFields": ["playbackContextId", "prepareId", "ready"],
+      "optionalPayloadFields": ["handoffId", "errorCode", "errorMessage"],
+      "forbiddenPayloadFields": ["sessionId"],
+      "fixtures": []
+    },
+    "player.play": {
+      "status": "targetDocOnly",
+      "requiredPayloadFields": ["playbackContextId", "baseControlVersion"],
+      "optionalPayloadFields": ["positionMs"],
+      "forbiddenPayloadFields": ["sessionId", "targetClientId"],
+      "fixtures": []
+    },
+    "player.pause": {
+      "status": "targetDocOnly",
+      "requiredPayloadFields": ["playbackContextId", "baseControlVersion"],
+      "optionalPayloadFields": ["positionMs"],
+      "forbiddenPayloadFields": ["sessionId", "targetClientId"],
+      "fixtures": [
+        {
+          "path": "player_control/pause_request.json",
+          "sha256": "82108e1db1366223471f448f5c43392ac7fdbc14bb9711346995a0cd2775b875"
+        }
+      ]
+    },
+    "player.seek": {
+      "status": "targetDocOnly",
+      "requiredPayloadFields": ["playbackContextId", "baseControlVersion", "positionMs"],
+      "optionalPayloadFields": [],
+      "forbiddenPayloadFields": ["sessionId", "targetClientId"],
+      "fixtures": []
+    },
+    "player.next": {
+      "status": "targetDocOnly",
+      "requiredPayloadFields": ["playbackContextId", "baseControlVersion"],
+      "optionalPayloadFields": [],
+      "forbiddenPayloadFields": ["sessionId", "targetClientId"],
+      "fixtures": []
+    },
+    "player.prev": {
+      "status": "targetDocOnly",
+      "requiredPayloadFields": ["playbackContextId", "baseControlVersion"],
+      "optionalPayloadFields": [],
+      "forbiddenPayloadFields": ["sessionId", "targetClientId"],
+      "fixtures": []
+    },
+    "queue.playItem": {
+      "status": "pendingServer",
+      "requiredPayloadFields": ["playbackContextId", "queueIndex", "baseQueueRevision", "baseControlVersion"],
+      "optionalPayloadFields": [],
+      "forbiddenPayloadFields": ["sessionId", "targetClientId"],
+      "fixtures": []
+    },
+    "player.setVolume": {
+      "status": "removed",
+      "requiredPayloadFields": [],
+      "optionalPayloadFields": [],
+      "forbiddenPayloadFields": [],
+      "fixtures": []
+    },
+    "player.requestState": {
+      "status": "removed",
+      "requiredPayloadFields": [],
+      "optionalPayloadFields": [],
+      "forbiddenPayloadFields": [],
+      "fixtures": []
+    },
+    "playback.handoff.start": {
+      "status": "targetDocOnly",
+      "requiredPayloadFields": ["playbackContextId", "targetClientId", "baseControlVersion"],
+      "optionalPayloadFields": [],
+      "forbiddenPayloadFields": ["sessionId"],
+      "fixtures": []
+    },
+    "playback.handoff.cancel": {
+      "status": "pendingServer",
+      "requiredPayloadFields": ["playbackContextId", "handoffId"],
+      "optionalPayloadFields": ["reason"],
+      "forbiddenPayloadFields": ["sessionId"],
+      "fixtures": []
+    },
+    "playback.handoff.complete": {
+      "status": "pendingServer",
+      "requiredPayloadFields": ["playbackContextId", "handoffId"],
+      "optionalPayloadFields": ["positionMs"],
+      "forbiddenPayloadFields": ["sessionId"],
+      "fixtures": []
+    },
+    "follow.start": {
+      "status": "targetDocOnly",
+      "requiredPayloadFields": ["sourcePlaybackContextId", "deviceSessionId"],
+      "optionalPayloadFields": [],
+      "forbiddenPayloadFields": ["sessionId", "sourceSessionId"],
+      "fixtures": []
+    },
+    "follow.stop": {
+      "status": "targetDocOnly",
+      "requiredPayloadFields": ["sourcePlaybackContextId"],
+      "optionalPayloadFields": [],
+      "forbiddenPayloadFields": ["sessionId", "sourceSessionId"],
+      "fixtures": []
+    },
+    "broadcast.start": {
+      "status": "targetDocOnly",
+      "requiredPayloadFields": ["playbackContextId", "queueSongIds", "currentIndex", "positionMs"],
+      "optionalPayloadFields": ["participants", "autoPlay"],
+      "forbiddenPayloadFields": ["sessionId"],
+      "fixtures": []
+    },
+    "broadcast.play": {"status": "pendingServer", "requiredPayloadFields": ["playbackContextId", "broadcastId"], "optionalPayloadFields": [], "forbiddenPayloadFields": ["sessionId"], "fixtures": []},
+    "broadcast.pause": {"status": "pendingServer", "requiredPayloadFields": ["playbackContextId", "broadcastId"], "optionalPayloadFields": [], "forbiddenPayloadFields": ["sessionId"], "fixtures": []},
+    "broadcast.seek": {"status": "pendingServer", "requiredPayloadFields": ["playbackContextId", "broadcastId", "positionMs"], "optionalPayloadFields": [], "forbiddenPayloadFields": ["sessionId"], "fixtures": []},
+    "broadcast.playItem": {"status": "pendingServer", "requiredPayloadFields": ["playbackContextId", "broadcastId", "queueIndex"], "optionalPayloadFields": [], "forbiddenPayloadFields": ["sessionId"], "fixtures": []},
+    "broadcast.queue.sync": {"status": "pendingServer", "requiredPayloadFields": ["playbackContextId", "broadcastId", "queueSongIds", "currentIndex", "positionMs"], "optionalPayloadFields": ["baseQueueRevision", "baseControlVersion"], "forbiddenPayloadFields": ["sessionId"], "fixtures": []},
+    "broadcast.status": {"status": "pendingServer", "requiredPayloadFields": ["playbackContextId", "broadcastId"], "optionalPayloadFields": [], "forbiddenPayloadFields": ["sessionId"], "fixtures": []},
+    "broadcast.stop": {"status": "pendingServer", "requiredPayloadFields": ["playbackContextId", "broadcastId"], "optionalPayloadFields": [], "forbiddenPayloadFields": ["sessionId"], "fixtures": []},
+    "system.ack": {
+      "status": "pendingServer",
+      "requiredPayloadFields": ["action"],
+      "optionalPayloadFields": [],
+      "forbiddenPayloadFields": [],
+      "fixtures": []
+    },
+    "system.error": {
+      "status": "targetDocOnly",
+      "requiredPayloadFields": ["action", "code", "message", "retryable"],
+      "optionalPayloadFields": ["playbackContextId", "currentControlVersion", "currentQueueRevision", "currentVersion", "currentClientSeq", "retryAfterMs"],
+      "forbiddenPayloadFields": [],
+      "fixtures": [
+        {
+          "path": "errors/control_conflict.json",
+          "sha256": "74d565bb7150c801919f844445f59263a93ca39ef3e9e555d5b15fd7aea879ad"
+        }
+      ]
+    },
+    "queue.local.set": {
+      "status": "removed",
+      "requiredPayloadFields": [],
+      "optionalPayloadFields": [],
+      "forbiddenPayloadFields": [],
+      "fixtures": []
+    },
+    "queue.ready.complete": {
+      "status": "removed",
+      "requiredPayloadFields": [],
+      "optionalPayloadFields": [],
+      "forbiddenPayloadFields": [],
+      "fixtures": []
+    },
+    "session.subscribe": {
+      "status": "removed",
+      "requiredPayloadFields": [],
+      "optionalPayloadFields": [],
+      "forbiddenPayloadFields": [],
+      "fixtures": []
+    }
+  }
+}
