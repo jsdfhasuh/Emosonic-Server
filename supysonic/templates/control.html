@@ -207,6 +207,7 @@
 
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
 <script>
+  const emoBrowserBootstrap = {{ emo_web_bootstrap | tojson }};
   const controlState = {
     selfClientId: `web-control-${Math.random().toString(36).slice(2, 10)}`,
     sessionId: `web-control:{{ request.user.name }}`,
@@ -1338,16 +1339,39 @@
     });
   }
 
-  socket.on('connect', () => {
-    updateConnectionState('ONLINE');
-    startHeartbeat();
-    pushEventLine(i18nText('Socket connected.', 'Socket 已连接。'), 'success');
+  async function authenticateBrowserSocket() {
+    const response = await fetch(emoBrowserBootstrap.authPasswordUrl, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        'X-Emo-CSRF-Token': emoBrowserBootstrap.csrfToken,
+        'X-Requested-With': 'fetch',
+      },
+    });
+    if (!response.ok) {
+      throw new Error(`browser credential request failed (${response.status})`);
+    }
+    const credential = await response.json();
     socket.emit('message', {
       type: 'auth',
       action: 'auth.login',
       requestId: 'web-auth-1',
-      payload: {},
+      payload: {
+        u: credential.userName,
+        p: credential.oneTimePassword,
+      },
       timestamp: Date.now() / 1000,
+    });
+  }
+
+  socket.on('connect', () => {
+    updateConnectionState('ONLINE');
+    startHeartbeat();
+    pushEventLine(i18nText('Socket connected.', 'Socket 已连接。'), 'success');
+    authenticateBrowserSocket().catch((error) => {
+      updateConnectionState('AUTH ERROR');
+      pushEventLine(i18nText(`Authentication failed: ${error.message}`, `认证失败：${error.message}`), 'error');
+      socket.disconnect();
     });
   });
 

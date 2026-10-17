@@ -344,11 +344,15 @@ CREATE TABLE IF NOT EXISTS emo_playback_context (
     playback_context_id VARCHAR(128) NOT NULL UNIQUE,
     user_name VARCHAR(64) NOT NULL,
     authority_client_id VARCHAR(128),
+    authority_device_session_id VARCHAR(128),
     origin_client_id VARCHAR(128),
+    timeline_id VARCHAR(128),
+    creation_fingerprint VARCHAR(64),
+    lifecycle VARCHAR(16) NOT NULL DEFAULT 'active',
     queue_json TEXT NOT NULL,
     current_index INTEGER NOT NULL DEFAULT 0,
     track_id VARCHAR(128),
-    state VARCHAR(32) NOT NULL DEFAULT 'stopped',
+    state VARCHAR(32) NOT NULL DEFAULT 'idle',
     position_ms INTEGER NOT NULL DEFAULT 0,
     volume INTEGER,
     queue_revision INTEGER NOT NULL DEFAULT 1,
@@ -356,9 +360,32 @@ CREATE TABLE IF NOT EXISTS emo_playback_context (
     version INTEGER NOT NULL DEFAULT 1,
     epoch INTEGER NOT NULL DEFAULT 1,
     playback_json TEXT,
+    closed_at DATETIME,
+    close_action VARCHAR(64),
+    close_request_fingerprint VARCHAR(64),
+    close_expected_epoch INTEGER,
+    close_base_version INTEGER,
+    closed_from_epoch INTEGER,
+    closed_from_version INTEGER,
+    final_epoch INTEGER,
+    final_version INTEGER,
+    final_queue_revision INTEGER,
+    final_control_version INTEGER,
+    close_outcome_json TEXT,
     created_at DATETIME NOT NULL,
     updated_at DATETIME NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_emo_playback_context_binding
+ON emo_playback_context (
+    user_name,
+    lifecycle,
+    authority_client_id,
+    authority_device_session_id
+);
+
+CREATE INDEX IF NOT EXISTS idx_emo_context_close_retention
+ON emo_playback_context (lifecycle, closed_at, playback_context_id);
 
 CREATE TABLE IF NOT EXISTS emo_device_playback_state (
     id CHAR(36) PRIMARY KEY,
@@ -372,10 +399,269 @@ CREATE TABLE IF NOT EXISTS emo_device_playback_state (
     volume INTEGER,
     is_authority INTEGER NOT NULL DEFAULT 0,
     mode VARCHAR(32) NOT NULL DEFAULT 'normal',
+    context_epoch INTEGER NOT NULL DEFAULT 1,
+    applied_control_version INTEGER NOT NULL DEFAULT 0,
+    client_seq INTEGER NOT NULL DEFAULT 0,
     playback_json TEXT,
     created_at DATETIME NOT NULL,
     updated_at DATETIME NOT NULL,
     UNIQUE(playback_context_id, owner_client_id)
+);
+
+CREATE TABLE IF NOT EXISTS emo_playback_control_transaction (
+    id CHAR(36) PRIMARY KEY,
+    playback_context_id VARCHAR(128) NOT NULL,
+    user_name VARCHAR(64) NOT NULL,
+    epoch INTEGER NOT NULL,
+    command_control_version INTEGER NOT NULL,
+    requesting_client_id VARCHAR(128) NOT NULL,
+    authority_client_id VARCHAR(128) NOT NULL,
+    authority_device_session_id VARCHAR(128) NOT NULL,
+    routed_connection_nonce VARCHAR(128) NOT NULL,
+    routed_connection_epoch INTEGER NOT NULL DEFAULT 1,
+    requesting_device_session_id VARCHAR(128),
+    requesting_connection_nonce VARCHAR(128),
+    requesting_connection_epoch INTEGER,
+    action VARCHAR(64) NOT NULL,
+    accepted_target_json TEXT NOT NULL,
+    status VARCHAR(32) NOT NULL DEFAULT 'pending',
+    error_code VARCHAR(64),
+    depends_on_control_version INTEGER,
+    accepted_at_ms INTEGER NOT NULL,
+    execution_timeout_ms INTEGER NOT NULL,
+    watchdog_deadline_at_ms INTEGER,
+    effective_at_server_ms INTEGER,
+    execution_eligible_at_ms INTEGER,
+    error_message TEXT,
+    applied_control_version INTEGER,
+    terminal_fingerprint VARCHAR(64),
+    terminal_at_ms INTEGER,
+    reconciled_by_control_version INTEGER,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    UNIQUE(playback_context_id, epoch, command_control_version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_emo_control_pending_deadline
+ON emo_playback_control_transaction (status, watchdog_deadline_at_ms);
+
+CREATE INDEX IF NOT EXISTS idx_emo_control_context_status
+ON emo_playback_control_transaction (
+    playback_context_id,
+    epoch,
+    status,
+    command_control_version
+);
+
+CREATE INDEX IF NOT EXISTS idx_emo_control_request_generation
+ON emo_playback_control_transaction (
+    requesting_client_id,
+    requesting_device_session_id,
+    requesting_connection_nonce,
+    requesting_connection_epoch,
+    status
+);
+
+CREATE INDEX IF NOT EXISTS idx_emo_control_authority_generation
+ON emo_playback_control_transaction (
+    authority_client_id,
+    authority_device_session_id,
+    routed_connection_nonce,
+    routed_connection_epoch,
+    status
+);
+
+CREATE INDEX IF NOT EXISTS idx_emo_control_retention
+ON emo_playback_control_transaction (
+    playback_context_id,
+    status,
+    terminal_at_ms,
+    epoch,
+    command_control_version
+);
+
+CREATE INDEX IF NOT EXISTS idx_emo_control_dependency_ref
+ON emo_playback_control_transaction (
+    playback_context_id,
+    epoch,
+    depends_on_control_version
+);
+
+CREATE INDEX IF NOT EXISTS idx_emo_control_reconciliation_ref
+ON emo_playback_control_transaction (
+    playback_context_id,
+    epoch,
+    reconciled_by_control_version
+);
+
+CREATE TABLE IF NOT EXISTS emo_core_startup_recovery (
+    id CHAR(36) PRIMARY KEY,
+    recovery_fingerprint VARCHAR(64) NOT NULL UNIQUE,
+    status VARCHAR(16) NOT NULL DEFAULT 'completed',
+    started_at_ms INTEGER NOT NULL,
+    completed_at_ms INTEGER NOT NULL,
+    pending_count INTEGER NOT NULL DEFAULT 0,
+    incomplete_generation_count INTEGER NOT NULL DEFAULT 0,
+    recovered_root_count INTEGER NOT NULL DEFAULT 0,
+    recovered_dependency_count INTEGER NOT NULL DEFAULT 0,
+    outcome_fingerprint VARCHAR(64) NOT NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_emo_core_recovery_status_completed
+ON emo_core_startup_recovery (status, completed_at_ms);
+
+CREATE INDEX IF NOT EXISTS idx_emo_core_recovery_retention
+ON emo_core_startup_recovery (
+    status,
+    completed_at_ms,
+    recovery_fingerprint
+);
+
+CREATE TABLE IF NOT EXISTS emo_follow_safety_lease (
+    id CHAR(36) PRIMARY KEY,
+    user_name VARCHAR(64) NOT NULL,
+    follower_client_id VARCHAR(128) NOT NULL,
+    follower_device_session_id VARCHAR(128) NOT NULL,
+    follower_connection_nonce VARCHAR(128) NOT NULL,
+    follower_connection_epoch INTEGER NOT NULL DEFAULT 1,
+    source_playback_context_id VARCHAR(128) NOT NULL,
+    source_authority_client_id VARCHAR(128) NOT NULL,
+    source_authority_device_session_id VARCHAR(128) NOT NULL,
+    source_connection_nonce VARCHAR(128) NOT NULL,
+    source_connection_epoch INTEGER NOT NULL DEFAULT 1,
+    suspended_playback_context_id VARCHAR(128) NOT NULL,
+    suspended_authority_client_id VARCHAR(128) NOT NULL,
+    suspended_authority_device_session_id VARCHAR(128) NOT NULL,
+    suspended_connection_nonce VARCHAR(128) NOT NULL,
+    suspended_connection_epoch INTEGER NOT NULL DEFAULT 1,
+    suspended_epoch INTEGER NOT NULL,
+    suspended_version INTEGER NOT NULL,
+    suspended_queue_revision INTEGER NOT NULL,
+    suspended_control_version INTEGER NOT NULL,
+    suspended_applied_control_version INTEGER NOT NULL,
+    phase VARCHAR(32) NOT NULL DEFAULT 'active',
+    follow_reconnect_grace_expires_at_ms INTEGER,
+    source_recovery_deadline_at_ms INTEGER,
+    lease_fingerprint VARCHAR(64) NOT NULL UNIQUE,
+    start_request_fingerprint VARCHAR(64) NOT NULL,
+    start_ack_json TEXT NOT NULL,
+    stop_request_fingerprint VARCHAR(64),
+    cleanup_fingerprint VARCHAR(64),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    UNIQUE(user_name, follower_client_id, follower_device_session_id),
+    UNIQUE(user_name, suspended_playback_context_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_emo_follow_user_phase_deadline
+ON emo_follow_safety_lease (
+    user_name,
+    phase,
+    follow_reconnect_grace_expires_at_ms
+);
+
+CREATE INDEX IF NOT EXISTS idx_emo_follow_source_phase
+ON emo_follow_safety_lease (source_playback_context_id, phase);
+
+CREATE TABLE IF NOT EXISTS emo_playback_control_reconciliation (
+    id CHAR(36) PRIMARY KEY,
+    playback_context_id VARCHAR(128) NOT NULL,
+    user_name VARCHAR(64) NOT NULL,
+    epoch INTEGER NOT NULL,
+    reconciliation_control_version INTEGER NOT NULL,
+    from_applied_control_version INTEGER NOT NULL,
+    through_control_version INTEGER NOT NULL,
+    trigger_kind VARCHAR(64) NOT NULL,
+    trigger_command_control_version INTEGER,
+    actual_fact_fingerprint VARCHAR(64) NOT NULL,
+    actual_fact_json TEXT NOT NULL,
+    canonical_update_json TEXT NOT NULL,
+    server_updated_at_ms INTEGER NOT NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    UNIQUE(playback_context_id, epoch, reconciliation_control_version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_emo_reconcile_gap
+ON emo_playback_control_reconciliation (
+    playback_context_id,
+    epoch,
+    through_control_version
+);
+
+CREATE INDEX IF NOT EXISTS idx_emo_reconcile_retention
+ON emo_playback_control_reconciliation (
+    playback_context_id,
+    server_updated_at_ms,
+    epoch,
+    reconciliation_control_version
+);
+
+CREATE INDEX IF NOT EXISTS idx_emo_reconcile_trigger_ref
+ON emo_playback_control_reconciliation (
+    playback_context_id,
+    epoch,
+    trigger_command_control_version
+);
+
+CREATE TABLE IF NOT EXISTS emo_playback_prepare_transaction (
+    id CHAR(36) PRIMARY KEY,
+    playback_context_id VARCHAR(128) NOT NULL,
+    user_name VARCHAR(64) NOT NULL,
+    epoch INTEGER NOT NULL,
+    intent_id VARCHAR(128) NOT NULL,
+    requesting_client_id VARCHAR(128) NOT NULL,
+    authority_client_id VARCHAR(128) NOT NULL,
+    authority_device_session_id VARCHAR(128) NOT NULL,
+    routed_connection_nonce VARCHAR(128) NOT NULL,
+    routed_connection_epoch INTEGER NOT NULL DEFAULT 1,
+    request_fingerprint VARCHAR(64) NOT NULL,
+    initial_queue_json TEXT,
+    control_version INTEGER NOT NULL,
+    status VARCHAR(32) NOT NULL DEFAULT 'preparing',
+    error_code VARCHAR(64),
+    error_message TEXT,
+    deadline_at_ms INTEGER NOT NULL,
+    canonical_result_json TEXT,
+    terminal_at_ms INTEGER,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    UNIQUE(playback_context_id, epoch, intent_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_emo_prepare_context_status
+ON emo_playback_prepare_transaction (playback_context_id, epoch, status);
+
+CREATE INDEX IF NOT EXISTS idx_emo_prepare_pending_deadline
+ON emo_playback_prepare_transaction (status, deadline_at_ms);
+
+CREATE TABLE IF NOT EXISTS emo_playback_local_intent (
+    id CHAR(36) PRIMARY KEY,
+    playback_context_id VARCHAR(128) NOT NULL,
+    user_name VARCHAR(64) NOT NULL,
+    epoch INTEGER NOT NULL,
+    intent_id VARCHAR(128) NOT NULL,
+    authority_client_id VARCHAR(128) NOT NULL,
+    authority_device_session_id VARCHAR(128) NOT NULL,
+    request_fingerprint VARCHAR(64) NOT NULL,
+    canonical_update_json TEXT NOT NULL,
+    control_version INTEGER NOT NULL,
+    superseded_through_control_version INTEGER NOT NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    UNIQUE(playback_context_id, epoch, intent_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_emo_local_intent_retention
+ON emo_playback_local_intent (
+    playback_context_id,
+    created_at,
+    epoch,
+    control_version
 );
 
 CREATE TABLE IF NOT EXISTS emo_playback_handoff (
@@ -385,15 +671,30 @@ CREATE TABLE IF NOT EXISTS emo_playback_handoff (
     playback_context_id VARCHAR(128) NOT NULL,
     user_name VARCHAR(64) NOT NULL,
     source_client_id VARCHAR(128) NOT NULL,
+    source_device_session_id VARCHAR(128),
+    source_connection_nonce VARCHAR(128),
+    source_connection_epoch INTEGER,
     target_client_id VARCHAR(128) NOT NULL,
+    target_device_session_id VARCHAR(128),
+    target_connection_nonce VARCHAR(128),
+    target_connection_epoch INTEGER,
     origin_client_id VARCHAR(128),
     status VARCHAR(32) NOT NULL,
     base_control_version INTEGER NOT NULL DEFAULT 0,
+    context_epoch INTEGER,
+    provisional_control_version INTEGER,
     snapshot_json TEXT,
     error_code VARCHAR(64),
     error_message TEXT,
     created_at DATETIME NOT NULL,
     updated_at DATETIME NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_emo_handoff_provisional_lane
+ON emo_playback_handoff (
+    playback_context_id,
+    context_epoch,
+    handoff_id
 );
 
 CREATE TABLE IF NOT EXISTS shared_track_link (
@@ -456,3 +757,236 @@ CREATE TABLE IF NOT EXISTS radio_station (
     homepage_url VARCHAR(256),
     created DATETIME NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS emo_broadcast (
+    id CHAR(36) PRIMARY KEY,
+    broadcast_id VARCHAR(128) NOT NULL UNIQUE,
+    user_name VARCHAR(64) NOT NULL,
+    playback_context_id VARCHAR(128) NOT NULL,
+    intent_id VARCHAR(128) NOT NULL,
+    owner_client_id VARCHAR(128) NOT NULL,
+    authority_client_id VARCHAR(128) NOT NULL,
+    authority_device_session_id VARCHAR(128) NOT NULL,
+    lifecycle_state VARCHAR(32) NOT NULL DEFAULT 'active',
+    broadcast_revision INTEGER NOT NULL DEFAULT 1,
+    snapshot_json TEXT NOT NULL,
+    authority_disconnect_deadline_ms INTEGER,
+    terminal_at_ms INTEGER,
+    full_expires_at_ms INTEGER,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_emo_broadcast_context_lifecycle
+ON emo_broadcast (user_name, playback_context_id, lifecycle_state);
+CREATE INDEX IF NOT EXISTS idx_emo_broadcast_disconnect_deadline
+ON emo_broadcast (lifecycle_state, authority_disconnect_deadline_ms);
+CREATE INDEX IF NOT EXISTS idx_emo_broadcast_terminal
+ON emo_broadcast (lifecycle_state, terminal_at_ms);
+
+CREATE TABLE IF NOT EXISTS emo_broadcast_intent_outcome (
+    id CHAR(36) PRIMARY KEY,
+    user_name VARCHAR(64) NOT NULL,
+    playback_context_id VARCHAR(128) NOT NULL,
+    owner_client_id VARCHAR(128) NOT NULL,
+    authority_client_id VARCHAR(128),
+    authority_device_session_id VARCHAR(128),
+    intent_id VARCHAR(128) NOT NULL,
+    request_fingerprint VARCHAR(64) NOT NULL,
+    broadcast_id VARCHAR(128) NOT NULL,
+    final_participants_json TEXT NOT NULL,
+    skipped_client_ids_json TEXT NOT NULL,
+    start_ack_json TEXT NOT NULL,
+    terminal_broadcast_revision INTEGER,
+    stop_ack_json TEXT,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    UNIQUE(user_name, playback_context_id, owner_client_id, intent_id)
+);
+CREATE INDEX IF NOT EXISTS idx_emo_broadcast_intent_context
+ON emo_broadcast_intent_outcome (playback_context_id, created_at);
+
+CREATE TABLE IF NOT EXISTS emo_broadcast_fence (
+    id CHAR(36) PRIMARY KEY,
+    resource_key VARCHAR(80) NOT NULL UNIQUE,
+    broadcast_id VARCHAR(128) NOT NULL,
+    user_name VARCHAR(64) NOT NULL,
+    role VARCHAR(16) NOT NULL,
+    phase VARCHAR(32) NOT NULL DEFAULT 'nonterminal',
+    playback_context_id VARCHAR(128),
+    client_id VARCHAR(128),
+    device_session_id VARCHAR(128),
+    recovery_slot_reserved INTEGER NOT NULL DEFAULT 0,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_emo_broadcast_fence_broadcast
+ON emo_broadcast_fence (broadcast_id, role, phase);
+CREATE INDEX IF NOT EXISTS idx_emo_broadcast_fence_recovery
+ON emo_broadcast_fence (user_name, phase, recovery_slot_reserved);
+
+CREATE TABLE IF NOT EXISTS emo_broadcast_participant (
+    id CHAR(36) PRIMARY KEY,
+    broadcast_id VARCHAR(128) NOT NULL,
+    user_name VARCHAR(64) NOT NULL,
+    client_id VARCHAR(128) NOT NULL,
+    device_session_id VARCHAR(128) NOT NULL,
+    suspended_playback_context_id VARCHAR(128) NOT NULL,
+    suspended_epoch INTEGER NOT NULL,
+    suspended_version INTEGER NOT NULL,
+    suspended_queue_revision INTEGER NOT NULL,
+    suspended_control_version INTEGER NOT NULL,
+    suspended_applied_control_version INTEGER NOT NULL,
+    restore_pending INTEGER NOT NULL DEFAULT 0,
+    terminal_confirmed INTEGER NOT NULL DEFAULT 0,
+    target_broadcast_revision INTEGER,
+    target_delivery_id VARCHAR(128),
+    deadline_broadcast_revision INTEGER,
+    feedback_deadline_at_server_ms INTEGER,
+    sync_status VARCHAR(32) NOT NULL DEFAULT 'pending',
+    applied_broadcast_revision INTEGER,
+    applied_queue_index INTEGER,
+    applied_track_id VARCHAR(128),
+    applied_position_ms INTEGER,
+    applied_state VARCHAR(32),
+    applied_playback_rate REAL,
+    applied_at_server_ms INTEGER,
+    failed_broadcast_revision INTEGER,
+    failed_last_applied_broadcast_revision INTEGER,
+    failed_error_code VARCHAR(64),
+    failed_error_message TEXT,
+    timed_out_broadcast_revision INTEGER,
+    last_feedback_client_seq INTEGER,
+    last_feedback_at_ms INTEGER,
+    restore_completed INTEGER NOT NULL DEFAULT 0,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    UNIQUE(broadcast_id, client_id, device_session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_emo_broadcast_participant_restore
+ON emo_broadcast_participant (user_name, restore_pending);
+CREATE INDEX IF NOT EXISTS idx_emo_broadcast_participant_deadline
+ON emo_broadcast_participant (sync_status, feedback_deadline_at_server_ms);
+
+CREATE TABLE IF NOT EXISTS emo_broadcast_revision (
+    id CHAR(36) PRIMARY KEY,
+    broadcast_id VARCHAR(128) NOT NULL,
+    broadcast_revision INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    canonical_action VARCHAR(32) NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    created_at DATETIME NOT NULL,
+    UNIQUE(broadcast_id, broadcast_revision)
+);
+CREATE INDEX IF NOT EXISTS idx_emo_broadcast_revision_created
+ON emo_broadcast_revision (broadcast_id, created_at_ms);
+
+CREATE TABLE IF NOT EXISTS emo_broadcast_delivery (
+    id CHAR(36) PRIMARY KEY,
+    delivery_id VARCHAR(128) NOT NULL UNIQUE,
+    broadcast_id VARCHAR(128) NOT NULL,
+    broadcast_revision INTEGER NOT NULL,
+    client_id VARCHAR(128) NOT NULL,
+    device_session_id VARCHAR(128) NOT NULL,
+    action VARCHAR(32) NOT NULL,
+    effective_at_server_ms INTEGER,
+    server_time_ms INTEGER,
+    delivery_position_ms INTEGER NOT NULL,
+    payload_json TEXT NOT NULL,
+    connection_nonce VARCHAR(128),
+    is_current INTEGER NOT NULL DEFAULT 1,
+    delivery_status VARCHAR(32) NOT NULL DEFAULT 'pending',
+    created_at_ms INTEGER NOT NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_emo_broadcast_delivery_current
+ON emo_broadcast_delivery (
+    broadcast_id, broadcast_revision, client_id, device_session_id, is_current
+);
+CREATE INDEX IF NOT EXISTS idx_emo_broadcast_delivery_status
+ON emo_broadcast_delivery (broadcast_id, delivery_status);
+
+CREATE TABLE IF NOT EXISTS emo_broadcast_feedback_settlement (
+    id CHAR(36) PRIMARY KEY,
+    playback_context_id VARCHAR(128) NOT NULL,
+    broadcast_id VARCHAR(128) NOT NULL,
+    client_id VARCHAR(128) NOT NULL,
+    device_session_id VARCHAR(128) NOT NULL,
+    connection_nonce VARCHAR(128) NOT NULL,
+    connection_epoch INTEGER NOT NULL DEFAULT 1,
+    client_seq INTEGER NOT NULL,
+    request_fingerprint VARCHAR(64) NOT NULL,
+    canonical_result_json TEXT NOT NULL,
+    follow_up_delivery_id VARCHAR(128),
+    created_at_ms INTEGER NOT NULL,
+    created_at DATETIME NOT NULL,
+    UNIQUE(
+        playback_context_id, broadcast_id, client_id, device_session_id,
+        connection_nonce, connection_epoch, client_seq
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_emo_broadcast_feedback_pair
+ON emo_broadcast_feedback_settlement (
+    broadcast_id, client_id, device_session_id, created_at_ms
+);
+
+CREATE TABLE IF NOT EXISTS emo_broadcast_terminal_recovery (
+    id CHAR(36) PRIMARY KEY,
+    user_name VARCHAR(64) NOT NULL,
+    playback_context_id VARCHAR(128) NOT NULL,
+    broadcast_id VARCHAR(128) NOT NULL,
+    client_id VARCHAR(128) NOT NULL,
+    device_session_id VARCHAR(128) NOT NULL,
+    terminal_broadcast_revision INTEGER NOT NULL,
+    current_delivery_id VARCHAR(128),
+    suspended_playback_context_id VARCHAR(128) NOT NULL,
+    suspended_epoch INTEGER NOT NULL,
+    suspended_version INTEGER NOT NULL,
+    suspended_queue_revision INTEGER NOT NULL,
+    suspended_control_version INTEGER NOT NULL,
+    suspended_applied_control_version INTEGER NOT NULL,
+    last_applied_broadcast_revision INTEGER,
+    terminal_queue_index INTEGER NOT NULL,
+    terminal_track_id VARCHAR(128) NOT NULL,
+    terminal_position_ms INTEGER NOT NULL,
+    terminal_playback_rate REAL NOT NULL,
+    terminal_at_server_ms INTEGER NOT NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    UNIQUE(user_name, client_id, device_session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_emo_broadcast_recovery_terminal
+ON emo_broadcast_terminal_recovery (terminal_at_server_ms);
+
+CREATE TABLE IF NOT EXISTS emo_broadcast_recovery_abandon (
+    id CHAR(36) PRIMARY KEY,
+    user_name VARCHAR(64) NOT NULL,
+    client_id VARCHAR(128) NOT NULL,
+    device_session_id VARCHAR(128) NOT NULL,
+    broadcast_id VARCHAR(128) NOT NULL,
+    request_fingerprint VARCHAR(64) NOT NULL,
+    terminal_broadcast_revision INTEGER NOT NULL,
+    obligation_kind VARCHAR(16) NOT NULL,
+    outcome_json TEXT NOT NULL,
+    abandoned_at_ms INTEGER NOT NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    UNIQUE(user_name, client_id, device_session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_emo_broadcast_abandon_time
+ON emo_broadcast_recovery_abandon (broadcast_id, abandoned_at_ms);
+
+CREATE TABLE IF NOT EXISTS emo_permanent_device_decommission (
+    id CHAR(36) PRIMARY KEY,
+    user_name VARCHAR(64) NOT NULL,
+    client_id VARCHAR(128) NOT NULL,
+    device_session_id VARCHAR(128) NOT NULL,
+    broadcast_id VARCHAR(128) NOT NULL,
+    abandon_request_fingerprint VARCHAR(64) NOT NULL,
+    decommissioned_at_ms INTEGER NOT NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    UNIQUE(user_name, client_id, device_session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_emo_permanent_decommission_time
+ON emo_permanent_device_decommission (user_name, decommissioned_at_ms);

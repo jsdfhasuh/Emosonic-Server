@@ -1,0 +1,6 @@
+ALTER TABLE emo_broadcast_participant
+ADD COLUMN applied_at_server_ms INTEGER;
+ALTER TABLE emo_broadcast_participant
+ADD COLUMN failed_error_message TEXT;
+ALTER TABLE emo_broadcast_participant
+ADD COLUMN timed_out_broadcast_revision INTEGER;

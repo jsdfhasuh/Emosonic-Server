@@ -1,5 +1,9 @@
 # Flutter Emo Socket.IO 对接文档
 
+> **Legacy Flutter 文档。** 本文的 `sessionId` 示例只适用于 legacy 协议，不得作为 strict-v2
+> 请求依据。PlaybackContext strict-v2 客户端必须以
+> `specs/emosonic_strict_v2_socketio_server_contract.md` 为唯一 wire contract。
+
 本文档给 Flutter 客户端工程师使用，用于对接当前 Emosonic Server 的 Emo 实时控制通道。
 
 ## 1. 结论

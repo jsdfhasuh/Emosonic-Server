@@ -1,0 +1,110 @@
+TAP version 13
+# Subtest: helpers reject forbidden nested session fields and duplicate queues
+ok 1 - helpers reject forbidden nested session fields and duplicate queues
+  ---
+  duration_ms: 3.042559
+  ...
+# Subtest: shared client action inventory matches the authoritative web fixtures
+ok 2 - shared client action inventory matches the authoritative web fixtures
+  ---
+  duration_ms: 0.773462
+  ...
+# Subtest: business requests are gated until transport bootstrap is ready
+ok 3 - business requests are gated until transport bootstrap is ready
+  ---
+  duration_ms: 0.639766
+  ...
+# Subtest: request retry reuses the byte-equivalent envelope and fingerprint
+ok 4 - request retry reuses the byte-equivalent envelope and fingerprint
+  ---
+  duration_ms: 3.362636
+  ...
+# Subtest: ACK action mismatch closes strict mode without fallback
+ok 5 - ACK action mismatch closes strict mode without fallback
+  ---
+  duration_ms: 0.744951
+  ...
+# Subtest: conflicting settlement, bad provenance, and inbound session fields are fatal
+ok 6 - conflicting settlement, bad provenance, and inbound session fields are fatal
+  ---
+  duration_ms: 0.525689
+  ...
+# Subtest: event-confirmed playback feedback settles by context and clientSeq
+ok 7 - event-confirmed playback feedback settles by context and clientSeq
+  ---
+  duration_ms: 1.315001
+  ...
+# Subtest: device volume commands and event confirmation use device identity
+ok 8 - device volume commands and event confirmation use device identity
+  ---
+  duration_ms: 0.662387
+  ...
+# Subtest: playback feedback settles only for the sending player identity
+ok 9 - playback feedback settles only for the sending player identity
+  ---
+  duration_ms: 8.807032
+  ...
+# Subtest: late valid settlements after timeout are tolerated and settlement history is bounded
+ok 10 - late valid settlements after timeout are tolerated and settlement history is bounded
+  ---
+  duration_ms: 1.509109
+  ...
+# Subtest: failed Context subscribe and status do not leave stale reconnect subscriptions
+ok 11 - failed Context subscribe and status do not leave stale reconnect subscriptions
+  ---
+  duration_ms: 1.742492
+  ...
+# Subtest: concurrent Context subscribes serialize and transient refresh failure keeps subscription
+ok 12 - concurrent Context subscribes serialize and transient refresh failure keeps subscription
+  ---
+  duration_ms: 1.364153
+  ...
+# Subtest: Context subscribe and unsubscribe crossover is serialized with unsubscribe winning
+ok 13 - Context subscribe and unsubscribe crossover is serialized with unsubscribe winning
+  ---
+  duration_ms: 0.95193
+  ...
+# Subtest: unsubscribe failures and terminal Context events always clear local subscription state
+ok 14 - unsubscribe failures and terminal Context events always clear local subscription state
+  ---
+  duration_ms: 0.653102
+  ...
+# Subtest: registration evidence requires closed metadata, provenance, and paired handoff capabilities
+ok 15 - registration evidence requires closed metadata, provenance, and paired handoff capabilities
+  ---
+  duration_ms: 1.157221
+  ...
+# Subtest: registration accepts remote volume only when the client requested the extension
+ok 16 - registration accepts remote volume only when the client requested the extension
+  ---
+  duration_ms: 0.256832
+  ...
+# Subtest: bootstrap fetches a fresh browser OTP and reaches ready with exact registration
+ok 17 - bootstrap fetches a fresh browser OTP and reaches ready with exact registration
+  ---
+  duration_ms: 5.280071
+  ...
+# Subtest: context cursors are canonical and physical reconnect resets clientSeq
+ok 18 - context cursors are canonical and physical reconnect resets clientSeq
+  ---
+  duration_ms: 0.701635
+  ...
+# Subtest: stale Context snapshots and commands settle requests without reaching UI events
+ok 19 - stale Context snapshots and commands settle requests without reaching UI events
+  ---
+  duration_ms: 0.664805
+  ...
+# Subtest: fallback owner lease prevents replacement loops and allows takeover after release
+ok 20 - fallback owner lease prevents replacement loops and allows takeover after release
+  ---
+  duration_ms: 52.282428
+  ...
+1..20
+# tests 20
+# suites 0
+# pass 20
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 166.420628

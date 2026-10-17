@@ -11,7 +11,7 @@ import random
 import string
 import uuid
 
-from ..db import User
+from ..db import User, db
 
 
 class UserManager:
@@ -37,12 +37,26 @@ class UserManager:
     @staticmethod
     def delete(uid):
         user = UserManager.get(uid)
-        user.delete_instance(recursive=True)
+        with db.atomic():
+            UserManager._delete_emo_security_records(user.name)
+            user.delete_instance(recursive=True)
 
     @staticmethod
     def delete_by_name(name):
         user = User.get(name=name)
-        user.delete_instance(recursive=True)
+        with db.atomic():
+            UserManager._delete_emo_security_records(user.name)
+            user.delete_instance(recursive=True)
+
+    @staticmethod
+    def _delete_emo_security_records(user_name):
+        # These durable tables intentionally use a stable username instead of
+        # a User foreign key, so account deletion must clean them explicitly.
+        from ..emo.broadcast_store import (
+            deleteBroadcastRecoveryDecommissionRecordsForUser,
+        )
+
+        return deleteBroadcastRecoveryDecommissionRecordsForUser(user_name)
 
     @staticmethod
     def try_auth(name, password):

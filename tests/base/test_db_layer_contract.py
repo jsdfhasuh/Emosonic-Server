@@ -3,6 +3,7 @@ import importlib
 from pathlib import Path
 from typing import Iterator
 import unittest
+from unittest import mock
 
 
 class DbLayerContractTestCase(unittest.TestCase):
@@ -60,6 +61,12 @@ class DbLayerContractTestCase(unittest.TestCase):
             "EmoSessionQueue",
             "EmoLocalQueue",
             "EmoPlaybackState",
+            "EmoPlaybackContext",
+            "EmoDevicePlaybackState",
+            "EmoPlaybackControlTransaction",
+            "EmoPlaybackPrepareTransaction",
+            "EmoPlaybackLocalIntent",
+            "EmoPlaybackHandoff",
             "StarredFolder",
             "StarredArtist",
             "StarredAlbum",
@@ -76,6 +83,7 @@ class DbLayerContractTestCase(unittest.TestCase):
             "release_database",
             "open_connection",
             "close_connection",
+            "connection_scope",
         ]
 
         for name in expected_names:
@@ -113,6 +121,60 @@ class DbLayerContractTestCase(unittest.TestCase):
         self.assertIs(db_module.release_database, runtime.release_database)
         self.assertIs(db_module.open_connection, runtime.open_connection)
         self.assertIs(db_module.close_connection, runtime.close_connection)
+        self.assertIs(db_module.connection_scope, runtime.connection_scope)
+
+    def test_connection_scope_closes_only_the_owned_connection(self):
+        runtime = importlib.import_module("supysonic.db_layer.runtime")
+        connection_open = False
+        physical_open_count = 0
+        close_count = 0
+
+        database = mock.Mock()
+
+        def is_closed():
+            return not connection_open
+
+        def connect(reuse=False):
+            nonlocal connection_open, physical_open_count
+            if connection_open:
+                if reuse:
+                    return False
+                raise RuntimeError("connection already open")
+            connection_open = True
+            physical_open_count += 1
+            return True
+
+        def close():
+            nonlocal connection_open, close_count
+            connection_open = False
+            close_count += 1
+
+        database.is_closed.side_effect = is_closed
+        database.connect.side_effect = connect
+        database.close.side_effect = close
+
+        with mock.patch.object(runtime, "db", database):
+            with runtime.connection_scope(reuse=True):
+                self.assertFalse(database.is_closed())
+                self.assertFalse(runtime.open_connection(reuse=True))
+                runtime.close_connection()
+                self.assertFalse(database.is_closed())
+
+            self.assertTrue(database.is_closed())
+            self.assertEqual(physical_open_count, 1)
+            self.assertEqual(close_count, 1)
+
+    def test_connection_scope_does_not_close_a_borrowed_connection(self):
+        runtime = importlib.import_module("supysonic.db_layer.runtime")
+        database = mock.Mock()
+        database.is_closed.return_value = False
+
+        with mock.patch.object(runtime, "db", database):
+            with runtime.connection_scope(reuse=True):
+                runtime.close_connection()
+
+        database.connect.assert_not_called()
+        database.close.assert_not_called()
 
     def test_serializer_module_exists(self):
         serializers = importlib.import_module("supysonic.db_layer.serializers")
@@ -176,6 +238,24 @@ class DbLayerContractTestCase(unittest.TestCase):
         self.assertIs(db_module.EmoSessionQueue, emo.EmoSessionQueue)
         self.assertIs(db_module.EmoLocalQueue, emo.EmoLocalQueue)
         self.assertIs(db_module.EmoPlaybackState, emo.EmoPlaybackState)
+        self.assertIs(db_module.EmoPlaybackContext, emo.EmoPlaybackContext)
+        self.assertIs(
+            db_module.EmoDevicePlaybackState,
+            emo.EmoDevicePlaybackState,
+        )
+        self.assertIs(
+            db_module.EmoPlaybackControlTransaction,
+            emo.EmoPlaybackControlTransaction,
+        )
+        self.assertIs(
+            db_module.EmoPlaybackPrepareTransaction,
+            emo.EmoPlaybackPrepareTransaction,
+        )
+        self.assertIs(
+            db_module.EmoPlaybackLocalIntent,
+            emo.EmoPlaybackLocalIntent,
+        )
+        self.assertIs(db_module.EmoPlaybackHandoff, emo.EmoPlaybackHandoff)
         self.assertIs(db_module.ClientRelease, client_releases.ClientRelease)
 
     def test_main_model_groups_are_shared_with_facade(self):

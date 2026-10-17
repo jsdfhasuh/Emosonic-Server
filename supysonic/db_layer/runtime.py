@@ -1,11 +1,16 @@
 import importlib
 import os.path
+from contextlib import contextmanager
+from threading import local
 from urllib.parse import urlparse
 
 from playhouse.db_url import parseresult_to_dict, schemes
 
 from .core import Meta, db
 from .schema import SCHEMA_VERSION, execute_sql_resource_script, list_migrations
+
+
+_connection_scope_state = local()
 
 
 def init_database(database_uri):
@@ -78,4 +83,23 @@ def open_connection(reuse=False):
 
 
 def close_connection():
+    if getattr(_connection_scope_state, "depth", 0) > 0:
+        return
     db.close()
+
+
+@contextmanager
+def connection_scope(reuse=False):
+    depth = getattr(_connection_scope_state, "depth", 0)
+    owns_connection = depth == 0 and db.is_closed()
+    if owns_connection:
+        db.connect(reuse)
+    _connection_scope_state.depth = depth + 1
+    try:
+        yield db
+    finally:
+        _connection_scope_state.depth = depth
+        if depth == 0:
+            del _connection_scope_state.depth
+        if owns_connection and not db.is_closed():
+            db.close()

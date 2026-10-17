@@ -16,11 +16,27 @@ from .db_layer.annotations import (
 from .db_layer.client_releases import ClientRelease
 from .db_layer.core import Meta, PathMixin, PrimaryKeyField, db, now, random
 from .db_layer.emo import (
+    EmoBroadcast,
+    EmoBroadcastDelivery,
+    EmoBroadcastFeedbackSettlement,
+    EmoBroadcastFence,
+    EmoBroadcastIntentOutcome,
+    EmoBroadcastParticipant,
+    EmoBroadcastRecoveryAbandon,
+    EmoBroadcastRevision,
+    EmoBroadcastTerminalRecovery,
     EmoDevicePlaybackState,
+    EmoCoreStartupRecovery,
+    EmoFollowSafetyLease,
     EmoLocalQueue,
+    EmoPlaybackControlTransaction,
     EmoPlaybackContext,
+    EmoPlaybackControlReconciliation,
     EmoPlaybackHandoff,
+    EmoPlaybackLocalIntent,
+    EmoPlaybackPrepareTransaction,
     EmoPlaybackState,
+    EmoPermanentDeviceDecommission,
     EmoSessionQueue,
 )
 from .db_layer.library import (
@@ -38,6 +54,7 @@ from .db_layer.playlists import Playlist, SharedTrackLink
 from .db_layer.review_tasks import AlbumReviewTask, ReviewTask
 from .db_layer.runtime import (
     close_connection,
+    connection_scope,
     init_database,
     open_connection,
     release_database,

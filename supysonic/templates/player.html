@@ -132,6 +132,7 @@
 
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
 <script>
+  const emoBrowserBootstrap = {{ emo_web_bootstrap | tojson }};
   const playerRoot = document.querySelector('.player-workspace');
   const playerAudio = document.getElementById('player-audio');
   const playerState = {
@@ -1047,10 +1048,33 @@
     reportPlayback(playerAudio.paused ? 'paused' : 'playing');
   });
 
+  async function authenticateBrowserSocket() {
+    const response = await fetch(emoBrowserBootstrap.authPasswordUrl, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        'X-Emo-CSRF-Token': emoBrowserBootstrap.csrfToken,
+        'X-Requested-With': 'fetch',
+      },
+    });
+    if (!response.ok) {
+      throw new Error(`browser credential request failed (${response.status})`);
+    }
+    const credential = await response.json();
+    playerState.authRequestId = nextRequestId('web-player-auth');
+    emitPlayerMessage('auth', 'auth.login', {
+      u: credential.userName,
+      p: credential.oneTimePassword,
+    }, { requestId: playerState.authRequestId });
+  }
+
   socket.on('connect', () => {
     document.getElementById('player-connection-state').textContent = 'ONLINE';
-    playerState.authRequestId = nextRequestId('web-player-auth');
-    emitPlayerMessage('auth', 'auth.login', {}, { requestId: playerState.authRequestId });
+    authenticateBrowserSocket().catch((error) => {
+      document.getElementById('player-connection-state').textContent = 'AUTH ERROR';
+      setStatus(`Authentication failed: ${error.message}`, `认证失败：${error.message}`);
+      socket.disconnect();
+    });
   });
   socket.on('disconnect', () => {
     playerState.registered = false;

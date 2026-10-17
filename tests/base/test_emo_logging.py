@@ -33,7 +33,8 @@ class EmoLoggingTestCase(unittest.TestCase):
 
     def tearDown(self):
         for client in self.clients:
-            client.disconnect(namespace="/emo")
+            if client.is_connected(namespace="/emo"):
+                client.disconnect(namespace="/emo")
         release_database()
         shutil.rmtree(self._dir)
         os.close(self._db[0])
@@ -138,7 +139,7 @@ class EmoLoggingTestCase(unittest.TestCase):
         content = self.readEmoLog()
 
         self.assertIn(
-            "emo event=auth_login result=failure user=alice client_request_id=auth-fail-1 reason=invalid_credentials",
+            "emo event=auth_login result=failure user=alice client_request_id=auth-fail-1 action=auth.login",
             content,
         )
         self.assertNotIn("wrong-password", content)
@@ -356,14 +357,13 @@ class EmoLoggingTestCase(unittest.TestCase):
             },
             namespace="/emo",
         )
-        client.get_received("/emo")
+        self.assertFalse(client.is_connected(namespace="/emo"))
 
         content = self.readEmoLog()
 
         self.assertIn("emo event=bad_message", content)
         self.assertIn("result=bad_request", content)
-        self.assertIn("reason=missing_action", content)
-        self.assertIn("client_request_id=missing-action-1", content)
+        self.assertIn("reason=invalid_correlation", content)
 
     def test_logs_unauthorized_action_before_authentication(self):
         client = socketio.test_client(self.app, namespace="/emo", flask_test_client=self.http_client)
