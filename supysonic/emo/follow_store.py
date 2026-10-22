@@ -1631,8 +1631,11 @@ def _source_fact_requires_recovery(
         or device.position_ms < 0
     ):
         return True, False
-    context_rate = context_playback.get("playbackRate", 1.0)
-    device_rate = playback.get("playbackRate", 1.0)
+    device_rate = playback.get("playbackRate")
+    # Strict Context snapshots omit rate; absence is not an intended 1x rate.
+    # Preserve an explicit legacy expectation, but use the settled authority
+    # fact when the Context has no rate field.
+    context_rate = context_playback.get("playbackRate", device_rate)
     if any(
         isinstance(value, bool)
         or not isinstance(value, (int, float))

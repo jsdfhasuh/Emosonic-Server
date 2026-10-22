@@ -932,6 +932,131 @@ class EmoFollowStoreTestCase(unittest.TestCase):
         self.assertEqual(lease["phase"], "active")
         self.assertNotIn("sourceRecoveryDeadlineAtMs", lease)
 
+    def _accept_source_rate(self, rate, client_seq, server_time_ms):
+        return applyStrictPlaybackUpdate(
+            "context-source", "alice", "source-1", "device:source-1",
+            "source-nonce-1",
+            {
+                "playbackContextId": "context-source",
+                "deviceSessionId": "device:source-1",
+                "origin": "passive",
+                "appliedControlVersion": 1,
+                "state": "playing",
+                "trackId": "song-1",
+                "positionMs": 200,
+                "positionSampledAtServerMs": server_time_ms,
+                "playbackRate": rate,
+                "clientSeq": client_seq,
+            },
+            server_time_ms,
+        )
+
+    def test_nonunit_follow_rate_stays_active_beyond_recovery_window(self):
+        self._create_lease()
+        for client_seq, sample_time in enumerate(range(1000, 35001, 1000), 2):
+            rate = 1.5 if client_seq % 2 == 0 else 0.8
+            accepted = self._accept_source_rate(rate, client_seq, sample_time)
+            self.assertNotIn("playbackRate", accepted["playbackContext"])
+            self.assertEqual(sweepFollowSafetyLeaseDeadlines(sample_time + 1), [])
+            lease = getFollowSafetyLeaseForFollower(
+                "alice", "follower-1", "device:follower-1",
+            )
+            self.assertEqual(lease["phase"], "active")
+            self.assertNotIn("sourceRecoveryDeadlineAtMs", lease)
+
+    def test_accepted_actual_rate_does_not_overwrite_explicit_context_rate(self):
+        context = db.EmoPlaybackContext.get(
+            db.EmoPlaybackContext.playback_context_id == "context-source"
+        )
+        context.playback_json = json.dumps({"playbackRate": 1.0})
+        context.save()
+        accepted = self._accept_source_rate(1.5, 2, 1000)
+        self.assertEqual(accepted["canonicalUpdate"]["playbackRate"], 1.5)
+        self.assertEqual(accepted["playbackContext"]["playbackRate"], 1.0)
+        self._create_lease()
+        transitions = sweepFollowSafetyLeaseDeadlines(1001)
+        self.assertEqual(len(transitions), 1)
+        self.assertEqual(transitions[0]["reason"], "sourceRecoveryStarted")
+
+    def test_absent_context_rate_still_rejects_missing_or_invalid_actual_rate(self):
+        self._create_lease()
+        device = db.EmoDevicePlaybackState.get(
+            db.EmoDevicePlaybackState.playback_context_id == "context-source"
+        )
+        original = json.loads(device.playback_json)
+        for label, rate in (
+            ("missing", None), ("null", None), ("nan", float("nan")),
+            ("infinite", float("inf")), ("boolean", True),
+            ("below_minimum", 0.49), ("above_maximum", 2.01),
+        ):
+            with self.subTest(label=label):
+                payload = dict(original)
+                if label == "missing":
+                    payload.pop("playbackRate")
+                else:
+                    payload["playbackRate"] = rate
+                device.playback_json = json.dumps(payload)
+                device.save()
+                db.EmoFollowSafetyLease.update(
+                    source_recovery_deadline_at_ms=None,
+                ).execute()
+                transitions = sweepFollowSafetyLeaseDeadlines(1001)
+                self.assertEqual(len(transitions), 1)
+                self.assertEqual(transitions[0]["reason"], "sourceRecoveryStarted")
+
+    def test_actual_rate_fallback_preserves_source_identity_and_freshness_guards(self):
+        self._accept_source_rate(1.5, 2, 1000)
+        self._create_lease()
+        device = db.EmoDevicePlaybackState.get(
+            db.EmoDevicePlaybackState.playback_context_id == "context-source"
+        )
+        original = json.loads(device.playback_json)
+        for label in (
+            "nonce", "session", "epoch", "control", "authority",
+            "track", "state", "stale_sample", "future_sample", "stale_receive",
+        ):
+            with self.subTest(label=label):
+                payload = dict(original)
+                device.device_session_id = "device:source-1"
+                device.context_epoch = 1
+                device.applied_control_version = 1
+                device.is_authority = 1
+                device.track_id = "song-1"
+                device.state = "playing"
+                if label == "nonce":
+                    payload["_connectionNonce"] = "foreign-source-nonce"
+                elif label == "session":
+                    device.device_session_id = "device:other"
+                elif label == "epoch":
+                    device.context_epoch = 2
+                elif label == "control":
+                    device.applied_control_version = 0
+                elif label == "authority":
+                    device.is_authority = 0
+                elif label == "track":
+                    device.track_id = "song-other"
+                elif label == "state":
+                    device.state = "paused"
+                elif label == "stale_sample":
+                    payload["positionSampledAtServerMs"] = 0
+                elif label == "future_sample":
+                    payload["positionSampledAtServerMs"] = 3002
+                elif label == "stale_receive":
+                    payload["serverUpdatedAtMs"] = 0
+                # Keep unaffected fact timestamps fresh at the sample time.
+                if label != "stale_sample" and label != "future_sample":
+                    payload["positionSampledAtServerMs"] = 3001
+                if label != "stale_receive":
+                    payload["serverUpdatedAtMs"] = 3001
+                device.playback_json = json.dumps(payload)
+                device.save()
+                db.EmoFollowSafetyLease.update(
+                    source_recovery_deadline_at_ms=None,
+                ).execute()
+                transitions = sweepFollowSafetyLeaseDeadlines(3001)
+                self.assertEqual(len(transitions), 1)
+                self.assertEqual(transitions[0]["reason"], "sourceRecoveryStarted")
+
     def test_source_idle_waits_while_stale_playing_uses_bounded_recovery(self):
         self._create_lease()
         source = db.EmoPlaybackContext.get(
