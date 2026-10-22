@@ -902,6 +902,36 @@ class EmoFollowStoreTestCase(unittest.TestCase):
         self.assertNotIn("followReconnectGraceExpiresAtMs", lease)
         self.assertNotIn("sourceRecoveryDeadlineAtMs", lease)
 
+    def test_accepted_nonunit_authority_rate_keeps_follow_source_active(self):
+        payload = {
+            "playbackContextId": "context-source",
+            "deviceSessionId": "device:source-1",
+            "origin": "passive",
+            "appliedControlVersion": 1,
+            "state": "playing",
+            "trackId": "song-1",
+            "positionMs": 200,
+            "positionSampledAtServerMs": 1000,
+            "playbackRate": 1.5,
+            "clientSeq": 2,
+        }
+        accepted = applyStrictPlaybackUpdate(
+            "context-source", "alice", "source-1", "device:source-1",
+            "source-nonce-1", payload, 1000,
+        )
+        self.assertEqual(accepted["canonicalUpdate"]["playbackRate"], 1.5)
+        self._create_lease()
+        self.assertEqual(
+            sweepFollowSafetyLeaseDeadlines(1001),
+            [],
+            "FOLLOW_ACCEPTED_AUTHORITY_RATE_MUST_NOT_START_RECOVERY",
+        )
+        lease = getFollowSafetyLeaseForFollower(
+            "alice", "follower-1", "device:follower-1",
+        )
+        self.assertEqual(lease["phase"], "active")
+        self.assertNotIn("sourceRecoveryDeadlineAtMs", lease)
+
     def test_source_idle_waits_while_stale_playing_uses_bounded_recovery(self):
         self._create_lease()
         source = db.EmoPlaybackContext.get(
