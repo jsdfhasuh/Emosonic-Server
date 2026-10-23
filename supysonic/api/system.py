@@ -9,11 +9,17 @@
 from flask import request
 
 from . import api_routing
+from ..server_identity import get_server_identity
 
 
 @api_routing("/ping")
 def ping():
-    return request.formatter.empty
+    if request.values.get("includeServerIdentity") != "true":
+        return request.formatter.empty
+    return request.formatter(
+        "serverIdentity",
+        {"version": 1, "id": get_server_identity(), "accountId": str(request.user.id)},
+    )
 
 
 @api_routing("/getLicense")
