@@ -98,9 +98,11 @@ def smoke() -> None:
 
     # This account exists only in the disposable container tmpfs. Never print its password.
     username = "test-smoke-" + secrets.token_hex(6)
-    password = secrets.token_urlsafe(32)
+    # The product's FixedCharField(40) truncates longer values when saving.
+    password = secrets.token_hex(16)
     init_database(config.BASE["database_uri"])
     UserManager.add(username, password)
+    assert UserManager.try_auth(username, password) is not None, "Disposable test account failed local authentication"
     close_connection()
 
     messages = queue.Queue()
