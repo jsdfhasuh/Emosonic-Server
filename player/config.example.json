@@ -1,0 +1,13 @@
+{
+  "server_url": "https://music.example.invalid",
+  "username": "REPLACE_WITH_ACCOUNT_NAME",
+  "password_file": "/run/secrets/player_password",
+  "device_name": "OpenWrt 音箱",
+  "client_id_file": "/var/lib/emosonic-player/client-id",
+  "runtime_dir": "/run/emosonic-player",
+  "state_dir": "/var/lib/emosonic-player",
+  "audio_device": "alsa/REPLACE_WITH_EXACT_ENUMERATED_DEVICE",
+  "protocol_version": "2.9.0",
+  "initial_volume": 20,
+  "allow_insecure_http": false
+}

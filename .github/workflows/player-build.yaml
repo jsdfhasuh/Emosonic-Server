@@ -1,0 +1,80 @@
+name: Headless player checks and ARM64 build
+
+on:
+  push:
+    branches: ["feat/openwrt-mpv-player-20261029"]
+    paths: ["player/**", ".github/workflows/player-build.yaml"]
+  pull_request:
+    paths: ["player/**", ".github/workflows/player-build.yaml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: player-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install player and test audio engine
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mpv
+          python -m pip install -r requirements.txt -r ci-requirements.txt ./player
+          python -m pip check
+      - name: Run player tests and entrypoint checks
+        env:
+          EMOSONIC_REAL_MPV_TESTS: "1"
+          PYTHONPATH: player/src:.
+        run: |
+          python -m unittest discover -s player/tests -v
+          emosonic --help
+          emosonic-playerd --help
+
+  arm64-build:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v3
+      - name: Build only, never publish
+        uses: docker/build-push-action@v6
+        with:
+          context: ./player
+          file: ./player/Dockerfile
+          platforms: linux/arm64
+          tags: emosonic-player:ci
+          push: false
+          load: true
+          provenance: false
+          build-args: |
+            SOURCE_REVISION=${{ github.sha }}
+      - name: Inspect ARM64 image without audio or network access
+        run: |
+          test "$(docker image inspect --format '{{.Architecture}}' emosonic-player:ci)" = arm64
+          docker run --rm --network none --entrypoint emosonic emosonic-player:ci --help
+          docker run --rm --network none --entrypoint emosonic-playerd emosonic-player:ci --help
+          docker run --rm --network none --entrypoint mpv emosonic-player:ci --ao=help | grep alsa
+          docker image inspect emosonic-player:ci > player-image-inspect.json
+          docker run --rm --network none --entrypoint cat emosonic-player:ci /opt/player/python-packages.txt > player-python-packages.txt
+          docker run --rm --network none --entrypoint cat emosonic-player:ci /opt/player/system-packages.txt > player-system-packages.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: player-build-metadata-${{ github.sha }}
+          path: |
+            player-image-inspect.json
+            player-python-packages.txt
+            player-system-packages.txt
+          retention-days: 14
