@@ -70,6 +70,20 @@ jobs:
           docker image inspect emosonic-player:ci > player-image-inspect.json
           docker run --rm --network none --entrypoint cat emosonic-player:ci /opt/player/python-packages.txt > player-python-packages.txt
           docker run --rm --network none --entrypoint cat emosonic-player:ci /opt/player/system-packages.txt > player-system-packages.txt
+      - name: Export private build artifact for manual deployment
+        run: |
+          mkdir -p player-delivery
+          docker save emosonic-player:ci | gzip -1 > player-delivery/emosonic-player-linux-arm64.tar.gz
+          cp player-image-inspect.json player-python-packages.txt player-system-packages.txt player-delivery/
+          printf 'source_commit=%s\nplatform=linux/arm64\nregistry_published=false\nphysical_usb_test=NOT_RUN\n' "$GITHUB_SHA" > player-delivery/BUILD-INFO.txt
+          (cd player-delivery && sha256sum emosonic-player-linux-arm64.tar.gz > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: emosonic-player-linux-arm64-${{ github.sha }}
+          path: player-delivery/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: player-build-metadata-${{ github.sha }}

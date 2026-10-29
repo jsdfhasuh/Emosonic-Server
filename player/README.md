@@ -156,3 +156,12 @@ The selected server's strict contract rejects duplicate song IDs in one queue
 same ID twice is rejected explicitly; it is never silently deduplicated. This
 is a discovered difference from the handoff's duplicate-occurrence example.
 Repeated executions of the same song still have distinct mpv run identities.
+
+
+## Build artifact
+Successful build-only CI also exports `emosonic-player-linux-arm64-<commit>` as
+an authenticated GitHub Actions artifact retained for 7 days. It contains a
+Docker-loadable `.tar.gz`, SHA256SUMS, source commit/platform information and
+package/image metadata. This is not a registry release or a deployed service.
+Verify SHA256SUMS before manual `docker load`; changing OpenWrt settings or
+starting playback remains a separate user-operated acceptance step.

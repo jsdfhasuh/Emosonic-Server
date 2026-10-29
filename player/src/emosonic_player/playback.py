@@ -345,6 +345,12 @@ class Player:
             event = await self.engine.events.get()
             try:
                 async with self.lock:
+                    if (event.kind == 'disconnected' and self.run_id is None and
+                            event.process_generation == getattr(self.engine, 'process_generation', -1)):
+                        self.needs_engine_restart = True
+                        self.error = 'audio_unavailable'
+                        await self._safe_stop()
+                        continue
                     if event.run_id != self.run_id or not self.run_id:
                         continue
                     if event.kind != 'eof':

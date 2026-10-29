@@ -160,6 +160,18 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
     def start_events(self):
         self.tasks.append(asyncio.create_task(self.player._engine_events()))
 
+    async def test_idle_engine_disconnect_requests_restart(self):
+        self.start_events()
+        self.player.run_id = None
+        self.engine.process_generation = 7
+        from emosonic_player.mpv import PlaybackEvent
+        await self.engine.events.put(PlaybackEvent('disconnected', None, 6))
+        await asyncio.sleep(.02)
+        self.assertFalse(self.player.needs_engine_restart)
+        await self.engine.events.put(PlaybackEvent('disconnected', None, 7))
+        await asyncio.sleep(.02)
+        self.assertTrue(self.player.needs_engine_restart)
+
     async def test_committed_pause_reuses_same_run_and_duplicate_command_is_noop(self):
         run = self.player.run_id
         await self.player._execute(self.command('player.pause'), 1)

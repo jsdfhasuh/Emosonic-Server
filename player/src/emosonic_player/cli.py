@@ -53,7 +53,10 @@ def main():
         parser().error('play requires one song ID, --playlist or --album')
     try:
         result = asyncio.run(call(socket_path, action, params))
-    except (OSError, ValueError, TimeoutError):
+    except ValueError as exc:
+        print('Request rejected: ' + str(exc)[:160], file=sys.stderr)
+        return 1
+    except (OSError, TimeoutError):
         print('Request failed; check daemon status and non-sensitive logs.', file=sys.stderr)
         return 1
     print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -14,9 +14,9 @@ import uuid
 
 from .config import client_identity, load_config, read_password
 from .mpv import MpvPlayer
-from .playback import Player
-from .protocol import ProtocolClient
-from .stream import MediaClient
+from .playback import Player, PlaybackError
+from .protocol import ProtocolClient, ProtocolError
+from .stream import MediaClient, MediaError
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,9 @@ async def serve_cli(reader, writer, player):
     except asyncio.CancelledError:
         writer.close()
         raise
+    except (PlaybackError, ProtocolError, MediaError) as exc:
+        # These exception classes contain authored categories, not raw server text.
+        response = {'ok': False, 'error': str(exc)}
     except Exception:
         response = {'ok': False, 'error': 'request_failed'}
     try:

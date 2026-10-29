@@ -48,6 +48,10 @@ class MpvPlayer:
         self._operations = asyncio.Lock()
         self._closing = False
 
+    @property
+    def process_generation(self) -> int:
+        return self._generation
+
     async def start(self) -> None:
         if self._process is not None:
             return
