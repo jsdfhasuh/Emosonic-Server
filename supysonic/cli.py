@@ -27,6 +27,8 @@ from .scanner_func.scanner_track_enrich import (
     runTrackMetadataEnrichmentPass,
 )
 from .track_metadata_config import get_track_metadata_llm_config
+from .track_metadata_background import BudgetedMetadataProvider, budget_is_configured
+from .metadata_budget import BudgetUnavailable
 
 
 logger = logging.getLogger(__package__)
@@ -274,12 +276,10 @@ def metadata_enrich(config, limit, track_ids, force, failed_only, dry_run, provi
     """Enrich track recommendation metadata."""
 
     try:
-        provider_instance = (
-            LLMMetadataProvider(get_track_metadata_llm_config(config))
-            if provider == "llm"
-            else LocalMetadataProvider()
-        )
-    except (TrackMetadataProviderError, LlmConfigError) as e:
+        settings = get_track_metadata_llm_config(config) if provider == "llm" else {}
+        provider_instance = (BudgetedMetadataProvider(settings) if budget_is_configured(settings)
+                             else LLMMetadataProvider(settings)) if provider == "llm" else LocalMetadataProvider()
+    except (TrackMetadataProviderError, LlmConfigError, BudgetUnavailable) as e:
         raise ClickException(str(e)) from e
 
     summary = runTrackMetadataEnrichmentPass(
@@ -301,6 +301,8 @@ def metadata_enrich(config, limit, track_ids, force, failed_only, dry_run, provi
     )
     if summary.get("rate_limited"):
         summary_line += ", stopped: rate_limited"
+    if summary.get("budget_paused"):
+        summary_line += ", stopped: metadata_budget_paused"
     click.echo(summary_line)
     for track in summary["tracks"]:
         line = "{status}\t{id}\t{reason}\t{title}".format(

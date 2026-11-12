@@ -179,8 +179,9 @@ log_level = INFO
 log_rotate = yes
 
 ; Minimum share of each daily recommendation playlist that was not present in
-; recent recommendation playlists. Set to 0 to disable. Default: 0.3
-recommend_playlist_rotation_ratio = 0.3
+; recent recommendation playlists, when artist diversity and the catalog allow.
+; Set to 0 to disable the minimum (repeat-score penalties still apply). Default: 0.8
+recommend_playlist_rotation_ratio = 0.8
 
 ; Number of previous natural days treated as recent recommendation exposure.
 ; Default: 3
@@ -209,8 +210,8 @@ mood_scene_playlists_active_users_only = on
 track_metadata_enrichment = off
 
 ; Provider for daemon-driven track metadata enrichment. "local" does not call
-; external services. "llm" uses [recommendation_agent] api_base_url, api_key,
-; model, timeout_seconds, max_output_tokens and temperature. Default: local
+; external services. "llm" uses [track_metadata_llm] when configured, otherwise
+; the legacy [recommendation_agent] settings. Default: local
 track_metadata_enrichment_provider = local
 
 ; Poll interval in seconds for track metadata enrichment. Default: 300
@@ -321,9 +322,10 @@ cache_ttl_seconds = 900
 ; Independent track metadata provider. Uncomment and configure the section to
 ; stop reusing recommendation_agent. Partial settings never inherit its key.
 ; Enable separately with daemon.track_metadata_enrichment_provider = llm.
+; Automatic web lookup and spending limits: docs/automatic-track-metadata-enrichment.md
 ;[track_metadata_llm]
 ;api_base_url = https://api.openai.com/v1
-;model = YOUR_MODEL_ID
+;model = gpt-6-luna
 ; Choose exactly one key source. File paths are absolute inside the container.
 ;api_key_file = /run/secrets/track_metadata_openai_key
 ;api_key_env = OPENAI_API_KEY
@@ -334,11 +336,26 @@ cache_ttl_seconds = 900
 ;token_limit_parameter = max_completion_tokens
 ; Blank temperature omits the parameter; the provider default is 0.2.
 ;temperature =
-; Omit for the model default; none disables reasoning on supported models.
-;reasoning_effort = none
+; Low reasoning is used for the bounded automatic enrichment configuration.
+;reasoning_effort = low
 ; json_schema requires a model/endpoint supporting strict structured outputs.
 ; json_object is the backward-compatible default.
 ;response_format = json_schema
+;
+; Opt-in software budget for metadata calls only, not an API-account billing cap.
+; Requires the official endpoint and supported model shown above.
+; Text and web requests share these persistent calendar-period counters.
+; USD 3 is held back, leaving USD 57 for monthly request admission.
+;monthly_budget_usd = 60
+;budget_safety_buffer_usd = 3
+;daily_budget_usd = 2
+;budget_timezone = Asia/Shanghai
+;
+; Automatic lookup for low-quality or unknown-language metadata; no manual API.
+; The daemon is still disabled above until track_metadata_enrichment is enabled.
+;web_search_enabled = on
+;web_max_tool_calls = 3
+;web_max_output_tokens = 4096
 
 [transcoding]
 ; Programs used to convert from one format/bitrate to another. Defaults: none

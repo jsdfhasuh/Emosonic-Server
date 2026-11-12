@@ -33,6 +33,10 @@ from ..scanner_func.scanner_track_enrich import (
     runTrackMetadataEnrichmentPass,
 )
 from ..track_metadata_config import get_track_metadata_llm_config
+from ..track_metadata_background import (
+    BudgetedMetadataProvider, budget_is_configured, runAutomaticMetadataPass,
+)
+from ..metadata_budget import BudgetUnavailable
 from ..utils import get_secret_key
 from ..watcher import SupysonicWatcher
 
@@ -202,10 +206,10 @@ class Daemon:
             provider = LocalMetadataProvider()
         elif provider_name == "llm":
             try:
-                provider = LLMMetadataProvider(
-                    get_track_metadata_llm_config(self.__config)
-                )
-            except (TrackMetadataProviderError, LlmConfigError) as exc:
+                settings = get_track_metadata_llm_config(self.__config)
+                provider = (BudgetedMetadataProvider(settings) if budget_is_configured(settings)
+                            else LLMMetadataProvider(settings))
+            except (TrackMetadataProviderError, LlmConfigError, BudgetUnavailable) as exc:
                 logger.warning(
                     format_log_event(
                         "daemon",
@@ -235,7 +239,9 @@ class Daemon:
                     provider=provider_name,
                 )
             )
-            summary = runTrackMetadataEnrichmentPass(
+            run_pass = (runAutomaticMetadataPass if isinstance(provider, BudgetedMetadataProvider)
+                        else runTrackMetadataEnrichmentPass)
+            summary = run_pass(
                 limit=self.__get_track_metadata_enrichment_batch_size(),
                 provider=provider,
                 stale_lock_seconds=self.__get_track_metadata_enrichment_stale_lock_seconds(),
@@ -252,6 +258,13 @@ class Daemon:
                     )
                 ),
             )
+            if summary.get("budget_paused"):
+                logger.info(format_log_event(
+                    "daemon", "track_metadata_enrichment_budget_paused",
+                    provider=provider_name, selected=summary["selected"],
+                    enriched=summary["enriched"], failed=summary["failed"],
+                ))
+                return False
             if summary.get("quota_exhausted"):
                 logger.warning(
                     format_log_event(

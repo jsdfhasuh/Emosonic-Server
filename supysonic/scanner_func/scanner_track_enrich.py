@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 
 from peewee import IntegrityError
@@ -28,6 +28,7 @@ from ..llm_client import (
     post_chat_completion,
 )
 from ..logging_utils import format_log_event
+from ..metadata_budget import BudgetExceeded, BudgetUnavailable
 from .scanner_review_tasks import createLowConfidenceTrackMetadataReviewTask
 
 
@@ -303,8 +304,9 @@ class LLMMetadataProvider:
     name = "llm"
     source = "llm"
 
-    def __init__(self, config: Mapping[str, object]) -> None:
+    def __init__(self, config: Mapping[str, object], request_callback=None) -> None:
         self.config = dict(config or {})
+        self.request_callback = request_callback
         self.api_base_url = str(self.config.get("api_base_url") or "").strip()
         self.api_key = str(self.config.get("api_key") or "").strip()
         self.model = str(self.config.get("model") or "").strip()
@@ -419,12 +421,15 @@ class LLMMetadataProvider:
             ),
         )
         try:
-            response_json = post_chat_completion(
-                self.api_base_url,
-                self.api_key,
-                payload,
-                timeout_seconds=self.timeout_seconds,
-            )
+            if self.request_callback is not None:
+                response_json = self.request_callback(payload)
+            else:
+                response_json = post_chat_completion(
+                    self.api_base_url,
+                    self.api_key,
+                    payload,
+                    timeout_seconds=self.timeout_seconds,
+                )
             parsed = parse_json_object_response(response_json)
         except LlmInvalidResponseError as exc:
             raise TrackMetadataInvalidResponseError(str(exc)) from exc
@@ -702,6 +707,17 @@ def runTrackMetadataEnrichmentPass(
                     **log_fields,
                 )
             )
+        except (BudgetExceeded, BudgetUnavailable) as exc:
+            reset = getattr(exc, "reset_at", None)
+            deadline = datetime.fromtimestamp(reset.timestamp()) if reset else now() + timedelta(days=1)
+            recordTrackEnrichmentAttempt(
+                track, provider, TrackMetadataEnrichmentTask.STATUS_RETRY,
+                reason="metadata_budget_paused", error=type(exc).__name__, next_retry_at=deadline,
+            )
+            track_info["status"] = "retry"
+            summary["budget_paused"] = True
+            summary["skipped"] += 1
+            stop_after_current = True
         except TrackMetadataInvalidResponseError as exc:
             recordTrackEnrichmentAttempt(
                 track,
@@ -1006,6 +1022,7 @@ def _claimTrackMetadataEnrichmentTask(
     track: Track,
     reason: str,
     force: bool = False,
+    respect_schedule: bool = False,
 ) -> Optional[TrackMetadataEnrichmentTask]:
     current_time = now()
     task = _get_or_create_track_metadata_enrichment_task(track, reason, force)
@@ -1013,6 +1030,15 @@ def _claimTrackMetadataEnrichmentTask(
         task = TrackMetadataEnrichmentTask.get_by_id(task.id)
         if task.status == TrackMetadataEnrichmentTask.STATUS_RUNNING:
             return None
+
+        eligible = TrackMetadataEnrichmentTask.status != TrackMetadataEnrichmentTask.STATUS_RUNNING
+        if respect_schedule:
+            eligible &= (
+                (TrackMetadataEnrichmentTask.next_retry_at.is_null()
+                 | (TrackMetadataEnrichmentTask.next_retry_at <= current_time))
+                & ((TrackMetadataEnrichmentTask.status != TrackMetadataEnrichmentTask.STATUS_FAILED)
+                   | (TrackMetadataEnrichmentTask.reason == TrackMetadataEnrichmentTask.REASON_PROVIDER_QUOTA))
+            )
 
         updated = (
             TrackMetadataEnrichmentTask.update(
@@ -1028,8 +1054,7 @@ def _claimTrackMetadataEnrichmentTask(
             )
             .where(
                 TrackMetadataEnrichmentTask.id == task.id,
-                TrackMetadataEnrichmentTask.status
-                != TrackMetadataEnrichmentTask.STATUS_RUNNING,
+                eligible,
             )
             .execute()
         )
