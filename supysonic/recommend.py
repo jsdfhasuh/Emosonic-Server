@@ -5,6 +5,7 @@ import os
 import re
 import time
 
+from collections import Counter
 from datetime import datetime, timedelta
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set
 
@@ -16,8 +17,13 @@ from .recommendation_feedback import (
     get_recommendation_feedback_preferences,
     track_matches_negative_recommendation_feedback,
 )
+from .recommendation_selection import select_diverse_recommendations
 from .track_metadata_quality import is_high_quality_track_metadata
-from .user_listening_profile import build_metadata_preference_profile_from_track_counts
+from .user_listening_profile import (
+    build_metadata_preference_profile_from_track_counts,
+    build_recommendation_play_weights,
+    get_recommendation_language,
+)
 from .tool import write_dict_to_json
 
 
@@ -32,20 +38,22 @@ RECOMMENDED_PLAYLIST_COMMENTS = (
 RECOMMENDED_PLAYLIST_DAY_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 SAFE_ARCHIVE_SEGMENT_RE = re.compile(r"[^A-Za-z0-9._@-]+")
 DEFAULT_RECOMMEND_PLAYLIST_RETENTION_DAYS = 5
-DEFAULT_RECOMMEND_PLAYLIST_ROTATION_RATIO = 0.3
+DEFAULT_RECOMMEND_PLAYLIST_ROTATION_RATIO = 0.8
 DEFAULT_RECOMMEND_PLAYLIST_ROTATION_LOOKBACK_DAYS = 3
+RECENT_RECOMMENDATION_SCORE_DECAY = 0.65
 RECOMMENDATION_SCORE_WEIGHTS = {
-    "genre_match": 0.24,
-    "artist_affinity": 0.20,
-    "album_affinity": 0.08,
-    "freshness": 0.08,
-    "popularity": 0.08,
-    "not_played": 0.08,
+    "genre_match": 0.18,
+    "artist_affinity": 0.16,
+    "album_affinity": 0.06,
+    "freshness": 0.06,
+    "popularity": 0.06,
+    "not_played": 0.06,
     "feedback": 0.04,
-    "mood_match": 0.08,
-    "scene_match": 0.05,
+    "mood_match": 0.07,
+    "scene_match": 0.04,
     "tag_match": 0.05,
     "energy_match": 0.02,
+    "language_match": 0.20,
 }
 
 
@@ -146,7 +154,7 @@ def _artist_display_name(track) -> str:
 
 
 def _buildRecommendationReasonProfile(user) -> Dict[str, object]:
-    trackPlayCounts = _getUserTrackPlayCounts(user)
+    trackPlayCounts = build_recommendation_play_weights(user)
     topGenres, topArtists = _getTopGenresAndArtists(trackPlayCounts)
     preferences = get_recommendation_feedback_preferences(user)
     likedMoreProfile = _buildLikedMoreProfile(preferences)
@@ -273,7 +281,7 @@ def _collectTracks(query, limit, excludedTrackIds, preferences=None):
     return selectedTracks
 
 
-def _normalized_count(count: int, max_count: int) -> float:
+def _normalized_count(count: float, max_count: float) -> float:
     if max_count <= 0:
         return 0.0
     return min(1.0, float(count or 0) / float(max_count))
@@ -309,7 +317,7 @@ def _buildMetadataPreferenceProfile(trackPlayCounts) -> Dict[str, object]:
     return build_metadata_preference_profile_from_track_counts(trackPlayCounts)
 
 
-def _metadataListScore(values, counts: Mapping[str, int]) -> float:
+def _metadataListScore(values, counts: Mapping[str, float]) -> float:
     if not values or not counts:
         return 0.0
     maxCount = max(counts.values()) if counts else 0
@@ -380,6 +388,12 @@ def _scoreRecommendationCandidate(
     notPlayedScore = 1.0 if track.id not in listenedTrackIds else 0.0
     feedbackScore = _recommendationFeedbackScore(track, likedMoreProfile)
     metadataScores = _trackMetadataScore(metadata, metadataProfile or {})
+    language = get_recommendation_language(track, metadata)
+    languageCounts = (metadataProfile or {}).get("language_counts", {})
+    languageScore = _normalized_count(
+        languageCounts.get(language, 0),
+        max(languageCounts.values(), default=0),
+    )
 
     return (
         genreScore * RECOMMENDATION_SCORE_WEIGHTS["genre_match"]
@@ -393,6 +407,7 @@ def _scoreRecommendationCandidate(
         + metadataScores["scene_match"] * RECOMMENDATION_SCORE_WEIGHTS["scene_match"]
         + metadataScores["tag_match"] * RECOMMENDATION_SCORE_WEIGHTS["tag_match"]
         + metadataScores["energy_match"] * RECOMMENDATION_SCORE_WEIGHTS["energy_match"]
+        + languageScore * RECOMMENDATION_SCORE_WEIGHTS["language_match"]
     )
 
 
@@ -407,13 +422,15 @@ def _dailyRecommendationJitter(track, recommendationDay) -> float:
 
 
 def _buildRecommendedTracks(
-    trackPlayCounts: Mapping[object, int],
+    trackPlayCounts: Mapping[object, float],
     numSongs: int,
     excludedTrackIds: Optional[Iterable[object]] = None,
     preferences: Optional[Mapping[str, object]] = None,
     recommendationDay: Optional[str] = None,
     recentTrackIds: Optional[Iterable[object]] = None,
     minimumFreshTracks: int = 0,
+    recentRecommendationCounts: Optional[Mapping[str, int]] = None,
+    seedTracks: Optional[Sequence[Track]] = None,
 ) -> List[Track]:
     if numSongs <= 0:
         return []
@@ -426,6 +443,10 @@ def _buildRecommendedTracks(
     genreCounts, artistCounts, albumCounts = _getPreferenceCounts(trackPlayCounts)
     likedMoreProfile = _buildLikedMoreProfile(preferences)
     metadataProfile = _buildMetadataPreferenceProfile(trackPlayCounts)
+    recentTrackIds = {str(trackId) for trackId in recentTrackIds or ()}
+    exposureCounts = {trackId: 1 for trackId in recentTrackIds}
+    exposureCounts.update(recentRecommendationCounts or {})
+    recentTrackIds.update(exposureCounts)
 
     candidateQuery = Track.select()
     if listenedTrackIds:
@@ -459,6 +480,8 @@ def _buildRecommendedTracks(
                 likedMoreProfile,
                 metadata=candidateMetadata.get(track.id),
                 metadataProfile=metadataProfile,
+            ) * RECENT_RECOMMENDATION_SCORE_DECAY ** exposureCounts.get(
+                str(track.id), 0
             ),
             int(track.play_count or 0),
             _dailyRecommendationJitter(track, recommendationDay),
@@ -472,23 +495,27 @@ def _buildRecommendedTracks(
         key=lambda item: (-item[0], -item[1], -item[2], item[3], item[4])
     )
     rankedTracks = [track for _, _, _, _, _, track in scoredCandidates]
-    recentTrackIds = {str(trackId) for trackId in recentTrackIds or ()}
-    minimumFreshTracks = min(numSongs, max(0, int(minimumFreshTracks or 0)))
-    if not recentTrackIds or minimumFreshTracks == 0:
-        return rankedTracks[:numSongs]
-
-    freshTracks = [
-        track for track in rankedTracks if str(track.id) not in recentTrackIds
-    ][:minimumFreshTracks]
-    selectedTrackIds = {str(track.id) for track in freshTracks}
-    for track in rankedTracks:
-        if len(selectedTrackIds) >= numSongs:
-            break
-        selectedTrackIds.add(str(track.id))
-
-    return [
-        track for track in rankedTracks if str(track.id) in selectedTrackIds
-    ][:numSongs]
+    if seedTracks:
+        # Retain the current daily list during API backfill, even if a seed was
+        # heard after generation. Newly added candidates still exclude history.
+        excludedIds = {str(trackId) for trackId in excludedTrackIds or ()}
+        retainedTracks = [
+            track for track in seedTracks
+            if str(track.id) not in excludedIds
+            and not track_matches_negative_recommendation_feedback(
+                track, preferences
+            )
+        ]
+        retainedIds = {str(track.id) for track in retainedTracks}
+        rankedTracks = retainedTracks + [
+            track for track in rankedTracks if str(track.id) not in retainedIds
+        ]
+    return select_diverse_recommendations(
+        rankedTracks,
+        numSongs,
+        recent_track_ids=recentTrackIds,
+        minimum_fresh_tracks=minimumFreshTracks,
+    )
 
 
 def _setPlaylistTracks(playlist, tracks):
@@ -533,6 +560,8 @@ def _get_recommend_playlist_rotation_ratio(
     except (TypeError, ValueError):
         ratio = DEFAULT_RECOMMEND_PLAYLIST_ROTATION_RATIO
 
+    if not math.isfinite(ratio):
+        ratio = DEFAULT_RECOMMEND_PLAYLIST_ROTATION_RATIO
     return min(1.0, max(0.0, ratio))
 
 
@@ -608,12 +637,20 @@ def _get_recent_recommended_track_ids(
     currentDay: str,
     lookbackDays: int,
 ) -> Set[str]:
+    return set(_get_recent_recommendation_counts(user, currentDay, lookbackDays))
+
+
+def _get_recent_recommendation_counts(
+    user: User,
+    currentDay: str,
+    lookbackDays: int,
+) -> Dict[str, int]:
     currentDate = _parse_recommendation_date(currentDay)
     if currentDate is None:
-        return set()
+        return {}
 
     cutoffDate = currentDate - timedelta(days=max(1, lookbackDays))
-    recentTrackIds: Set[str] = set()
+    tracksByDay = {}
     query = Playlist.select().where(
         (Playlist.user == user) & recommended_playlist_where()
     )
@@ -625,12 +662,14 @@ def _get_recent_recommended_track_ids(
             or playlistDate < cutoffDate
         ):
             continue
-        recentTrackIds.update(
+        tracksByDay.setdefault(playlistDate, set()).update(
             trackId.strip()
             for trackId in str(playlist.tracks or "").split(",")
             if trackId.strip()
         )
-    return recentTrackIds
+    return dict(Counter(
+        trackId for trackIds in tracksByDay.values() for trackId in trackIds
+    ))
 
 
 def _serialize_recommend_playlist_track(track, reason: str = ""):
@@ -747,11 +786,12 @@ def _createRecommendPlaylistForUser(
         return None, False
 
     recommendationDay = getRecommendationDay() if day is None else day
-    recentTrackIds = _get_recent_recommended_track_ids(
+    recentRecommendationCounts = _get_recent_recommendation_counts(
         user,
         recommendationDay,
         _get_recommend_playlist_rotation_lookback_days(config),
     )
+    recentTrackIds = set(recentRecommendationCounts)
     _archive_old_recommended_playlists_for_user(
         user, recommendationDay, config=config
     )
@@ -759,7 +799,7 @@ def _createRecommendPlaylistForUser(
     if existingPlaylist is not None:
         return existingPlaylist, False
 
-    trackPlayCounts = _getUserTrackPlayCounts(user)
+    trackPlayCounts = build_recommendation_play_weights(user)
     if not trackPlayCounts:
         return None, False
 
@@ -772,6 +812,7 @@ def _createRecommendPlaylistForUser(
         recommendationDay=recommendationDay,
         recentTrackIds=recentTrackIds,
         minimumFreshTracks=_get_minimum_fresh_track_count(numSongs, config),
+        recentRecommendationCounts=recentRecommendationCounts,
     )
     if not recommendedTracks:
         return None, False
@@ -790,6 +831,20 @@ def _createRecommendPlaylistForUser(
         user.name,
         len(recommendedTracks),
         sum(str(track.id) not in recentTrackIds for track in recommendedTracks),
+    )
+    artistCounts = Counter(track.artist_id for track in recommendedTracks)
+    logger.info(
+        "recommendation event=daily_personalization user=%s day=%s "
+        "track_count=%d fresh_count=%d recent_repeat_count=%d "
+        "artist_count=%d max_artist_tracks=%d rotation_target=%d",
+        user.name,
+        recommendationDay,
+        len(recommendedTracks),
+        sum(str(track.id) not in recentTrackIds for track in recommendedTracks),
+        sum(str(track.id) in recentTrackIds for track in recommendedTracks),
+        len(artistCounts),
+        max(artistCounts.values(), default=0),
+        _get_minimum_fresh_track_count(numSongs, config),
     )
     return playlist, True
 
