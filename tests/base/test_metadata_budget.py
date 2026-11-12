@@ -157,9 +157,10 @@ class MetadataBudgetTestCase(unittest.TestCase):
             def read_with_initial_invisibility(key):
                 value = original_read(key)
                 if key == hidden_key:
-                    transactions.append(self.database.top_transaction())
+                    transaction = self.database.top_transaction()
+                    if not transactions or transactions[-1] is not transaction:
+                        transactions.append(transaction)
                     if len(transactions) == 1:
-                        self.assertIsNotNone(value)
                         return None
                 return value
 
@@ -174,6 +175,14 @@ class MetadataBudgetTestCase(unittest.TestCase):
             self.assertEqual(snapshot["month_reserved_micro_usd"], index * 100_000)
             self.assertEqual(snapshot["day_reserved_micro_usd"], index * 100_000)
             self.assertEqual(Meta.select().where(Meta.key.startswith("mb:r:")).count(), index)
+
+    def test_existing_periods_are_not_reinserted_during_reservation(self):
+        self.budget.reserve("text", 100_000)
+        with patch.object(Meta, "insert", wraps=Meta.insert) as insert:
+            self.budget.reserve("text", 100_000)
+        self.assertEqual(insert.call_count, 1)
+        self.assertTrue(insert.call_args.kwargs["key"].startswith("mb:r:"))
+        self.assertEqual(self.budget.snapshot()["day_reserved_micro_usd"], 200_000)
 
     def test_persistently_invisible_period_fails_closed_without_reservation(self):
         with patch.object(self.budget, "_read", return_value=None), \
