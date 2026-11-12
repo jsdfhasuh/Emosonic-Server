@@ -149,6 +149,39 @@ class MetadataBudgetTestCase(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(BudgetUnavailable):
                 self.budget.reserve("text", 1)
 
+    def test_temporarily_invisible_period_retries_in_a_new_transaction(self):
+        original_read = self.budget._read
+        for index, hidden_key in enumerate(("mb:m:202611", "mb:d:20261112"), 1):
+            transactions = []
+
+            def read_with_initial_invisibility(key):
+                value = original_read(key)
+                if key == hidden_key:
+                    transactions.append(self.database.top_transaction())
+                    if len(transactions) == 1:
+                        self.assertIsNotNone(value)
+                        return None
+                return value
+
+            with self.subTest(key=hidden_key), patch.object(
+                self.budget, "_read", side_effect=read_with_initial_invisibility,
+            ), patch("supysonic.metadata_budget.time.sleep") as sleep:
+                self.budget.reserve("text", 100_000)
+                sleep.assert_called_once()
+                self.assertEqual(len(transactions), 2)
+                self.assertIsNot(transactions[0], transactions[1])
+            snapshot = self.budget.snapshot()
+            self.assertEqual(snapshot["month_reserved_micro_usd"], index * 100_000)
+            self.assertEqual(snapshot["day_reserved_micro_usd"], index * 100_000)
+            self.assertEqual(Meta.select().where(Meta.key.startswith("mb:r:")).count(), index)
+
+    def test_persistently_invisible_period_fails_closed_without_reservation(self):
+        with patch.object(self.budget, "_read", return_value=None), \
+                patch("supysonic.metadata_budget.time.sleep"), \
+                self.assertRaises(BudgetUnavailable):
+            self.budget.reserve("text", 100_000)
+        self.assertEqual(Meta.select().count(), 0)
+
     def test_missing_settlement_bucket_cannot_release_money(self):
         reservation = self.budget.reserve("text", 100_000)
         Meta.delete().where(Meta.key == reservation.day_key).execute()

@@ -204,6 +204,9 @@ class MetadataBudget:
                 initial = {"v": 1, "s": 0, "r": 0, "l": limit, "b": False}
                 Meta.insert(key=key, value=_encode(initial)).on_conflict_ignore().execute()
                 raw = self._read(key)
+                if raw is None:
+                    # A concurrent insert can be invisible in MySQL's current snapshot.
+                    raise _RetryTransaction
                 state = _bucket(raw)
                 state["l"] = min(state["l"], limit)
                 self._cas(key, raw, state)
