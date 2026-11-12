@@ -179,8 +179,9 @@ log_level = INFO
 log_rotate = yes
 
 ; Minimum share of each daily recommendation playlist that was not present in
-; recent recommendation playlists. Set to 0 to disable. Default: 0.3
-recommend_playlist_rotation_ratio = 0.3
+; recent recommendation playlists, when artist diversity and the catalog allow.
+; Set to 0 to disable the minimum (repeat-score penalties still apply). Default: 0.8
+recommend_playlist_rotation_ratio = 0.8
 
 ; Number of previous natural days treated as recent recommendation exposure.
 ; Default: 3

@@ -8,9 +8,10 @@
 import logging
 import time
 import uuid
+from types import SimpleNamespace
 from typing import Any, Iterable, List, Set
 
-from flask import request
+from flask import current_app, request
 
 from ..db import (
     Artist,
@@ -18,15 +19,19 @@ from ..db import (
     StarredTrack,
     Track,
     User,
-    User_Play_Activity,
     db,
     random,
 )
 from ..logging_utils import format_log_event
 from ..mood_scene_playlist_service import get_system_mood_scene_playlist_display_name
 from ..recommend import (
+    _buildRecommendedTracks,
+    _get_minimum_fresh_track_count,
+    _get_recent_recommendation_counts,
+    _get_recommend_playlist_rotation_lookback_days,
     buildRecommendationReasonMap,
     getLatestRecommendedPlaylist,
+    getRecommendationDay,
     getRecommendedPlaylistForDay,
     non_recommended_playlist_where,
 )
@@ -37,6 +42,7 @@ from ..recommendation_feedback import (
     set_recommendation_feedback,
     track_matches_negative_recommendation_feedback,
 )
+from ..user_listening_profile import build_recommendation_play_weights
 from . import get_entity, api_routing
 from .exceptions import Forbidden, GenericError, MissingParameter
 
@@ -171,19 +177,9 @@ def _add_unique_recommended_tracks(
             break
 
 
-def _get_user_listened_track_ids(user) -> Set[uuid.UUID]:
-    return {
-        activity.track_id
-        for activity in User_Play_Activity.select(User_Play_Activity.track_id).where(
-            User_Play_Activity.user == user
-        )
-    }
-
-
 def _backfill_recommended_tracks(
     user,
     tracks: List[Track],
-    seed_tracks: Iterable[Track],
     count: int,
     preferences: dict,
     seen_track_ids: Set[str],
@@ -191,65 +187,22 @@ def _backfill_recommended_tracks(
     if len(tracks) >= count:
         return
 
-    seed_tracks = list(seed_tracks)
-    liked_more_song_ids = preferences.get("liked_more_song_ids", set())
-    if liked_more_song_ids:
-        seed_tracks.extend(
-            Track.select().where(Track.id.in_(list(liked_more_song_ids)))
-        )
-
-    genres = []
-    artist_ids = []
-    for track in seed_tracks:
-        if track.genre and track.genre not in genres:
-            genres.append(track.genre)
-        if track.artist_id and track.artist_id not in artist_ids:
-            artist_ids.append(track.artist_id)
-
-    query_limit = max((count - len(tracks)) * 5, 50)
-    for genre in genres:
-        _add_unique_recommended_tracks(
-            tracks,
-            Track.select()
-            .where(Track.genre == genre)
-            .order_by(Track.play_count.desc(), Track.id)
-            .limit(query_limit),
-            count,
-            preferences,
-            seen_track_ids,
-        )
-
-    for artist_id in artist_ids:
-        _add_unique_recommended_tracks(
-            tracks,
-            Track.select()
-            .where(Track.artist == artist_id)
-            .order_by(Track.play_count.desc(), Track.id)
-            .limit(query_limit),
-            count,
-            preferences,
-            seen_track_ids,
-        )
-
-    listened_track_ids = _get_user_listened_track_ids(user)
-    popular_query = Track.select()
-    if listened_track_ids:
-        popular_query = popular_query.where(Track.id.not_in(list(listened_track_ids)))
-    _add_unique_recommended_tracks(
-        tracks,
-        popular_query.order_by(Track.play_count.desc(), Track.id).limit(query_limit),
-        count,
-        preferences,
-        seen_track_ids,
+    config = SimpleNamespace(DAEMON=current_app.config.get("DAEMON", {}))
+    day = getRecommendationDay()
+    recent_counts = _get_recent_recommendation_counts(
+        user, day, _get_recommend_playlist_rotation_lookback_days(config)
     )
-
-    _add_unique_recommended_tracks(
-        tracks,
-        Track.select().order_by(random()).limit(query_limit),
+    tracks[:] = _buildRecommendedTracks(
+        build_recommendation_play_weights(user),
         count,
-        preferences,
-        seen_track_ids,
+        preferences=preferences,
+        recommendationDay=day,
+        recentRecommendationCounts=recent_counts,
+        minimumFreshTracks=_get_minimum_fresh_track_count(count, config),
+        seedTracks=tracks,
     )
+    seen_track_ids.clear()
+    seen_track_ids.update(str(track.id) for track in tracks)
 
 
 def _get_filtered_recommended_tracks(
@@ -273,11 +226,10 @@ def _get_filtered_recommended_tracks(
         preferences,
         seen_track_ids,
     )
-    before_backfill_count = len(recommended_tracks)
+    before_backfill_ids = set(seen_track_ids)
     _backfill_recommended_tracks(
         user,
         recommended_tracks,
-        playlist_tracks,
         count,
         preferences,
         seen_track_ids,
@@ -287,10 +239,7 @@ def _get_filtered_recommended_tracks(
             {
                 "source_track_count": len(playlist_tracks),
                 "filtered_feedback_track_count": filtered_feedback_track_count,
-                "backfilled_track_count": max(
-                    0,
-                    len(recommended_tracks) - before_backfill_count,
-                ),
+                "backfilled_track_count": len(seen_track_ids - before_backfill_ids),
                 "preferences": preferences,
             }
         )

@@ -1,6 +1,7 @@
 import os
 import unittest
 
+from collections import Counter
 from unittest.mock import patch
 
 from supysonic.db import (
@@ -126,6 +127,25 @@ class RecommendApiTestCase(TestBase):
             playlist.add(track)
         playlist.save()
         return playlist
+
+    def _diverse_daily_pool(self):
+        User_Play_Activity.create(track=self.track, user=self.user)
+        originals = []
+        spares = []
+        for artist_index in range(10):
+            artist = Artist.create(name=f"Diverse Artist {artist_index}")
+            album = Album.create(name=f"Diverse Album {artist_index}", artist=artist)
+            for index in range(6):
+                track = self._create_track(
+                    f"Diverse Candidate {artist_index}-{index}",
+                    1000 + artist_index * 6 + index,
+                    genre="rock",
+                    play_count=100 if artist_index == 1 and index == 5 else 0,
+                    artist=artist,
+                    album=album,
+                )
+                (spares if index == 5 else originals).append(track)
+        return originals, spares
 
     def test_recommended_playlist_api_does_not_submit_background_generation_task(self):
         with patch("supysonic.TaskManger.TaskManager.submit_task") as submit_task:
@@ -435,6 +455,83 @@ class RecommendApiTestCase(TestBase):
         self.assertNotIn(str(self.track.id), logged)
         self.assertNotIn("Song", logged)
 
+    def test_backfill_after_dislike_keeps_artist_cap_and_excludes_heard_candidates(self):
+        originals, spares = self._diverse_daily_pool()
+        heard = self._create_track(
+            "Already Heard Popular Candidate",
+            2000,
+            genre="rock",
+            play_count=10000,
+            artist=originals[5].artist,
+            album=originals[5].album,
+        )
+        User_Play_Activity.create(track=heard, user=self.user)
+        playlist = self._create_recommended_playlist(self.user, *originals)
+        original_ids = playlist.tracks
+        self._post_feedback("dislike", target_id=originals[0].id)
+
+        rv = self._get_recommended_playlist()
+
+        payload = rv.json["subsonic-response"]["playlist"]
+        entries = payload["entry"]
+        entry_ids = {entry["id"] for entry in entries}
+        self.assertEqual(payload["songCount"], 50)
+        self.assertEqual(len(entry_ids), 50)
+        self.assertLessEqual(max(Counter(e["artistId"] for e in entries).values()), 5)
+        self.assertIn(str(spares[0].id), entry_ids)
+        self.assertNotIn(str(originals[0].id), entry_ids)
+        self.assertNotIn(str(heard.id), entry_ids)
+        self.assertNotIn(str(self.track.id), entry_ids)
+        self.assertEqual(Playlist.get_by_id(playlist.id).tracks, original_ids)
+
+    def test_backfill_after_track_deletion_keeps_artist_cap(self):
+        originals, spares = self._diverse_daily_pool()
+        self._create_recommended_playlist(self.user, *originals)
+        deleted_id = str(originals[0].id)
+        originals[0].delete_instance()
+
+        rv = self._get_recommended_playlist()
+
+        payload = rv.json["subsonic-response"]["playlist"]
+        entries = payload["entry"]
+        entry_ids = {entry["id"] for entry in entries}
+        self.assertEqual(payload["songCount"], 50)
+        self.assertEqual(len(entry_ids), 50)
+        self.assertLessEqual(max(Counter(e["artistId"] for e in entries).values()), 5)
+        self.assertIn(str(spares[0].id), entry_ids)
+        self.assertNotIn(deleted_id, entry_ids)
+
+    def test_backfill_small_catalog_keeps_heard_seed_but_not_new_heard_tracks(self):
+        keeper = self._create_track("Heard Daily Seed", 2, genre="rock")
+        heard = self._create_track("Other Heard Track", 3, genre="rock", play_count=999)
+        fresh = self._create_track("Only Unheard Candidate", 4, genre="jazz")
+        User_Play_Activity.create(track=keeper, user=self.user)
+        User_Play_Activity.create(track=heard, user=self.user)
+        self._create_recommended_playlist(self.user, self.track, keeper)
+        self._post_feedback("dislike")
+
+        rv = self._get_recommended_playlist()
+
+        payload = rv.json["subsonic-response"]["playlist"]
+        entry_ids = [entry["id"] for entry in payload["entry"]]
+        self.assertEqual(payload["songCount"], 2)
+        self.assertEqual(entry_ids, [str(keeper.id), str(fresh.id)])
+        self.assertNotIn(str(heard.id), entry_ids)
+
+    def test_full_daily_playlist_does_not_rerank_or_change_order(self):
+        originals, _ = self._diverse_daily_pool()
+        self._create_recommended_playlist(self.user, *originals)
+
+        with patch("supysonic.api.playlists._buildRecommendedTracks") as rank:
+            rv = self._get_recommended_playlist()
+
+        rank.assert_not_called()
+        payload = rv.json["subsonic-response"]["playlist"]
+        self.assertEqual(
+            [entry["id"] for entry in payload["entry"]],
+            [str(track.id) for track in originals],
+        )
+
     def test_get_recommended_playlist_backfills_from_like_more_seed(self):
         keeper = self._create_track("Keeper", 2, genre="sparse", play_count=4)
         seed_artist = Artist.create(name="Seed Artist")
@@ -534,7 +631,9 @@ class RecommendApiTestCase(TestBase):
         self.assertNotIn(str(hidden.id), entry_ids)
         self.assertNotIn(str(hidden_artist.id), artist_ids)
         self.assertIn(str(visible.id), entry_ids)
-        self.assertIn(str(visible_backfill.id), entry_ids)
+        self.assertIn(str(self.track.id), entry_ids)
+        self.assertNotIn(str(visible_backfill.id), entry_ids)
+        self.assertEqual(len(artist_ids), 2)
 
         self._post_feedback("restore_artist", target_id=hidden_artist.id)
         restored = self._get_recommended_playlist()
@@ -660,7 +759,9 @@ class RecommendApiTestCase(TestBase):
         self.assertNotIn(str(hidden_album.id), album_ids)
         self.assertNotIn("blocked", genres)
         self.assertIn(str(visible.id), entry_ids)
-        self.assertIn(str(visible_backfill.id), entry_ids)
+        self.assertIn(str(self.track.id), entry_ids)
+        self.assertNotIn(str(visible_backfill.id), entry_ids)
+        self.assertEqual(len({entry["artistId"] for entry in payload["entry"]}), 2)
 
         self._post_feedback("restore_album", target_id=hidden_album.id)
         self._post_feedback("restore_style", target_id="BLOCKED")
