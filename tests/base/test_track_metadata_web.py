@@ -167,6 +167,54 @@ class TrackMetadataWebTestCase(unittest.TestCase):
         value["output"][-1]["content"][0]["annotations"] = [{"type": "url_citation", "url": URL}]
         self.assertEqual(parse_web_response(value)["language"], "zh")
 
+    def test_opened_or_searched_detail_page_action_url_supplies_provenance(self):
+        detail_url = "https://music.example.com/song/456"
+        for action_type in ("open_page", "find_in_page"):
+            with self.subTest(action_type=action_type):
+                data = result()
+                data["sources"][0]["url"] = detail_url
+                value = response(data)
+                value["output"].insert(2, {
+                    "type": "web_search_call", "status": "completed",
+                    "action": {"type": action_type, "url": detail_url},
+                })
+                parsed = parse_web_response(value)
+                self.assertEqual(parsed["language"], "zh")
+                self.assertEqual(parsed["raw"]["web_lookup"]["sources"][0]["url"], detail_url)
+
+    def test_unsafe_detail_page_action_url_does_not_supply_provenance(self):
+        for action_type in ("open_page", "find_in_page"):
+            for url in ("http://music.example.com/song", "https://user:pass@music.example.com/song",
+                        "https://127.0.0.1/song", "https://host.local/song",
+                        "https://music.example.com/song?token=secret"):
+                with self.subTest(action_type=action_type, url=url):
+                    data = result()
+                    data["sources"][0]["url"] = url
+                    value = response(data)
+                    value["output"].insert(2, {
+                        "type": "web_search_call", "status": "completed",
+                        "action": {"type": action_type, "url": url},
+                    })
+                    with self.assertRaises(LlmInvalidResponseError):
+                        parse_web_response(value)
+
+    def test_search_action_url_alone_does_not_supply_detail_page_provenance(self):
+        value = response()
+        value["output"][1]["action"] = {"type": "search", "url": URL, "sources": []}
+        with self.assertRaises(LlmInvalidResponseError):
+            parse_web_response(value)
+
+    def test_opened_detail_page_does_not_trust_a_different_model_url(self):
+        data = result()
+        data["sources"][0]["url"] = "https://music.example.com/song/invented"
+        value = response(data)
+        value["output"].insert(2, {
+            "type": "web_search_call", "status": "completed",
+            "action": {"type": "open_page", "url": "https://music.example.com/song/456"},
+        })
+        with self.assertRaises(LlmInvalidResponseError):
+            parse_web_response(value)
+
     def test_injected_request_callback_is_used_once(self):
         callback = Mock(return_value=response())
         parsed = WebMetadataProvider(CONFIG, request_callback=callback).enrich(TRACK)

@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from peewee import DatabaseError
 
-from .db_layer.core import Meta
+from .db import Meta
 
 
 MICRO_USD = 1_000_000

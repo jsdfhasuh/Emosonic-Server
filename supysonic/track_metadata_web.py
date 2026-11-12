@@ -202,6 +202,10 @@ def parse_web_response(response: Mapping[str, object], max_tool_calls: int = 3) 
                 safe = _public_url(source.get("url")) if isinstance(source, Mapping) else None
                 if safe:
                     sources.add(safe)
+            if action_type in ("open_page", "find_in_page"):
+                safe = _public_url(action.get("url"))
+                if safe:
+                    sources.add(safe)
         elif item.get("type") == "message":
             if item.get("status", "completed") != "completed":
                 raise LlmInvalidResponseError("Web metadata message did not complete.")
