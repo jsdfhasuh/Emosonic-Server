@@ -30,6 +30,10 @@ class WebMetadataResultRejected(LlmInvalidResponseError):
     """Transport/accounting succeeded, but this recording's evidence was unusable."""
 
 
+class WebMetadataIdentityError(LlmConfigError):
+    """This recording cannot form a safe search identity; no request was sent."""
+
+
 def _object(properties: dict) -> dict:
     return {"type": "object", "properties": properties,
             "required": list(properties), "additionalProperties": False}
@@ -88,13 +92,14 @@ def build_web_payload(track_input: Mapping[str, object], config: Mapping[str, ob
     track = {}
     for field in ("title", "artist", "album", "genre", "year"):
         value = track_input.get(field)
-        if value is not None and not isinstance(value, (str, int)):
-            raise LlmConfigError("Invalid web metadata track identity.")
+        if value is not None and type(value) not in (str, int):
+            raise WebMetadataIdentityError("Invalid web metadata track identity.")
         if isinstance(value, str) and (len(value) > 500 or SECRET_TEXT.search(value)):
-            raise LlmConfigError("Invalid web metadata track identity.")
+            raise WebMetadataIdentityError("Invalid web metadata track identity.")
         track[field] = value
-    if not track.get("title") or not track.get("artist"):
-        raise LlmConfigError("Web metadata requires a title and artist.")
+    if any(not isinstance(track[field], str) or not track[field].strip()
+           for field in ("title", "artist")):
+        raise WebMetadataIdentityError("Web metadata requires a title and artist.")
     payload = {
         "model": MODEL, "reasoning": {"effort": "low"}, "store": False,
         "service_tier": "default", "max_tool_calls": calls,

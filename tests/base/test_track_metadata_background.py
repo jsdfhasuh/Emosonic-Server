@@ -6,6 +6,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
+from peewee import OperationalError
+
 from supysonic import db
 from supysonic import track_metadata_background as background
 from supysonic.llm_client import LlmInvalidResponseError
@@ -128,6 +130,172 @@ class TrackMetadataBackgroundTestCase(unittest.TestCase):
         self.assertEqual(provider.text_calls, [])
         self.assertEqual(self.metadata(track).language, "yue")
         self.assertEqual(db.TrackMetadataEnrichmentTask.get().status, "completed")
+
+    def test_invalid_web_identity_is_terminal_without_budget_or_http(self):
+        for field in ("title", "artist"):
+            for value in ("", " \t\n"):
+                with self.subTest(field=field, value=value):
+                    track = self.create_track()
+                    if field == "artist":
+                        track.artist = db.Artist.create(name=value)
+                    else:
+                        track.title = value
+                    track.save()
+                    original = self.apply(track)
+                    provider = self.budgeted_provider()
+                    provider.budget = Mock()
+                    with patch.object(background, "post_web_response") as post, \
+                            patch.object(background.requests, "post") as text_post:
+                        summary = background.runAutomaticMetadataPass(1, provider)
+                    self.assertEqual(summary["selected"], 1)
+                    self.assertEqual(summary["skipped"], 1)
+                    self.assertEqual(summary["failed"], 0)
+                    self.assertFalse(summary["budget_paused"])
+                    provider.budget.reserve.assert_not_called()
+                    provider.budget.settle.assert_not_called()
+                    post.assert_not_called()
+                    text_post.assert_not_called()
+                    self.assertIsNone(db.Meta.get_or_none(db.Meta.key == background.PAUSE_KEY))
+                    current = self.metadata(track)
+                    for name in ("language", "mood_json", "scene_json", "tags_json",
+                                 "summary", "confidence", "energy", "valence", "danceability"):
+                        self.assertEqual(getattr(current, name), getattr(original, name))
+                    raw = json.loads(current.raw_json)
+                    self.assertEqual(raw["original"], "retained")
+                    self.assertEqual(raw["web_lookup"]["status"], "skipped")
+                    self.assertEqual(raw["web_lookup"]["reason"], "invalid_identity")
+                    self.assertFalse(raw["web_lookup"]["request_sent"])
+                    self.assertEqual(raw["web_lookup"]["track_last_modification"], 100)
+                    task = db.TrackMetadataEnrichmentTask.get(
+                        db.TrackMetadataEnrichmentTask.track == track,
+                    )
+                    self.assertEqual(task.status, "skipped")
+                    self.assertEqual(task.reason, "invalid_web_identity")
+                    self.assertIsNone(task.next_retry_at)
+                    self.assertIsNone(task.locked_at)
+                    self.assertIsNotNone(task.completed_at)
+
+    def test_invalid_identity_does_not_block_valid_web_candidate_in_same_pass(self):
+        valid = self.create_track()
+        self.apply(valid)
+        invalid = self.create_track()
+        invalid.artist = db.Artist.create(name="")
+        invalid.created = db.now() + timedelta(seconds=1)
+        invalid.save()
+        self.apply(invalid)
+        provider = self.budgeted_provider()
+        with patch.object(background, "post_web_response", return_value=web_response()) as post:
+            summary = background.runAutomaticMetadataPass(2, provider)
+        self.assertEqual(summary["selected"], 2)
+        self.assertEqual(summary["skipped"], 1)
+        self.assertEqual(summary["web_enriched"], 1)
+        self.assertEqual(summary["failed"], 0)
+        self.assertFalse(summary["budget_paused"])
+        post.assert_called_once()
+        self.assertIsNone(db.Meta.get_or_none(db.Meta.key == background.PAUSE_KEY))
+        self.assertEqual(json.loads(self.metadata(invalid).raw_json)["web_lookup"]["status"], "skipped")
+        self.assertEqual(self.metadata(valid).confidence, 0.7)
+        self.assertEqual(provider.budget.snapshot()["month_reserved_micro_usd"], 0)
+        self.assertGreater(provider.budget.snapshot()["month_spent_micro_usd"], 0)
+
+    def test_skipped_identity_is_not_retried_after_database_reopen(self):
+        track = self.create_track()
+        track.artist = db.Artist.create(name="")
+        track.save()
+        self.apply(track)
+        background.runAutomaticMetadataPass(1, self.budgeted_provider())
+        attempt_count = db.TrackMetadataEnrichmentTask.get().attempt_count
+        db.release_database()
+        db.init_database(self.config.BASE["database_uri"])
+        provider = self.budgeted_provider()
+        provider.budget = Mock()
+        with patch.object(background, "post_web_response") as post:
+            summary = background.runAutomaticMetadataPass(3, provider)
+        self.assertEqual(summary["selected"], 0)
+        self.assertEqual(db.TrackMetadataEnrichmentTask.get().attempt_count, attempt_count)
+        provider.budget.reserve.assert_not_called()
+        post.assert_not_called()
+
+    def test_identity_skip_storage_failure_aborts_and_rolls_back_terminal_state(self):
+        for failure in ("marker_cas", "task_storage"):
+            with self.subTest(failure=failure):
+                valid = self.create_track()
+                self.apply(valid)
+                invalid = self.create_track()
+                invalid.artist = db.Artist.create(name="")
+                invalid.created = db.now() + timedelta(seconds=1)
+                invalid.save()
+                original = self.apply(invalid)
+                provider = self.budgeted_provider()
+                before = provider.budget.snapshot()
+                if failure == "marker_cas":
+                    fault = patch.object(db.TrackMetadata, "update")
+                    expected = BudgetUnavailable
+                else:
+                    fault = patch.object(background, "recordTrackEnrichmentAttempt",
+                                         side_effect=OperationalError("Task storage failed."))
+                    expected = OperationalError
+                with patch.object(background, "post_web_response") as web_post, \
+                        patch.object(background.requests, "post") as text_post, fault as storage:
+                    if failure == "marker_cas":
+                        storage.return_value.where.return_value.execute.return_value = 0
+                    with self.assertRaises(expected):
+                        background.runAutomaticMetadataPass(2, provider)
+                web_post.assert_not_called()
+                text_post.assert_not_called()
+                self.assertEqual(provider.budget.snapshot(), before)
+                self.assertIsNone(db.Meta.get_or_none(db.Meta.key == background.PAUSE_KEY))
+                self.assertEqual(self.metadata(invalid).raw_json, original.raw_json)
+                self.assertNotIn("web_lookup", json.loads(self.metadata(valid).raw_json))
+                invalid_task = db.TrackMetadataEnrichmentTask.get(
+                    db.TrackMetadataEnrichmentTask.track == invalid,
+                )
+                # The earlier committed claim remains available to stale-lock recovery.
+                self.assertEqual(invalid_task.status, "running")
+                self.assertEqual(invalid_task.reason, "automatic_web_lookup")
+                self.assertIsNotNone(invalid_task.locked_at)
+                self.assertIsNone(invalid_task.completed_at)
+                valid_task = db.TrackMetadataEnrichmentTask.get(
+                    db.TrackMetadataEnrichmentTask.track == valid,
+                )
+                self.assertEqual(valid_task.status, "completed")
+                self.assertEqual(valid_task.attempt_count, 0)
+
+    def test_changed_recording_reconsiders_previous_identity_skip(self):
+        track = self.create_track()
+        track.artist = db.Artist.create(name="")
+        track.save()
+        self.apply(track)
+        background.runAutomaticMetadataPass(1, self.budgeted_provider())
+        track.artist = self.artist
+        track.last_modification = 200
+        track.save()
+        provider = FakeProvider()
+        summary = background.runAutomaticMetadataPass(2, provider)
+        self.assertEqual(summary["enriched"], 2)
+        self.assertEqual(len(provider.text_calls), 1)
+        self.assertEqual(len(provider.web_calls), 1)
+        marker = json.loads(self.metadata(track).raw_json)["web_lookup"]
+        self.assertEqual(marker["status"], "completed")
+        self.assertEqual(marker["track_last_modification"], 200)
+
+    def test_real_web_configuration_error_still_pauses_globally(self):
+        track = self.create_track()
+        self.apply(track)
+        provider = self.budgeted_provider(web_max_tool_calls=4)
+        provider.budget = Mock()
+        with patch.object(background, "post_web_response") as post:
+            summary = background.runAutomaticMetadataPass(1, provider)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["skipped"], 0)
+        self.assertNotIn("web_lookup", json.loads(self.metadata(track).raw_json))
+        pause = db.Meta.get_or_none(db.Meta.key == background.PAUSE_KEY)
+        self.assertIsNotNone(pause)
+        self.assertGreater(int(pause.value), datetime.now().timestamp())
+        self.assertEqual(db.TrackMetadataEnrichmentTask.get().status, "retry")
+        self.assertEqual(db.TrackMetadataEnrichmentTask.get().last_error, "LlmConfigError")
+        provider.budget.reserve.assert_not_called()
+        post.assert_not_called()
 
     def test_high_quality_current_metadata_is_skipped(self):
         track = self.create_track()

@@ -96,6 +96,14 @@ Database errors, corrupt accounting, or unsupported pricing fail closed before a
 new paid request. Known daily/monthly exhaustion pauses until the relevant reset;
 other accounting uncertainty pauses the paid worker for 24 hours.
 
+A missing, blank, malformed, or unsafe song identity is a recording-local web
+skip, not an API configuration failure. It records `web_lookup.status=skipped`,
+`reason=invalid_identity`, and `request_sent=false`, preserves existing metadata,
+and continues unrelated candidates without HTTP, budget reservation, or a global
+pause. The unchanged recording is not retried after a restart. A recording
+modification can make it eligible again through the normal refresh path. Genuine
+endpoint/model/request-bound configuration errors still use global backoff.
+
 Ordinary text failures have exponential backoff. Web attempts are different: a
 marker is committed before the network call, and an attempted lookup is terminal
 for that unchanged recording, including failed or inconclusive attempts. This
@@ -126,6 +134,11 @@ configuration, request bodies, or API keys:
 - `metadata_budget_settled`: request kind and accounted `cost_micro_usd`.
 - `metadata_budget_paused`: accounting prevented further paid work.
 - `metadata_background_retry`: retry/backoff with error type and delay.
+- `metadata_identity_skipped`: recording-local invalid identity, no paid request.
+
+A `web_lookup` marker alone does not prove a search was sent: distinguish
+non-billable `skipped` markers from completed, inconclusive, or failed requests
+when reporting lookup counts and metadata coverage.
 
 For read-only diagnostics, `MetadataBudget.snapshot()` exposes current day/month
 spent, reserved, remaining, blocked status, and reset timestamps without keys or

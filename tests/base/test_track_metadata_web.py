@@ -9,7 +9,7 @@ from supysonic.llm_client import (
     LlmConfigError, LlmInvalidResponseError, LlmQuotaError, LlmTimeoutError, LlmUpstreamError,
 )
 from supysonic.track_metadata_web import (
-    WebMetadataProvider, WebMetadataResultRejected,
+    WebMetadataIdentityError, WebMetadataProvider, WebMetadataResultRejected,
     build_web_payload, parse_web_response, post_web_response,
 )
 
@@ -69,6 +69,34 @@ class TrackMetadataWebTestCase(unittest.TestCase):
                 build_web_payload(TRACK, config)
         with self.assertRaises(LlmConfigError):
             build_web_payload(dict(TRACK, title=""), CONFIG)
+
+    def test_invalid_identity_has_local_type_and_never_requests(self):
+        updates = [
+            {field: value}
+            for field in ("title", "artist")
+            for value in (None, "", " \t\n", 123, ["name"], "x" * 501)
+        ]
+        updates.extend(({"album": {"name": "Album"}}, {"genre": True},
+                        {"year": []}, {"artist": "Bearer private-token"}))
+        for update in updates:
+            with self.subTest(update=update):
+                callback = Mock()
+                provider = WebMetadataProvider(CONFIG, request_callback=callback)
+                with patch("supysonic.track_metadata_web.post_web_response") as post:
+                    with self.assertRaises(WebMetadataIdentityError) as raised:
+                        provider.enrich(dict(TRACK, **update))
+                self.assertIsInstance(raised.exception, LlmConfigError)
+                self.assertNotIn("private-token", str(raised.exception))
+                callback.assert_not_called()
+                post.assert_not_called()
+
+    def test_config_errors_are_not_local_identity_errors(self):
+        for update in ({"model": "other"}, {"api_base_url": "http://localhost"},
+                       {"web_max_tool_calls": 4}, {"web_max_output_tokens": 0}):
+            with self.subTest(update=update):
+                with self.assertRaises(LlmConfigError) as raised:
+                    build_web_payload(dict(TRACK, artist=""), dict(CONFIG, **update))
+                self.assertNotIsInstance(raised.exception, WebMetadataIdentityError)
 
     def test_parser_preserves_evidence_not_hidden_reasoning_or_audio_numbers(self):
         parsed = parse_web_response(response())

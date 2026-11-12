@@ -19,7 +19,9 @@ from .scanner_func.scanner_track_enrich import (
 )
 from .scanner_func.scanner_review_tasks import createLowConfidenceTrackMetadataReviewTask
 from .track_metadata_quality import is_high_quality_track_metadata, is_llm_track_metadata
-from .track_metadata_web import WebMetadataProvider, WebMetadataResultRejected, post_web_response
+from .track_metadata_web import (
+    WebMetadataIdentityError, WebMetadataProvider, WebMetadataResultRejected, post_web_response,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -212,6 +214,25 @@ def _finish_web_error(metadata: TrackMetadata, error: Exception) -> None:
         ).execute()
 
 
+def _skip_web_identity(metadata: TrackMetadata, error: WebMetadataIdentityError) -> None:
+    original = metadata.raw_json
+    raw = _read_raw(metadata)
+    if "web_lookup" in raw:
+        raise BudgetUnavailable("Metadata changed before its identity skip.")
+    raw["web_lookup"] = {
+        "status": "skipped", "reason": "invalid_identity", "request_sent": False,
+        "error_type": type(error).__name__, "finished_at": now().isoformat(),
+        "track_last_modification": metadata.track_last_modification,
+    }
+    updated = TrackMetadata.update(raw_json=json.dumps(raw, ensure_ascii=False)).where(
+        TrackMetadata.id == metadata.id,
+        TrackMetadata.raw_json.is_null() if original is None else TrackMetadata.raw_json == original,
+        TrackMetadata.track_last_modification == metadata.track_last_modification,
+    ).execute()
+    if updated != 1:
+        raise BudgetUnavailable("Metadata changed before its identity skip.")
+
+
 def _pause_until(deadline: datetime) -> None:
     value = str(int(deadline.timestamp()))
     for _ in range(8):
@@ -272,6 +293,20 @@ def runAutomaticMetadataPass(limit: int, provider: BudgetedMetadataProvider,
                 summary["enriched"] += 1
                 summary["web_enriched"] += int(web)
                 summary["tracks"].append({"id": str(track.id), "stage": "web" if web else "text"})
+            except WebMetadataIdentityError as error:
+                if not web:
+                    raise
+                with TrackMetadata._meta.database.atomic():
+                    _skip_web_identity(metadata, error)
+                    recordTrackEnrichmentAttempt(
+                        track, provider, "skipped", reason="invalid_web_identity",
+                        error=type(error).__name__,
+                    )
+                summary["skipped"] += 1
+                logger.info(format_log_event(
+                    "track_metadata_enrichment", "metadata_identity_skipped",
+                    error_type=type(error).__name__, stage="web",
+                ))
             except (BudgetExceeded, BudgetUnavailable) as error:
                 if web:
                     _finish_web_error(metadata, error)
