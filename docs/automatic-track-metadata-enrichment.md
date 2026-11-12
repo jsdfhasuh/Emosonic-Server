@@ -96,6 +96,11 @@ Database errors, corrupt accounting, or unsupported pricing fail closed before a
 new paid request. Known daily/monthly exhaustion pauses until the relevant reset;
 other accounting uncertainty pauses the paid worker for 24 hours.
 
+If usage has already been settled but a web answer fails evidence validation,
+only that recording is rejected. The batch ends, but unrelated songs can proceed
+at the next scheduled pass. Malformed transport responses before settlement still
+retain their reservation and use the global backoff.
+
 Ordinary text failures have exponential backoff. Web attempts are different: a
 marker is committed before the network call, and an attempted lookup is terminal
 for that unchanged recording, including failed or inconclusive attempts. This
@@ -112,8 +117,9 @@ proof of language or mood. Language needs explicit source evidence; inferred
 fields remain distinguished from sourced fields. No audio analysis is performed,
 and web lookup does not invent energy, valence, or danceability values.
 
-Sources must appear in the actual tool sources or citations. Bounded, sanitized
-evidence and the attempt status are retained in metadata `raw_json.web_lookup`;
+Sources must appear in the actual tool sources, citations, or validated
+`open_page`/`find_in_page` action URLs. Bounded, sanitized evidence and the attempt
+status are retained in metadata `raw_json.web_lookup`;
 full pages and full lyrics are not stored. Existing high-quality fields are kept
 when a candidate has no replacement value. Ambiguous results can remain unknown
 or low-confidence, and a web lookup is not a factual-correctness guarantee.
@@ -126,6 +132,7 @@ configuration, request bodies, or API keys:
 - `metadata_budget_settled`: request kind and accounted `cost_micro_usd`.
 - `metadata_budget_paused`: accounting prevented further paid work.
 - `metadata_background_retry`: retry/backoff with error type and delay.
+- `metadata_result_rejected`: settled web answer rejected for one recording.
 
 For read-only diagnostics, `MetadataBudget.snapshot()` exposes current day/month
 spent, reserved, remaining, blocked status, and reset timestamps without keys or
