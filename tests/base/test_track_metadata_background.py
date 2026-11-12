@@ -8,8 +8,10 @@ from unittest.mock import Mock, patch
 
 from supysonic import db
 from supysonic import track_metadata_background as background
+from supysonic.llm_client import LlmInvalidResponseError
 from supysonic.metadata_budget import BudgetExceeded, BudgetUnavailable
 from supysonic.scanner_func import scanner_track_enrich
+from supysonic.track_metadata_web import WebMetadataResultRejected
 
 from ..testbase import TestConfig
 from .test_track_metadata_web import response as web_response
@@ -307,6 +309,69 @@ class TrackMetadataBackgroundTestCase(unittest.TestCase):
         second = FakeProvider()
         background.runAutomaticMetadataPass(2, second)
         self.assertEqual(second.web_calls, [])
+
+    def test_invalid_web_result_is_terminal_without_pausing_other_recordings(self):
+        failed_track = self.create_track()
+        self.apply(failed_track)
+        first = FakeProvider()
+
+        def invalid_response(unused):
+            raise WebMetadataResultRejected("Unsupported metadata evidence.")
+
+        first.web_hook = invalid_response
+        summary = background.runAutomaticMetadataPass(1, first)
+        self.assertEqual(summary["failed"], 1)
+        self.assertFalse(summary["budget_paused"])
+        self.assertIsNone(db.Meta.get_or_none(db.Meta.key == background.PAUSE_KEY))
+        marker = json.loads(self.metadata(failed_track).raw_json)["web_lookup"]
+        self.assertEqual(marker["status"], "failed")
+        self.assertEqual(len(first.web_calls), 1)
+
+        other_track = self.create_track()
+        self.apply(other_track)
+        second = FakeProvider()
+        following = background.runAutomaticMetadataPass(2, second)
+        self.assertEqual(following["web_enriched"], 1)
+        self.assertEqual([track["title"] for track in second.web_calls], [other_track.title])
+        self.assertFalse(following["budget_paused"])
+        self.assertIsNone(db.Meta.get_or_none(db.Meta.key == background.PAUSE_KEY))
+        final = background.runAutomaticMetadataPass(2, second)
+        self.assertEqual(final["selected"], 0)
+        self.assertEqual(len(second.web_calls), 1)
+
+    def test_unsettled_transport_invalid_response_pauses_and_retains_reservation(self):
+        track = self.create_track()
+        self.apply(track)
+        provider = self.budgeted_provider()
+        with patch.object(background, "post_web_response", side_effect=LlmInvalidResponseError(
+                "Invalid upstream response before accounting.")) as post:
+            summary = background.runAutomaticMetadataPass(1, provider)
+            self.assertEqual(summary["failed"], 1)
+            pause = db.Meta.get_or_none(db.Meta.key == background.PAUSE_KEY)
+            self.assertIsNotNone(pause)
+            self.assertGreater(int(pause.value), datetime.now().timestamp())
+            self.assertEqual(provider.budget.snapshot()["month_reserved_micro_usd"], 1_000_000)
+            self.assertEqual(provider.budget.snapshot()["month_spent_micro_usd"], 0)
+            other = self.create_track()
+            self.apply(other)
+            following = background.runAutomaticMetadataPass(2, provider)
+            self.assertTrue(following["budget_paused"])
+            post.assert_called_once()
+
+    def test_settled_web_evidence_rejection_does_not_pause_other_work(self):
+        track = self.create_track()
+        self.apply(track)
+        provider = self.budgeted_provider()
+        response = web_response()
+        response["output"] = []
+        with patch.object(background, "post_web_response", return_value=response):
+            summary = background.runAutomaticMetadataPass(1, provider)
+        self.assertEqual(summary["failed"], 1)
+        self.assertFalse(summary["budget_paused"])
+        self.assertIsNone(db.Meta.get_or_none(db.Meta.key == background.PAUSE_KEY))
+        self.assertEqual(provider.budget.snapshot()["month_reserved_micro_usd"], 0)
+        self.assertGreater(provider.budget.snapshot()["month_spent_micro_usd"], 0)
+        self.assertEqual(json.loads(self.metadata(track).raw_json)["web_lookup"]["status"], "failed")
 
     def test_real_wrapper_reserves_marks_posts_and_settles_in_order(self):
         track = self.create_track()

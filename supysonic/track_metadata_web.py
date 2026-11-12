@@ -26,6 +26,10 @@ SECRET_QUERY = re.compile(r"token|secret|password|passwd|credential|signature|^s
 SECRET_TEXT = re.compile(r"sk-[A-Za-z0-9_-]{20,}|Bearer\s+\S+", re.I)
 
 
+class WebMetadataResultRejected(LlmInvalidResponseError):
+    """Transport/accounting succeeded, but this recording's evidence was unusable."""
+
+
 def _object(properties: dict) -> dict:
     return {"type": "object", "properties": properties,
             "required": list(properties), "additionalProperties": False}
@@ -347,4 +351,7 @@ class WebMetadataProvider:
             post_web_response(str(self.config.get("api_key") or ""), payload,
                               timeout_seconds=float(self.config.get("web_timeout_seconds", 60)))
         )
-        return parse_web_response(response, max_tool_calls=payload["max_tool_calls"])
+        try:
+            return parse_web_response(response, max_tool_calls=payload["max_tool_calls"])
+        except LlmInvalidResponseError:
+            raise WebMetadataResultRejected("Web metadata evidence was rejected.") from None

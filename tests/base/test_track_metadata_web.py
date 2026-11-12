@@ -9,7 +9,8 @@ from supysonic.llm_client import (
     LlmConfigError, LlmInvalidResponseError, LlmQuotaError, LlmTimeoutError, LlmUpstreamError,
 )
 from supysonic.track_metadata_web import (
-    WebMetadataProvider, build_web_payload, parse_web_response, post_web_response,
+    WebMetadataProvider, WebMetadataResultRejected,
+    build_web_payload, parse_web_response, post_web_response,
 )
 
 
@@ -220,6 +221,31 @@ class TrackMetadataWebTestCase(unittest.TestCase):
         parsed = WebMetadataProvider(CONFIG, request_callback=callback).enrich(TRACK)
         self.assertEqual(parsed["model"], "gpt-6-luna")
         callback.assert_called_once()
+
+    def test_provider_evidence_rejection_after_successful_callback_has_distinct_type(self):
+        value = response()
+        value["output"] = []
+        callback = Mock(return_value=value)
+        with self.assertRaises(WebMetadataResultRejected):
+            WebMetadataProvider(CONFIG, request_callback=callback).enrich(TRACK)
+        callback.assert_called_once()
+
+    def test_callback_or_transport_invalid_response_is_not_translated(self):
+        for use_callback in (True, False):
+            with self.subTest(use_callback=use_callback):
+                error = LlmInvalidResponseError("Unparsed upstream response.")
+                callback = Mock(side_effect=error)
+                provider = WebMetadataProvider(CONFIG, request_callback=callback if use_callback else None)
+                with patch("supysonic.track_metadata_web.post_web_response", side_effect=error) as post:
+                    with self.assertRaises(LlmInvalidResponseError) as raised:
+                        provider.enrich(TRACK)
+                self.assertIs(raised.exception, error)
+                self.assertNotIsInstance(raised.exception, WebMetadataResultRejected)
+                if use_callback:
+                    callback.assert_called_once()
+                    post.assert_not_called()
+                else:
+                    post.assert_called_once()
 
     @patch("supysonic.track_metadata_web.requests.post")
     def test_transport_fixed_endpoint_no_redirect_or_retry(self, post):

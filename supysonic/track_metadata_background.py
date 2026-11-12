@@ -19,7 +19,7 @@ from .scanner_func.scanner_track_enrich import (
 )
 from .scanner_func.scanner_review_tasks import createLowConfidenceTrackMetadataReviewTask
 from .track_metadata_quality import is_high_quality_track_metadata, is_llm_track_metadata
-from .track_metadata_web import WebMetadataProvider, post_web_response
+from .track_metadata_web import WebMetadataProvider, WebMetadataResultRejected, post_web_response
 
 
 logger = logging.getLogger(__name__)
@@ -283,6 +283,18 @@ def runAutomaticMetadataPass(limit: int, provider: BudgetedMetadataProvider,
                 summary["budget_paused"] = True
                 logger.warning(format_log_event("track_metadata_enrichment", "metadata_budget_paused",
                                                 error_type=type(error).__name__))
+                return summary
+            except WebMetadataResultRejected as error:
+                _finish_web_error(metadata, error)
+                recordTrackEnrichmentAttempt(
+                    track, provider, "retry", reason="invalid_response",
+                    error=type(error).__name__, next_retry_at=now() + timedelta(days=1),
+                )
+                summary["failed"] += 1
+                logger.warning(format_log_event(
+                    "track_metadata_enrichment", "metadata_result_rejected",
+                    error_type=type(error).__name__, stage="web",
+                ))
                 return summary
             except Exception as error:
                 if web:
