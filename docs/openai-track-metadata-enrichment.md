@@ -128,4 +128,56 @@ provider can drain eligible retries; permanently failed items need bounded revie
 - OpenWrt can reach the official API (an unauthenticated probe returned 401).
 - Focused regression suite: 139 tests, 138 passed. The directory-deletion
   cleanup test failed identically in a separately extracted HEAD baseline; no
-  deletion logic was changed. Live server cutover remains pending.
+  deletion logic was changed.
+- Linux Python 3.12 CI passed: 2,186 unit tests (3 skipped), then 5 network-suite
+  tests (1 skipped). Package builds and both Docker architectures succeeded in
+  [Docker Publish run 43138513230](https://github.com/jsdfhasuh/Emosonic-Server/actions/runs/43138513230).
+
+## Authorized OpenWrt cutover
+
+The user authorized a service restart and exactly three specified missing tracks.
+The new container started at 2026-11-12 10:16:26 Asia/Shanghai, using source
+`ebda4536763e6f25c05d728e20d90cd628a32acf` and image
+`ghcr.io/jsdfhasuh/emosonic-server@sha256:9d4280d44c491518352fd86121e28b76734cb2b4a6fe694cb6e4279f76e8e8ff`.
+
+Verified after the cutover:
+
+- Login HTTP 200, daemon process, and OpenWrt guard running; container restart
+  count remained zero during verification.
+- Dedicated configuration resolves to the official API, `gpt-6-luna`, and low
+  reasoning. Background enrichment, path hints, and payload logging are off.
+- Key mounted read-only from a mode-0600 file within a mode-0700 private directory.
+  The recommendation agent's configuration is unchanged.
+- Bounded CLI result: `Selected: 3, enriched: 3, failed: 0, skipped: 0`.
+  Read-only database verification found exactly these three rows for the new model,
+  with provider/source `llm`, task status `completed`, and matching track mtimes.
+
+| Track ID | Model language | Confidence | Recommendation quality gate |
+| --- | --- | --- | --- |
+| `36d88242-7839-4f7f-9532-3898461ee2ca` | `zh` | 0.87 | Passed |
+| `ebdd1c68-9f1e-4492-8032-6da533b717f5` | `zh` | 0.42 | Excluded |
+| `5bfb5273-6b98-46e2-a3eb-d0cb96033ab1` | `zh` | 0.30 | Excluded |
+
+The gate requires confidence >= 0.5 plus semantic fields and an LLM source.
+The last two records are stored but do not contribute to recommendation semantic
+profiles or candidate semantic scores. Completed tasks and model-generated
+language labels are not independent factual verification. No audio was analyzed.
+No additional paid enrichment or full-library activation was performed.
+
+Rollback assets remain on OpenWrt:
+
+- Previous stopped container: `supysonic-openwrt-before-openai-ebda453`.
+- Private configuration and container backup directory:
+  `/mnt/django-emmc/supysonic/openai-metadata-ebda453`.
+
+A rollback must coordinate the OpenWrt guard, restore the previous configuration
+and container name, then verify login and daemon health. The original config had
+background enrichment enabled against the failing legacy provider; keep it disabled
+when preparing a rollback unless explicitly asked to resume those retries.
+Do not copy private backup contents into the repository. Successful sample rows
+are not automatically removed by a container rollback.
+
+Client playback/reconnect and long-term operation were not tested. This cutover
+does not fix daily recommendation language weighting or establish that the two
+low-confidence songs were accurately characterized. Background enrichment remains
+disabled pending a separate volume/budget decision and sample-quality review.

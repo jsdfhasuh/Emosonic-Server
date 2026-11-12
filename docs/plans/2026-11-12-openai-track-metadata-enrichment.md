@@ -59,5 +59,10 @@ retrying older tracks. Daily recommendation ranking is out of scope here.
 - [x] User-supplied API authentication and ten bounded inference requests; no
   production database writes. Small-sample recommendation: `gpt-6-luna`, low
   reasoning, 1,536 token limit, strict JSON schema.
-- [ ] Deploy source and private runtime configuration, then verify selected DB writes.
-- [ ] Controlled background activation and result verification.
+- [x] Deploy source and private runtime configuration, then verify selected DB writes.
+  The user authorized a restart and exactly three selected songs. Runtime source
+  is `ebda4536763e6f25c05d728e20d90cd628a32acf`; login, daemon, and guard checks
+  passed. All three tasks completed and their metadata timestamps match the
+  tracks. Only one sample passed the existing confidence/semantic quality gate.
+- Deferred, not authorized: background activation or full-library enrichment.
+  Automatic enrichment remains disabled; two low-confidence samples need review.
