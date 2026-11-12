@@ -16,6 +16,7 @@ from .daemon.client import DaemonClient
 from .daemon.exceptions import DaemonUnavailableError
 from .db import Folder, User, init_database, release_database
 from .logging_manager import build_web_logging_config, configure_web_logging
+from .llm_client import LlmConfigError
 from .managers.folder import FolderManager
 from .managers.user import UserManager
 from .scanner import Scanner
@@ -25,6 +26,7 @@ from .scanner_func.scanner_track_enrich import (
     TrackMetadataProviderError,
     runTrackMetadataEnrichmentPass,
 )
+from .track_metadata_config import get_track_metadata_llm_config
 
 
 logger = logging.getLogger(__package__)
@@ -273,11 +275,11 @@ def metadata_enrich(config, limit, track_ids, force, failed_only, dry_run, provi
 
     try:
         provider_instance = (
-            LLMMetadataProvider(config.RECOMMENDATION_AGENT)
+            LLMMetadataProvider(get_track_metadata_llm_config(config))
             if provider == "llm"
             else LocalMetadataProvider()
         )
-    except TrackMetadataProviderError as e:
+    except (TrackMetadataProviderError, LlmConfigError) as e:
         raise ClickException(str(e)) from e
 
     summary = runTrackMetadataEnrichmentPass(

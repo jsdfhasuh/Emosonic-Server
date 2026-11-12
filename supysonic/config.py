@@ -145,6 +145,7 @@ class DefaultConfig:
         "temperature": 0.7,
         "cache_ttl_seconds": 900,
     }
+    TRACK_METADATA_LLM = {}
     TRANSCODING = {}
     MIMETYPES = {}
 

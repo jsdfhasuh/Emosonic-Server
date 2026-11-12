@@ -288,8 +288,8 @@ track_metadata_enrichment_log_payload = off
 [recommendation_agent]
 ; OpenAI-compatible model endpoint for the recommendation page Agent.
 ; Disabled unless enabled, api_key, and model are set.
-; Track metadata LLM enrichment reuses this endpoint/key/model when explicitly
-; selected, but does not require recommendation_agent.enabled.
+; Track metadata LLM enrichment reuses these settings only if the dedicated
+; [track_metadata_llm] section has no settings. Agent enabled is not required.
 enabled = off
 
 ; Defaults: https://api.openai.com/v1
@@ -317,6 +317,28 @@ temperature = 0.7
 ; Seconds to reuse identical Agent results for the same user/context.
 ; Set to 0 to disable Agent result caching. Default: 900
 cache_ttl_seconds = 900
+
+; Independent track metadata provider. Uncomment and configure the section to
+; stop reusing recommendation_agent. Partial settings never inherit its key.
+; Enable separately with daemon.track_metadata_enrichment_provider = llm.
+;[track_metadata_llm]
+;api_base_url = https://api.openai.com/v1
+;model = YOUR_MODEL_ID
+; Choose exactly one key source. File paths are absolute inside the container.
+;api_key_file = /run/secrets/track_metadata_openai_key
+;api_key_env = OPENAI_API_KEY
+;api_key =
+;timeout_seconds = 60
+;max_output_tokens = 2048
+; Use max_completion_tokens for OpenAI; max_tokens is the legacy default.
+;token_limit_parameter = max_completion_tokens
+; Blank temperature omits the parameter; the provider default is 0.2.
+;temperature =
+; Omit for the model default; none disables reasoning on supported models.
+;reasoning_effort = none
+; json_schema requires a model/endpoint supporting strict structured outputs.
+; json_object is the backward-compatible default.
+;response_format = json_schema
 
 [transcoding]
 ; Programs used to convert from one format/bitrate to another. Defaults: none

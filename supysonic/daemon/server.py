@@ -15,6 +15,7 @@ from .client import DaemonCommand
 from ..db import Folder, open_connection, close_connection
 from ..jukebox import Jukebox
 from ..logging_utils import format_log_event
+from ..llm_client import LlmConfigError
 from ..mood_scene_playlist_service import (
     DEFAULT_MOOD_SCENE_DAILY_PLAYLIST_LIMIT,
     DEFAULT_MOOD_SCENE_PLAYLIST_RETENTION_DAYS,
@@ -31,6 +32,7 @@ from ..scanner_func.scanner_track_enrich import (
     TrackMetadataProviderError,
     runTrackMetadataEnrichmentPass,
 )
+from ..track_metadata_config import get_track_metadata_llm_config
 from ..utils import get_secret_key
 from ..watcher import SupysonicWatcher
 
@@ -201,9 +203,9 @@ class Daemon:
         elif provider_name == "llm":
             try:
                 provider = LLMMetadataProvider(
-                    getattr(self.__config, "RECOMMENDATION_AGENT", {})
+                    get_track_metadata_llm_config(self.__config)
                 )
-            except TrackMetadataProviderError as exc:
+            except (TrackMetadataProviderError, LlmConfigError) as exc:
                 logger.warning(
                     format_log_event(
                         "daemon",

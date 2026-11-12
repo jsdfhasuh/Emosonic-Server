@@ -8,6 +8,9 @@ import requests
 
 DEFAULT_RATE_LIMIT_RETRY_DELAY_SECONDS = 5.0
 MAX_RATE_LIMIT_RETRY_DELAY_SECONDS = 60.0
+SUPPORTED_REASONING_EFFORTS = (
+    "none", "minimal", "low", "medium", "high", "xhigh", "max",
+)
 FENCED_JSON_RE = re.compile(r"```\s*(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 
 
@@ -48,16 +51,32 @@ def build_chat_completion_payload(
     max_output_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
     json_object: bool = True,
+    token_limit_parameter: str = "max_tokens",
+    json_schema: Optional[Mapping[str, object]] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> Dict[str, object]:
+    if token_limit_parameter not in ("max_tokens", "max_completion_tokens"):
+        raise LlmConfigError("Unsupported LLM token limit parameter.")
     payload: Dict[str, object] = {
         "model": model,
         "messages": [dict(message) for message in messages],
     }
     if max_output_tokens is not None and max_output_tokens > 0:
-        payload["max_tokens"] = int(max_output_tokens)
+        payload[token_limit_parameter] = int(max_output_tokens)
     if temperature is not None:
         payload["temperature"] = float(temperature)
-    if json_object:
+    if reasoning_effort is not None:
+        reasoning_effort = str(reasoning_effort).strip()
+        if reasoning_effort and reasoning_effort not in SUPPORTED_REASONING_EFFORTS:
+            raise LlmConfigError("Unsupported LLM reasoning effort.")
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
+    if json_schema is not None:
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": dict(json_schema),
+        }
+    elif json_object:
         payload["response_format"] = {"type": "json_object"}
     return payload
 
@@ -90,7 +109,12 @@ def post_chat_completion(
             timeout_seconds=timeout_seconds,
         )
     except LlmUpstreamError as first_error:
-        if _upstream_response_format_error(first_error.details):
+        response_format = request_payload.get("response_format")
+        legacy_json_mode = (
+            isinstance(response_format, Mapping)
+            and response_format.get("type") == "json_object"
+        )
+        if legacy_json_mode and _upstream_response_format_error(first_error.details):
             fallback_payload = dict(request_payload)
             fallback_payload.pop("response_format", None)
             return _post_chat_completion_once(
@@ -113,7 +137,14 @@ def post_chat_completion(
 def parse_json_object_response(response_json: Mapping[str, object]) -> Dict[str, object]:
     try:
         choices = response_json["choices"]
-        message = choices[0]["message"]
+        choice = choices[0]
+        message = choice["message"]
+        if not isinstance(choice, Mapping) or not isinstance(message, Mapping):
+            raise TypeError("Invalid completion choice")
+        if choice.get("finish_reason") == "length":
+            raise LlmInvalidResponseError("LLM response was truncated by its token limit.")
+        if choice.get("finish_reason") == "content_filter" or message.get("refusal"):
+            raise LlmInvalidResponseError("LLM refused to provide the requested JSON response.")
         content = message["content"]
     except (KeyError, IndexError, TypeError) as exc:
         raise LlmInvalidResponseError("LLM response did not include message content.") from exc
@@ -202,23 +233,23 @@ def _post_chat_completion_once(
             json=request_payload,
             timeout=timeout_seconds,
         )
-    except requests.exceptions.Timeout as exc:
+    except requests.exceptions.Timeout:
         raise LlmTimeoutError(
             "LLM request timed out.",
             details={"retryable": True},
-        ) from exc
+        ) from None
     except requests.exceptions.RequestException as exc:
         raise LlmUpstreamError(
             "LLM request failed.",
             details={
                 "upstreamErrorCode": exc.__class__.__name__,
-                "upstreamMessage": str(exc),
+                "upstreamMessage": _redact_upstream_message(str(exc), api_key),
                 "retryable": True,
             },
-        ) from exc
+        ) from None
 
     if getattr(response, "status_code", 200) >= 400:
-        details = _extract_upstream_error(response)
+        details = _extract_upstream_error(response, api_key=api_key)
         if details.get("quotaExhausted"):
             raise LlmQuotaError(
                 "LLM quota exhausted.",
@@ -239,7 +270,22 @@ def _post_chat_completion_once(
     return response_json
 
 
-def _extract_upstream_error(response: object) -> Dict[str, object]:
+def _redact_upstream_message(message: str, api_key: str = "") -> str:
+    if api_key:
+        message = message.replace(api_key, "[REDACTED]")
+    message = re.sub(
+        r"(?i)\bBearer\s+[^\s,;\"'<>]+",
+        "Bearer [REDACTED]",
+        message,
+    )
+    return message
+
+
+def _extract_upstream_error(
+    response: object,
+    *,
+    api_key: str = "",
+) -> Dict[str, object]:
     status_code = getattr(response, "status_code", None)
     details: Dict[str, object] = {
         "upstreamStatus": status_code,
@@ -261,9 +307,9 @@ def _extract_upstream_error(response: object) -> Dict[str, object]:
     if not message:
         message = str(getattr(response, "text", "") or getattr(response, "reason", ""))
     if message:
-        details["upstreamMessage"] = message
+        details["upstreamMessage"] = _redact_upstream_message(message, api_key)
     if error_code:
-        details["upstreamErrorCode"] = error_code
+        details["upstreamErrorCode"] = _redact_upstream_message(error_code, api_key)
     if _is_quota_exhausted_error(status_code, message, error_code):
         details["quotaExhausted"] = True
         details["retryable"] = False

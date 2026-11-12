@@ -19,6 +19,7 @@ from ..db import (
     now,
 )
 from ..llm_client import (
+    SUPPORTED_REASONING_EFFORTS,
     LlmClientError,
     LlmInvalidResponseError,
     LlmQuotaError,
@@ -266,6 +267,38 @@ class LocalMetadataProvider:
         }
 
 
+TRACK_METADATA_JSON_SCHEMA = {
+    "name": "track_recommendation_metadata",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "language": {
+                "type": ["string", "null"],
+                "enum": [
+                    "zh", "yue", "en", "ja", "ko", "fr", "es", "de", "other", None,
+                ],
+            },
+            "mood": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+            "scene": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+            "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+            "summary": {"type": ["string", "null"], "maxLength": 80},
+            "energy": {"type": ["integer", "null"], "minimum": 0, "maximum": 100},
+            "valence": {"type": ["integer", "null"], "minimum": 0, "maximum": 100},
+            "danceability": {
+                "type": ["integer", "null"], "minimum": 0, "maximum": 100,
+            },
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        },
+        "required": [
+            "language", "mood", "scene", "tags", "summary", "energy",
+            "valence", "danceability", "confidence",
+        ],
+    },
+}
+
+
 class LLMMetadataProvider:
     name = "llm"
     source = "llm"
@@ -277,7 +310,7 @@ class LLMMetadataProvider:
         self.model = str(self.config.get("model") or "").strip()
         if not self.api_base_url or not self.api_key or not self.model:
             raise TrackMetadataProviderError(
-                "LLM metadata provider requires recommendation_agent.api_base_url, "
+                "LLM metadata provider requires api_base_url, "
                 "api_key, and model."
             )
         self.timeout_seconds = _positiveFloat(
@@ -288,10 +321,34 @@ class LLMMetadataProvider:
             self.config.get("max_output_tokens"),
             DEFAULT_LLM_MAX_OUTPUT_TOKENS,
         )
-        self.temperature = _nonNegativeFloat(
-            self.config.get("temperature"),
-            DEFAULT_LLM_TEMPERATURE,
+        temperature = self.config.get("temperature", DEFAULT_LLM_TEMPERATURE)
+        omit_temperature = temperature is None or (
+            isinstance(temperature, str) and not temperature.strip()
         )
+        self.temperature = (
+            None
+            if omit_temperature
+            else _nonNegativeFloat(temperature, DEFAULT_LLM_TEMPERATURE)
+        )
+        self.token_limit_parameter = str(
+            self.config.get("token_limit_parameter", "max_tokens")
+        ).strip()
+        if self.token_limit_parameter not in ("max_tokens", "max_completion_tokens"):
+            raise TrackMetadataProviderError("Unsupported LLM token limit parameter.")
+        self.response_format = str(
+            self.config.get("response_format", "json_object")
+        ).strip()
+        if self.response_format not in ("json_object", "json_schema"):
+            raise TrackMetadataProviderError("Unsupported LLM metadata response format.")
+        reasoning_effort = self.config.get("reasoning_effort")
+        self.reasoning_effort = (
+            None if reasoning_effort is None else str(reasoning_effort).strip() or None
+        )
+        if (
+            self.reasoning_effort is not None
+            and self.reasoning_effort not in SUPPORTED_REASONING_EFFORTS
+        ):
+            raise TrackMetadataProviderError("Unsupported LLM reasoning effort.")
 
     def enrich(self, track_input: Mapping[str, object]) -> Dict[str, object]:
         messages = [
@@ -353,6 +410,13 @@ class LLMMetadataProvider:
             max_output_tokens=self.max_output_tokens,
             temperature=self.temperature,
             json_object=True,
+            token_limit_parameter=self.token_limit_parameter,
+            reasoning_effort=self.reasoning_effort,
+            json_schema=(
+                TRACK_METADATA_JSON_SCHEMA
+                if self.response_format == "json_schema"
+                else None
+            ),
         )
         try:
             response_json = post_chat_completion(

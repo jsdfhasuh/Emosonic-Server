@@ -22,6 +22,8 @@ from supysonic.scanner_func import scanner_track_enrich
 from supysonic.scanner_func.scanner_track_enrich import (
     LLMMetadataProvider,
     LocalMetadataProvider,
+    TrackMetadataInvalidResponseError,
+    TrackMetadataProviderError,
     buildTrackMetadataInput,
     countTracksMissingCurrentMetadata,
     countTracksNeedingEnrichment,
@@ -540,7 +542,7 @@ class TrackMetadataEnrichmentTestCase(unittest.TestCase):
         )
 
         self.assertNotEqual(result.exit_code, 0)
-        self.assertIn("recommendation_agent.api_base_url", result.output)
+        self.assertIn("api_base_url", result.output)
 
     def test_llm_provider_uses_defaults_for_invalid_numeric_config(self):
         provider = LLMMetadataProvider(
@@ -1043,6 +1045,125 @@ class TrackMetadataEnrichmentTestCase(unittest.TestCase):
             task.reason,
             db.TrackMetadataEnrichmentTask.REASON_INVALID_RESPONSE,
         )
+
+
+class LLMMetadataProviderTestCase(unittest.TestCase):
+    def _provider(self, **options):
+        config = {
+            "api_base_url": "https://llm.example/v1",
+            "api_key": "test-private-api-key",
+            "model": "metadata-model",
+        }
+        config.update(options)
+        return LLMMetadataProvider(config)
+
+    def _response(self):
+        content = json.dumps({
+            "language": "zh", "mood": [], "scene": [], "tags": [],
+            "summary": None, "energy": None, "valence": None,
+            "danceability": None, "confidence": 0.2,
+        })
+        return {"choices": [{"message": {"content": content}}]}
+
+    def test_default_request_keeps_existing_parameters(self):
+        provider = self._provider()
+        with patch(
+            "supysonic.scanner_func.scanner_track_enrich.post_chat_completion",
+            return_value=self._response(),
+        ) as post:
+            provider.enrich({"title": "Test"})
+        payload = post.call_args.args[2]
+        self.assertEqual(payload["max_tokens"], 900)
+        self.assertEqual(payload["temperature"], 0.2)
+        self.assertEqual(payload["response_format"], {"type": "json_object"})
+        self.assertNotIn("reasoning_effort", payload)
+
+    def test_reasoning_effort_none_is_sent_explicitly(self):
+        provider = self._provider(reasoning_effort="none")
+        with patch(
+            "supysonic.scanner_func.scanner_track_enrich.post_chat_completion",
+            return_value=self._response(),
+        ) as post:
+            provider.enrich({"title": "Test"})
+        self.assertEqual(post.call_args.args[2]["reasoning_effort"], "none")
+
+    def test_empty_reasoning_effort_is_omitted(self):
+        for effort in (None, "", "  "):
+            with self.subTest(effort=effort):
+                provider = self._provider(reasoning_effort=effort)
+                with patch(
+                    "supysonic.scanner_func.scanner_track_enrich.post_chat_completion",
+                    return_value=self._response(),
+                ) as post:
+                    provider.enrich({"title": "Test"})
+                self.assertNotIn("reasoning_effort", post.call_args.args[2])
+
+    def test_empty_temperature_is_omitted(self):
+        for temperature in (None, "", "   "):
+            with self.subTest(temperature=temperature):
+                provider = self._provider(
+                    temperature=temperature,
+                    token_limit_parameter="max_completion_tokens",
+                )
+                with patch(
+                    "supysonic.scanner_func.scanner_track_enrich.post_chat_completion",
+                    return_value=self._response(),
+                ) as post:
+                    provider.enrich({"title": "Test"})
+                payload = post.call_args.args[2]
+                self.assertNotIn("temperature", payload)
+                self.assertNotIn("max_tokens", payload)
+                self.assertEqual(payload["max_completion_tokens"], 900)
+
+    def test_json_schema_defines_all_metadata_fields(self):
+        provider = self._provider(response_format="json_schema")
+        with patch(
+            "supysonic.scanner_func.scanner_track_enrich.post_chat_completion",
+            return_value=self._response(),
+        ) as post:
+            provider.enrich({"title": "Test"})
+        response_format = post.call_args.args[2]["response_format"]
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertTrue(response_format["json_schema"]["strict"])
+        schema = response_format["json_schema"]["schema"]
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(set(schema["required"]), set(schema["properties"]))
+        self.assertEqual(len(schema["required"]), 9)
+        self.assertIn(None, schema["properties"]["language"]["enum"])
+
+    def test_invalid_request_options_fail_before_network(self):
+        for options in (
+            {"response_format": "unsupported"},
+            {"token_limit_parameter": "unsupported"},
+            {"reasoning_effort": "unsupported"},
+        ):
+            with self.subTest(options=options):
+                with self.assertRaises(TrackMetadataProviderError):
+                    self._provider(**options)
+
+    def test_truncated_response_is_not_accepted_as_metadata(self):
+        response = self._response()
+        response["choices"][0]["finish_reason"] = "length"
+        with patch(
+            "supysonic.scanner_func.scanner_track_enrich.post_chat_completion",
+            return_value=response,
+        ):
+            with self.assertRaises(TrackMetadataInvalidResponseError):
+                self._provider().enrich({"title": "Test"})
+
+    def test_upstream_key_echo_is_not_exposed_in_provider_error(self):
+        response = SimpleNamespace(
+            status_code=401,
+            json=lambda: {"error": {
+                "message": "Incorrect test-private-api-key; Authorization: Bearer another-key",
+            }},
+        )
+        with patch("supysonic.llm_client.requests.post", return_value=response):
+            with self.assertRaises(TrackMetadataProviderError) as caught:
+                self._provider().enrich({"title": "Test"})
+        self.assertNotIn("test-private-api-key", str(caught.exception))
+        self.assertNotIn("another-key", str(caught.exception))
+        self.assertIn("[REDACTED]", str(caught.exception))
 
 
 if __name__ == "__main__":

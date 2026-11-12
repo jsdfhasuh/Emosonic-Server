@@ -7,7 +7,12 @@ from supysonic.daemon.server import Daemon
 
 
 class DaemonRecommendRefreshTestCase(unittest.TestCase):
-    def createDaemon(self, recommendation_agent_config=None, **daemon_config):
+    def createDaemon(
+        self,
+        recommendation_agent_config=None,
+        track_metadata_llm_config=None,
+        **daemon_config,
+    ):
         recommendation_agent = {
             "enabled": False,
             "api_base_url": "https://llm.example/v1",
@@ -27,6 +32,8 @@ class DaemonRecommendRefreshTestCase(unittest.TestCase):
             BASE={},
             RECOMMENDATION_AGENT=recommendation_agent,
         )
+        if track_metadata_llm_config is not None:
+            config.TRACK_METADATA_LLM = track_metadata_llm_config
         return Daemon(config)
 
     def test_refresh_recommend_playlists_runs_once_per_day(self):
@@ -298,7 +305,94 @@ class DaemonRecommendRefreshTestCase(unittest.TestCase):
         run_pass.assert_called_once()
         self.assertEqual(run_pass.call_args.kwargs["limit"], 3)
         self.assertFalse(run_pass.call_args.kwargs["log_payload"])
-        self.assertEqual(run_pass.call_args.kwargs["provider"].name, "llm")
+        provider = run_pass.call_args.kwargs["provider"]
+        self.assertEqual(provider.name, "llm")
+        self.assertEqual(provider.api_base_url, "https://llm.example/v1")
+        self.assertEqual(provider.api_key, "secret")
+        self.assertEqual(provider.model, "metadata-model")
+
+    def test_track_metadata_enrichment_prefers_dedicated_llm_config(self):
+        daemon = self.createDaemon(
+            recommendation_agent_config={
+                "api_key": "legacy-test-key",
+                "model": "legacy-test-model",
+            },
+            track_metadata_llm_config={
+                "api_base_url": "https://api.openai.com/v1",
+                "api_key": "metadata-test-key",
+                "model": "metadata-test-model",
+            },
+            track_metadata_enrichment_provider="llm",
+        )
+
+        with patch("supysonic.daemon.server.open_connection", return_value=True), patch(
+            "supysonic.daemon.server.close_connection"
+        ), patch(
+            "supysonic.daemon.server.runTrackMetadataEnrichmentPass",
+            return_value={"selected": 1, "enriched": 1, "failed": 0, "skipped": 0},
+        ) as run_pass:
+            self.assertTrue(daemon._Daemon__run_track_metadata_enrichment())
+
+        run_pass.assert_called_once()
+        provider = run_pass.call_args.kwargs["provider"]
+        self.assertEqual(provider.api_base_url, "https://api.openai.com/v1")
+        self.assertEqual(provider.api_key, "metadata-test-key")
+        self.assertEqual(provider.model, "metadata-test-model")
+        self.assertEqual(
+            daemon._Daemon__config.RECOMMENDATION_AGENT["api_key"],
+            "legacy-test-key",
+        )
+
+    def test_track_metadata_enrichment_empty_dedicated_config_uses_legacy(self):
+        daemon = self.createDaemon(
+            recommendation_agent_config={
+                "api_key": "legacy-test-key",
+                "model": "legacy-test-model",
+            },
+            track_metadata_llm_config={},
+            track_metadata_enrichment_provider="llm",
+        )
+
+        with patch("supysonic.daemon.server.open_connection", return_value=True), patch(
+            "supysonic.daemon.server.close_connection"
+        ), patch(
+            "supysonic.daemon.server.runTrackMetadataEnrichmentPass",
+            return_value={"selected": 1, "enriched": 1, "failed": 0, "skipped": 0},
+        ) as run_pass:
+            self.assertTrue(daemon._Daemon__run_track_metadata_enrichment())
+
+        run_pass.assert_called_once()
+        provider = run_pass.call_args.kwargs["provider"]
+        self.assertEqual(provider.api_base_url, "https://llm.example/v1")
+        self.assertEqual(provider.api_key, "legacy-test-key")
+        self.assertEqual(provider.model, "legacy-test-model")
+
+    def test_track_metadata_enrichment_partial_config_does_not_use_legacy_key(self):
+        for dedicated_config in (
+            {"api_base_url": "https://api.openai.com/v1"},
+            {"model": "metadata-test-model"},
+            {
+                "api_base_url": "https://api.openai.com/v1",
+                "model": "metadata-test-model",
+            },
+        ):
+            with self.subTest(config=dedicated_config):
+                daemon = self.createDaemon(
+                    recommendation_agent_config={
+                        "api_key": "legacy-test-key",
+                        "model": "legacy-test-model",
+                    },
+                    track_metadata_llm_config=dedicated_config,
+                    track_metadata_enrichment_provider="llm",
+                )
+
+                with patch("supysonic.daemon.server.open_connection") as open_db, patch(
+                    "supysonic.daemon.server.runTrackMetadataEnrichmentPass"
+                ) as run_pass:
+                    self.assertFalse(daemon._Daemon__run_track_metadata_enrichment())
+
+                open_db.assert_not_called()
+                run_pass.assert_not_called()
 
     def test_track_metadata_enrichment_skips_unconfigured_llm_provider(self):
         daemon = self.createDaemon(track_metadata_enrichment_provider="llm")
