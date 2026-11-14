@@ -1182,7 +1182,7 @@ def recommendation_agent():
     )
     try:
         payload = request_recommendation_agent(
-            current_app.config.get("RECOMMENDATION_AGENT", {}),
+            current_app.config,
             request.user,
             message,
             language,
@@ -1222,7 +1222,7 @@ def recommendation_agent():
 def recommendation_agent_health():
     return jsonify(
         get_recommendation_agent_health(
-            current_app.config.get("RECOMMENDATION_AGENT", {})
+            current_app.config
         )
     )
 
@@ -1369,7 +1369,7 @@ def recommendation_agent_stream():
         yield _sse_event("status", {"status": "thinking"})
         try:
             for event_name, payload in stream_recommendation_agent(
-                current_app.config.get("RECOMMENDATION_AGENT", {}),
+                current_app.config,
                 request.user,
                 message,
                 language,

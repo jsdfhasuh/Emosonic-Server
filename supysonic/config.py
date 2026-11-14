@@ -136,6 +136,12 @@ class DefaultConfig:
     SPOTIFY = {"client_id": None, "client_secret": None}
     RECOMMENDATION_AGENT = {
         "enabled": False,
+        "provider": "compatible",
+        "profile_enabled": False,
+        "daily_selection_enabled": False,
+        "profile_refresh_interval_seconds": 21600,
+        "profile_batch_size": 2,
+        "reasoning_effort": "low",
         "api_base_url": "https://api.openai.com/v1",
         "api_key": "",
         "model": "",

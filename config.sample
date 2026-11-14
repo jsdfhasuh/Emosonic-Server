@@ -319,6 +319,19 @@ temperature = 0.7
 ; Set to 0 to disable Agent result caching. Default: 900
 cache_ttl_seconds = 900
 
+; Default compatible preserves the legacy agent-only behavior. OpenAI enables
+; the budgeted official-API path for chat and optional background music features.
+; See docs/openai-recommendations.md. No API calls are made by profile page reads.
+provider = compatible
+profile_enabled = off
+daily_selection_enabled = off
+profile_refresh_interval_seconds = 21600
+profile_batch_size = 2
+; For provider=openai: model=gpt-6-luna, timeout_seconds=120. Clear api_key above
+; when using api_key_file; reuse the existing private mount, never copy its value.
+;api_key_file = /run/secrets/track_metadata_openai_key
+reasoning_effort = low
+
 ; Independent track metadata provider. Uncomment and configure the section to
 ; stop reusing recommendation_agent. Partial settings never inherit its key.
 ; Enable separately with daemon.track_metadata_enrichment_provider = llm.
@@ -342,7 +355,8 @@ cache_ttl_seconds = 900
 ; json_object is the backward-compatible default.
 ;response_format = json_schema
 ;
-; Opt-in software budget for metadata calls only, not an API-account billing cap.
+; Shared software budget for metadata and provider=openai recommendations;
+; not an API-account billing cap. Calls from other software are not included.
 ; Requires the official endpoint and supported model shown above.
 ; Text and web requests share these persistent calendar-period counters.
 ; USD 3 is held back, leaving USD 57 for monthly request admission.

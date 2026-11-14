@@ -112,6 +112,12 @@ def clear_recommendation_agent_cache(user) -> int:
         return 0
     return (
         RecommendationAgentCache.delete()
-        .where(RecommendationAgentCache.user == user)
+        .where(
+            RecommendationAgentCache.user == user,
+            ~RecommendationAgentCache.message.in_((
+                "__openai_profile_v1__", "__openai_profile_attempt_v1__",
+                "__openai_daily_v1__", "__openai_daily_attempt_v1__",
+            )),
+        )
         .execute()
     )

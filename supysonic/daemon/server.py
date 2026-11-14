@@ -23,6 +23,7 @@ from ..mood_scene_playlist_service import (
     refresh_daily_mood_scene_playlists,
 )
 from ..recommend import getRecommendationDay, refreshDailyRecommendPlaylists
+from ..recommendation_openai_profile import openai_profile_enabled, refresh_openai_profiles
 from ..scheduler import IntervalScheduler
 from ..scanner import Scanner
 from ..scanner_func.scanner_review_tasks import runReviewTaskMaintenance
@@ -193,9 +194,36 @@ class Daemon:
             self.__get_track_metadata_enrichment_interval(),
             enabled=self.__config.DAEMON.get("track_metadata_enrichment", False),
         )
+        self.__scheduler.register(
+            "openai-profile-refresh",
+            self.__refresh_openai_profiles,
+            self.__get_recommend_refresh_interval(),
+            enabled=openai_profile_enabled(self.__config),
+        )
 
     def __run_review_task_maintenance(self):
         return runReviewTaskMaintenance()
+
+    def __refresh_openai_profiles(self):
+        opened = False
+        try:
+            opened = open_connection(True)
+            summary = refresh_openai_profiles(self.__config)
+            if summary["selected"]:
+                logger.info(format_log_event(
+                    "daemon", "openai_profile_refresh_completed",
+                    selected=summary["selected"], updated=summary["updated"],
+                    skipped=summary["skipped"], failed=summary["failed"],
+                ))
+            return summary["failed"] == 0
+        except Exception as exc:
+            logger.warning(format_log_event(
+                "daemon", "openai_profile_refresh_failed", error_type=type(exc).__name__,
+            ))
+            return False
+        finally:
+            if opened:
+                close_connection()
 
     def __run_track_metadata_enrichment(self):
         provider_name = str(

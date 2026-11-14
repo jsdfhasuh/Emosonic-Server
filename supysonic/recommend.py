@@ -18,6 +18,11 @@ from .recommendation_feedback import (
     track_matches_negative_recommendation_feedback,
 )
 from .recommendation_selection import select_diverse_recommendations
+from .recommendation_openai_daily import (
+    daily_candidate_limit,
+    openai_daily_selection_enabled,
+    select_openai_daily_tracks,
+)
 from .track_metadata_quality import is_high_quality_track_metadata
 from .user_listening_profile import (
     build_metadata_preference_profile_from_track_counts,
@@ -786,15 +791,43 @@ def _createRecommendPlaylistForUser(
         return None, False
 
     recommendationDay = getRecommendationDay() if day is None else day
+    if not openai_daily_selection_enabled(config):
+        return _createRecommendPlaylistForUserUnlocked(
+            user, numSongs, recommendationDay, config
+        )
+
+    existingPlaylist = getRecommendedPlaylistForDay(user, recommendationDay)
+    if existingPlaylist is not None:
+        return existingPlaylist, False
+    from .openai_recommendations import OpenAIRecommendationError, recommendation_lease
+
+    with recommendation_lease(f"daily:{user.id}:{recommendationDay}") as acquired:
+        if not acquired:
+            existingPlaylist = getRecommendedPlaylistForDay(user, recommendationDay)
+            if existingPlaylist is not None:
+                return existingPlaylist, False
+            raise OpenAIRecommendationError(
+                "Daily recommendation generation is already running", reason="busy"
+            )
+        return _createRecommendPlaylistForUserUnlocked(
+            user, numSongs, recommendationDay, config
+        )
+
+
+def _createRecommendPlaylistForUserUnlocked(
+    user: User, numSongs: int, recommendationDay: str, config: Optional[object]
+):
+    useOpenAI = openai_daily_selection_enabled(config)
     recentRecommendationCounts = _get_recent_recommendation_counts(
         user,
         recommendationDay,
         _get_recommend_playlist_rotation_lookback_days(config),
     )
     recentTrackIds = set(recentRecommendationCounts)
-    _archive_old_recommended_playlists_for_user(
-        user, recommendationDay, config=config
-    )
+    if not useOpenAI:
+        _archive_old_recommended_playlists_for_user(
+            user, recommendationDay, config=config
+        )
     existingPlaylist = getRecommendedPlaylistForDay(user, recommendationDay)
     if existingPlaylist is not None:
         return existingPlaylist, False
@@ -804,16 +837,26 @@ def _createRecommendPlaylistForUser(
         return None, False
 
     preferences = get_recommendation_feedback_preferences(user)
+    candidateCount = daily_candidate_limit(numSongs) if useOpenAI else numSongs
     recommendedTracks = _buildRecommendedTracks(
         trackPlayCounts,
-        numSongs,
+        candidateCount,
         excludedTrackIds=preferences["disliked_song_ids"],
         preferences=preferences,
         recommendationDay=recommendationDay,
         recentTrackIds=recentTrackIds,
-        minimumFreshTracks=_get_minimum_fresh_track_count(numSongs, config),
+        minimumFreshTracks=_get_minimum_fresh_track_count(candidateCount, config),
         recentRecommendationCounts=recentRecommendationCounts,
     )
+    if useOpenAI and recommendedTracks:
+        recommendedTracks = select_openai_daily_tracks(
+            config, user, recommendedTracks, numSongs, recommendationDay,
+            recent_track_ids=recentTrackIds,
+            minimum_fresh_tracks=_get_minimum_fresh_track_count(numSongs, config),
+        )
+        existingPlaylist = getRecommendedPlaylistForDay(user, recommendationDay)
+        if existingPlaylist is not None:
+            return existingPlaylist, False
     if not recommendedTracks:
         return None, False
 
@@ -824,6 +867,10 @@ def _createRecommendPlaylistForUser(
     )
     _setPlaylistTracks(playlist, recommendedTracks)
     playlist.save()
+    if useOpenAI:
+        _archive_old_recommended_playlists_for_user(
+            user, recommendationDay, config=config
+        )
     logger.info(
         "Created recommended playlist %s for %s with %d tracks, "
         "%d outside recent recommendations",
@@ -836,7 +883,7 @@ def _createRecommendPlaylistForUser(
     logger.info(
         "recommendation event=daily_personalization user=%s day=%s "
         "track_count=%d fresh_count=%d recent_repeat_count=%d "
-        "artist_count=%d max_artist_tracks=%d rotation_target=%d",
+        "artist_count=%d max_artist_tracks=%d rotation_target=%d provider=%s",
         user.name,
         recommendationDay,
         len(recommendedTracks),
@@ -845,6 +892,7 @@ def _createRecommendPlaylistForUser(
         len(artistCounts),
         max(artistCounts.values(), default=0),
         _get_minimum_fresh_track_count(numSongs, config),
+        "openai" if useOpenAI else "local",
     )
     return playlist, True
 
@@ -853,10 +901,12 @@ def refreshDailyRecommendPlaylists(
     num_songs=50, day=None, config: Optional[object] = None
 ) -> int:
     createdCount = 0
+    pendingCount = 0
+    useOpenAI = openai_daily_selection_enabled(config)
     recommendationDay = getRecommendationDay() if day is None else day
     for user in _getUsersWithPlayActivity():
         try:
-            _, wasCreated = _createRecommendPlaylistForUser(
+            playlist, wasCreated = _createRecommendPlaylistForUser(
                 user,
                 numSongs=num_songs,
                 day=recommendationDay,
@@ -864,12 +914,23 @@ def refreshDailyRecommendPlaylists(
             )
             if wasCreated:
                 createdCount += 1
+            if useOpenAI and playlist is None:
+                pendingCount += 1
         except Exception:
+            pendingCount += 1
             logger.exception(
                 "Failed to create recommended playlist for user %s on %s",
                 user.name,
                 recommendationDay,
             )
+    if useOpenAI and pendingCount:
+        from .openai_recommendations import OpenAIRecommendationError
+
+        # The daemon only marks a day complete when this batch returns normally.
+        raise OpenAIRecommendationError(
+            f"Daily OpenAI recommendations remain pending for {pendingCount} users",
+            reason="incomplete",
+        )
     return createdCount
 
 

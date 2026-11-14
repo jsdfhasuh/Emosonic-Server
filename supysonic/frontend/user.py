@@ -14,6 +14,7 @@ from ..db import ClientPrefs, User
 from ..lastfm import LastFm, is_configured
 from ..listenbrainz import ListenBrainz
 from ..managers.user import UserManager
+from ..recommendation_openai_profile import get_cached_openai_profile, openai_profile_enabled
 from ..user_listening_profile import build_user_listening_profile
 
 from . import admin_only, frontend
@@ -154,12 +155,18 @@ def user_profile(uid, user):
         api_key=_get_lastfm_api_key(),
         clients=user.clients,
         listening_profile=listening_profile,
+        openai_profile_enabled=openai_profile_enabled(current_app.config),
+        openai_profile=(get_cached_openai_profile(user)
+                        if openai_profile_enabled(current_app.config) else None),
     )
 
 
 @frontend.route("/api/me/listening-profile")
 def user_listening_profile_api():
-    return jsonify(build_user_listening_profile(request.user))
+    profile = build_user_listening_profile(request.user)
+    profile["aiAnalysis"] = (get_cached_openai_profile(request.user)
+                             if openai_profile_enabled(current_app.config) else None)
+    return jsonify(profile)
 
 
 @frontend.route("/user/<uid>", methods=["POST"])

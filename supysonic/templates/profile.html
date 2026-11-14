@@ -135,10 +135,47 @@
   </div>
 </div>
 
+{% if openai_profile_enabled %}
+<section class="console-section-spacer text-break" aria-labelledby="openai-profile-heading">
+  <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+    <h2 id="openai-profile-heading" class="h5 mb-0" data-i18n-en="OpenAI Music Preferences" data-i18n-zh="OpenAI 音乐偏好">OpenAI Music Preferences</h2>
+    {% if openai_profile and openai_profile.stale %}
+    <span class="text-muted small" data-i18n-en="Last available analysis" data-i18n-zh="最近一次有效分析">Last available analysis</span>
+    {% endif %}
+  </div>
+  {% if openai_profile %}
+  <p class="mb-2">{{ openai_profile.summary }}</p>
+  <p class="mb-3">{{ openai_profile.recentTrend }}</p>
+  <div class="row g-3">
+    <div class="col-md-6">
+      <h3 class="h6" data-i18n-en="Language preferences" data-i18n-zh="语言偏好">Language preferences</h3>
+      <div class="d-flex flex-wrap gap-2">
+        {% for language in openai_profile.preferredLanguages %}<span class="console-chip">{{ language }}</span>{% else %}<span class="console-muted">-</span>{% endfor %}
+      </div>
+    </div>
+    <div class="col-md-6">
+      <h3 class="h6" data-i18n-en="Musical moods" data-i18n-zh="音乐氛围">Musical moods</h3>
+      <div class="d-flex flex-wrap gap-2">
+        {% for mood in openai_profile.preferredMoods %}<span class="console-chip">{{ mood }}</span>{% else %}<span class="console-muted">-</span>{% endfor %}
+      </div>
+    </div>
+  </div>
+  {% if openai_profile.discoveryDirections %}
+  <h3 class="h6 mt-3" data-i18n-en="Discovery directions" data-i18n-zh="探索方向">Discovery directions</h3>
+  <ul class="mb-2">{% for direction in openai_profile.discoveryDirections %}<li>{{ direction }}</li>{% endfor %}</ul>
+  {% endif %}
+  {% if openai_profile.cautions %}<p class="console-muted small mb-2">{{ openai_profile.cautions }}</p>{% endif %}
+  <p class="console-muted small mb-0"><span data-i18n-en="Analyzed" data-i18n-zh="分析时间">Analyzed</span>: {{ openai_profile.generatedAt }}</p>
+  {% else %}
+  <p class="console-muted mb-0" data-i18n-en="No analysis available yet." data-i18n-zh="暂无可用分析">No analysis available yet.</p>
+  {% endif %}
+</section>
+{% endif %}
+
 <div class="card console-section-spacer">
-  <div class="card-header d-flex justify-content-between align-items-center">
+  <div class="card-header d-flex flex-wrap gap-2 justify-content-between align-items-center">
     <span data-i18n-en="Listening Profile" data-i18n-zh="听歌画像">Listening Profile</span>
-    <span class="console-chip">{{ listening_profile.playCount if listening_profile else 0 }} <span data-i18n-en="plays" data-i18n-zh="次播放">plays</span></span>
+    <span class="console-chip">{{ listening_profile.playCount if listening_profile else 0 }} <span data-i18n-en="metadata-covered plays" data-i18n-zh="次已覆盖元数据的播放">metadata-covered plays</span></span>
   </div>
   <div class="card-body">
     {% if listening_profile and listening_profile.playCount %}
@@ -189,12 +226,12 @@
       </div>
       <div class="col-xl-4">
         <ul class="console-info-list">
-          <li><span data-i18n-en="Track count" data-i18n-zh="曲目数">Track count</span><strong>{{ listening_profile.trackCount }}</strong></li>
+          <li><span data-i18n-en="Metadata-covered tracks" data-i18n-zh="已覆盖元数据的曲目数">Metadata-covered tracks</span><strong>{{ listening_profile.trackCount }}</strong></li>
           <li><span data-i18n-en="Average energy" data-i18n-zh="平均能量">Average energy</span><strong>{{ listening_profile.averageEnergy if listening_profile.averageEnergy is not none else '-' }}</strong></li>
           <li><span data-i18n-en="Average valence" data-i18n-zh="平均情绪值">Average valence</span><strong>{{ listening_profile.averageValence if listening_profile.averageValence is not none else '-' }}</strong></li>
           <li><span data-i18n-en="Average danceability" data-i18n-zh="平均舞动性">Average danceability</span><strong>{{ listening_profile.averageDanceability if listening_profile.averageDanceability is not none else '-' }}</strong></li>
-          <li><span data-i18n-en="Recent 7 days" data-i18n-zh="近 7 天">Recent 7 days</span><strong>{{ listening_profile.recent7Days.playCount }}</strong></li>
-          <li><span data-i18n-en="Recent 30 days" data-i18n-zh="近 30 天">Recent 30 days</span><strong>{{ listening_profile.recent30Days.playCount }}</strong></li>
+          <li><span data-i18n-en="Covered plays, 7 days" data-i18n-zh="近 7 天已覆盖播放">Covered plays, 7 days</span><strong>{{ listening_profile.recent7Days.playCount }}</strong></li>
+          <li><span data-i18n-en="Covered plays, 30 days" data-i18n-zh="近 30 天已覆盖播放">Covered plays, 30 days</span><strong>{{ listening_profile.recent30Days.playCount }}</strong></li>
         </ul>
       </div>
     </div>
