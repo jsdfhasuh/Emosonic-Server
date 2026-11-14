@@ -2,19 +2,23 @@
 
 import json
 import logging
+import math
 from datetime import datetime, timedelta
-from typing import Mapping
+from typing import Mapping, Optional
 
 import requests
 from peewee import JOIN
 
 from .db import Meta, Track, TrackMetadata, TrackMetadataEnrichmentTask, now
-from .llm_client import LlmConfigError, LlmUpstreamError, _extract_upstream_error
+from .llm_client import LlmConfigError, LlmTimeoutError, LlmUpstreamError
 from .logging_utils import format_log_event
 from .metadata_budget import BudgetExceeded, BudgetUnavailable, MetadataBudget
 from .metadata_pricing import reserve_request_micro_usd, response_cost_micro_usd
+from .metadata_provider_backoff import decode_backoff, read_backoff, record_transient_failure, reset_backoff
+from .metadata_provider_errors import safe_metadata_error_details, transport_error_details
 from .scanner_func.scanner_track_enrich import (
-    LLMMetadataProvider, _claimTrackMetadataEnrichmentTask, _recoverStaleTrackMetadataTasks,
+    LLMMetadataProvider, TrackMetadataInvalidResponseError, TrackMetadataProviderError,
+    TrackMetadataQuotaError, _claimTrackMetadataEnrichmentTask, _recoverStaleTrackMetadataTasks,
     applyTrackMetadataEnrichment, buildTrackMetadataInput, recordTrackEnrichmentAttempt,
 )
 from .scanner_func.scanner_review_tasks import createLowConfidenceTrackMetadataReviewTask
@@ -27,6 +31,44 @@ from .track_metadata_web import (
 logger = logging.getLogger(__name__)
 PAUSE_KEY = "metadata_paid_pause"
 WEB_REASON = "automatic_web_lookup"
+
+
+class MetadataProviderPaused(Exception):
+    def __init__(self, deadline: datetime, reason: str) -> None:
+        super().__init__("Metadata provider is paused.")
+        self.deadline = deadline
+        self.reason = reason
+
+
+def _check_provider_pause() -> Optional[str]:
+    pause = Meta.get_or_none(Meta.key == PAUSE_KEY)
+    if pause and int(pause.value) > datetime.now().timestamp():
+        raise MetadataProviderPaused(datetime.fromtimestamp(int(pause.value)), "metadata_budget_paused")
+    observed = read_backoff()
+    deadline = decode_backoff(observed)["u"]
+    if deadline > datetime.now().timestamp():
+        raise MetadataProviderPaused(datetime.fromtimestamp(deadline), "provider_backoff")
+    return observed
+
+
+def _transient_error_details(error: Exception) -> dict:
+    if isinstance(error, (LlmConfigError, TrackMetadataQuotaError)):
+        return {}
+    if not isinstance(error, (TrackMetadataProviderError, LlmUpstreamError, LlmTimeoutError)):
+        return {}
+    details = getattr(error, "details", {})
+    if details.get("quotaExhausted") or details.get("retryable") is not True:
+        return {}
+    status = details.get("upstreamStatus")
+    transport = details.get("transportError")
+    if not ((type(status) is int and (status in (408, 429) or 500 <= status <= 599))
+            or (status is None and transport in ("timeout", "network"))):
+        return {}
+    retry_after = details.get("retryAfterSeconds", 0)
+    if type(retry_after) not in (int, float) or not math.isfinite(retry_after) or retry_after < 0:
+        retry_after = 0
+    return {"upstream_status": status, "transport_error": transport if transport in ("timeout", "network") else None,
+            "retry_after": min(math.ceil(retry_after), 86400)}
 
 
 def budget_is_configured(config: Mapping[str, object]) -> bool:
@@ -52,6 +94,7 @@ class BudgetedMetadataProvider:
         self.text_provider = LLMMetadataProvider(self.config, self._text_request)
 
     def _request(self, payload: dict, kind: str, before_request=None) -> dict:
+        observed_backoff = _check_provider_pause()
         payload = dict(payload, service_tier="default")
         reservation = self.budget.reserve(kind, reserve_request_micro_usd(payload, kind=kind))
         # A durable attempt marker precedes network I/O, but follows budget approval.
@@ -71,12 +114,13 @@ class BudgetedMetadataProvider:
                     headers={"Authorization": "Bearer " + self.api_key},
                     json=payload, timeout=60, allow_redirects=False,
                 )
-            except requests.RequestException:
-                raise LlmUpstreamError("Metadata request outcome is unknown; allowance retained.") from None
+            except requests.RequestException as error:
+                raise LlmUpstreamError("Metadata request outcome is unknown; allowance retained.",
+                                       transport_error_details(error)) from None
             try:
                 if result.status_code != 200:
                     raise LlmUpstreamError("Metadata API request failed; allowance retained.",
-                                           _extract_upstream_error(result, api_key=self.api_key))
+                                           safe_metadata_error_details(result, api_key=self.api_key))
                 try:
                     response = result.json()
                 except ValueError:
@@ -87,6 +131,7 @@ class BudgetedMetadataProvider:
         if cost is None:
             raise BudgetUnavailable("Metadata usage is unavailable; request allowance retained.")
         self.budget.settle(reservation, cost)
+        reset_backoff(observed_backoff)
         logger.info(format_log_event("track_metadata_enrichment", "metadata_budget_settled",
                                      kind=kind, cost_micro_usd=cost))
         return response
@@ -247,10 +292,11 @@ def _pause_until(deadline: datetime) -> None:
 def runAutomaticMetadataPass(limit: int, provider: BudgetedMetadataProvider,
                              stale_lock_seconds: int = 900, **unused) -> dict:
     summary = {"selected": 0, "enriched": 0, "web_enriched": 0, "failed": 0,
-               "skipped": 0, "budget_paused": False, "tracks": []}
-    pause = Meta.get_or_none(Meta.key == PAUSE_KEY)
-    if pause and int(pause.value) > datetime.now().timestamp():
-        summary["budget_paused"] = True
+               "skipped": 0, "budget_paused": False, "provider_paused": False, "tracks": []}
+    try:
+        _check_provider_pause()
+    except MetadataProviderPaused as error:
+        summary["budget_paused" if error.reason == "metadata_budget_paused" else "provider_paused"] = True
         return summary
     _recoverStaleTrackMetadataTasks(now(), stale_lock_seconds)
     text_limit = max(1, limit - 1) if provider.web_enabled else limit
@@ -293,6 +339,11 @@ def runAutomaticMetadataPass(limit: int, provider: BudgetedMetadataProvider,
                 summary["enriched"] += 1
                 summary["web_enriched"] += int(web)
                 summary["tracks"].append({"id": str(track.id), "stage": "web" if web else "text"})
+            except MetadataProviderPaused as error:
+                recordTrackEnrichmentAttempt(track, provider, "retry", reason=error.reason,
+                                             next_retry_at=error.deadline)
+                summary["budget_paused" if error.reason == "metadata_budget_paused" else "provider_paused"] = True
+                return summary
             except WebMetadataIdentityError as error:
                 if not web:
                     raise
@@ -319,8 +370,9 @@ def runAutomaticMetadataPass(limit: int, provider: BudgetedMetadataProvider,
                 logger.warning(format_log_event("track_metadata_enrichment", "metadata_budget_paused",
                                                 error_type=type(error).__name__))
                 return summary
-            except WebMetadataResultRejected as error:
-                _finish_web_error(metadata, error)
+            except (WebMetadataResultRejected, TrackMetadataInvalidResponseError) as error:
+                if web:
+                    _finish_web_error(metadata, error)
                 recordTrackEnrichmentAttempt(
                     track, provider, "retry", reason="invalid_response",
                     error=type(error).__name__, next_retry_at=now() + timedelta(days=1),
@@ -328,20 +380,35 @@ def runAutomaticMetadataPass(limit: int, provider: BudgetedMetadataProvider,
                 summary["failed"] += 1
                 logger.warning(format_log_event(
                     "track_metadata_enrichment", "metadata_result_rejected",
-                    error_type=type(error).__name__, stage="web",
+                    error_type=type(error).__name__, stage="web" if web else "text",
                 ))
-                return summary
+                continue
             except Exception as error:
                 if web:
                     _finish_web_error(metadata, error)
-                delay = min(86400, 300 * 2 ** min(task.attempt_count, 8))
-                deadline = datetime.now().astimezone() + timedelta(seconds=delay)
-                _pause_until(deadline)
-                recordTrackEnrichmentAttempt(track, provider, "retry", reason="provider_error",
+                transient = _transient_error_details(error)
+                if transient:
+                    deadline, failures = record_transient_failure(transient["retry_after"])
+                    reason = "provider_backoff"
+                    summary["provider_paused"] = True
+                else:
+                    deadline = datetime.now().astimezone() + timedelta(days=1)
+                    _pause_until(deadline)
+                    failures = None
+                    reason = "provider_error"
+                    summary["provider_paused"] = True
+                recordTrackEnrichmentAttempt(track, provider, "retry", reason=reason,
                                              error=type(error).__name__,
                                              next_retry_at=datetime.fromtimestamp(deadline.timestamp()))
                 summary["failed"] += 1
+                details = getattr(error, "details", {})
+                status = details.get("upstreamStatus")
                 logger.warning(format_log_event("track_metadata_enrichment", "metadata_background_retry",
-                                                error_type=type(error).__name__, retry_after_seconds=delay))
+                    error_type=type(error).__name__, failure_class="transient" if transient else "hard",
+                    consecutive_failures=failures,
+                    upstream_status=status if type(status) is int and 100 <= status <= 599 else None,
+                    quota_exhausted=details.get("quotaExhausted") is True,
+                    transport_error=transient.get("transport_error"),
+                    retry_after_seconds=max(0, math.ceil(deadline.timestamp() - datetime.now().timestamp()))))
                 return summary
     return summary

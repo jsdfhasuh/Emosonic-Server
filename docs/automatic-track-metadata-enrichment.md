@@ -104,7 +104,22 @@ pause. The unchanged recording is not retried after a restart. A recording
 modification can make it eligible again through the normal refresh path. Genuine
 endpoint/model/request-bound configuration errors still use global backoff.
 
-Ordinary text failures have exponential backoff. Web attempts are different: a
+Transient connection failures, timeouts, HTTP 408, ordinary rate limits (429),
+and server errors (5xx) use a separate persistent provider backoff. Consecutive
+failures wait 5, 10, 20, then at most 30 minutes, independent of any track's
+lifetime attempt count. A numeric provider `Retry-After` may extend this delay,
+up to 24 hours. An accounted successful response resets the observed failure
+streak without clearing a newer concurrent failure. Authentication, quota,
+configuration, unaccounted invalid responses, and unknown errors retain a
+24-hour hard pause. Budget reset deadlines are not shortened by provider backoff.
+
+An accounted but unusable text result is a track-local failure with a one-day
+retry delay; other candidates continue. Rejected web evidence is also local.
+The provider backoff lives in `Meta.metadata_provider_backoff`; the older
+`metadata_paid_pause` remains a hard/budget pause. Do not automatically truncate
+old pauses: their original failure classification may no longer be available.
+
+Web attempts are different: a
 marker is committed before the network call, and an attempted lookup is terminal
 for that unchanged recording, including failed or inconclusive attempts. This
 prevents repeated searches after restarts and means transient web failures are
@@ -133,7 +148,10 @@ configuration, request bodies, or API keys:
 
 - `metadata_budget_settled`: request kind and accounted `cost_micro_usd`.
 - `metadata_budget_paused`: accounting prevented further paid work.
-- `metadata_background_retry`: retry/backoff with error type and delay.
+- `metadata_background_retry`: transient/hard class, safe HTTP status, consecutive
+  transient failure count, transport category, and retry delay (no error body).
+- `metadata_provider_paused`: daemon correctly reports provider backoff rather
+  than claiming an empty batch completed successfully.
 - `metadata_identity_skipped`: recording-local invalid identity, no paid request.
 
 A `web_lookup` marker alone does not prove a search was sent: distinguish

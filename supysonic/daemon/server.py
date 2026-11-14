@@ -265,6 +265,13 @@ class Daemon:
                     enriched=summary["enriched"], failed=summary["failed"],
                 ))
                 return False
+            if summary.get("provider_paused"):
+                logger.info(format_log_event(
+                    "daemon", "metadata_provider_paused",
+                    provider=provider_name, selected=summary["selected"],
+                    enriched=summary["enriched"], failed=summary["failed"],
+                ))
+                return False
             if summary.get("quota_exhausted"):
                 logger.warning(
                     format_log_event(

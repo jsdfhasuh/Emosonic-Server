@@ -49,6 +49,33 @@ class TrackMetadataBudgetRoutingTestCase(unittest.TestCase):
         legacy_pass.assert_not_called()
         legacy_provider.assert_not_called()
 
+    def test_daemon_provider_pause_is_not_reported_as_completed(self):
+        self.summary.update(provider_paused=True, selected=1, failed=1)
+        with patch("supysonic.daemon.server.get_track_metadata_llm_config", return_value=self.settings), \
+                patch("supysonic.daemon.server.open_connection", return_value=False), \
+                patch("supysonic.daemon.server.runAutomaticMetadataPass", return_value=self.summary) as automatic, \
+                self.assertLogs("supysonic.daemon.server", level="INFO") as captured:
+            daemon = self.daemon()
+            self.assertFalse(daemon._Daemon__run_track_metadata_enrichment())
+            self.assertEqual(daemon._Daemon__get_track_metadata_enrichment_interval(), 300)
+        automatic.assert_called_once()
+        output = "\n".join(captured.output)
+        self.assertIn("event=metadata_provider_paused", output)
+        self.assertNotIn("event=track_metadata_enrichment_completed", output)
+        self.assertNotIn("event=track_metadata_enrichment_budget_paused", output)
+
+    def test_daemon_budget_pause_keeps_existing_log_and_priority(self):
+        self.summary.update(budget_paused=True, provider_paused=True)
+        with patch("supysonic.daemon.server.get_track_metadata_llm_config", return_value=self.settings), \
+                patch("supysonic.daemon.server.open_connection", return_value=False), \
+                patch("supysonic.daemon.server.runAutomaticMetadataPass", return_value=self.summary), \
+                self.assertLogs("supysonic.daemon.server", level="INFO") as captured:
+            self.assertFalse(self.daemon()._Daemon__run_track_metadata_enrichment())
+        output = "\n".join(captured.output)
+        self.assertIn("event=track_metadata_enrichment_budget_paused", output)
+        self.assertNotIn("event=metadata_provider_paused", output)
+        self.assertNotIn("event=track_metadata_enrichment_completed", output)
+
     def test_cli_uses_budgeted_provider_even_for_forced_enrichment(self):
         with patch("supysonic.cli.get_track_metadata_llm_config", return_value=self.settings), \
                 patch("supysonic.cli.runTrackMetadataEnrichmentPass", return_value=self.summary) as run_pass, \

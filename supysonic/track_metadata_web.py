@@ -16,6 +16,7 @@ from .llm_client import (
     LlmUpstreamError,
 )
 from .metadata_pricing import MODEL, reserve_request_micro_usd
+from .metadata_provider_errors import safe_metadata_error_details, transport_error_details
 
 
 ENDPOINT = "https://api.openai.com/v1/responses"
@@ -307,24 +308,16 @@ def post_web_response(api_key: str, payload: Mapping[str, object], timeout_secon
                                "Content-Type": "application/json"},
             json=dict(payload), timeout=timeout_seconds, allow_redirects=False,
         )
-    except requests.exceptions.Timeout:
-        raise LlmTimeoutError("Web metadata request timed out; outcome is uncertain.") from None
-    except requests.exceptions.RequestException:
-        raise LlmUpstreamError("Web metadata request failed; outcome is uncertain.") from None
+    except requests.exceptions.Timeout as error:
+        raise LlmTimeoutError("Web metadata request timed out; outcome is uncertain.",
+                              details=transport_error_details(error)) from None
+    except requests.exceptions.RequestException as error:
+        raise LlmUpstreamError("Web metadata request failed; outcome is uncertain.",
+                               details=transport_error_details(error)) from None
     try:
         if response.status_code != 200:
-            details = {"upstreamStatus": response.status_code,
-                       "rateLimited": response.status_code == 429,
-                       "retryable": response.status_code == 429 or response.status_code >= 500}
-            code = None
-            try:
-                body = response.json()
-                error = body.get("error", {}) if isinstance(body, dict) else {}
-                code = error.get("code") if isinstance(error, dict) else None
-            except (ValueError, TypeError):
-                pass
-            if code == "insufficient_quota":
-                details["quotaExhausted"] = True
+            details = safe_metadata_error_details(response, api_key=api_key)
+            if details["quotaExhausted"]:
                 raise LlmQuotaError("Web metadata quota is exhausted.", details=details)
             raise LlmUpstreamError("Web metadata HTTP request failed.", details=details)
         if len(response.content) > MAX_RESPONSE_BYTES:

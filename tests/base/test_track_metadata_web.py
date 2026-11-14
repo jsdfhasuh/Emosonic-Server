@@ -295,7 +295,44 @@ class TrackMetadataWebTestCase(unittest.TestCase):
             with self.assertRaises(expected) as raised:
                 post_web_response("secret-key", build_web_payload(TRACK, CONFIG))
             self.assertNotIn("secret-key", str(raised.exception))
+            self.assertNotIn("secret-key", str(raised.exception.details))
+            self.assertTrue(raised.exception.details["retryable"])
+            self.assertEqual(raised.exception.details["transportError"],
+                             "timeout" if expected is LlmTimeoutError else "network")
             post.assert_called_once()
+
+    @patch("supysonic.track_metadata_web.requests.post")
+    def test_transport_configuration_failure_remains_nonretryable(self, post):
+        for error in (requests.exceptions.SSLError("secret-key"),
+                      requests.exceptions.InvalidURL("secret-key")):
+            with self.subTest(error=type(error).__name__):
+                post.reset_mock()
+                post.side_effect = error
+                with self.assertRaises(LlmUpstreamError) as raised:
+                    post_web_response("secret-key", build_web_payload(TRACK, CONFIG))
+                self.assertEqual(raised.exception.details, {"retryable": False})
+                self.assertNotIn("secret-key", str(raised.exception))
+                post.assert_called_once()
+
+    @patch("supysonic.track_metadata_web.requests.post")
+    def test_http_classification_and_retry_hint_are_safe(self, post):
+        for status, retryable in ((408, True), (429, True), (503, True), (401, False)):
+            with self.subTest(status=status):
+                post.reset_mock()
+                upstream = Mock(status_code=status, headers={"Retry-After": "75"})
+                upstream.json.return_value = {"error": {"message": "Bearer secret-key"}}
+                post.return_value = upstream
+                with self.assertRaises(LlmUpstreamError) as raised:
+                    post_web_response("secret-key", build_web_payload(TRACK, CONFIG))
+                self.assertEqual(raised.exception.details["retryable"], retryable)
+                self.assertEqual(raised.exception.details["upstreamStatus"], status)
+                if retryable:
+                    self.assertEqual(raised.exception.details["retryAfterSeconds"], 75)
+                else:
+                    self.assertNotIn("retryAfterSeconds", raised.exception.details)
+                self.assertNotIn("secret-key", str(raised.exception.details))
+                upstream.close.assert_called_once()
+                post.assert_called_once()
 
     @patch("supysonic.track_metadata_web.requests.post")
     def test_http_redirect_and_quota_are_safe(self, post):
@@ -308,4 +345,24 @@ class TrackMetadataWebTestCase(unittest.TestCase):
                 post_web_response("secret-key", build_web_payload(TRACK, CONFIG))
             self.assertNotIn("secret-key", str(raised.exception))
             self.assertNotIn("secret-key", str(raised.exception.details))
+            self.assertFalse(raised.exception.details["retryable"])
             upstream.close.assert_called_once()
+
+    @patch("supysonic.track_metadata_web.requests.post")
+    def test_unaccounted_invalid_json_keeps_transport_error_type(self, post):
+        for invalid_value in (ValueError("secret-body"), []):
+            with self.subTest(invalid_value=type(invalid_value).__name__):
+                post.reset_mock()
+                upstream = Mock(status_code=200, content=b"invalid")
+                if isinstance(invalid_value, ValueError):
+                    upstream.json.side_effect = invalid_value
+                else:
+                    upstream.json.return_value = invalid_value
+                post.return_value = upstream
+                with self.assertRaises(LlmInvalidResponseError) as raised:
+                    post_web_response("secret-key", build_web_payload(TRACK, CONFIG))
+                self.assertNotIsInstance(raised.exception, WebMetadataResultRejected)
+                self.assertEqual(raised.exception.details, {})
+                self.assertNotIn("secret-body", str(raised.exception))
+                post.assert_called_once()
+                upstream.close.assert_called_once()
