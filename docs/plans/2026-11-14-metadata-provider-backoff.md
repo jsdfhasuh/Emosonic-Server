@@ -49,4 +49,27 @@ distinguish transient failures from configuration and accounting failures.
 
 - Baseline: deployed code revision `3aa5b57`, with documentation commit `30ef17f`.
 - No client changes or public release are needed.
-- Implementation and verification: in progress.
+- Implementation, focused tests, independent review, deployment, and bounded
+  live verification completed on 2026-11-14.
+
+## Verification result
+
+- Code revision: `ae8d27d6942f48acc3a089d2f3b0109368b94f5c`.
+- Focused offline suite: 118 tests passed. The first sandboxed combined run hit
+  Windows temporary-directory permissions; the unchanged suite passed outside
+  that sandbox, then passed again after final integration changes.
+- Linux CI: 2,351 tests (3 skipped), plus 5 network tests (1 skipped), package
+  checks, image revision validation, and AMD64/ARM64 publication succeeded.
+- CI run: https://github.com/jsdfhasuh/Emosonic-Server/actions/runs/43543422280
+- Image-only deployment passed health and exact configuration preservation
+  checks, retaining the previous container for rollback.
+- The precisely matched legacy pause was resumed once after backup and CAS
+  checks. The recovery did not modify budget records or release reservations.
+  The old record did not retain its HTTP status, so it was not retroactively
+  classified as a proven transient error.
+- The first natural batch at 10:14 Asia/Shanghai processed two text records and
+  one web record: selected=3, enriched=3, failed=0. The original blocking task
+  completed, both global pause states were absent, and new usage settled.
+- An enriched web task can still have unknown language; task completion is not
+  equivalent to fully resolved metadata. Long-term behavior remains subject to
+  future provider failures and budget admission, not this bounded observation.
