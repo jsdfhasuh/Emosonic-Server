@@ -73,3 +73,23 @@ Logs use `openai_recommendation_accounted workload=profile|daily|chat` with
 micro-USD cost, without credentials or prompts. Local deterministic tests mock
 OpenAI; a live deployment still requires bounded profile/daily/chat probes and
 separate user listening acceptance.
+
+## Client acceptance
+
+No Android or Windows application build is required. On each platform:
+
+1. Open Discovery and pull to refresh daily recommendations. The existing daily
+   playlist must open with real library songs and its normal cover/title fields.
+2. Refresh again: the same day's order should remain stable, with no additional
+   `recommendation_daily` reservation or accounted-call log.
+3. Tap a recommended song once. Record expected versus actual title/audio and
+   whether playback starts with one tap; backend health does not establish this.
+4. Confirm favorites, play history and negative feedback retain their behavior.
+
+For a playback mismatch, provide both Android controller and Windows authority
+logs with the test time and expected/actual behavior. The default Windows log is
+`%USERPROFILE%\Documents\debug.log`; it must not be edited or truncated. Android
+logs may be collected read-only through an already-authorized ADB connection.
+Server-side evidence is `openai_recommendation_accounted` and the persisted budget
+workload records. Real-device and subjective listening acceptance are separate
+from automated tests and the bounded live service probes.

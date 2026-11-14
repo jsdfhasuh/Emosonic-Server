@@ -56,4 +56,17 @@ spending and unknown-outcome reservations must not be reset.
 - https://developers.openai.com/api/docs/guides/structured-outputs?api-mode=chat
 - https://developers.openai.com/api/docs/guides/latest-model/gpt-6-astra.md
 - Baseline deployed code: `ae8d27d`; documentation baseline: `c62b224`.
-- Implementation and acceptance: in progress.
+- Implemented and deployed code: `34f08079bc9643800259a8776a13ad22c46f4a73`.
+- Local integration regression: 232 tests passed; the final bounded-chat and
+  transport suite passed 21 tests after the last input/concurrency hardening.
+- Linux CI: 2415 tests (3 skips), network suite 5 tests (1 skip), wheel/sdist
+  verification and AMD64/ARM64 image publication passed.
+  https://github.com/jsdfhasuh/Emosonic-Server/actions/runs/43551306598
+- Live bounded acceptance: background profiles generated and accounted;
+  profile reads reused cache; chat first call succeeded and repeat was a free
+  cache hit; one daily ranking of 150 candidates produced a validated 50-track
+  replacement, with private prior-content backup and unchanged playlist ID.
+- New recommendation requests settled without new unknown reservations; existing
+  metadata counters, reservations, budget and provider-backoff state preserved.
+- Rollback container/config retained. Client playback and subjective recommendation
+  quality remain pending user validation; this is personal-lab acceptance only.
