@@ -8,14 +8,17 @@
 import os
 import os.path
 import sys
+import warnings
 
-from datetime import datetime
+from importlib.util import find_spec
 
-from gevent import socket
-from gevent.pywsgi import WSGIServer
-from geventwebsocket.handler import WebSocketHandler
+from gevent import monkey
 
 from ._base import BaseServer
+
+
+if find_spec("geventwebsocket") is None:
+    raise ImportError("The gevent backend requires gevent-websocket")
 
 
 class FlushingStream:
@@ -30,48 +33,55 @@ class FlushingStream:
         self._stream.flush()
 
 
-class EmosonicWebSocketHandler(WebSocketHandler):
-    def format_request(self):
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        status = (self._orig_status or self.status or "000").split()[0]
-        length = self.response_length or "-"
-        if self.time_finish:
-            duration = f"{(self.time_finish - self.time_start):.6f}s"
-        else:
-            duration = "-"
-
-        client_address = (
-            self.client_address[0]
-            if isinstance(self.client_address, tuple)
-            else self.client_address
-        ) or "-"
-        method = self.command or "-"
-        path = self.path or "-"
-        if path.startswith("/emo/ws"):
-            category = "SOCKET"
-        elif path.startswith("/rest/stream"):
-            category = "STREAM"
-        elif path.startswith("/rest/"):
-            category = "REST"
-        else:
-            category = "HTTP"
-        return (
-            f"[{now}] [ACCESS:{category}] {client_address} {method} {path} "
-            f"status={status} bytes={length} duration={duration}"
-        )
-
-    def log_request(self):
-        self.server.log.write(self.format_request() + "\n")
-
-
 class GeventServer(BaseServer):
+    @classmethod
+    def prepare_runtime(cls) -> None:
+        """Make I/O, locks and connection locals cooperative before app imports."""
+        required = ("socket", "ssl", "threading", "time", "select")
+        if all(monkey.is_module_patched(name) for name in required):
+            return
+
+        unsafe = (
+            "ssl",
+            "peewee",
+            "supysonic.web",
+            "supysonic.db",
+            "supysonic.db_layer",
+            "supysonic.emo",
+        )
+        loaded = [name for name in unsafe if name in sys.modules]
+        if loaded:
+            raise RuntimeError(
+                "Gevent runtime must be prepared before importing application, "
+                "database or SSL state; already imported: " + ", ".join(loaded)
+                + ". Start a fresh process with supysonic-server -S gevent."
+            )
+
+        # Network-only patching would leave Peewee locals and locks shared by
+        # concurrent greenlets. Patch the complete runtime before creating them.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", monkey.MonkeyPatchWarning)
+            monkey.patch_all()
+        if not all(monkey.is_module_patched(name) for name in required):
+            raise RuntimeError("Gevent runtime preparation was incomplete")
+
     def _build_kwargs(self):
+        import logging
+
+        from gevent import socket
+
+        from ._gevent_handler import EmosonicWebSocketHandler
+
         rv = {
             "application": self._load_app(),
             "handler_class": EmosonicWebSocketHandler,
             "log": FlushingStream(sys.stdout),
             "error_log": FlushingStream(sys.stderr),
         }
+        logging.getLogger(__name__).info(
+            "server event=gevent_runtime_ready socket=cooperative "
+            "connection_local=greenlet locks=cooperative"
+        )
 
         if self._socket is not None:
             if os.path.exists(self._socket):
@@ -88,6 +98,8 @@ class GeventServer(BaseServer):
         return rv
 
     def _run(self, **kwargs):
+        from gevent.pywsgi import WSGIServer
+
         return WSGIServer(**kwargs).serve_forever()
 
 

@@ -7,9 +7,6 @@
 
 from abc import ABCMeta, abstractmethod
 
-from ..web import create_application
-
-
 class BaseServer(metaclass=ABCMeta):
     def __init__(
         self, *, host=None, port=None, socket=None, processes=None, threads=None
@@ -20,6 +17,10 @@ class BaseServer(metaclass=ABCMeta):
         self._processes = processes
         self._threads = threads
 
+    @classmethod
+    def prepare_runtime(cls) -> None:
+        """Prepare the backend before application state is imported."""
+
     @abstractmethod
     def _build_kwargs(self): ...
 
@@ -27,7 +28,10 @@ class BaseServer(metaclass=ABCMeta):
     def _run(self, **kwargs): ...
 
     def _load_app(self):
+        from ..web import create_application
+
         return create_application()
 
     def run(self):
+        self.prepare_runtime()
         self._run(**self._build_kwargs())

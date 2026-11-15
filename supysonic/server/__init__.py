@@ -14,7 +14,6 @@ from click.exceptions import UsageError, ClickException
 from click.types import Choice
 
 from ..config import IniConfig
-from ..emo.strict_v2_safety import validate_strict_v2_worker_count
 
 
 _servers = [
@@ -122,6 +121,14 @@ def main(server, host, port, socket, processes, threads):
     if socket is not None:
         host = None
         port = None
+
+    try:
+        server.prepare_runtime()
+    except RuntimeError as exc:
+        raise ClickException(str(exc)) from exc
+
+    # The safety module imports application state and must follow runtime setup.
+    from ..emo.strict_v2_safety import validate_strict_v2_worker_count
 
     runtime_config = IniConfig.from_common_locations()
     try:

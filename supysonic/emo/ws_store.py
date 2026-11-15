@@ -317,6 +317,7 @@ _strict_playback_context_locks = {}
 _strict_playback_context_locks_guard = threading.Lock()
 _strict_authority_pair_locks = {}
 _strict_authority_pair_locks_guard = threading.Lock()
+_strict_sqlite_transaction_lock = threading.RLock()
 _strict_stable_client_locks = {}
 _strict_stable_client_locks_guard = threading.Lock()
 _core_startup_recovery_lock = threading.RLock()
@@ -1249,8 +1250,11 @@ def _strict_authority_pair_lock(authority_pairs):
 @contextmanager
 def _strict_playback_context_transaction() -> Iterator[None]:
     if isinstance(db.obj, SqliteDatabase):
-        with db.atomic("IMMEDIATE"):
-            yield
+        # Wait cooperatively before SQLite's native busy wait can stall the
+        # greenlet that owns the write transaction and needs to commit it.
+        with _strict_sqlite_transaction_lock:
+            with db.atomic("IMMEDIATE"):
+                yield
         return
     with db.atomic():
         yield

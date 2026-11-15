@@ -1897,50 +1897,9 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
             self.assertEqual(context["authorityClientId"], "source-1")
 
     def test_close_and_complete_handoff_are_linearized_by_context_tombstone(self):
-        createStrictPlaybackContextState(
+        committed_handoff = self._commit_exact_handoff_source(
             "context-close-race",
-            "alice",
-            "source-1",
-            "device:source-1",
-            ["song-1"],
-            0,
-            100,
-            "playing",
-        )
-        savePlaybackHandoff(
-            {
-                "handoffId": "handoff-close-race",
-                "requestId": "handoff-start-close-race",
-                "playbackContextId": "context-close-race",
-                "userName": "alice",
-                "sourceClientId": "source-1",
-                "sourceDeviceSessionId": "device:source-1",
-                "sourceConnectionNonce": "source-nonce-close",
-                "sourceConnectionEpoch": 1,
-                "targetClientId": "target-1",
-                "targetDeviceSessionId": "device:target-1",
-                "targetConnectionNonce": "target-nonce-close",
-                "targetConnectionEpoch": 1,
-                "originClientId": "controller-1",
-                "status": "committed",
-                "baseControlVersion": 1,
-                "contextEpoch": 1,
-                "controlVersion": 2,
-                "prepareId": "prepare-close-race",
-                "snapshot": {
-                    "sourceEpoch": 1,
-                    "sourceControlVersion": 1,
-                    "handoffControlVersion": 2,
-                    "prepareId": "prepare-close-race",
-                    "currentIndex": 0,
-                    "trackId": "song-1",
-                    "positionMs": 100,
-                    "positionSampledAtServerMs": 1000,
-                    "playbackRate": 1.0,
-                    "effectiveAtServerMs": 1000,
-                    "trackDurationMs": None,
-                },
-            }
+            "handoff-close-race",
         )
         barrier = threading.Barrier(2)
 
@@ -1959,8 +1918,8 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
                     "context-close-race",
                     "handoff-close-race",
                     "alice",
-                    "target-1",
-                    "device:target-1",
+                    committed_handoff["targetClientId"],
+                    committed_handoff["targetDeviceSessionId"],
                 )
                 return "completed", completed[0]
             except PlaybackContextClosedError as exc:
@@ -1985,13 +1944,17 @@ class EmoWebSocketStoreTestCase(unittest.TestCase):
         )
         self.assertEqual(context["lifecycle"], "closed")
         if handoff["status"] == "completed":
-            self.assertEqual(context["authorityClientId"], "target-1")
+            self.assertEqual(
+                context["authorityClientId"], committed_handoff["targetClientId"]
+            )
             self.assertEqual(context["version"], 3)
             self.assertEqual(context["controlVersion"], 2)
         else:
             self.assertEqual(handoff["status"], "failed")
             self.assertEqual(handoff["errorCode"], "context_closed")
-            self.assertEqual(context["authorityClientId"], "source-1")
+            self.assertEqual(
+                context["authorityClientId"], committed_handoff["sourceClientId"]
+            )
             self.assertEqual(context["version"], 2)
             self.assertEqual(context["controlVersion"], 1)
 
