@@ -10,6 +10,7 @@ from unittest.mock import patch
 from emosonic_player.config import load_config, read_password, client_identity
 from emosonic_player.cli import parser, main
 from emosonic_player.stream import MediaClient
+from emosonic_player.main import main as daemon_main
 
 
 class ConfigTests(unittest.TestCase):
@@ -45,6 +46,16 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(parser().parse_args(['play', '--playlist', 'id']).playlist, 'id')
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             parser().parse_args(['--password', 'secret'])
+
+    def test_audio_check_does_not_load_config_or_credentials(self):
+        args = ['emosonic-playerd', '--config', '/not-present', '--check-audio',
+                'alsa/plughw:CARD=USB,DEV=0']
+        with (patch('sys.argv', args),
+              patch('emosonic_player.main.check_audio') as check,
+              patch('emosonic_player.main.load_config') as load):
+            self.assertEqual(daemon_main(), 0)
+        check.assert_awaited_once_with('alsa/plughw:CARD=USB,DEV=0')
+        load.assert_not_called()
 
     def test_stream_url_authentication_not_plain_password(self):
         client = MediaClient('https://music.example.test', 'test', 'private-test')

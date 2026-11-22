@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 import tempfile
 
+from .config import validate_audio_device
+
 
 class MpvError(RuntimeError):
     """Safe error category; deliberately excludes mpv response/URL text."""
@@ -25,9 +27,9 @@ class MpvPlayer:
     def __init__(self, audio_device: str, runtime_dir: str | Path,
                  executable: str = "mpv", timeout: float = 10.0,
                  *, allow_null_output_for_tests: bool = False):
-        if (not audio_device or audio_device == "auto"
-                or (audio_device == "null" and not allow_null_output_for_tests)):
-            raise ValueError("an explicit audio device is required")
+        if not (audio_device == "null" and allow_null_output_for_tests):
+            validate_audio_device(audio_device)
+        self.expected_ao = "null" if audio_device == "null" else "alsa"
         self.audio_device = audio_device
         self.runtime_dir = Path(runtime_dir)
         self.executable = executable
@@ -67,8 +69,9 @@ class MpvPlayer:
                 "--no-config", "--load-scripts=no", "--terminal=no",
                 "--input-default-bindings=no", "--input-terminal=no",
                 "--audio-fallback-to-null=no",
-                *( ["--ao=null"] if self.audio_device == "null" else
-                   ["--audio-device=" + self.audio_device] ),
+                # The alsa/ prefix selects ALSA and the PCM in one option.
+                *(["--ao=null"] if self.expected_ao == "null" else
+                  ["--audio-device=" + self.audio_device]),
                 "--input-ipc-server=" + str(socket),
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,
@@ -224,6 +227,8 @@ class MpvPlayer:
                         and not await self._command(["get_property", "paused-for-cache"])
                         and not await self._command(["get_property", "core-idle"]))
             await self._until(playing)
+            if await self._command(["get_property", "current-ao"]) != self.expected_ao:
+                raise MpvError("mpv_audio_output_mismatch")
 
     async def pause(self) -> None:
         async with self._operation():

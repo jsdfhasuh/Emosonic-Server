@@ -39,7 +39,7 @@ class MemoryWriter:
 class FakeMpv:
     def __init__(self):
         self.props = {"pause": True, "paused-for-cache": False, "core-idle": False,
-                      "seeking": False, "idle-active": True, "time-pos": 0, "duration": 10, "volume": 100}
+                      "seeking": False, "idle-active": True, "current-ao": "alsa", "time-pos": 0, "duration": 10, "volume": 100}
         self.entry = 0
         self.writer = None
         self.ignore = False
@@ -120,6 +120,14 @@ class MpvTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["volume"], 25)
         self.assertNotIn("secret", str(status))
 
+    async def test_play_rejects_wrong_audio_backend_and_closes_process(self):
+        await self.player.load("local.wav", "run1")
+        self.fake.props["current-ao"] = "pulse"
+        with self.assertRaisesRegex(MpvError, "mpv_audio_output_mismatch"):
+            await self.player.play()
+        self.assertIsNone(self.player._writer)
+        self.assertIsNone(self.player._run_id)
+
     async def test_eof_once_and_same_song_new_occurrence(self):
         await self.player.load("https://example/song", "occurrence1")
         old = self.fake.entry
@@ -192,7 +200,8 @@ class MpvTests(unittest.IsolatedAsyncioTestCase):
             await self.player.load("url", "r", float("nan"))
 
     def test_requires_explicit_output(self):
-        for value in ("", "auto", "null"):
+        for value in ("", "auto", "null", "pulse/default", "alsa/", "alsa/default",
+                      "alsa/null", "alsa/sysdefault"):
             with self.assertRaises(ValueError):
                 MpvPlayer(value, self.temp.name)
 

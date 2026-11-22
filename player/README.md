@@ -58,10 +58,53 @@ CI `.github/workflows/player-build.yaml` 是独立 build-only 流程：测试、
 基础镜像标签及系统间接依赖不是不可变快照；正式发布时记录实际 image digest
 及包清单。不能仅看 mpv 包大小推断最终镜像体积。构建会检查 ALSA 输出是否存在。
 
+## AB13X USB 声卡：先验收本地链路
+
+```text
+OpenWrt 上的 emosonic-playerd → 私有 Unix socket / mpv JSON IPC
+                            → mpv 的 ALSA 输出 → snd-usb-audio → AB13X → 音箱
+```
+
+App 和 SSH CLI 仍走同一个 playerd 与服务端队列。没有 MPD、PulseAudio、
+蓝牙、图形界面或对外开放的 mpv 端口；这次也不改服务器协议。
+
+1. 在 OpenWrt 上插好声卡，用 `cat /proc/asound/cards` 和 `aplay -l`（若已安装）
+   对照 USB 声卡与播放设备；有多个 USB 声卡时，用 `lsusb`（若已安装）
+   与 `/sys/class/sound/cardN/device` 对照，不能仅凭 USB 声卡出现在列表就认定是 AB13X。
+   `N` 是本次枚举的卡号、`D` 是播放设备号，容器只映射
+   `/dev/snd/pcmCNDp` 和 `/dev/snd/controlCN`（把 `N`、`D` 换成数字）。
+2. 用 `cat /proc/asound/cardN/id` 取 ALSA 卡 ID，并将它填入
+   `alsa/plughw:CARD=<卡ID>,DEV=<播放设备号>`。不要把商品名或
+   `hw:0,0` 写死，也不要选择 `alsa/default`。若采用其他显式 PCM，
+   可参考 `mpv --audio-device=help`；`plughw` 允许 ALSA 转换格式，
+   不要求它一定在 mpv 的枚举列表中。
+3. 开启音箱并先调低它自己的物理音量。用与正式播放同一镜像、同一对设备节点
+   跑本地 2 秒测试音。无需账号、服务器或网络，例如已设置 Compose 所用的
+   `AUDIO_GID`、`ALSA_PCM_DEVICE` 和 `ALSA_CONTROL_DEVICE` 后：
+
+   ```sh
+   docker run --rm --network none --cap-drop ALL \
+     --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec \
+     --group-add "$AUDIO_GID" \
+     --device "$ALSA_PCM_DEVICE:$ALSA_PCM_DEVICE:rw" \
+     --device "$ALSA_CONTROL_DEVICE:$ALSA_CONTROL_DEVICE:rw" \
+     --entrypoint emosonic-playerd "${PLAYER_IMAGE:-emosonic-player:local}" \
+     --check-audio 'alsa/plughw:CARD=<卡ID>,DEV=<播放设备号>'
+   ```
+
+   原生环境已具备 Python 3.12+、可运行本包及带 ALSA/JSON IPC 的 mpv 时，也可以直接
+   跑 `emosonic-playerd --check-audio <ALSA_PCM>`；镜像仍是本分支的交付路径。
+   测试只接触所选声卡，若设备被其他播放器占用，不要并行跑或停止不相关服务。
+   返回 0 表示 mpv 经 IPC 报告 ALSA 输出并完整播放，**仍需耳听确认 AB13X 接的音箱**
+   出声。如果没有设备、权限不足或错误地打开了其他后端，不报告测试成功。
+4. 将同一个 PCM 写入 `config.json`，再按下文进行 App/CLI 与真实音箱的联合验收。
+   换 USB 口或热插拔后，卡 ID 可能不变，但容器映射的设备节点可能变了；
+   先重新确认节点，必要时仅重建播放器容器。不开启自动播放或服务自启动。
+
 ## 配置和凭据
 
 复制 `config.example.json` 到仓库外的私有目录，填入实际服务器 HTTPS 地址、
-用户名和**设备枚举得到的明确 ALSA 名称**。默认拒绝明文 HTTP；
+用户名和**已确认的特定 ALSA PCM**。默认拒绝明文 HTTP；
 `allow_insecure_http` 仅供隔离本地开发使用，不用于真实账户的公网连接。
 
 密码通过 `password_file` 指定的独立文件读取，不提供命令行密码参数。

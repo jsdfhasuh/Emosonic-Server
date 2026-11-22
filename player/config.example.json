@@ -6,7 +6,7 @@
   "client_id_file": "/var/lib/emosonic-player/client-id",
   "runtime_dir": "/run/emosonic-player",
   "state_dir": "/var/lib/emosonic-player",
-  "audio_device": "alsa/REPLACE_WITH_EXACT_ENUMERATED_DEVICE",
+  "audio_device": "alsa/plughw:CARD=REPLACE_WITH_ALSA_CARD_ID,DEV=0",
   "protocol_version": "2.9.0",
   "initial_volume": 20,
   "allow_insecure_http": false

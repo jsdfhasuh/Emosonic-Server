@@ -7,6 +7,14 @@ import uuid
 from urllib.parse import urlsplit
 
 
+def validate_audio_device(value: str) -> None:
+    driver, separator, pcm = value.partition('/')
+    if (driver != 'alsa' or not separator or not pcm or pcm != pcm.strip()
+            or pcm.split(':', 1)[0] in ('auto', 'default', 'null')
+            or pcm == 'sysdefault'):
+        raise ValueError('select an explicit ALSA PCM, not auto, default or null')
+
+
 def load_config(path: str) -> dict:
     config = json.loads(Path(path).read_text())
     for key in ('server_url', 'username', 'password_file', 'audio_device'):
@@ -21,8 +29,7 @@ def load_config(path: str) -> dict:
         raise ValueError('HTTPS required; HTTP is explicit local development only')
     if not url.hostname:
         raise ValueError('server hostname required')
-    if not config['audio_device'].startswith('alsa/') or config['audio_device'] in ('alsa/null', 'alsa/default'):
-        raise ValueError('an explicit enumerated ALSA device is required')
+    validate_audio_device(config['audio_device'])
     config.setdefault('device_name', 'OpenWrt speaker')
     config.setdefault('runtime_dir', '/run/emosonic-player')
     config.setdefault('state_dir', '/var/lib/emosonic-player')
