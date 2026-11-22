@@ -1,6 +1,7 @@
 """Bounded OpenAI ranking of eligible local-library recommendation candidates."""
 
 import json
+import logging
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 
 from .db import Track, TrackMetadata, User
@@ -25,12 +26,14 @@ from .user_listening_profile import (
     get_recommendation_language,
 )
 
+logger = logging.getLogger(__name__)
 
 DAILY_CANDIDATE_LIMIT = 150
 DAILY_CONTEXT_MAX_BYTES = 48 * 1024
 DAILY_CACHE_TTL_SECONDS = 48 * 60 * 60
 DAILY_INVALID_RETRY_SECONDS = 6 * 60 * 60
 DAILY_PROMPT_VERSION = 1
+DAILY_VALIDATION_VERSION = 2
 
 DAILY_SYSTEM_PROMPT = (
     "Rank local music candidates for a daily discovery playlist. Return every "
@@ -175,6 +178,7 @@ def _ranking_schema(candidate_count: int) -> Dict[str, object]:
 
 
 def _validate_ranking(payload: object, candidate_count: int) -> List[int]:
+    """Validate candidate IDs and place omitted candidates after the model's picks."""
     if not isinstance(payload, dict) or set(payload) != {"ranked_candidate_ids"}:
         raise OpenAIRecommendationError(
             "Invalid daily recommendation response shape", reason="invalid_response"
@@ -183,13 +187,25 @@ def _validate_ranking(payload: object, candidate_count: int) -> List[int]:
     if (
         not isinstance(ranking, list)
         or len(ranking) != candidate_count
-        or any(type(index) is not int for index in ranking)
-        or set(ranking) != set(range(1, candidate_count + 1))
+        or any(
+            type(index) is not int or not 1 <= index <= candidate_count
+            for index in ranking
+        )
     ):
         raise OpenAIRecommendationError(
             "Invalid daily recommendation candidate identifiers", reason="invalid_response"
         )
-    return ranking
+    ordered_ids = dict.fromkeys(ranking)
+    duplicate_count = candidate_count - len(ordered_ids)
+    if duplicate_count:
+        logger.info(
+            "openai_daily_ranking_deduplicated candidate_count=%d duplicate_count=%d",
+            candidate_count, duplicate_count,
+        )
+        # Candidate IDs follow the existing local preference order.
+        for index in range(1, candidate_count + 1):
+            ordered_ids.setdefault(index)
+    return list(ordered_ids)
 
 
 def select_openai_daily_tracks(
@@ -221,6 +237,7 @@ def select_openai_daily_tracks(
     if payload is None:
         failure_hash = build_recommendation_agent_context_hash({
             "workload": "openai_daily_invalid", "day": day,
+            "validationVersion": DAILY_VALIDATION_VERSION,
         })
         if get_cached_recommendation_agent_payload(user, failure_hash) is not None:
             raise OpenAIRecommendationError("Daily recommendation validation retry is delayed")
@@ -246,7 +263,7 @@ def select_openai_daily_tracks(
             raise
         save_recommendation_agent_cache_payload(
             user, context_hash, "__openai_daily_v1__", "", str(settings.get("model") or ""),
-            payload, ttl_seconds=DAILY_CACHE_TTL_SECONDS,
+            {"ranked_candidate_ids": ranking}, ttl_seconds=DAILY_CACHE_TTL_SECONDS,
         )
     else:
         ranking = _validate_ranking(payload, len(candidates))

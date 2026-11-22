@@ -14,6 +14,10 @@ from supysonic.recommend import (
     create_recommend_playlist,
     refreshDailyRecommendPlaylists,
 )
+from supysonic.recommendation_agent_cache import (
+    build_recommendation_agent_context_hash,
+    save_recommendation_agent_cache_payload,
+)
 from supysonic.recommendation_feedback import set_recommendation_feedback
 from supysonic.recommendation_openai_daily import (
     DAILY_CANDIDATE_LIMIT,
@@ -26,11 +30,10 @@ from ..testbase import TestBase
 
 
 class OpenAIDailyRankingValidationTestCase(unittest.TestCase):
-    def test_exact_permutation_required(self):
+    def test_ranking_rejects_invalid_shape_type_and_range(self):
         self.assertEqual(_validate_ranking({"ranked_candidate_ids": [3, 1, 2]}, 3), [3, 1, 2])
         invalid = [
             None, [], {}, {"ranked_candidate_ids": [1, 2]},
-            {"ranked_candidate_ids": [1, 2, 2]},
             {"ranked_candidate_ids": [1, 2, 4]},
             {"ranked_candidate_ids": [0, 1, 2]},
             {"ranked_candidate_ids": [True, 2, 3]},
@@ -42,6 +45,10 @@ class OpenAIDailyRankingValidationTestCase(unittest.TestCase):
         for payload in invalid:
             with self.subTest(payload=payload), self.assertRaises(OpenAIRecommendationError):
                 _validate_ranking(payload, 3)
+
+    def test_duplicate_ids_keep_first_occurrence_and_append_missing_in_candidate_order(self):
+        payload = {"ranked_candidate_ids": [5, 3, 5, 2, 3]}
+        self.assertEqual(_validate_ranking(payload, 5), [5, 3, 2, 1, 4])
 
 
 class OpenAIDailyRecommendationsTestCase(TestBase):
@@ -201,6 +208,27 @@ class OpenAIDailyRecommendationsTestCase(TestBase):
                 self._generate(1)
         self.request.assert_called_once()
         self.assertEqual(Playlist.select().count(), 0)
+
+    def test_duplicates_generate_unique_tracks_despite_old_cooldown(self):
+        self._play(self._track("Seed"))
+        candidates = [self._track(f"Candidate {index}") for index in range(4)]
+        legacy_hash = build_recommendation_agent_context_hash({
+            "workload": "openai_daily_invalid", "day": "2026-11-14",
+        })
+        save_recommendation_agent_cache_payload(
+            self.user, legacy_hash, "__openai_daily_attempt_v1__", "",
+            "gpt-6-luna", {"invalidResult": True}, ttl_seconds=21600,
+        )
+        self.request.side_effect = None
+        self.request.return_value = {"ranked_candidate_ids": [4, 2, 4, 2]}
+        self.assertEqual(self._generate(4), 1)
+        prompt = json.loads(self.request.call_args.args[1][1]["content"])
+        expected = [prompt["candidates"][index - 1]["title"] for index in (4, 2, 1, 3)]
+        playlist = Playlist.get(Playlist.user == self.user)
+        self.assertEqual([track.title for track in playlist.get_tracks()], expected)
+        self.assertEqual(set(playlist.tracks.split(",")), {str(track.id) for track in candidates})
+        self.assertEqual(self._generate(4), 0)
+        self.request.assert_called_once()
 
     def test_cached_valid_ranking_avoids_rebilling(self):
         self._play(self._track("Seed"))

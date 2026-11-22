@@ -42,7 +42,9 @@ provider mode is unchanged and is not covered by this OpenAI budget path.
   profiles refresh no sooner than six hours; unchanged music facts are reused.
   Failed attempts back off per user and retain the previous profile.
 - Daily playlists first recall at most 150 eligible local tracks. OpenAI ranks
-  request-local IDs; unknown IDs, duplicates and incomplete rankings are rejected.
+  request-local IDs. Repeated IDs keep their first position, and omitted IDs
+  caused by repeats are appended in local candidate order. Wrong lengths and
+  unknown IDs are rejected.
   Listening/negative feedback eligibility and diversity are rechecked before save.
 - Same-day existing playlists and API backfill remain non-billable. A deliberate
   first-day replacement needs a private playlist backup and a validated replacement;
