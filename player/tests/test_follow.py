@@ -197,6 +197,9 @@ class FollowTests(unittest.IsolatedAsyncioTestCase):
         self.wire.own.update(queueSongIds=['new'], trackId='new', queueRevision=3,
                              controlVersion=4, version=5, state='paused')
         await self.follow.on_event({'action': 'device.list', 'payload': {'devices': []}})
+        self.assertTrue(self.follow.active)
+        self.assertTrue(self.engine.paused)
+        await self.follow.on_event({'action': 'playback.context.closed', 'payload': {'playbackContextId': 'speaker'}})
         self.assertFalse(self.follow.active)
         self.assertEqual((self.engine.loads[-1], self.engine.position, self.engine.paused), ('new', 5000, True))
 
@@ -231,10 +234,45 @@ class FollowTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(PlaybackError):
             await self.follow.stop()
         self.assertEqual(self.follow.phase, 'release_pending')
-        self.assertTrue(self.engine.paused)
+        self.assertEqual(self.engine.loads, ['first', 'original'])
         self.wire.fail_stop = False
         await self.follow.stop()
         self.assertFalse(self.follow.active)
+
+    async def test_committed_source_handoff_keeps_context_and_rejects_unconfirmed_or_retired_pair(self):
+        await self.follow.start('speaker')
+        old = self.wire.source
+        migrated = dict(old, authorityClientId='target', authorityDeviceSessionId='target-dev',
+                        epoch=3, version=5, controlVersion=4, currentIndex=1, trackId='second')
+        notification = {'action': 'queue.context.sync', 'payload': migrated}
+        await self.follow.on_event(notification)
+        self.assertEqual(self.follow.source['authorityClientId'], 'speaker')
+        self.wire.source, self.wire.source_fact = migrated, fact(migrated, 1, positionMs=9000)
+        await self.follow.on_event(notification)
+        self.assertTrue(self.follow.active)
+        self.assertEqual(self.engine.loads, ['first', 'second'])
+        self.assertEqual(self.follow.source['authorityClientId'], 'target')
+        await self.follow.on_event({'action': 'playback.update', 'payload': fact(old, 100, state='paused')})
+        await self.follow.on_event({'action': 'playback.context.status',
+                                    'payload': {'playbackContext': old, 'deviceStates': [fact(old, 101)]}})
+        self.assertEqual(self.follow.fact['clientSeq'], 1)
+        self.assertFalse(self.engine.paused)
+        self.assertEqual(self.follow.track, 'second')
+
+    async def test_failed_original_restoration_keeps_lease_until_native_restore_succeeds(self):
+        await self.follow.start('speaker')
+        load = self.player._load
+        async def fail(*args, **kwargs):
+            raise PlaybackError('audio unavailable')
+        self.player._load = fail
+        with self.assertRaises(PlaybackError):
+            await self.follow.stop()
+        self.assertTrue(self.follow.active)
+        self.assertNotIn('follow.stop', [a for a, _ in self.wire.commands])
+        self.player._load = load
+        await self.follow.stop()
+        self.assertEqual(self.wire.commands[-1][0], 'follow.stop')
+        self.assertEqual(self.engine.loads[-1], 'original')
 
     async def test_reconnect_releases_pending_lease_without_replaying_mirror(self):
         await self.follow.start('speaker')

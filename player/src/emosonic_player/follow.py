@@ -19,7 +19,7 @@ def _binding(context):
 
 
 def _cursor(context):
-    return tuple(context[k] for k in ('controlVersion', 'queueRevision'))
+    return tuple(context[k] for k in ('controlVersion', 'queueRevision', 'version'))
 
 
 class Follow:
@@ -49,6 +49,8 @@ class Follow:
                 self.record = None
         self.phase = 'release_pending' if self.record else 'idle'
         self.source = self.fact = self.track = self.run = None
+        self.source_online = True
+        self.restored = False
         self.speed = 1.0
         self.drift = None
         self.watch = None
@@ -124,10 +126,13 @@ class Follow:
             position = sample.get('position_ms')
             position = round(position) if position is not None else own_fact['positionMs']
             record = {'source': source_context_id, 'scope': self.scope, 'bound': _binding(own), 'cursor': _cursor(own),
-                      'originalState': old_state, 'positionMs': position}
+                      'originalState': old_state, 'positionMs': position,
+                      'originalRate': sample.get('speed') or own_fact.get('playbackRate') or 1.0}
             self._save(record)
             self.phase = 'acquiring'
             self.source, self.fact = source, None
+            self.source_online = True
+            self.restored = True
             self.generation = self.wire.generation
             touched_audio = False
             try:
@@ -146,6 +151,7 @@ class Follow:
                 if any(ack.get(k) != v for k, v in expected.items()) or not self._current():
                     raise PlaybackError('Follow start acknowledgement mismatch')
                 touched_audio = True
+                self.restored = False
                 self.player.run_id = None
                 await self.player._safe_stop()
                 self.phase = 'waiting_source'
@@ -166,9 +172,19 @@ class Follow:
         if not self._current():
             raise PlaybackError('Follow connection changed')
         if _binding(context) != _binding(self.source):
-            await self._stop(restore=True)
-            raise PlaybackError('Follow source authority changed')
-        self._queue(context)
+            # The lease follows the Context through a committed Handoff. Only a
+            # newly requested status can adopt another pair and reset clientSeq.
+            if (self.player._is_ours(context) or not all(_binding(context))
+                    or context['epoch'] <= self.source['epoch']
+                    or context['version'] <= self.source['version']
+                    or context['controlVersion'] < self.source['controlVersion']
+                    or context['queueRevision'] < self.source['queueRevision']):
+                self.fact = None
+                await self._hold()
+                raise PlaybackError('Follow source migration is not confirmed')
+            self.source, self.fact, self.source_online = context, None, True
+        else:
+            self._queue(context)
         if fact:
             self._fact(fact)
         await self._apply()
@@ -197,7 +213,8 @@ class Follow:
     def _anchor(self):
         fact = self.fact
         source = self.source
-        if not fact or not self._current() or fact.get('appliedControlVersion') != source['controlVersion']:
+        if (not fact or not self.source_online or not self._current()
+                or fact.get('appliedControlVersion') != source['controlVersion']):
             return None
         if fact['state'] == 'idle' and not source['queueSongIds']:
             return ('idle', None, 0, 1.0)
@@ -319,13 +336,16 @@ class Follow:
         lease = self.record
         generation = self.wire.generation
         if action == 'device.list' and isinstance(p.get('devices'), list):
-            present = any(d.get('clientId') == self.source['authorityClientId'] and
-                          d.get('deviceSessionId') == self.source['authorityDeviceSessionId']
-                          and 'player' in d.get('roles', []) for d in p['devices'])
-            if not present:
-                async with self.player.lock:
-                    if self.record is lease and self.generation == generation and self._current():
-                        await self._stop(restore=True)
+            async with self.player.lock:
+                if (self.record is lease and self.generation == generation and self._current()
+                        and self.phase != 'release_pending'):
+                    self.source_online = any(
+                        d.get('clientId') == self.source['authorityClientId']
+                        and d.get('deviceSessionId') == self.source['authorityDeviceSessionId']
+                        and 'player' in d.get('roles', []) for d in p['devices'])
+                    if not self.source_online:
+                        self.fact = None
+                        await self._hold()
             return False
         if context.get('playbackContextId') != lease['source']:
             return False
@@ -340,8 +360,9 @@ class Follow:
                 elif action == 'playback.update':
                     self._fact(p)
                     await self._apply()
-                elif context.get('epoch', 0) >= self.source['epoch'] and _binding(context) != _binding(self.source):
-                    await self._stop(restore=True)
+                elif _binding(context) != _binding(self.source):
+                    if context.get('epoch', 0) > self.source['epoch']:
+                        await self._refresh()
                 else:
                     self._queue(context)
                     for fact in p.get('deviceStates', []):
@@ -413,22 +434,34 @@ class Follow:
         record = self.record
         if tuple(record['bound'][2:]) != (self.wire.client_id, self.wire.device_session_id):
             raise PlaybackError('Follow recovery requires its original device session')
-        ack = (await self.wire.request('follow.stop', {'sourcePlaybackContextId': record['source']}))['payload']
-        if ack.get('action') != 'follow.stop':
-            raise PlaybackError('Follow stop acknowledgement mismatch')
-        if restore and record['bound'][3] == self.wire.device_session_id:
+        if restore and not self.restored:
             own, fact = await self._status(record['bound'][0])
-            if (tuple(record['bound']) == _binding(own) and self.player._is_ours(own)
-                    and fact and fact.get('appliedControlVersion') == own['controlVersion']):
+            if self.player._is_ours(own):
+                if not fact or fact.get('appliedControlVersion') != own['controlVersion']:
+                    raise PlaybackError('suspended authority is not settled')
                 self.player.context = copy.deepcopy(own)
                 self.player.executed = copy.deepcopy(own)
                 self.player.applied = own['controlVersion']
                 if own['queueSongIds']:
-                    same = tuple(record['cursor']) == _cursor(own)
+                    same = tuple(record['bound']) == _binding(own) and tuple(record['cursor']) == _cursor(own)
                     state = record['originalState'] if same else fact['state']
                     position = record['positionMs'] if same else fact['positionMs']
                     if state in ('playing', 'paused'):
-                        await self.player._load(dict(own, positionMs=position), paused=state == 'paused')
+                        rate = record.get('originalRate', 1) if same else fact['playbackRate']
+                        try:
+                            await self.player.engine.set_speed(rate)
+                            await self.player._load(dict(own, positionMs=position), paused=state == 'paused')
+                        except Exception:
+                            self.player.run_id = None
+                            await self.player._safe_stop()
+                            raise
+            self.restored = True
+        ack = (await self.wire.request('follow.stop', {'sourcePlaybackContextId': record['source']}))['payload']
+        if ack.get('action') != 'follow.stop':
+            raise PlaybackError('Follow stop acknowledgement mismatch')
+        if self.release_retry and self.release_retry is not asyncio.current_task():
+            self.release_retry.cancel()
+            self.release_retry = None
         self._save(None)
         self.phase = 'idle'
         self.error = None

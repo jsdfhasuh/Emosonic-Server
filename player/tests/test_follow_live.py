@@ -44,13 +44,6 @@ class FollowLoopbackTests(unittest.IsolatedAsyncioTestCase):
         return player
 
     async def test_restart_releases_lease_for_recovered_pair_and_new_connection_nonce(self):
-        def pending_at_timeout():
-            for task in asyncio.all_tasks():
-                frame = task.get_stack(limit=1)
-                if frame:
-                    print(task.get_name(), frame[0].f_code.co_name, frame[0].f_lineno, flush=True)
-        debug = asyncio.get_running_loop().call_later(17, pending_at_timeout)
-        self.addCleanup(debug.cancel)
         source, follower = await self.new_player('restart-source'), await self.new_player('restart-follower')
         original, first, _ = self.fixture['songs']
         for player, song in ((source, first), (follower, original)):
@@ -138,10 +131,13 @@ class FollowLoopbackTests(unittest.IsolatedAsyncioTestCase):
             # Startup may need a seek and a speed adjustment; once settled, every
             # sample over the following nine seconds must meet the same 50 ms limit.
             settled = 0
-            async with asyncio.timeout(12):
-                while settled < 4:
-                    settled = settled + 1 if (await measure())[0] <= 50 else 0
-                    await asyncio.sleep(.25)
+            deadline = time.monotonic() + 12
+            while settled < 4:
+                sample = await measure()
+                settled = settled + 1 if sample[0] <= 50 else 0
+                if time.monotonic() >= deadline:
+                    self.fail(f'Follow did not settle: last sample={sample}, status={follower.follow.status()}')
+                await asyncio.sleep(.25)
             start = time.monotonic()
             while True:
                 readings.append(await measure())
