@@ -5153,6 +5153,7 @@ def _handle_strict_v2_context_control(
                 action,
                 payload["baseControlVersion"],
                 base_queue_revision=payload.get("baseQueueRevision"),
+                replacement_queue=payload.get("queueSongIds"),
                 position_ms=position_ms,
                 current_index=requested_index,
                 requesting_client_id=requester_generation["clientId"],
@@ -5289,7 +5290,7 @@ def _handle_strict_v2_context_control(
         # correlated ACK so replacement cannot disconnect the requester
         # between dispatch completion and response delivery.
         _send_ack(request_id)
-    if action == "queue.playItem":
+    if action == "queue.playItem" and "queueSongIds" not in payload:
         _run_post_commit_push(
             action,
             request_id,
@@ -11204,10 +11205,12 @@ def _handle_strict_v2_playback_update(
                 playback_context,
             ),
         )
-    context_and_queue_changed = payload["origin"] == "localUser" or (
-        payload["origin"] == "remoteCommand"
-        and payload["executionStatus"] == "failed"
-    ) or result.get("controlReconciliation") is not None
+    context_and_queue_changed = (
+        payload["origin"] == "localUser"
+        or (payload["origin"] == "remoteCommand" and payload["executionStatus"] == "failed")
+        or result.get("controlReconciliation") is not None
+        or result.get("queueReplaced")
+    )
     if context_and_queue_changed:
         _run_post_commit_push(
             "playback.update",

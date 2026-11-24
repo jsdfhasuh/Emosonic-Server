@@ -223,8 +223,8 @@ class StrictV2CoreTestCase(unittest.TestCase):
                     "requestId": request_id,
                     "payload": {
                         "deviceSessionId": "device:phone-1",
-                        "queueSongIds": queue_song_ids or ["song-2", "song-1"],
-                        "currentIndex": 0,
+                        "queueSongIds": ["song-2", "song-1"] if queue_song_ids is None else queue_song_ids,
+                        **({"currentIndex": 0} if queue_song_ids != [] else {}),
                         "positionMs": position_ms,
                         "state": state,
                     },
@@ -7280,6 +7280,171 @@ class StrictV2CoreTestCase(unittest.TestCase):
             + transaction["executionTimeoutMs"]
             + 2000,
         )
+
+    def start_queue_replacement(self, *, empty=False):
+        player = self.ready_strict_client()
+        if empty:
+            self.create_context(player, queue_song_ids=[], state="idle", position_ms=0)
+        else:
+            self.create_context(player, queue_song_ids=["old-1", "old-2"])
+        controller = self.ready_strict_client(
+            roles=["controller"], client_id="remote", device_session_id="device:remote"
+        )
+        self.emit_strict(controller, "state", "playback.context.subscribe", "watch",
+                         {"playbackContextId": "context-1"})
+        body = {"playbackContextId": "context-1", "baseControlVersion": 1,
+                "baseQueueRevision": 1, "queueSongIds": ["new-1", "new-2"], "queueIndex": 1}
+        with mock.patch.object(emo_ws, "_start_control_watchdog"):
+            reply = self.emit_strict(controller, "command", "queue.playItem", "replace", body)
+            replay = self.emit_strict(controller, "command", "queue.playItem", "replace", body)
+        self.assertIn("system.ack", [m["action"] for m in reply])
+        self.assertEqual([m["action"] for m in replay], ["system.ack"])
+        commands = [m["payload"] for m in self.messages(player) if m["action"] == "queue.playItem"]
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0]["queueSongIds"], body["queueSongIds"])
+        self.assertEqual(commands[0]["queueIndex"], 1)
+        self.assertEqual(commands[0]["queueRevision"], 2)
+        self.assertNotIn("replaceQueue", commands[0])
+        old_queue = [] if empty else ["old-1", "old-2"]
+        for message in reply:
+            if message["action"] in {"queue.context.sync", "playback.context.status"}:
+                snapshot = message["payload"].get("playbackContext", message["payload"])
+                self.assertEqual(snapshot["queueSongIds"], old_queue)
+        staged = getPlaybackContextState("context-1")
+        self.assertEqual(staged["queueSongIds"], old_queue)
+        self.assertEqual(staged["queueRevision"], 1)
+        self.assertEqual(staged["controlVersion"], 2)
+        return player, controller
+
+    def replacement_feedback(self, player, *, track="new-2", failed=False, seq=1):
+        feedback = {
+            "playbackContextId": "context-1", "deviceSessionId": "device:phone-1",
+            "origin": "remoteCommand", "executionStatus": "failed" if failed else "committed",
+            "commandControlVersion": 2, "appliedControlVersion": 1 if failed else 2,
+            "state": "playing" if track else "idle", "positionMs": 19 if track else 0,
+            "clientSeq": seq,
+        }
+        if track:
+            feedback["trackId"] = track
+        if failed:
+            feedback["errorCode"] = "track_load_failed"
+        return self.emit_strict(player, "event", "playback.update", "proof-%d" % seq, feedback)
+
+    def test_replacement_publishes_target_only_on_matching_execution(self):
+        player, controller = self.start_queue_replacement()
+        conflict = self.emit_strict(controller, "command", "player.next", "concurrent",
+                                    {"playbackContextId": "context-1", "baseControlVersion": 2})
+        self.assertEqual(conflict[0]["payload"]["code"], "conflict")
+        sync = self.emit_strict(player, "state", "queue.context.sync", "queue-edit", {
+            "playbackContextId": "context-1", "deviceSessionId": "device:phone-1",
+            "queueSongIds": ["old-1", "different-tail"], "currentIndex": 0, "positionMs": 1200,
+            "baseQueueRevision": 1, "baseControlVersion": 2,
+        })
+        self.assertEqual(sync[0]["payload"]["code"], "conflict")
+        wrong = self.replacement_feedback(player, track="old-1")
+        self.assertEqual(wrong[0]["payload"]["code"], "conflict")
+        self.assertEqual(emo_ws.getPlaybackControlTransaction("context-1", 1, 2)["status"], "pending")
+        self.replacement_feedback(player, seq=2)
+        events = {m["action"]: m["payload"] for m in self.messages(controller)}
+        for action in ("queue.context.sync", "playback.context.status"):
+            snapshot = events[action].get("playbackContext", events[action])
+            self.assertEqual(snapshot["queueSongIds"], ["new-1", "new-2"])
+            self.assertEqual(snapshot["currentIndex"], 1)
+            self.assertEqual(snapshot["queueRevision"], 2)
+            self.assertEqual(snapshot["controlVersion"], 2)
+        self.assertEqual(events["playback.update"]["executionStatus"], "committed")
+        self.assertEqual(events["playback.update"]["trackId"], "new-2")
+        self.replacement_feedback(player, seq=2)
+        self.assertEqual(self.messages(controller), [])
+        self.assertEqual(getPlaybackContextState("context-1")["queueRevision"], 2)
+
+    def test_replacement_initializes_idle_context_after_commit(self):
+        player, _controller = self.start_queue_replacement(empty=True)
+        collision = self.create_context(
+            player, request_id="reinitialize", queue_song_ids=["other"], state="paused",
+        )
+        self.assertEqual(collision[0]["payload"]["code"], "conflict")
+        self.replacement_feedback(player)
+        self.assertEqual(getPlaybackContextState("context-1")["queueSongIds"], ["new-1", "new-2"])
+
+    def test_replacement_is_superseded_by_local_selection_on_original_queue(self):
+        player, _controller = self.start_queue_replacement()
+        self.emit_strict(player, "event", "playback.update", "local-selection", {
+            "playbackContextId": "context-1", "deviceSessionId": "device:phone-1",
+            "origin": "localUser", "executionStatus": "committed", "intentId": "local",
+            "epoch": 1, "observedControlVersion": 2, "state": "playing", "positionMs": 0,
+            "queueIndex": 1, "trackId": "old-2", "clientSeq": 1,
+        })
+        self.assertEqual(emo_ws.getPlaybackControlTransaction("context-1", 1, 2)["status"], "superseded")
+        self.replacement_feedback(player, seq=2)
+        context = getPlaybackContextState("context-1")
+        self.assertEqual(context["queueSongIds"], ["old-1", "old-2"])
+        self.assertEqual(context["trackId"], "old-2")
+
+    def test_replacement_requires_current_cursors_controller_role_and_same_user(self):
+        player = self.ready_strict_client()
+        self.create_context(player)
+        controller = self.ready_strict_client(
+            roles=["controller"], client_id="remote", device_session_id="device:remote"
+        )
+        body = {"playbackContextId": "context-1", "queueIndex": 0,
+                "queueSongIds": ["new"], "baseQueueRevision": 1, "baseControlVersion": 1}
+        wrong_role = self.emit_strict(player, "command", "queue.playItem", "wrong-role", body)
+        self.assertEqual(wrong_role[0]["payload"]["code"], "forbidden")
+        for field in ("baseQueueRevision", "baseControlVersion"):
+            stale = self.emit_strict(controller, "command", "queue.playItem", field, {**body, field: 2})
+            self.assertEqual(stale[0]["payload"]["code"], "stale_version")
+        bob = self.connect()
+        self.authenticate(bob, user_name="bob", password="B0b")
+        with self.enable_all_profiles():
+            self.register(bob, "bob-register", self.strict_registration_payload(
+                roles=["controller"], client_id="remote-bob", device_session_id="device:bob"))
+        cross_user = self.emit_strict(bob, "command", "queue.playItem", "not-my-context", body)
+        self.assertIn(cross_user[0]["payload"]["code"], ("forbidden", "not_found"))
+        self.assertEqual(getPlaybackContextState("context-1")["controlVersion"], 1)
+        self.assertIsNone(emo_ws.getPlaybackControlTransaction("context-1", 1, 2))
+        self.assertFalse(any(m["action"] == "queue.playItem" for m in self.messages(player)))
+
+    def test_failed_replacement_keeps_old_queue_and_reconciles_track(self):
+        player, _controller = self.start_queue_replacement()
+        self.replacement_feedback(player, track="old-1", failed=True)
+        context = getPlaybackContextState("context-1")
+        self.assertEqual(context["queueSongIds"], ["old-1", "old-2"])
+        self.assertEqual(context["queueRevision"], 1)
+        self.assertEqual(context["trackId"], "old-1")
+        self.assertEqual(context["positionMs"], 19)
+        self.assertEqual(context["controlVersion"], 3)
+
+    def test_failed_first_selection_reconciles_empty_context(self):
+        player, _controller = self.start_queue_replacement(empty=True)
+        self.replacement_feedback(player, track=None, failed=True)
+        context = getPlaybackContextState("context-1")
+        self.assertEqual((context["queueSongIds"], context["state"]), ([], "idle"))
+        self.assertEqual(context["controlVersion"], 3)
+        self.assertEqual(context["queueRevision"], 1)
+
+    def test_timed_out_replacement_leaves_old_queue_and_rejects_late_commit(self):
+        player, controller = self.start_queue_replacement()
+        transaction = emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        emo_ws._sweep_expired_control_transactions(transaction["watchdogDeadlineAtMs"])
+        settled = next(m for m in self.messages(controller) if m["action"] == "playback.control.settled")
+        self.assertEqual(settled["payload"]["errorCode"], "execution_unknown")
+        self.messages(player)
+        self.assertEqual(self.replacement_feedback(player)[0]["payload"]["code"], "conflict")
+        context = getPlaybackContextState("context-1")
+        self.assertEqual(context["queueSongIds"], ["old-1", "old-2"])
+        self.assertEqual(context["queueRevision"], 1)
+        self.assertEqual(context["positionMs"], 1200)
+
+    def test_restart_recovery_keeps_the_original_queue_of_an_unconfirmed_replacement(self):
+        self.start_queue_replacement()
+        emo_store.recoverPendingPlaybackControlsForStartup(emo_ws._server_time_ms())
+        terminal = emo_ws.getPlaybackControlTransaction("context-1", 1, 2)
+        self.assertEqual((terminal["status"], terminal["errorCode"]), ("failed", "execution_unknown"))
+        context = getPlaybackContextState("context-1")
+        self.assertEqual(context["queueSongIds"], ["old-1", "old-2"])
+        self.assertEqual(context["trackId"], "old-1")
+        self.assertEqual((context["currentIndex"], context["positionMs"]), (0, 1200))
 
     def test_control_does_not_mutate_when_authority_emit_capacity_is_unavailable(self):
         player = self.ready_strict_client()

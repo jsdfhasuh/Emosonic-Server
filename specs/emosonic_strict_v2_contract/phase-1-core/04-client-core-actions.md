@@ -5,6 +5,8 @@
 > 覆盖范围：原契约第 5 节引言及第 5.1—5.2.2 节。本文件是完整契约的一个规范分卷，不能脱离入口列出的公共规则单独解释。
 ## 5. 客户端到服务端：全部 strict-v2 请求
 
+后续个人实验室可选扩展见[普通远控替换队列并点播](../../2026-11-24-remote-queue-replacement.md)。
+
 除第 3 节的认证、注册、设备列表和 heartbeat 外，以下是 Flutter 必须实现的 normative strict
 action allowlist。所有请求均不得含 `sessionId` 或顶层 `targetClientId`。payload 内
 target 字段也禁止，例外只有第 5.2 节 `device.setVolume` 与第 5.4 节 `playback.handoff.start`。

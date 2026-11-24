@@ -191,11 +191,11 @@
       "profile": "core",
       "type": "command",
       "contractSection": "5.2/6.7",
-      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "queueIndex:int>=0", "baseQueueRevision:int>=0", "baseControlVersion:int>=0"], "optional": []},
+      "payloadSchema": {"closed": true, "required": ["playbackContextId:string", "queueIndex:int>=0", "baseQueueRevision:int>=0", "baseControlVersion:int>=0"], "optional": ["queueSongIds:non-empty-distinct-string[]"]},
       "settlement": "correlated_ack",
       "serverPushes": ["queue.playItem", "queue.context.sync", "playback.context.status"],
       "roleCapabilityGate": "same-user controller; authority canPlay",
-      "cursorMutation": "version/queueRevision/controlVersion +1",
+      "cursorMutation": "controlVersion +1 at admission; queueRevision +1 on selection (on committed authority feedback for replacement)",
       "errorConditionFields": ["playbackContextId", "currentControlVersion", "currentQueueRevision", "currentVersion", "retryAfterMs"]
     },
     "player.play": {
