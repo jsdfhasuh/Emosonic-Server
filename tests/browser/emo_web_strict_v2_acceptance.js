@@ -448,8 +448,45 @@ async function run() {
     assert.equal(await control.locator('[data-control="player.play"]').isDisabled(), true);
     completedSteps.push('startup-idle-context');
 
-    logStep('populate the source idle Context and verify duplicate-queue UI');
-    await addTracks(playerOne, 2);
+    logStep('isolate a delayed library search and draft when changing players');
+    await control.locator('#strict-library-query').fill('Strict One');
+    await control.locator('#strict-library-search button').click();
+    await control.waitForFunction(() => document.querySelector('#strict-library-results').options.length === 1);
+    await control.locator('#strict-library-add').click();
+    const searchPattern = '**/player/search?q=previous-selection';
+    let holdSearch;
+    const oldSearch = new Promise(resolve => { holdSearch = resolve; });
+    await control.route(searchPattern, holdSearch);
+    await control.locator('#strict-library-query').fill('previous-selection');
+    await control.locator('#strict-library-search button').click();
+    const oldRoute = await oldSearch;
+    await selectControlPlayer(control, playerTwoIdentity.clientId);
+    await Promise.all([
+      control.waitForResponse(response => response.url().endsWith('/player/search?q=previous-selection')),
+      oldRoute.fulfill({ status: 503, body: '' }),
+    ]);
+    // Let fetch resolve and its error handler render before inspecting the new selection.
+    await control.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    assert.equal(await control.locator('#strict-initial-tracks li').count(), 0);
+    assert.equal(await control.locator('#strict-library-results option').count(), 0);
+    assert.equal(await control.locator('#strict-control-error').isVisible(), false);
+    await control.unroute(searchPattern, holdSearch);
+    await selectControlPlayer(control, playerOneIdentity.clientId);
+
+    logStep('choose two songs from the controller for an empty player Context');
+    await control.locator('#strict-library-query').fill('Strict');
+    await control.locator('#strict-library-search button').click();
+    await control.waitForFunction(() => document.querySelector('#strict-library-results').options.length === 2);
+    for (const index of [0, 1]) {
+      await control.locator('#strict-library-results').selectOption({ index });
+      await control.locator('#strict-library-add').click();
+    }
+    await control.locator('#strict-initial-submit').click();
+    await control.waitForFunction(() => document.querySelectorAll('#strict-control-queue .strict-queue-copy').length === 2);
+    await playerOne.waitForFunction(() => document.querySelectorAll('#strict-player-queue li').length === 2);
+    completedSteps.push('controller-initial-queue');
+
+    logStep('verify duplicate-queue UI');
     const sourceContextId = (await acceptanceSnapshot(playerOne)).contextId;
     await playerOne.locator('#strict-search-results li button').first().click();
     await playerOne.waitForFunction(() => (

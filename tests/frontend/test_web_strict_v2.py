@@ -84,6 +84,29 @@ class WebStrictV2FrontendTestCase(FrontendTestBase):
             self.assertNotIn('"sourceSessionId"', response.data)
             self.assert_inline_scripts_parse(response.data)
 
+    def test_ready_core_selects_modern_control_without_changing_local_player(self):
+        self.set_protocol("legacy")
+        with self.app_context():
+            current_app.config["WEBAPP"]["emo_strict_v2_core_enabled"] = True
+
+        response = self.client.get("/control")
+        self.assertIn('id="strict-control-root"', response.data)
+        self.assertIn("/control?protocol=legacy", response.data)
+        self.assertIn('data-search-url="/player/search"', response.data)
+        self.assertIn("initialQueueSongIds: ids", response.data)
+        self.assertIn("playback.context.prepared", response.data)
+        self.assertIn('id="strict-initial-submit"', response.data)
+        legacy = self.client.get("/control?protocol=legacy")
+        self.assertIn("'session.subscribe'", legacy.data)
+        self.assertIn("/control?protocol=strict_v2", legacy.data)
+        self.assertIn("'queue.local.get'", self.client.get("/player").data)
+
+    def test_disabled_core_leaves_legacy_control_as_the_only_mode(self):
+        self.set_protocol("legacy")
+        response = self.client.get("/control?protocol=strict_v2")
+        self.assertIn("'session.subscribe'", response.data)
+        self.assertNotIn('id="strict-control-root"', response.data)
+
     def test_strict_player_exposes_context_follow_broadcast_handoff_and_owner_lock(self):
         self.set_protocol("strict_v2")
         response = self.client.get("/player")
