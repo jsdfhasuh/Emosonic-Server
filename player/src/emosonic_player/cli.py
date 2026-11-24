@@ -15,6 +15,8 @@ def parser():
         commands.add_parser(command)
     search = commands.add_parser('search')
     search.add_argument('query')
+    announce = commands.add_parser('announce', help='play a WAV from the HA socket audio directory')
+    announce.add_argument('file')
     play = commands.add_parser('play')
     play.add_argument('song', nargs='?')
     choice = play.add_mutually_exclusive_group()
@@ -28,7 +30,7 @@ def parser():
 
 
 async def call(socket_path, action, params):
-    async with asyncio.timeout(45):
+    async with asyncio.timeout(180 if action == 'announce' else 45):
         reader, writer = await asyncio.open_unix_connection(socket_path, limit=1024 * 1024)
         try:
             writer.write((json.dumps({'action': action, 'params': params}) + '\n').encode())

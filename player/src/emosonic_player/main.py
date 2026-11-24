@@ -1,6 +1,7 @@
 """Owned-process lifecycle; no SSH, host configuration or deployment actions."""
 import argparse
 import asyncio
+from contextlib import AsyncExitStack, asynccontextmanager
 import fcntl
 import json
 import logging
@@ -33,20 +34,29 @@ def private_directory(path):
     return directory
 
 
-async def serve_cli(reader, writer, player):
+async def serve_cli(reader, writer, player, ha_audio=None):
     try:
         peer = writer.get_extra_info('socket')
         _, uid, _ = struct.unpack('3i', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-        if uid != os.getuid():
+        if uid != os.getuid() and not (ha_audio is not None and uid == 0):
             raise ValueError('different user')
-        async with asyncio.timeout(40):
+        async with asyncio.timeout(40) as deadline:
             line = await reader.readline()
             if len(line) > 16384:
                 raise ValueError('request too large')
             request = json.loads(line)
             if set(request) != {'action', 'params'} or not isinstance(request['params'], dict):
                 raise ValueError('invalid request')
-            result = await player.cli(request['action'], request['params'])
+            action, params = request['action'], request['params']
+            if ha_audio is not None and action == 'announce':
+                deadline.reschedule(asyncio.get_running_loop().time() + 165)
+                if set(params) != {'file'}:
+                    raise PlaybackError('expected one WAV filename')
+                result = await player.announce_file(ha_audio, params['file'])
+            elif ha_audio is not None and action == 'status':
+                result = await player.ha_status()
+            else:
+                result = await player.cli(action, params)
         response = {'ok': True, 'result': result}
     except asyncio.CancelledError:
         writer.close()
@@ -64,6 +74,35 @@ async def serve_cli(reader, writer, player):
     finally:
         writer.close()
         await writer.wait_closed()
+
+
+@asynccontextmanager
+async def control_socket(path, player, ha_audio=None):
+    if path.exists() or path.is_symlink():
+        info = path.lstat()
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError('unsafe existing control socket path')
+        if ha_audio is not None:
+            try:
+                _, writer = await asyncio.open_unix_connection(path)
+            except ConnectionRefusedError:
+                pass  # Socket left behind by a previous process.
+            else:
+                writer.close()
+                await writer.wait_closed()
+                raise ValueError('HA control socket is in use')
+        path.unlink()
+    server = await asyncio.start_unix_server(
+        lambda r, w: serve_cli(r, w, player, ha_audio), path=path, limit=16385)
+    bound = path.lstat()
+    try:
+        os.chmod(path, 0o600)
+        yield
+    finally:
+        server.close()
+        await server.wait_closed()
+        if path.exists() and os.path.samestat(bound, path.lstat()):
+            path.unlink()
 
 
 async def run(config):
@@ -87,19 +126,24 @@ async def run(config):
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
-    path = runtime / 'control.sock'
-    server = None
+    sockets = AsyncExitStack()
     try:
-        if path.exists() or path.is_symlink():
-            if not stat.S_ISSOCK(path.lstat().st_mode) or path.lstat().st_uid != os.getuid():
-                raise ValueError('unsafe existing control socket path')
-            path.unlink()
         await engine.start()
         await engine.set_volume(config['initial_volume'])
         await player.start()
-        server = await asyncio.start_unix_server(
-            lambda r, w: serve_cli(r, w, player), path=path, limit=16385)
-        os.chmod(path, 0o600)
+        await sockets.enter_async_context(control_socket(runtime / 'control.sock', player))
+        if 'ha_socket' in config:
+            ha_path = Path(config['ha_socket'])
+            parent = ha_path.parent.resolve()
+            if (not ha_path.is_absolute() or parent.is_relative_to(runtime.resolve())
+                    or runtime.resolve().is_relative_to(parent) or ha_path.name == 'audio'):
+                raise ValueError('HA socket needs a separate absolute directory')
+            private_directory(ha_path.parent)
+            audio = parent / 'audio'
+            audio.mkdir(mode=0o700, exist_ok=True)
+            if not stat.S_ISDIR(audio.lstat().st_mode):
+                raise ValueError('invalid HA audio directory')
+            await sockets.enter_async_context(control_socket(ha_path, player, audio))
         delay = 1
         while not stop.is_set():
             try:
@@ -130,14 +174,10 @@ async def run(config):
                     pass
                 delay = min(30, delay * 2)
     finally:
-        if server:
-            server.close()
-            await server.wait_closed()
+        await sockets.aclose()
         await wire.close()
         await player.close()
         await media.close()
-        if path.exists():
-            path.unlink()
         os.close(lockfd)
 
 

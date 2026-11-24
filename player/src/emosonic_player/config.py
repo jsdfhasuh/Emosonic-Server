@@ -30,6 +30,9 @@ def load_config(path: str) -> dict:
     if not url.hostname:
         raise ValueError('server hostname required')
     validate_audio_device(config['audio_device'])
+    if 'ha_socket' in config and (not isinstance(config['ha_socket'], str)
+                                  or not os.path.isabs(config['ha_socket'])):
+        raise ValueError('ha_socket must be an absolute Unix socket path')
     config.setdefault('device_name', 'OpenWrt speaker')
     config.setdefault('runtime_dir', '/run/emosonic-player')
     config.setdefault('state_dir', '/var/lib/emosonic-player')

@@ -2,6 +2,7 @@
 import asyncio
 import copy
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from emosonic_player.mpv import MpvError, PlaybackEvent
 from emosonic_player.playback import Player, PlaybackError
@@ -59,6 +60,9 @@ class FakeEngine:
 
     async def close(self):
         self.closed = True
+
+    async def start(self):
+        self.closed = False
 
 
 class FakeMedia:
@@ -159,6 +163,99 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
 
     def start_events(self):
         self.tasks.append(asyncio.create_task(self.player._engine_events()))
+
+    async def start_announcement(self):
+        self.start_events()
+        request = asyncio.create_task(self.player.announce('/tmp/speech.wav', 5))
+        self.tasks.append(request)
+        await self.wait_for(lambda: self.engine.loads[-1][0] == '/tmp/speech.wav' and not self.engine.sample['paused'])
+        return request, self.engine.run
+
+    async def test_announcement_restores_exact_music_cursor_and_never_advances_queue(self):
+        self.engine.sample.update(paused=False, position_ms=3456)
+        old_queue = copy.deepcopy(self.player.context)
+        request, speech = await self.start_announcement()
+        status = await self.player.cli('status', {})
+        self.assertTrue(status['announcing'])
+        self.assertEqual(status['audio']['position_ms'], 3456)
+        await self.engine.events.put(PlaybackEvent('eof', speech, 1))
+        self.assertEqual(await request, {'completed': True})
+        self.assertEqual(self.engine.loads[-1][0], 'https://music.test/first')
+        self.assertEqual(self.engine.sample['position_ms'], 3456)
+        self.assertFalse(self.engine.sample['paused'])
+        await self.engine.events.put(PlaybackEvent('eof', speech, 1))
+        await asyncio.sleep(0)
+        self.assertEqual(old_queue, self.player.context)
+        self.assertEqual(self.wire.requests, [])
+
+    async def test_announcement_failure_restores_original_pause(self):
+        self.engine.sample.update(paused=True, position_ms=987)
+        request, speech = await self.start_announcement()
+        await self.engine.events.put(PlaybackEvent('error', speech, 1))
+        with self.assertRaisesRegex(PlaybackError, 'announcement playback failed'):
+            await request
+        self.assertEqual(self.engine.loads[-1][0], 'https://music.test/first')
+        self.assertEqual(self.engine.sample['position_ms'], 987)
+        self.assertTrue(self.engine.sample['paused'])
+
+    async def test_incoming_pause_preempts_announcement_with_frozen_music_position(self):
+        self.engine.sample.update(paused=False, position_ms=1234)
+        request, speech = await self.start_announcement()
+        await self.player._execute(self.command('player.pause'), 1)
+        self.assertEqual(await request, {'completed': False, 'reason': 'interrupted'})
+        await self.engine.events.put(PlaybackEvent('eof', speech, 1))
+        await asyncio.sleep(0)
+        self.assertTrue(self.engine.sample['paused'])
+        self.assertEqual(self.player.executed['positionMs'], 1234)
+        self.assertEqual(self.player.executed['currentIndex'], 0)
+        self.assertEqual(self.player.applied, 1)
+
+    async def test_idle_announcement_and_away_pause(self):
+        self.player.run_id = None
+        self.player.context = self.player.executed = dict(context(), queueSongIds=[], state='idle')
+        await self.engine.stop()
+        request, speech = await self.start_announcement()
+        self.assertEqual(await self.player.cli('pause', {}), {'accepted': True})
+        self.assertFalse((await request)['completed'])
+        await self.engine.events.put(PlaybackEvent('eof', speech, 1))
+        await asyncio.sleep(0)
+        self.assertIsNone(self.player.run_id)
+        self.assertIsNone(self.engine.run)
+        self.assertEqual(self.wire.requests, [])
+
+    async def test_away_pause_during_file_preparation_prevents_late_speech(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def prepare(*_args):
+            entered.set()
+            await release.wait()
+            return 1
+        self.player.context = self.player.executed = dict(context(), queueSongIds=[], state='idle')
+        self.player.run_id = None
+        with patch('emosonic_player.playback.asyncio.to_thread', prepare):
+            request = asyncio.create_task(self.player.announce_file('/ha/audio', 'test.wav'))
+            await entered.wait()
+            await self.player.cli('pause', {})
+            release.set()
+            self.assertEqual(await request, {'completed': False, 'reason': 'interrupted'})
+        self.assertEqual(len(self.engine.loads), 1)
+
+    async def test_new_track_preempts_announcement_and_late_eof(self):
+        request, speech = await self.start_announcement()
+        await self.player._execute(self.command('player.next'), 1)
+        self.assertFalse((await request)['completed'])
+        await self.engine.events.put(PlaybackEvent('eof', speech, 1))
+        await asyncio.sleep(0)
+        self.assertEqual(self.engine.loads[-1][0], 'https://music.test/second')
+        self.assertEqual(self.player.executed['currentIndex'], 1)
+        self.assertFalse(self.engine.sample['paused'])
+
+    async def test_ha_status_caches_only_the_matching_track(self):
+        self.player.media.get = AsyncMock(return_value={'song': {'id': 'first', 'title': 'One', 'path': 'private'}})
+        self.assertEqual((await self.player.ha_status())['track'], {'id': 'first', 'title': 'One'})
+        await self.player.ha_status()
+        self.player.media.get.assert_awaited_once_with('getSong', id='first')
+        self.player.context['currentIndex'] = 1
+        self.assertIsNone((await self.player.ha_status())['track'])
 
     async def test_idle_engine_disconnect_requests_restart(self):
         self.start_events()

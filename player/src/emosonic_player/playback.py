@@ -5,12 +5,26 @@ can settle an in-flight operation. Audio executions remain strictly serialized.
 """
 import asyncio
 import copy
+from dataclasses import dataclass
 import math
+from pathlib import Path
+import tempfile
+import time
 import uuid
+import wave
+
+from .announcement import prepare_wave
 
 
 class PlaybackError(RuntimeError):
     pass
+
+
+@dataclass
+class Announcement:
+    run_id: str
+    finished: asyncio.Future
+    music_sample: dict
 
 
 class Player:
@@ -30,24 +44,129 @@ class Player:
         self.last_sample = None
         self.last_sample_time = None
         self.needs_engine_restart = False
+        self.announcement = None
+        self._announcement_request = None
+        self._track_id = None
+        self._track_info = None
+        self._track_retry_at = 0
 
     async def start(self):
         self._tasks = [asyncio.create_task(self._commands()), asyncio.create_task(self._engine_events()),
                        asyncio.create_task(self._progress())]
 
     async def close(self):
+        self._interrupt_announcement()
         for task in self._tasks:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await self.engine.close()
 
     async def _safe_stop(self):
+        self._interrupt_announcement()
         try:
             await self.engine.stop()
         except Exception:
             # close() terminates the owned process even after IPC loss.
             await self.engine.close()
             self.needs_engine_restart = True
+
+    def _interrupt_announcement(self):
+        if self._announcement_request:
+            self._announcement_request.set()
+        announcement, self.announcement = self.announcement, None
+        if announcement and not announcement.finished.done():
+            announcement.finished.set_result('interrupted')
+
+    @staticmethod
+    def _music_cursor(context):
+        return tuple((context or {}).get(k) for k in
+                     ('playbackContextId', 'epoch', 'queueRevision', 'controlVersion'))
+
+    async def _music_sample(self):
+        if self.announcement:
+            return dict(self.announcement.music_sample)
+        return await self.engine.snapshot()
+
+    async def announce_file(self, directory, name):
+        if self._announcement_request or self.announcement:
+            raise PlaybackError('announcement already in progress')
+        interrupted = asyncio.Event()
+        self._announcement_request = interrupted
+        try:
+            with tempfile.TemporaryDirectory(prefix='announcement-') as folder:
+                clip = Path(folder) / 'speech.wav'
+                try:
+                    duration = await asyncio.to_thread(prepare_wave, directory, name, clip)
+                except (OSError, ValueError, EOFError, wave.Error):
+                    raise PlaybackError('invalid announcement WAV') from None
+                return await self.announce(str(clip), duration, interrupted)
+        finally:
+            self._announcement_request = None
+
+    async def announce(self, filename, duration, interrupted=None):
+        async with self.lock:
+            if interrupted and interrupted.is_set():
+                return {'completed': False, 'reason': 'interrupted'}
+            if self.announcement:
+                raise PlaybackError('announcement already in progress')
+            if not self.wire.ready:
+                raise PlaybackError('server not connected')
+            sample = await self.engine.snapshot()
+            music_loaded = self.run_id is not None
+            if music_loaded:
+                if (sample['run_id'] != self.run_id or sample['position_ms'] is None
+                        or not self.executed or self._music_cursor(self.executed) != self._music_cursor(self.context)):
+                    raise PlaybackError('music state is changing')
+                self.executed['positionMs'] = round(sample['position_ms'])
+            cursor = self._music_cursor(self.context)
+            generation = self.wire.generation
+            speech = Announcement(uuid.uuid4().hex, asyncio.get_running_loop().create_future(), sample)
+            self.announcement = speech
+            self.run_id = None
+        outcome = 'failed'
+        try:
+            async with self.lock:
+                if self.announcement is speech:
+                    await self.engine.load(filename, speech.run_id)
+                    if self.announcement is speech:
+                        await self.engine.play()
+            async with asyncio.timeout(duration + 5):
+                outcome = await asyncio.shield(speech.finished)
+        except (TimeoutError, RuntimeError):
+            outcome = 'failed'
+        finally:
+            async with self.lock:
+                if self.announcement is speech:
+                    try:
+                        if outcome != 'eof':
+                            # mpv closes itself on a failed load/IPC timeout.
+                            # Reopen the same configured PCM before restoring music.
+                            await self.engine.close()
+                            await self.engine.start()
+                            await self.engine.set_volume(sample['volume'])
+                        if (music_loaded and self.announcement is speech and self.wire.ready
+                                and self.wire.generation == generation and self.executed
+                                and self._is_ours(self.context or {}) and self._music_cursor(self.context) == cursor):
+                            await self._load(self.executed, paused=True)
+                            if self.announcement is not speech:
+                                self.run_id = None
+                            elif not sample['paused']:
+                                await self.engine.play()
+                    except Exception:
+                        self.run_id = None
+                        self.error = 'announcement_restore_failed'
+                        await self._safe_stop()
+                        raise PlaybackError('music restore failed') from None
+                    finally:
+                        if self.announcement is speech:
+                            self.announcement = None
+                else:
+                    outcome = 'interrupted'
+        if outcome == 'interrupted':
+            return {'completed': False, 'reason': 'interrupted'}
+        if outcome != 'eof':
+            raise PlaybackError('announcement playback failed')
+        return {'completed': True}
 
     def _is_ours(self, context):
         return (context.get('authorityClientId') == self.wire.client_id and
@@ -107,6 +226,8 @@ class Player:
                     self.executed = None
                     self.error = 'context_epoch_changed'
                     await self._safe_stop()
+            if self.announcement and self._music_cursor(context) != self._music_cursor(self.context):
+                await self._safe_stop()
             self.context = copy.deepcopy(context)
         elif action == 'playback.context.closed':
             if self.context and p.get('playbackContextId') == self.context['playbackContextId']:
@@ -158,6 +279,8 @@ class Player:
             actual = (await self.engine.snapshot())['volume']
             if actual is None or not math.isfinite(actual) or abs(actual - p['volume']) > .1:
                 raise PlaybackError('volume confirmation mismatch')
+            if self.announcement:
+                self.announcement.music_sample['volume'] = actual
             seq = self.volume_sequence
             await self.wire.send_confirmed('device.volume.update', {
                 'deviceSessionId': self.wire.device_session_id,
@@ -178,6 +301,10 @@ class Player:
             return
         if p.get('dependsOnControlVersion', self.applied) != self.applied or version != self.applied + 1:
             raise PlaybackError('control dependency is not committed')
+        if self._announcement_request:
+            self._announcement_request.set()
+        if self.announcement:
+            await self._safe_stop()
         target = copy.deepcopy(self.executed)
         if action == 'queue.playItem':
             target.update(queueSongIds=p['queueSongIds'], currentIndex=p['queueIndex'],
@@ -345,6 +472,13 @@ class Player:
             event = await self.engine.events.get()
             try:
                 async with self.lock:
+                    speech = self.announcement
+                    if speech and (event.run_id == speech.run_id or
+                                   (event.kind == 'disconnected' and event.run_id is None and
+                                    event.process_generation == getattr(self.engine, 'process_generation', -1))):
+                        if not speech.finished.done():
+                            speech.finished.set_result(event.kind)
+                        continue
                     if (event.kind == 'disconnected' and self.run_id is None and
                             event.process_generation == getattr(self.engine, 'process_generation', -1)):
                         self.needs_engine_restart = True
@@ -409,7 +543,8 @@ class Player:
                 continue
             try:
                 async with self.lock:
-                    await self._report('passive')
+                    if self.run_id and not self.announcement:
+                        await self._report('passive')
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -421,10 +556,18 @@ class Player:
         if action == 'status':
             return {'connected': self.wire.ready, 'context': self.context,
                     'appliedControlVersion': self.applied, 'error': self.error,
-                    'audio': await self.engine.snapshot()}
+                    'announcing': self.announcement is not None, 'audio': await self._music_sample()}
         if action == 'queue':
             return {'songs': (self.context or {}).get('queueSongIds', []),
                     'index': (self.context or {}).get('currentIndex')}
+        if self._announcement_request and action in ('pause', 'stop', 'play', 'resume', 'next', 'prev', 'seek'):
+            self._announcement_request.set()
+        if action in ('pause', 'stop') and (self.announcement or self._announcement_request):
+            async with self.lock:
+                if self.announcement:
+                    await self._safe_stop()
+                if not (self.context or {}).get('queueSongIds'):
+                    return {'accepted': True}
         if not self.wire.ready:
             raise PlaybackError('server not connected')
         if action == 'search':
@@ -454,7 +597,7 @@ class Player:
             if action == 'seek':
                 value = params['seconds']
                 if isinstance(value, str) and value.startswith(('+', '-')):
-                    sample = await self.engine.snapshot()
+                    sample = await self._music_sample()
                     value = (sample.get('position_ms') or 0) / 1000 + float(value)
                 extra['positionMs'] = max(0, round(float(value) * 1000))
             return await self._control('player.' + ('play' if action == 'resume' else action), **extra)
@@ -476,6 +619,28 @@ class Player:
             await self.reconcile()
             return {'stopped': True}
         raise PlaybackError('unsupported CLI action')
+
+    async def ha_status(self):
+        result = await self.cli('status', {})
+        context = result['context'] or {}
+        queue, index = context.get('queueSongIds', []), context.get('currentIndex')
+        if not (type(index) is int and 0 <= index < len(queue) and self.wire.ready):
+            return result
+        track_id = queue[index]
+        if track_id != self._track_id or (self._track_info is None and time.monotonic() >= self._track_retry_at):
+            self._track_id = track_id
+            self._track_info = None
+            self._track_retry_at = time.monotonic() + 30
+            try:
+                async with asyncio.timeout(2):
+                    response = await self.media.get('getSong', id=track_id)
+                song = response.get('song') or {}
+                if self._track_id == track_id and song.get('id') == track_id:
+                    self._track_info = {k: song[k] for k in ('id', 'title', 'artist', 'album') if k in song}
+            except (RuntimeError, TimeoutError):
+                pass  # The HA entity can still display the canonical song ID.
+        result['track'] = self._track_info if self._track_id == track_id else None
+        return result
 
     async def _control(self, action, **extra):
         context = self.context
