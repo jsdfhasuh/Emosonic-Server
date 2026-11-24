@@ -134,6 +134,32 @@ class FakeWire:
 
 
 class PlaybackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scheduled_pause_waits_and_uses_group_position(self):
+        clock = self.wire.server_time_ms()
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        self.wire.server_time_ms = lambda: clock + int((loop.time() - start) * 1000)
+        await self.engine.play()
+        due = clock + 65
+        task = asyncio.create_task(self.player._execute(self.command(
+            'player.pause', effectiveAtServerMs=due, serverTimeMs=due-300, positionMs=350), 1))
+        self.tasks.append(task)
+        await asyncio.sleep(.01)
+        self.assertFalse(self.engine.sample['paused'])
+        await task
+        self.assertTrue(self.engine.sample['paused'])
+        self.assertEqual(self.engine.sample['position_ms'], 350)
+        self.assertGreaterEqual(self.wire.server_time_ms(), due)
+
+    async def test_expired_group_play_reports_effective_at_missed(self):
+        due = self.wire.server_time_ms() - 1100
+        with self.assertRaisesRegex(PlaybackError, 'deadline'):
+            await self.player._execute(self.command(
+                'player.play', effectiveAtServerMs=due, serverTimeMs=due-300, positionMs=240), 1)
+        failed = [p for action, p in self.wire.emitted if action == 'playback.update']
+        self.assertEqual(failed[-1]['errorCode'], 'effective_at_missed')
+        self.assertEqual(self.player.applied, 0)
+
     async def asyncSetUp(self):
         self.wire, self.engine = FakeWire(), FakeEngine()
         self.player = Player(self.wire, self.engine, FakeMedia())

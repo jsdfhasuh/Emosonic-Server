@@ -14,10 +14,10 @@ import uuid
 import wave
 
 from .announcement import prepare_wave
-
-
-class PlaybackError(RuntimeError):
-    pass
+from .broadcast import Broadcast
+from .errors import PlaybackError
+from .follow import Follow
+from .handoff import Handoff
 
 
 @dataclass
@@ -28,7 +28,7 @@ class Announcement:
 
 
 class Player:
-    def __init__(self, wire, engine, media):
+    def __init__(self, wire, engine, media, state_dir=None):
         self.wire, self.engine, self.media = wire, engine, media
         self.context = None
         self.executed = None
@@ -49,6 +49,14 @@ class Player:
         self._track_id = None
         self._track_info = None
         self._track_retry_at = 0
+        self.follow = Follow(self, state_dir)
+        self.broadcast = Broadcast(self, state_dir)
+        self.handoff = Handoff(self)
+
+    @property
+    def _other_audio(self):
+        """A synchronized role currently owns mpv instead of our ordinary queue."""
+        return self.follow.active or self.broadcast.blocks_core or self.handoff.busy
 
     async def start(self):
         self._tasks = [asyncio.create_task(self._commands()), asyncio.create_task(self._engine_events()),
@@ -59,6 +67,9 @@ class Player:
         for task in self._tasks:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        await self.handoff.reset()
+        await self.follow.close()
+        await self.broadcast.disconnected()
         await self.engine.close()
 
     async def _safe_stop(self):
@@ -109,6 +120,8 @@ class Player:
                 return {'completed': False, 'reason': 'interrupted'}
             if self.announcement:
                 raise PlaybackError('announcement already in progress')
+            if self._other_audio or self.broadcast.occupied or self.handoff.source:
+                raise PlaybackError('synchronized playback in progress')
             if not self.wire.ready:
                 raise PlaybackError('server not connected')
             sample = await self.engine.snapshot()
@@ -174,6 +187,10 @@ class Player:
 
     async def reconcile(self):
         """New physical connection: establish idle/paused authority, never replay."""
+        await self.handoff.reset()
+        await self.follow.reconcile()
+        if await self.broadcast.recover():
+            return
         async with self.lock:
             await self._safe_stop()
             self.run_id = None
@@ -193,9 +210,14 @@ class Player:
             if context.get('queueSongIds'):
                 await self._load(context, paused=True)
                 await self._report('passive', state='paused')
+            elif getattr(self.wire, 'negotiated', {}).get('effectiveAtPlayback'):
+                await self._report('passive', state='idle')
             self.error = None
 
     async def disconnected(self):
+        await self.handoff.reset()
+        await self.follow.disconnected()
+        await self.broadcast.disconnected()
         self.run_id = None
         self.error = 'server_disconnected'
         await self._safe_stop()
@@ -206,6 +228,12 @@ class Player:
                 break
 
     async def on_event(self, message):
+        if await self.handoff.on_event(message):
+            return
+        if await self.follow.on_event(message):
+            return
+        if await self.broadcast.on_event(message):
+            return
         action = message.get('action')
         p = message.get('payload', {})
         if action in ('queue.context.sync', 'playback.context.status', 'playback.context.ensure'):
@@ -270,6 +298,8 @@ class Player:
 
     async def _execute(self, message, generation):
         action, p = message['action'], message['payload']
+        if self._other_audio and action != 'device.setVolume':
+            return
         if action == 'playback.context.prepare':
             await self._prepare_context(p)
             return
@@ -323,20 +353,48 @@ class Player:
                 target['state'] = 'paused'
         target['controlVersion'] = version
         previous = self.executed
+        deadline = p.get('effectiveAtServerMs')
+        error_code = 'playback_failed'
         try:
+            if deadline is not None:
+                if (type(deadline) is not int or type(p.get('serverTimeMs')) is not int
+                        or deadline - p['serverTimeMs'] < 250):
+                    raise PlaybackError('invalid effective-at schedule')
+                delay = (deadline - self.wire.server_time_ms()) / 1000
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                if (generation != self.wire.generation or key in self.invalidated
+                        or not self.wire.ready or self._other_audio
+                        or self._music_cursor(self.executed) != self._music_cursor(previous)):
+                    raise PlaybackError('scheduled command superseded')
+                if self.wire.server_time_ms() - deadline > 1000:
+                    error_code = 'effective_at_missed'
+                    raise PlaybackError('missed effective-at deadline')
             async with asyncio.timeout(min(30, max(.1, p['executionTimeoutMs'] / 1000))):
                 if target['state'] == 'stopped':
                     self.run_id = None
                     await self._safe_stop()
                 elif (not self.run_id or action in ('player.next', 'player.prev', 'queue.playItem')):
-                    await self._load(target, paused=target['state'] != 'playing')
-                else:
-                    if action == 'player.seek':
-                        await self.engine.seek(target['positionMs'])
-                    elif action == 'player.play':
+                    await self._load(target, paused=True)
+                    if target['state'] == 'playing':
+                        if deadline is not None:
+                            late = max(0, self.wire.server_time_ms() - deadline)
+                            if late > 1000:
+                                error_code = 'effective_at_missed'
+                                raise PlaybackError('missed effective-at deadline')
+                            if late:
+                                await self.engine.seek(target['positionMs'] + late)
                         await self.engine.play()
-                    else:
+                else:
+                    if action == 'player.pause':
                         await self.engine.pause()
+                    if (action == 'player.seek' or
+                            (action in ('player.play', 'player.pause') and 'positionMs' in p)):
+                        late = (max(0, self.wire.server_time_ms() - deadline)
+                                if deadline is not None and target['state'] == 'playing' else 0)
+                        await self.engine.seek(target['positionMs'] + late)
+                    if action == 'player.play':
+                        await self.engine.play()
                 if generation != self.wire.generation or key in self.invalidated:
                     raise PlaybackError('execution invalidated')
                 self.executed = target
@@ -354,7 +412,7 @@ class Player:
                 try:
                     await self._report('remoteCommand', command_version=version,
                                        state='paused' if previous.get('queueSongIds') else 'idle',
-                                       failed=True)
+                                       failed=True, error_code=error_code)
                 except Exception:
                     pass
             raise
@@ -402,7 +460,8 @@ class Player:
         if not paused:
             await self.engine.play()
 
-    async def _report(self, origin, command_version=None, state=None, failed=False):
+    async def _report(self, origin, command_version=None, state=None, failed=False,
+                      error_code='playback_failed'):
         context = self.executed
         if not context:
             raise PlaybackError('missing execution context')
@@ -410,6 +469,10 @@ class Player:
             sample = await self.engine.snapshot()
             self.last_sample = sample
             self.last_sample_time = self.wire.server_time_ms()
+            sampled = sample.get('position_sampled_monotonic')
+            if sampled is not None:
+                elapsed = asyncio.get_running_loop().time() - sampled
+                self.last_sample_time -= max(0, round(elapsed * 1000))
         except Exception:
             if not failed and state != 'stopped':
                 raise
@@ -425,7 +488,7 @@ class Player:
                    'deviceSessionId': self.wire.device_session_id, 'origin': origin,
                    'state': state, 'positionMs': round(position) if state != 'idle' else 0,
                    'positionSampledAtServerMs': self.last_sample_time or self.wire.server_time_ms(),
-                   'playbackRate': 1.0, 'clientSeq': self.sequence,
+                   'playbackRate': sample.get('speed') or 1.0, 'clientSeq': self.sequence,
                    'appliedControlVersion': self.applied}
         if state != 'idle':
             payload['trackId'] = context['queueSongIds'][context['currentIndex']]
@@ -434,7 +497,7 @@ class Player:
                            commandControlVersion=command_version,
                            appliedControlVersion=self.applied if failed else command_version)
             if failed:
-                payload['errorCode'] = 'playback_failed'
+                payload['errorCode'] = error_code
         expected_seq = self.sequence
         confirmation = await self.wire.send_confirmed('playback.update', payload,
             'playback.update', lambda m: (
@@ -487,6 +550,8 @@ class Player:
                         continue
                     if event.run_id != self.run_id or not self.run_id:
                         continue
+                    if self._other_audio:
+                        continue
                     if event.kind != 'eof':
                         self.needs_engine_restart = True
                         self.error = 'audio_unavailable'
@@ -538,12 +603,12 @@ class Player:
 
     async def _progress(self):
         while True:
-            await asyncio.sleep(2)
-            if self.lock.locked() or not self.run_id or not self.wire.ready:
+            await asyncio.sleep(1 if (self.executed or {}).get('state') == 'playing' else 2)
+            if self.lock.locked() or not self.run_id or not self.wire.ready or self._other_audio:
                 continue
             try:
                 async with self.lock:
-                    if self.run_id and not self.announcement:
+                    if self.run_id and not self.announcement and not self._other_audio:
                         await self._report('passive')
             except asyncio.CancelledError:
                 raise
@@ -556,7 +621,13 @@ class Player:
         if action == 'status':
             return {'connected': self.wire.ready, 'context': self.context,
                     'appliedControlVersion': self.applied, 'error': self.error,
+                    'follow': self.follow.status(), 'broadcast': self.broadcast.status(),
+                    'handoffPending': self.handoff.busy,
                     'announcing': self.announcement is not None, 'audio': await self._music_sample()}
+        if action == 'follow-status':
+            return self.follow.status()
+        if action == 'broadcast-status' and not self.wire.ready:
+            return self.broadcast.status()
         if action == 'queue':
             return {'songs': (self.context or {}).get('queueSongIds', []),
                     'index': (self.context or {}).get('currentIndex')}
@@ -570,6 +641,39 @@ class Player:
                     return {'accepted': True}
         if not self.wire.ready:
             raise PlaybackError('server not connected')
+        if action == 'devices':
+            devices = await self.wire.request('device.list', {}, type='state', reply_actions={'device.list'})
+            return [{k: d[k] for k in ('clientId', 'deviceSessionId', 'deviceName', 'roles',
+                                        'capabilities') if k in d}
+                    for d in devices['payload']['devices']]
+        if action == 'contexts':
+            result = await self.wire.request('playback.context.list', {
+                'authorityClientId': params['client_id'],
+                'authorityDeviceSessionId': params['session_id']}, type='state',
+                reply_actions={'playback.context.list'})
+            return result['payload']['contexts']
+        if action == 'follow-stop':
+            return await self.follow.stop()
+        if action == 'handoff-cancel':
+            return await self.handoff.cancel()
+        if action == 'follow':
+            if self.broadcast.occupied or self.handoff.busy or self._announcement_request:
+                raise PlaybackError('another playback operation is in progress')
+            return await self.follow.start(params['context'])
+        if action == 'handoff':
+            if self.follow.active or self.broadcast.occupied or self._announcement_request:
+                raise PlaybackError('another playback operation is in progress')
+            return await self.handoff.start(params['target'])
+        if action.startswith('broadcast-'):
+            if self.follow.active or self.handoff.busy or self._announcement_request:
+                raise PlaybackError('another playback operation is in progress')
+            return await self.broadcast.cli(action, params)
+        if self.broadcast.occupied and action in ('pause', 'resume', 'stop'):
+            command = {'pause': 'broadcast-pause', 'resume': 'broadcast-play', 'stop': 'broadcast-stop'}
+            return await self.broadcast.cli(command[action], {})
+        if (self._other_audio and
+                action in ('play', 'pause', 'resume', 'stop', 'seek', 'next', 'prev')):
+            raise PlaybackError('finish synchronized playback before controlling the local queue')
         if action == 'search':
             return await self.media.search(params['query'])
         if action == 'playlists':
@@ -624,9 +728,19 @@ class Player:
         result = await self.cli('status', {})
         context = result['context'] or {}
         queue, index = context.get('queueSongIds', []), context.get('currentIndex')
-        if not (type(index) is int and 0 <= index < len(queue) and self.wire.ready):
+        track_id = queue[index] if type(index) is int and 0 <= index < len(queue) else None
+        if self.follow.active:
+            context = self.follow.source or {}
+            track_id = self.follow.track
+            result['context'] = dict(context, trackId=track_id, state=self.follow.phase)
+            result['appliedControlVersion'] = (self.follow.fact or {}).get('appliedControlVersion')
+        elif self.broadcast.blocks_core:
+            overlay = self.broadcast.status()
+            track_id = overlay.get('mirrorTrackId')
+            result['context'] = overlay.get('mirrorContext', {})
+            result['appliedControlVersion'] = result['context'].get('controlVersion')
+        if not track_id or not self.wire.ready:
             return result
-        track_id = queue[index]
         if track_id != self._track_id or (self._track_info is None and time.monotonic() >= self._track_retry_at):
             self._track_id = track_id
             self._track_info = None

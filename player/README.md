@@ -7,10 +7,28 @@ mpv，不维护第二份业务队列。
 
 ## 范围和验证边界
 
-第一阶段仅 Core：播放、暂停、定位、音量、队列、自然下一首、状态与恢复。
-Handoff、Follow、Broadcast 不支持，不声明相应能力。手机退出但播放端仍
-连接服务器时，不应停播；播放端与服务器失联时暂停，重新确认身份和上下文
-后才接受新命令，不重放旧控制。
+音箱支持播放、暂停、定位、音量、队列和自然下一首，并通过 Emo Socket 协商
+Follow 跟随、Broadcast 群播和双向 Handoff 接力。仅启用 Core 的服务器仍可用于普通遥控。
+手机退出时音箱可以继续播放。音箱与服务端失联时停止输出，重连后重新确认播放任务。
+
+在 App 完整播放器的设备栏选「跟随」，会让手上的设备跟着所选音箱播放。
+「切换播放」把正在播放的任务交给所选设备，目标应为空闲且没有队列。
+「选入群播」和「开始群播」可以让本机和所选设备一起播放。
+
+从 SSH 反向操作时，先执行 `emosonic devices`，再用
+`emosonic contexts CLIENT_ID SESSION_ID` 查看所选设备的播放任务：
+
+- `emosonic follow CONTEXT_ID` 让音箱跟着该任务播放，`emosonic follow-status`
+  查看状态和估算偏差，`emosonic follow-stop` 恢复音箱原任务。
+- `emosonic handoff CLIENT_ID` 将音箱正在播的任务交给目标。`emosonic handoff-cancel`
+  可取消尚未完成的交接。被交接的一端预载并按时起播，原端在转移成功后释放播放。
+- `emosonic broadcast-start CLIENT_ID [CLIENT_ID ...]` 以音箱为源组播。
+  `broadcast-status` 查询组状态，`broadcast-pause`、`broadcast-play`、
+  `broadcast-seek 毫秒`、`broadcast-play-item 从零开始的索引` 和 `broadcast-stop`
+  分别用于控制和退组。群主和音源可以控制全组。
+
+普通播放仍能插播 HA 门口通知并恢复原曲。在跟随、群播或交接占用音频时，
+播放器会向 HA 报告当前模式忙，以免插播打断按时起播或覆盖另一设备的播放位置。
 
 本目录提供开发代码、测试和部署材料，**不表示已在用户 OpenWrt 部署**。
 USB 实际出声、音质、三首连续播放、拔插、资源趋势和对现有 HA/网络服务的
@@ -186,7 +204,8 @@ docker compose -f player/compose.yaml stop player
    迟到 mpv 事件、断线和重连；确认不重放、不双响、不漏掉同一 run 合法 EOF。
 3. 实际 USB 放音至少跨三首、手机退出、声卡拔插、进程退出、资源趋势和现有
    HA/网络服务检查；各项单独记录 PASS/FAIL/NOT_RUN。
-4. 以后单独实现和验收 Handoff；不得由 Core 成功推断高级同步能力。
+4. 分别验证跟随时的曲目、两端实际位置和暂停，群播的定时执行和退组恢复，
+   以及 Handoff 往返及中途取消。检查源端在交接前持续播放，目标确认执行后原端释放。
 
 参考：[mpv IPC](https://mpv.io/manual/stable/#json-ipc)、
 [Python Socket.IO](https://python-socketio.readthedocs.io/en/stable/client.html)、

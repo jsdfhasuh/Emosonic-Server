@@ -253,6 +253,15 @@ class MpvPlayer:
             return not seeking and isinstance(position, (int, float)) and abs(position * 1000 - position_ms) <= 250
         await self._until(reached)
 
+    async def set_speed(self, rate: float) -> None:
+        if not math.isfinite(rate) or rate <= 0:
+            raise ValueError("invalid playback rate")
+        async with self._operation():
+            await self._command(["set_property", "speed", rate])
+            actual = await self._command(["get_property", "speed"])
+            if not isinstance(actual, (int, float)) or abs(actual - rate) > .001:
+                raise MpvError("mpv_speed_unconfirmed")
+
     async def set_volume(self, percent: float) -> None:
         if not math.isfinite(percent) or not 0 <= percent <= 100:
             raise ValueError("volume must be between 0 and 100")
@@ -278,17 +287,25 @@ class MpvPlayer:
         async with self._operation():
             run = self._run_id
             result = {"run_id": run, "process_generation": self._generation}
-            for prop, key in (("time-pos", "position_ms"), ("duration", "duration_ms"),
-                              ("pause", "paused"), ("paused-for-cache", "buffering"),
-                              ("volume", "volume")):
+            for prop, key in (("audio-pts", "position_ms"), ("time-pos", "position_ms"),
+                              ("duration", "duration_ms"), ("pause", "paused"), ("paused-for-cache", "buffering"),
+                              ("volume", "volume"), ("speed", "speed")):
+                if prop == "time-pos" and result.get("position_ms") is not None:
+                    continue
+                before = asyncio.get_running_loop().time()
                 try:
                     value = await self._command(["get_property", prop])
                 except MpvError as error:
                     if str(error) != "mpv_command_failed":
                         raise
                     value = None
+                if key == "position_ms" and (type(value) not in (int, float)
+                                             or not math.isfinite(value) or value < 0):
+                    value = None
                 if key.endswith("_ms") and isinstance(value, (int, float)):
                     value *= 1000
+                if key == "position_ms" and value is not None:
+                    result["position_sampled_monotonic"] = (before + asyncio.get_running_loop().time()) / 2
                 result[key] = value
             if run != self._run_id:
                 raise MpvError("mpv_snapshot_superseded")

@@ -16,7 +16,9 @@ import tempfile
 import uuid
 import wave
 
+from .broadcast import Broadcast
 from .config import client_identity, load_config, read_password, validate_audio_device
+from .follow import Follow
 from .mpv import MpvError, MpvPlayer
 from .playback import Player, PlaybackError
 from .protocol import ProtocolClient, ProtocolError
@@ -115,11 +117,18 @@ async def run(config):
         raise ValueError('another player daemon is running') from None
     password = read_password(config['password_file'])
     identity = client_identity(config['client_id_file'])
+    state_dir = Path(config['state_dir'])
+    recovery_sessions = {sid for profile in (Follow, Broadcast)
+                         if (sid := profile.recovery_session(
+                             state_dir, config['server_url'], config['username'], identity))}
+    if len(recovery_sessions) > 1:
+        raise ValueError('inconsistent synchronized playback recovery sessions')
+    session = recovery_sessions.pop() if recovery_sessions else 'instance-' + uuid.uuid4().hex
     wire = ProtocolClient(config['server_url'], config['username'], password, identity,
-                          'instance-' + uuid.uuid4().hex, config['device_name'])
+                          session, config['device_name'])
     media = MediaClient(config['server_url'], config['username'], password)
     engine = MpvPlayer(config['audio_device'], str(runtime))
-    player = Player(wire, engine, media)
+    player = Player(wire, engine, media, state_dir)
     wire.on_event = player.on_event
     wire.on_disconnect = player.disconnected
     stop = asyncio.Event()

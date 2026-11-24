@@ -360,7 +360,9 @@ def serve_queue_fixture(manifest):
         config.TESTING = False
         config.BASE['database_uri'] = 'sqlite:///' + str(Path(work) / 'music.sqlite')
         config.WEBAPP.update(cache_dir=work, mount_emosonic=True, emo_development_mode=True,
-                             emo_strict_v2_allow_local_test_evidence=True, emo_strict_v2_core_enabled=True)
+                             emo_strict_v2_allow_local_test_evidence=True, emo_strict_v2_core_enabled=True,
+                             emo_strict_v2_follow_enabled=True, emo_strict_v2_handoff_enabled=True,
+                             emo_strict_v2_broadcast_enabled=True)
         app = create_application(config)
         username, password = 'queue-test-user', secrets.token_urlsafe(20)
         UserManager.add(username, password)

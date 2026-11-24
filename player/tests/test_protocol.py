@@ -73,6 +73,16 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.socket.messages[1]['payload']['capabilities'], CAPABILITIES)
         self.assertLess(abs(self.client.server_time_ms() - 100000), 100)
 
+    async def test_server_can_negotiate_core_without_synchronization(self):
+        envelope = {'payload': {'action': 'device.register', 'clientId': 'box',
+            'deviceSessionId': 'instance', 'strictV2': {'protocolVersion': '2.9.0',
+            'connectionEpoch': 1, 'connectionNonce': 'nonce'},
+            'negotiatedCapabilities': dict(CAPABILITIES, supportsFollow=False,
+                supportsBroadcast=False, effectiveAtPlayback=False, playbackPrepare=False)}}
+        self.client._validate_registration(envelope)
+        self.assertTrue(self.client.negotiated['canPlay'])
+        self.assertFalse(self.client.negotiated['supportsFollow'])
+
     async def test_idle_heartbeat_and_reconnect_after_losing_registration(self):
         await self.client.close()
         lost = asyncio.Event()

@@ -1,20 +1,23 @@
 """Strict Core Socket.IO transport, separate from playback and server runtime."""
 import asyncio
 import math
+from collections import deque
 from collections.abc import Callable
 import time
 import uuid
 from urllib.parse import urlsplit
 
 # Engine.IO keepalives do not refresh the server's registered device.
-HEARTBEAT_INTERVAL_SECONDS = 20
+HEARTBEAT_INTERVAL_SECONDS = 5
 
 CAPABILITIES = {
-    "playbackContextV2": True, "playbackPrepare": False,
-    "effectiveAtPlayback": False, "canPlay": True, "canPause": True,
-    "canSeek": True, "canSetVolume": True, "supportsFollow": False,
-    "supportsBroadcast": False, "remoteVolumeControl": True,
+    "playbackContextV2": True, "playbackPrepare": True,
+    "effectiveAtPlayback": True, "canPlay": True, "canPause": True,
+    "canSeek": True, "canSetVolume": True, "supportsFollow": True,
+    "supportsBroadcast": True, "remoteVolumeControl": True,
 }
+CORE_CAPABILITIES = ("playbackContextV2", "canPlay", "canPause", "canSeek",
+                     "canSetVolume", "remoteVolumeControl")
 
 
 class ProtocolError(RuntimeError):
@@ -43,6 +46,8 @@ class ProtocolClient:
         self._waiters = []
         self._tasks = set()
         self._clock_offset = None
+        self._clock_samples = deque(maxlen=3)
+        self.negotiated = {}
         self._send_lock = asyncio.Lock()
 
     def _spawn(self, coroutine):
@@ -59,6 +64,8 @@ class ProtocolClient:
     def _invalidate(self):
         self.ready, self.nonce, self.epoch = False, None, None
         self._clock_offset = None
+        self._clock_samples.clear()
+        self.negotiated = {}
         for _, future, _ in self._pending.values():
             if not future.done():
                 future.set_exception(ProtocolError("connection_lost"))
@@ -112,14 +119,11 @@ class ProtocolClient:
             }, type="device")
             # The receive path sets provenance before any following events arrive.
             self._validate_registration(registration)
-            best = None
             for _ in range(3):
-                sample = await self._ping()
-                if best is None or sample[0] < best[0]:
-                    best = sample
+                self._clock_samples.append(await self._ping())
             if generation != self.generation:
                 raise ProtocolError("connection_lost")
-            self._clock_offset = best[1]
+            self._clock_offset = min(self._clock_samples)[1]
             self.ready = True
             self._spawn(self._heartbeat(generation))
         except asyncio.CancelledError:
@@ -144,7 +148,10 @@ class ProtocolClient:
         while generation == self.generation:
             await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
             try:
-                await self._ping()
+                sample = await self._ping()
+                if generation == self.generation:
+                    self._clock_samples.append(sample)
+                    self._clock_offset = min(self._clock_samples)[1]
             except ProtocolError:
                 if generation == self.generation:
                     self._connection_lost()
@@ -164,12 +171,13 @@ class ProtocolClient:
         caps = p.get("negotiatedCapabilities")
         if (not isinstance(caps, dict) or set(caps) != set(CAPABILITIES)
                 or any(type(v) is not bool for v in caps.values())
-                or caps != CAPABILITIES):
+                or not all(caps[k] for k in CORE_CAPABILITIES)):
             raise ProtocolError("capability_mismatch")
         nonce = metadata["connectionNonce"]
         if message.get("connectionNonce", nonce) != nonce or message.get("connectionEpoch", 1) != 1:
             raise ProtocolError("registration_provenance_mismatch")
         self.nonce, self.epoch = nonce, 1
+        self.negotiated = dict(caps)
 
     def server_time_ms(self):
         if self._clock_offset is None:
@@ -281,7 +289,8 @@ class ProtocolClient:
                 known = {"unauthorized", "bad_request", "not_found", "conflict",
                          "forbidden", "rate_limited", "authority_offline",
                          "restore_in_progress", "internal_error", "core_not_ready",
-                         "strict_v2_core_not_ready"}
+                         "strict_v2_core_not_ready", "capability_required", "clock_not_ready",
+                         "queue_required", "not_supported", "effective_at_missed"}
                 future.set_exception(ProtocolError(code if code in known else "server_error"))
             else:
                 try:

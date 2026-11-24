@@ -1,10 +1,16 @@
 """Fail-closed configuration and persistent, non-secret identity."""
+import hashlib
 import json
 import os
 from pathlib import Path
 import stat
 import uuid
 from urllib.parse import urlsplit
+
+
+def recovery_scope(server_url, username, client_id):
+    identity = json.dumps([server_url.rstrip('/'), username, client_id], separators=(',', ':'))
+    return hashlib.sha256(identity.encode('utf-8')).hexdigest()
 
 
 def validate_audio_device(value: str) -> None:
