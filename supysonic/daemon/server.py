@@ -8,7 +8,7 @@
 import logging
 import time
 
-from multiprocessing.connection import Listener, Client
+from multiprocessing.connection import Client, Listener, answer_challenge, deliver_challenge
 from threading import Thread, Event
 
 from .client import DaemonCommand
@@ -50,6 +50,7 @@ class Daemon:
     def __init__(self, config):
         self.__config = config
         self.__listener = None
+        self.__authkey = None
         self.__watcher = None
         self.__scanner = None
         self.__jukebox = None
@@ -80,9 +81,8 @@ class Daemon:
             )
 
     def run(self):
-        self.__listener = Listener(
-            address=self.__config.DAEMON["socket"], authkey=get_secret_key("daemon_key")
-        )
+        self.__authkey = get_secret_key("daemon_key")
+        self.__listener = Listener(address=self.__config.DAEMON["socket"])
         logger.info(format_log_event("daemon", "listening", socket=self.__listener.address))
 
         if self.__config.DAEMON["run_watcher"]:
@@ -111,11 +111,28 @@ class Daemon:
             time.sleep(1)
 
     def __listen(self):
-        while not self.__stopped.is_set():
-            conn = self.__listener.accept()
-            self.__handle_connection(conn)
-
-        self.__listener.close()
+        try:
+            while not self.__stopped.is_set():
+                try:
+                    conn = self.__listener.accept()
+                except ConnectionError as exc:
+                    logger.warning(format_log_event(
+                        "daemon", "rpc_connection_rejected", error_type=type(exc).__name__,
+                    ))
+                    continue
+                with conn:
+                    try:
+                        # Authenticate inside the accepted connection's lifetime.
+                        # These are the two checks normally made by Listener.accept().
+                        deliver_challenge(conn, self.__authkey)
+                        answer_challenge(conn, self.__authkey)
+                        self.__handle_connection(conn)
+                    except Exception as exc:
+                        logger.warning(format_log_event(
+                            "daemon", "rpc_client_failed", error_type=type(exc).__name__,
+                        ))
+        finally:
+            self.__listener.close()
 
     def __get_recommend_refresh_interval(self):
         return max(60, int(self.__config.DAEMON.get("recommend_refresh_interval", 300)))
@@ -523,7 +540,7 @@ class Daemon:
             self.__watcher.remove_folder(folder.path)
 
     def terminate(self):
-        with Client(self.__listener.address, authkey=self.__listener._authkey) as c:
+        with Client(self.__listener.address, authkey=self.__authkey) as c:
             self.__stopped.set()
             c.send(None)
 
