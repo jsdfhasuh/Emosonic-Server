@@ -61,7 +61,9 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         finally:
             self.broadcast_ready_patcher.stop()
 
-    def connect_broadcast_devices(self, participant_roles=None):
+    def connect_broadcast_devices(
+        self, participant_roles=None, source_context_state="playing"
+    ):
         authority = self.connect_device(
             "alice",
             "Alic3",
@@ -104,7 +106,7 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             device_session_id="device:authority-1",
             queue_song_ids=["source-song-1", "source-song-2"],
             position_ms=900,
-            state="playing",
+            state=source_context_state,
         )
         self.ensure_playback_context(
             participant,
@@ -5223,7 +5225,9 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         self.assertEqual(self.get_messages(authority), [])
 
     def test_source_queue_sync_derives_one_broadcast_queue_sync(self):
-        authority, participant, controller = self.connect_broadcast_devices()
+        authority, participant, controller = self.connect_broadcast_devices(
+            source_context_state="paused",
+        )
         start_ack = self.get_ack(
             self.start_strict_broadcast(
                 controller,
@@ -5273,6 +5277,12 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         )
         self.assertEqual(context["currentIndex"], 1)
         self.assertEqual(context["trackId"], "source-song-2")
+        self.assertEqual(context["state"], "paused")
+        self.assertEqual(ordinary["payload"]["state"], "playing")
+        self.assertEqual(
+            ordinary["payload"]["positionMs"],
+            100 + ordinary["payload"]["effectiveAtServerMs"] - sampled_at_ms,
+        )
         self.assertEqual(persisted["snapshot"]["broadcastRevision"], 2)
         self.assertEqual(persisted["revisions"][-1]["action"], "queue.sync")
         self.assertEqual(
@@ -5290,6 +5300,28 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             persisted["snapshot"]["serverUpdatedAtMs"],
             ordinary["payload"]["effectiveAtServerMs"],
         )
+
+    def test_source_queue_sync_preserves_reported_pause(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        self.get_ack(
+            self.start_strict_broadcast(controller, participants=["participant-1"]),
+            "broadcast-start-1",
+        )
+        self.update_source_playback(
+            authority, 2, int(time.time() * 1000), state="paused",
+        )
+        self._push(self.get_messages(participant), "broadcast.pause")
+
+        self.sync_source_queue(
+            authority, ["source-song-1", "source-song-2"], current_index=1,
+        )
+        self.get_ack(self.get_messages(authority), "source-queue-sync-1")
+        target = self._push(
+            self.get_messages(participant), "broadcast.queue.sync",
+        )["payload"]
+        self.assertEqual(target["trackId"], "source-song-2")
+        self.assertEqual(target["state"], "paused")
+        self.assertEqual(target["positionMs"], 0)
 
     def test_source_queue_clear_atomically_terminals_with_pre_idle_snapshot(self):
         authority, participant, controller = self.connect_broadcast_devices()

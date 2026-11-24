@@ -10890,9 +10890,12 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
                 server_time_ms,
             )
         effective_at_server_ms = server_time_ms + 250
-        playback_rate = persisted_broadcast["snapshot"]["playbackRate"]
+        # Queue sync supplies the new item and position, but no transport state.
+        previous_snapshot = persisted_broadcast["snapshot"]
+        state_name = previous_snapshot["state"]
+        playback_rate = previous_snapshot["playbackRate"]
         projected_position_ms = result["positionMs"]
-        if result["state"] == "playing":
+        if state_name == "playing":
             sampled_at_ms = payload["positionSampledAtServerMs"]
             if (
                 sampled_at_ms > server_time_ms + 50
@@ -10913,7 +10916,7 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
             result,
             "broadcast.queue.sync",
             projected_position_ms,
-            result["state"],
+            state_name,
             playback_rate,
             server_time_ms,
             effective_at_server_ms,
