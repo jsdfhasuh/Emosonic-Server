@@ -249,3 +249,14 @@ class FollowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(recovered.active)
         self.assertEqual(self.engine.loads, ['first'])
         self.wire.ready = False
+
+    async def test_lost_stop_reply_is_retried_and_unblocks_ordinary_controls(self):
+        await self.follow.start('speaker')
+        self.wire.fail_stop = True
+        with self.assertRaises(PlaybackError):
+            await self.follow.stop()
+        self.assertTrue(self.follow.active)
+        self.wire.fail_stop = False
+        await asyncio.wait_for(self.follow.release_retry, 3)
+        self.assertFalse(self.follow.active)
+        self.assertEqual(self.engine.loads, ['first', 'original'])

@@ -52,6 +52,7 @@ class Follow:
         self.speed = 1.0
         self.drift = None
         self.watch = None
+        self.release_retry = None
         self.last_valid = self.last_refresh = 0.0
         self.generation = None
         self.error = None
@@ -377,6 +378,31 @@ class Follow:
                     await self._quiet()
 
     async def _stop(self, restore):
+        try:
+            return await self._release(restore)
+        except Exception as exc:
+            self.error = type(exc).__name__
+            if self._current() and (self.release_retry is None or self.release_retry.done()):
+                self.release_retry = asyncio.create_task(self._retry_release(self.record, restore))
+            raise
+
+    async def _retry_release(self, record, restore):
+        # An unacknowledged release still fences native output. Retry the
+        # idempotent stop for this lease only; a new start owns another record.
+        delay = 1
+        while self._current() and self.record is record:
+            await asyncio.sleep(delay)
+            async with self.player.lock:
+                if not self._current() or self.record is not record or self.phase != 'release_pending':
+                    return
+                try:
+                    await self._release(restore)
+                    return
+                except Exception as exc:
+                    self.error = type(exc).__name__
+            delay = min(8, delay * 2)
+
+    async def _release(self, restore):
         if not self.active:
             return self.status()
         self.phase = 'release_pending'
@@ -415,6 +441,9 @@ class Follow:
 
     async def disconnected(self):
         async with self.player.lock:
+            if self.release_retry:
+                self.release_retry.cancel()
+                self.release_retry = None
             if self.active:
                 self.phase = 'release_pending'
                 if self.watch and self.watch is not asyncio.current_task():
@@ -434,6 +463,13 @@ class Follow:
     async def close(self):
         if self.active and self.wire.ready:
             async with self.player.lock:
-                await self._stop(restore=False)
+                if self.release_retry:
+                    self.release_retry.cancel()
+                    self.release_retry = None
+                try:
+                    await self._release(restore=False)
+                except Exception as exc:
+                    # Preserve the journal across shutdown if the reply was lost.
+                    self.error = type(exc).__name__
         else:
             await self.disconnected()
