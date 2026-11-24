@@ -11019,7 +11019,9 @@ def _handle_strict_v2_playback_update(
         current_user_name,
         payload["playbackContextId"],
     )
-    track_duration_ms = getTrackDurationMs(payload.get("trackId"))
+    track_duration_ms = (
+        getTrackDurationMs(payload.get("trackId")) if persisted_broadcast is not None else None
+    )
 
     def projection_hook(
         _record,
@@ -13157,10 +13159,18 @@ class EmoNamespace(Namespace):
             disconnect(sid=request.sid, namespace="/emo")
             return
         g.emo_request_action = action
-
         session_info = state.get_session(request.sid)
-        current_user_name = None if session_info is None else session_info.get("userName")
         current_client = state.get_client_for_sid(request.sid)
+        # Source facts and their consumers cross several stores. Reuse the same
+        # physical DB connection, including the durable device revocation check.
+        scoped = action in {"playback.update", "follow.start", "broadcast.start"} and (
+            _is_strict_playback_context_v2(current_client)
+        )
+        with connection_scope(reuse=True) if scoped else nullcontext():
+            return self._dispatch_message(message, action, request_id, session_info, current_client)
+
+    def _dispatch_message(self, message, action, request_id, session_info, current_client):
+        current_user_name = None if session_info is None else session_info.get("userName")
         if current_client is not None and _revoke_decommissioned_sid_if_needed(
             request.sid
         ):
