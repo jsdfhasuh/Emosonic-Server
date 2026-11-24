@@ -7,6 +7,7 @@ from unittest import mock
 
 from flask_socketio.test_client import SocketIOTestClient
 
+from supysonic.db_layer.core import db
 from supysonic.emo import ws as emo_ws
 from supysonic.emo import ws_state as emo_ws_state
 from supysonic.emo.ws import (
@@ -34,6 +35,36 @@ from tests.base.test_emo_ws import (
 
 
 class StrictV2HandoffTestCase(EmoWebSocketTestCase):
+    def test_start_preserves_fresh_sample_on_high_latency_database_connections(self):
+        source, _, controller = self.connect_handoff_devices()
+        now = emo_ws._server_time_ms()
+        self.report_strict_playback_context(
+            source, "aged-playing-sample", "context-handoff-1", "device:source-1",
+            state="playing", position_ms=1300, client_seq=2, sampled_at_server_ms=now - 1350,
+        )
+        # Model the measured connection handshake cost without a timing-sensitive sleep.
+        connect = db.obj._connect
+        clock = now
+
+        def open_database():
+            nonlocal clock
+            clock += 103
+            return connect()
+
+        with mock.patch.object(db.obj, "_connect", open_database), mock.patch.object(
+            emo_ws, "_server_time_ms", side_effect=lambda: clock
+        ):
+            messages = self.start_handoff(controller)
+        self.assertIsNotNone(self.get_ack(messages, "handoff-start-1"))
+
+    def test_start_still_rejects_expired_playing_sample(self):
+        _, target, controller = self.connect_handoff_devices()
+        with mock.patch.object(emo_ws, "_server_time_ms", return_value=emo_ws._server_time_ms() + 2100):
+            messages = self.start_handoff(controller)
+        error = self.get_error(messages, "handoff-start-1")
+        self.assertEqual(error["payload"]["code"], "conflict")
+        self.assertFalse(any(m["action"] == "playback.prepare" for m in self.get_messages(target)))
+
     def connect_handoff_replacement(self, client_id: str) -> SocketIOTestClient:
         return self.connect_authenticated_client(
             "alice",

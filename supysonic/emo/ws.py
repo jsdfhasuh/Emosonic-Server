@@ -11934,7 +11934,8 @@ def _handle_handoff_start(
         raise ValueError("playback.handoff.start requires a non-empty targetClientId")
     if source_client_id == target_client_id:
         raise ValueError("playback.handoff.start source and target must be different")
-    if strict_v2:
+    if strict_v2 and _lifecycle_locked:
+        # Fence reads are authoritative after acquiring the generation locks and dispatch barrier.
         _require_broadcast_pair_action_allowed(
             current_user_name,
             current_client.get("clientId"),
@@ -11981,14 +11982,17 @@ def _handle_handoff_start(
                     raise PermissionError(
                         "Playback handoff requester physical generation changed"
                     )
-                return _handle_handoff_start(
-                    current_user_name,
-                    locked_client,
-                    payload,
-                    request_id,
-                    request_sid,
-                    _lifecycle_locked=True,
-                )
+                # Reuse the connection for synchronous admission, including its independent
+                # database transactions. The target's ready/complete events run in later requests.
+                with connection_scope(reuse=True) if strict_v2 else nullcontext():
+                    return _handle_handoff_start(
+                        current_user_name,
+                        locked_client,
+                        payload,
+                        request_id,
+                        request_sid,
+                        _lifecycle_locked=True,
+                    )
 
     existing_handoff = (
         state.get_playback_handoff_by_request(
