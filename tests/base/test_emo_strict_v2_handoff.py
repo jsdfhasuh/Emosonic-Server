@@ -523,6 +523,41 @@ class StrictV2HandoffTestCase(EmoWebSocketTestCase):
         self.assertEqual(self.get_messages(source), [])
         self.assertEqual(getPlaybackContextState("context-handoff-1"), replayed_context)
 
+    def test_status_reports_ordinary_pause_and_seek_after_handoff(self):
+        _, target, controller = self.connect_handoff_devices()
+        ack = self.get_ack(self.start_handoff(controller), "handoff-start-1")["payload"]
+        target.emit("message", {
+            "type": "event", "action": "playback.ready", "requestId": "ready",
+            "payload": {
+                "playbackContextId": "context-handoff-1", "handoffId": ack["handoffId"],
+                "prepareId": ack["prepareId"], "deviceSessionId": "device:target-1", "ready": True,
+            },
+        }, namespace="/emo")
+        commit = next(m for m in self.get_messages(target) if m["action"] == "player.play")
+        self.complete_handoff(target, ack["handoffId"], commit, "complete")
+        for seq, position in ((2, 1200), (3, 0)):
+            request_id = "ordinary-%d" % seq
+            target.emit("message", {
+                "type": "event", "action": "playback.update", "requestId": request_id,
+                "payload": {
+                    "playbackContextId": "context-handoff-1", "deviceSessionId": "device:target-1",
+                    "origin": "localUser", "executionStatus": "committed", "intentId": request_id,
+                    "epoch": 2, "observedControlVersion": seq, "queueIndex": 0, "trackId": "song-1",
+                    "state": "paused", "positionMs": position, "playbackRate": 1.0, "clientSeq": seq,
+                    "positionSampledAtServerMs": int(time.time() * 1000),
+                },
+            }, namespace="/emo")
+            self.assertFalse(any(m["action"] == "system.error" for m in self.get_messages(target)))
+            controller.emit("message", {
+                "type": "state", "action": "playback.context.status", "requestId": request_id,
+                "payload": {"playbackContextId": "context-handoff-1"},
+            }, namespace="/emo")
+            status = self.get_direct_response(self.get_messages(controller), "playback.context.status", request_id)
+            self.assertEqual(status["payload"]["playbackContext"]["controlVersion"], seq + 1)
+            device, = status["payload"]["deviceStates"]
+            self.assertEqual((device["appliedControlVersion"], device["state"], device["positionMs"]),
+                             (seq + 1, "paused", position))
+
     def test_ready_rejects_payload_device_outside_frozen_current_target(self):
         source, target, controller = self.connect_handoff_devices()
         start_ack = self.get_ack(

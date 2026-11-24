@@ -9556,14 +9556,21 @@ def _build_playback_context_status_payload(playback_context):
                 previous is not None
                 and previous.get("deviceSessionId") == device_session_id
                 and previous.get("_connectionNonce", previous.get("connectionNonce")) == runtime_nonce
-                and previous.get("_connectionEpoch", previous.get("connectionEpoch")) == runtime_connection_epoch
             ):
+                # Ordinary SQLite facts persist the physical nonce but may omit
+                # the strict-v2 connection epoch, which is always 1 on registration.
+                previous_epoch = previous.get("_connectionEpoch", previous.get("connectionEpoch", 1))
+
                 def sequence(value):
                     return tuple(
                         value.get(key) if type(value.get(key)) is int else 0
                         for key in ("appliedControlVersion", "clientSeq")
                     )
-                if sequence(device_state) < sequence(previous):
+                if (
+                    type(previous_epoch) is int
+                    and previous_epoch == runtime_connection_epoch
+                    and sequence(device_state) < sequence(previous)
+                ):
                     continue
             device_states_by_client_id[client_id] = device_state
         device_states = list(device_states_by_client_id.values())
