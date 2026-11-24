@@ -1,13 +1,19 @@
-"""Actual server handler integration, in-process transport and fake audio only.
+"""Server integration, plus opt-in loopback Socket.IO and real mpv coverage."""
+import sys
 
-This exercises unmodified Flask/Socket.IO/database code. It does not establish
-network, ARM64 container, USB audio, or physical output acceptance.
-"""
+if __name__ == '__main__' and sys.argv[1:2] == ['--serve-queue-fixture']:
+    from gevent import monkey
+    monkey.patch_all()
+
 import asyncio
+import json
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from urllib.parse import parse_qs, urlsplit
+import wave
 
 from emosonic_player.playback import Player
 from emosonic_player.protocol import ProtocolClient, ProtocolError
@@ -338,3 +344,163 @@ class ServerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.engine.play = original_play
         await self.player.cli('resume', {})
         await self.until(lambda: not self.engine.paused and self.player.error is None)
+
+
+def serve_queue_fixture(manifest):
+    """Start a disposable loopback server for validating the two source revisions together."""
+    import secrets
+    from gevent.pywsgi import WSGIServer
+    from geventwebsocket.handler import WebSocketHandler
+    from supysonic.db import Album, Artist, Folder, Track
+
+    root = manifest.parent
+    root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=root) as work:
+        config = TestConfig(False, True)
+        config.TESTING = False
+        config.BASE['database_uri'] = 'sqlite:///' + str(Path(work) / 'music.sqlite')
+        config.WEBAPP.update(cache_dir=work, mount_emosonic=True, emo_development_mode=True,
+                             emo_strict_v2_allow_local_test_evidence=True, emo_strict_v2_core_enabled=True)
+        app = create_application(config)
+        username, password = 'queue-test-user', secrets.token_urlsafe(20)
+        UserManager.add(username, password)
+        folder = Folder.create(name='Fixture', path=work, root=True)
+        artist = Artist.create(name='Fixture')
+        album = Album.create(name='Fixture', artist=artist)
+        ids = []
+        for number, title in enumerate(('Original', 'New first', 'New selection'), 1):
+            path = Path(work) / f'{number}.wav'
+            with wave.open(str(path), 'wb') as wav:
+                wav.setparams((1, 2, 8000, 0, 'NONE', 'not compressed'))
+                wav.writeframes(b'\0\0' * (8000 * 60))
+            track = Track.create(title=title, number=number, disc=1, artist=artist, album=album,
+                                 path=str(path), root_folder=folder, folder=folder,
+                                 duration=60, bitrate=128, last_modification=0)
+            ids.append(str(track.id))
+        server = WSGIServer(('127.0.0.1', 0), app, handler_class=WebSocketHandler, log=None)
+        server.init_socket()
+        fixture = {'port': server.server_port, 'username': username, 'password': password, 'songs': ids}
+        temporary = manifest.with_suffix('.tmp')
+        with temporary.open('x', encoding='utf-8') as stream:
+            os.chmod(temporary, 0o600)
+            json.dump(fixture, stream)
+        temporary.replace(manifest)
+        try:
+            server.serve_forever()
+        finally:
+            manifest.unlink(missing_ok=True)
+            server.stop()
+            release_database()
+
+
+@unittest.skipUnless(os.environ.get('EMOSONIC_QUEUE_FIXTURE'), 'requires the disposable cross-branch server')
+class LiveRemoteQueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_replace_nonempty_queue_then_pause_from_independent_controller(self):
+        from emosonic_player.mpv import MpvPlayer
+        from emosonic_player.stream import MediaClient
+
+        fixture = json.loads(Path(os.environ['EMOSONIC_QUEUE_FIXTURE']).read_text())
+        url = f"http://127.0.0.1:{fixture['port']}"
+        credentials = (url, fixture['username'], fixture['password'])
+        original, first, selected = fixture['songs']
+        media = MediaClient(*credentials)
+        self.addAsyncCleanup(media.close)
+        runtime = tempfile.TemporaryDirectory()
+        self.addCleanup(runtime.cleanup)
+        engine = MpvPlayer('null', runtime.name, allow_null_output_for_tests=True)
+        await engine.start()
+        self.addAsyncCleanup(engine.close)
+        speaker, desktop, remote = [
+            ProtocolClient(*credentials, name, name + '-session', name)
+            for name in ('speaker', 'desktop', 'independent')
+        ]
+        player = Player(speaker, engine, media)
+        speaker.on_event = player.on_event
+        proofs = []
+
+        async def observe(message):
+            payload = message.get('payload', {})
+            if message.get('action') == 'playback.update' and payload.get('executionStatus') == 'committed':
+                proofs.append(payload)
+
+        remote.on_event = observe
+        for client in (speaker, desktop, remote):
+            self.addAsyncCleanup(client.close)
+            await client.connect()
+        await player.start()
+        self.addAsyncCleanup(player.close)
+        await player.reconcile()
+        context_id = player.context['playbackContextId']
+        desktop_own = (await desktop.request('playback.context.ensure', {
+            'deviceSessionId': desktop.device_session_id, 'queueSongIds': [],
+            'positionMs': 0, 'state': 'idle'}, reply_actions={'playback.context.ensure'}))['payload']
+        self.assertNotEqual(context_id, desktop_own['playbackContextId'])
+        for client in (desktop, remote):
+            await client.request('playback.context.subscribe', {'playbackContextId': context_id}, type='state')
+
+        async def status(client, target=context_id):
+            reply = await client.request('playback.context.status', {'playbackContextId': target},
+                                         type='state', reply_actions={'playback.context.status'})
+            return reply['payload']
+
+        async def committed(queue, index, wanted_state):
+            async with asyncio.timeout(15):
+                while not any(
+                    item.get('playbackContextId') == context_id and item.get('trackId') == queue[index]
+                    and item.get('state') == wanted_state and item.get('appliedControlVersion') == player.applied
+                    for item in proofs
+                ):
+                    await asyncio.sleep(.05)
+            snapshot = await status(remote)
+            context = snapshot['playbackContext']
+            self.assertEqual(context['queueSongIds'], queue)
+            self.assertEqual(context['currentIndex'], index)
+            device = next(item for item in snapshot['deviceStates'] if item['clientId'] == speaker.client_id)
+            peer = await status(desktop)
+            peer_device = next(item for item in peer['deviceStates'] if item['clientId'] == speaker.client_id)
+            for observed in (peer_device, device):
+                self.assertEqual(observed['state'], wanted_state)
+                self.assertEqual(observed['trackId'], queue[index])
+                self.assertEqual(observed['appliedControlVersion'], context['controlVersion'])
+            for authority in (peer['playbackContext'], player.context, player.executed):
+                for key in ('playbackContextId', 'queueSongIds', 'currentIndex', 'queueRevision', 'controlVersion'):
+                    self.assertEqual(authority[key], context[key], key)
+            self.assertIsNone(player.error)
+            info = await engine.snapshot()
+            self.assertEqual(info['paused'], wanted_state == 'paused')
+            self.assertEqual(await engine._command(['get_property', 'current-ao']), 'null')
+            # Inspect just the track ID. The authenticated stream URL stays private.
+            uri = urlsplit(await engine._command(['get_property', 'path']))
+            self.assertEqual(uri.path, '/rest/stream.view')
+            self.assertEqual(parse_qs(uri.query)['id'], [queue[index]])
+            print(f"canonical queueRevision={context['queueRevision']} controlVersion={context['controlVersion']} "
+                  f"index={index} item={queue[index]} state={wanted_state} mpvPaused={info['paused']}", flush=True)
+            return context
+
+        await player.cli('play', {'song': original})
+        before = await committed([original], 0, 'playing')
+        replacement = [first, selected]
+        self.assertNotIn(selected, before['queueSongIds'])
+        await desktop.request('queue.playItem', {
+            'playbackContextId': context_id, 'baseQueueRevision': before['queueRevision'],
+            'baseControlVersion': before['controlVersion'], 'queueSongIds': replacement, 'queueIndex': 1,
+        })
+        playing = await committed(replacement, 1, 'playing')
+        self.assertEqual(playing['queueRevision'], before['queueRevision'] + 1)
+        self.assertEqual(playing['controlVersion'], before['controlVersion'] + 1)
+        await remote.request('player.pause', {
+            'playbackContextId': context_id, 'baseControlVersion': playing['controlVersion'],
+        })
+        paused = await committed(replacement, 1, 'paused')
+        self.assertEqual(paused['queueRevision'], playing['queueRevision'])
+        self.assertEqual(paused['controlVersion'], playing['controlVersion'] + 1)
+        own = (await status(desktop, desktop_own['playbackContextId']))['playbackContext']
+        self.assertEqual(own['queueSongIds'], [])
+        self.assertEqual(own['queueRevision'], desktop_own['queueRevision'])
+
+
+if __name__ == '__main__':
+    if sys.argv[1:2] == ['--serve-queue-fixture']:
+        serve_queue_fixture(Path(sys.argv[2]).resolve())
+    else:
+        unittest.main()
