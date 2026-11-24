@@ -132,6 +132,7 @@ ACTION_SCHEMAS = {
     "queue.playItem": ActionSchema(
         "command",
         ("playbackContextId", "queueIndex", "baseQueueRevision", "baseControlVersion"),
+        ("queueSongIds",),
     ),
     "player.play": ActionSchema(
         "command", ("playbackContextId", "baseControlVersion"), ("positionMs",)
@@ -449,6 +450,9 @@ def _validate_field(
 
 
 def _validate_action_combinations(action: str, payload: Dict[str, object]) -> None:
+    if action == "queue.playItem" and "queueSongIds" in payload:
+        if payload["queueIndex"] >= len(payload["queueSongIds"]):
+            raise StrictRequestValidationError("queueIndex is outside queueSongIds")
     if action in {"playback.context.ensure", "queue.context.sync"}:
         queue = payload["queueSongIds"]
         if queue:
