@@ -500,6 +500,37 @@ class LiveRemoteQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(own['queueSongIds'], [])
         self.assertEqual(own['queueRevision'], desktop_own['queueRevision'])
 
+        # Next on the final track leaves the queue selected and stops the decoder.
+        await remote.request('player.next', {
+            'playbackContextId': context_id, 'baseControlVersion': paused['controlVersion'],
+        })
+        async with asyncio.timeout(15):
+            while player.applied != paused['controlVersion'] + 1:
+                await asyncio.sleep(.05)
+        stopped = (await status(remote))['playbackContext']
+        self.assertEqual(stopped['state'], 'stopped')
+        self.assertTrue(await engine._command(['get_property', 'idle-active']))
+
+        await player.disconnected()
+        await speaker.close()
+        await speaker.connect()
+        await player.reconcile()
+        restored = await status(remote)
+        self.assertEqual(restored['playbackContext'], stopped)
+        actual = next(item for item in restored['deviceStates'] if item['clientId'] == speaker.client_id)
+        self.assertEqual((actual['state'], actual['trackId'], actual['positionMs'],
+                          actual['appliedControlVersion']),
+                         ('stopped', selected, stopped['positionMs'], stopped['controlVersion']))
+        self.assertIsNone(player.run_id)
+        self.assertTrue(await engine._command(['get_property', 'idle-active']))
+        proofs.clear()
+        await remote.request('player.play', {
+            'playbackContextId': context_id, 'baseControlVersion': stopped['controlVersion'],
+        })
+        resumed = await committed(replacement, 1, 'playing')
+        self.assertEqual(resumed['queueRevision'], stopped['queueRevision'])
+        self.assertEqual(resumed['controlVersion'], stopped['controlVersion'] + 1)
+
 
 if __name__ == '__main__':
     if sys.argv[1:2] == ['--serve-queue-fixture']:

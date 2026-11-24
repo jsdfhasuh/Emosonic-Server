@@ -120,6 +120,8 @@ class FakeWire:
 
     async def request(self, action, payload, **kwargs):
         self.requests.append((action, copy.deepcopy(payload)))
+        if action == 'playback.context.ensure':
+            return {'payload': copy.deepcopy(self.canonical)}
         if action == 'playback.context.status':
             return {'payload': {'playbackContext': copy.deepcopy(self.canonical)}}
         if action == 'queue.context.sync':
@@ -173,6 +175,66 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
+
+    async def test_same_session_reconnect_preserves_stopped_queue_until_play(self):
+        self.wire.canonical.update(state='stopped', currentIndex=1, positionMs=420,
+                                   queueRevision=4, controlVersion=15)
+        stopped = copy.deepcopy(self.wire.canonical)
+        await self.player.disconnected()
+        self.wire.generation += 1
+        self.engine.loads.clear()
+        await self.player.reconcile()
+
+        self.assertIsNone(self.player.run_id)
+        self.assertIsNone(self.engine.run)
+        self.assertEqual(self.engine.loads, [])
+        self.assertEqual(self.player.context, stopped)
+        self.assertEqual(self.player.executed, stopped)
+        self.assertEqual(self.player.applied, 15)
+        [(action, fact)] = self.wire.emitted
+        self.assertEqual(action, 'playback.update')
+        self.assertEqual((fact['state'], fact['positionMs'], fact['trackId'],
+                          fact['appliedControlVersion'], fact['origin']),
+                         ('stopped', 420, 'second', 15, 'passive'))
+
+        await self.player._execute(self.command('player.play', version=16), self.wire.generation)
+        self.assertEqual(self.engine.loads, [('https://music.test/second', self.engine.run)])
+        self.assertFalse(self.engine.sample['paused'])
+        self.assertEqual(self.engine.sample['position_ms'], 420)
+        self.assertEqual(self.player.executed['queueRevision'], 4)
+        self.assertEqual(self.player.applied, 16)
+
+    async def test_reconnect_other_queue_states_do_not_start_audio(self):
+        self.wire.negotiated = {'effectiveAtPlayback': True}
+        for state in ('paused', 'playing', 'idle'):
+            with self.subTest(state=state):
+                self.wire.canonical = context()
+                self.wire.canonical.update(state=state, controlVersion=2)
+                idle = state == 'idle'
+                if idle:
+                    self.wire.canonical['queueSongIds'] = []
+                    self.wire.canonical.pop('currentIndex')
+                self.engine.loads.clear()
+                self.wire.emitted.clear()
+                await self.player.reconcile()
+                self.assertEqual(len(self.engine.loads), 0 if idle else 1)
+                self.assertTrue(self.engine.sample['paused'])
+                self.assertEqual(self.player.run_id is None, idle)
+                [(action, fact)] = self.wire.emitted
+                self.assertEqual(action, 'playback.update')
+                self.assertEqual(fact['state'], 'idle' if idle else 'paused')
+                self.assertEqual(fact['appliedControlVersion'], 2)
+
+    async def test_failed_idle_confirmation_restarts_engine_without_stopped_fact(self):
+        self.wire.canonical.update(state='stopped', controlVersion=15)
+        with patch.object(self.engine, 'stop', side_effect=MpvError('idle confirmation failed')):
+            with self.assertRaisesRegex(MpvError, 'idle confirmation failed'):
+                await self.player.reconcile()
+        self.assertIsNone(self.player.run_id)
+        self.assertTrue(self.engine.closed)
+        self.assertTrue(self.player.needs_engine_restart)
+        self.assertFalse(self.wire.requests)
+        self.assertFalse(self.wire.emitted)
 
     def command(self, action='player.play', version=1, **extra):
         return {'type': 'command', 'action': action, 'payload': {

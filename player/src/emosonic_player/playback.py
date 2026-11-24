@@ -72,7 +72,7 @@ class Player:
         await self.broadcast.disconnected()
         await self.engine.close()
 
-    async def _safe_stop(self):
+    async def _safe_stop(self, *, require_confirmation=False):
         self._interrupt_announcement()
         try:
             await self.engine.stop()
@@ -80,6 +80,8 @@ class Player:
             # close() terminates the owned process even after IPC loss.
             await self.engine.close()
             self.needs_engine_restart = True
+            if require_confirmation:
+                raise
 
     def _interrupt_announcement(self):
         if self._announcement_request:
@@ -186,14 +188,15 @@ class Player:
                 context.get('authorityDeviceSessionId') == self.wire.device_session_id)
 
     async def reconcile(self):
-        """New physical connection: establish idle/paused authority, never replay."""
+        """Restore the queue on a new physical connection without starting audio."""
         await self.handoff.reset()
         await self.follow.reconcile()
         if await self.broadcast.recover():
             return
         async with self.lock:
-            await self._safe_stop()
             self.run_id = None
+            await self._safe_stop(require_confirmation=True)
+            self.last_sample = self.last_sample_time = None
             self.applied = self.sequence = self.volume_sequence = 0
             self.invalidated.clear()
             response = await self.wire.request('playback.context.ensure', {
@@ -205,9 +208,10 @@ class Player:
             self.context = copy.deepcopy(context)
             self.executed = copy.deepcopy(context)
             self.applied = context['controlVersion']
-            # Existing same-instance context may contain a queue: load paused,
-            # then canonical pause before permitting user commands.
-            if context.get('queueSongIds'):
+            if context['state'] == 'stopped':
+                # mpv confirmed idle. Keep the selected track unloaded until play.
+                await self._report('passive', state='stopped')
+            elif context.get('queueSongIds'):
                 await self._load(context, paused=True)
                 await self._report('passive', state='paused')
             elif getattr(self.wire, 'negotiated', {}).get('effectiveAtPlayback'):
