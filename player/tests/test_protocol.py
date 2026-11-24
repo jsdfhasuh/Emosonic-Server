@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from unittest.mock import AsyncMock, patch
 from emosonic_player.protocol import CAPABILITIES, ProtocolClient, ProtocolError
 
 
@@ -10,6 +11,8 @@ class Socket:
         self.messages = []
         self.suppress = False
         self.bad_registration = False
+        self.ping_seen = asyncio.Event()
+        self.pong_nonce = 'nonce'
 
     def on(self, event, handler, namespace):
         self.handlers[event] = handler
@@ -43,6 +46,8 @@ class Socket:
             if action == 'system.ping':
                 reply['action'] = 'system.pong'
                 reply['payload'] = {'serverTimeMs': 100000}
+                reply['connectionNonce'] = self.pong_nonce
+                self.ping_seen.set()
         await self.handlers['message'](reply)
 
 
@@ -67,6 +72,40 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.socket.messages[1]['payload']['roles'], ['player', 'controller'])
         self.assertEqual(self.socket.messages[1]['payload']['capabilities'], CAPABILITIES)
         self.assertLess(abs(self.client.server_time_ms() - 100000), 100)
+
+    async def test_idle_heartbeat_and_reconnect_after_losing_registration(self):
+        await self.client.close()
+        lost = asyncio.Event()
+        self.client.on_disconnect = AsyncMock(side_effect=lost.set)
+        with patch('emosonic_player.protocol.HEARTBEAT_INTERVAL_SECONDS', .01):
+            await self.client.connect()
+            self.socket.ping_seen.clear()
+            await asyncio.wait_for(self.socket.ping_seen.wait(), 1)
+            self.assertTrue(self.client.ready)
+            previous_generation = self.client.generation
+            old_receiver = self.socket.handlers['message']
+
+            # A live transport can lose its registration. A pong without
+            # current provenance must not keep the authority online.
+            self.socket.pong_nonce = None
+            waiting = self.client.expect_event('queue.context.sync', timeout=1)
+            await asyncio.wait_for(lost.wait(), 1)
+            self.assertFalse(self.client.ready)
+            self.assertIsNone(self.client.nonce)
+            with self.assertRaisesRegex(ProtocolError, 'connection_lost'):
+                await waiting
+            self.client.on_disconnect.assert_awaited_once()
+
+            self.socket = Socket()
+            await self.client.connect()
+            self.assertTrue(self.client.ready)
+            self.assertGreater(self.client.generation, previous_generation)
+            self.assertEqual([m['action'] for m in self.socket.messages],
+                             ['auth.login', 'device.register'] + ['system.ping'] * 3)
+            waiting = self.client.expect_event('queue.context.sync')
+            await old_receiver(self.event())
+            self.assertFalse(waiting.done())
+            waiting.cancel()
 
     async def test_canonical_before_ack_and_wrong_provenance(self):
         waiting = self.client.expect_event('queue.context.sync', lambda x: x['payload'].get('queueRevision') == 2)

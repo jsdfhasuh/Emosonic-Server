@@ -1,9 +1,12 @@
 """Subsonic HTTPS API; signed URLs are private values, never command arguments."""
 import hashlib
+import json
 import secrets
 from urllib.parse import urlencode
 
 import aiohttp
+
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
 
 class MediaError(RuntimeError):
@@ -33,10 +36,11 @@ class MediaClient:
                                         params={**self._auth(), **params}, allow_redirects=False) as response:
                 if response.status != 200:
                     raise MediaError('music API request failed')
-                raw = await response.content.read(4 * 1024 * 1024 + 1)
-                if len(raw) > 4 * 1024 * 1024:
-                    raise MediaError('music API response too large')
-                import json
+                raw = bytearray()
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    if len(raw) + len(chunk) > MAX_RESPONSE_BYTES:
+                        raise MediaError('music API response too large')
+                    raw.extend(chunk)
                 result = json.loads(raw).get('subsonic-response', {})
                 if result.get('status') != 'ok':
                     raise MediaError('music API rejected request')

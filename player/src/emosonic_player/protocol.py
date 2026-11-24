@@ -6,6 +6,9 @@ import time
 import uuid
 from urllib.parse import urlsplit
 
+# Engine.IO keepalives do not refresh the server's registered device.
+HEARTBEAT_INTERVAL_SECONDS = 20
+
 CAPABILITIES = {
     "playbackContextV2": True, "playbackPrepare": False,
     "effectiveAtPlayback": False, "canPlay": True, "canPause": True,
@@ -66,6 +69,16 @@ class ProtocolClient:
                 future.set_exception(ProtocolError("connection_lost"))
         self._waiters.clear()
 
+    def _connection_lost(self):
+        self.generation += 1
+        self._invalidate()
+        current = asyncio.current_task()
+        for task in list(self._tasks):
+            if task is not current:
+                task.cancel()
+        if self.on_disconnect:
+            self._spawn(self.on_disconnect())
+
     async def connect(self):
         if self._socket is not None:
             await self.close()
@@ -83,11 +96,7 @@ class ProtocolClient:
                 self._receive(message)
         async def disconnected(*_):
             if generation == self.generation:
-                self._invalidate()
-                for task in list(self._tasks):
-                    task.cancel()
-                if self.on_disconnect:
-                    self._spawn(self.on_disconnect())
+                self._connection_lost()
         self._socket.on("message", handler=receive, namespace="/emo")
         self._socket.on("disconnect", handler=disconnected, namespace="/emo")
         try:
@@ -105,17 +114,14 @@ class ProtocolClient:
             self._validate_registration(registration)
             best = None
             for _ in range(3):
-                before = time.monotonic() * 1000
-                pong = await self.request("system.ping", {}, type="system", reply_actions={"system.pong"})
-                after = time.monotonic() * 1000
-                sample = pong["payload"].get("serverTimeMs")
-                if type(sample) not in {int, float} or not math.isfinite(sample) or sample <= 0:
-                    raise ProtocolError("invalid_clock_sample")
-                rtt = after - before
-                if best is None or rtt < best[0]:
-                    best = (rtt, sample - (before + after) / 2)
+                sample = await self._ping()
+                if best is None or sample[0] < best[0]:
+                    best = sample
+            if generation != self.generation:
+                raise ProtocolError("connection_lost")
             self._clock_offset = best[1]
             self.ready = True
+            self._spawn(self._heartbeat(generation))
         except asyncio.CancelledError:
             await self.close()
             raise
@@ -124,6 +130,25 @@ class ProtocolClient:
             if isinstance(exc, ProtocolError):
                 raise
             raise ProtocolError("connection_failed") from None
+
+    async def _ping(self):
+        before = time.monotonic() * 1000
+        pong = await self.request("system.ping", {}, type="system", reply_actions={"system.pong"})
+        after = time.monotonic() * 1000
+        server_time = pong["payload"].get("serverTimeMs")
+        if type(server_time) not in {int, float} or not math.isfinite(server_time) or server_time <= 0:
+            raise ProtocolError("invalid_clock_sample")
+        return after - before, server_time - (before + after) / 2
+
+    async def _heartbeat(self, generation):
+        while generation == self.generation:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            try:
+                await self._ping()
+            except ProtocolError:
+                if generation == self.generation:
+                    self._connection_lost()
+                return
 
     def _validate_registration(self, message):
         p = message.get("payload", {})
@@ -159,10 +184,11 @@ class ProtocolClient:
         allowed = set(reply_actions or {"system.ack"}) | {"system.error"}
         self._pending[request_id] = (action, future, allowed)
         try:
-            async with self._send_lock:
-                await self._socket.emit("message", {"type": type, "action": action,
-                    "requestId": request_id, "payload": payload}, namespace="/emo")
-            return await asyncio.wait_for(future, self.timeout)
+            async with asyncio.timeout(self.timeout):
+                async with self._send_lock:
+                    await self._socket.emit("message", {"type": type, "action": action,
+                        "requestId": request_id, "payload": payload}, namespace="/emo")
+                return await future
         except asyncio.TimeoutError:
             raise ProtocolError("request_timeout") from None
         except asyncio.CancelledError:
