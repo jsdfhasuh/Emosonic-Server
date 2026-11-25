@@ -5,7 +5,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager, nullcontext
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 from flask import (
     current_app,
@@ -42,11 +42,12 @@ from .broadcast_store import (
     compactExpiredBroadcastStates,
     createBroadcastRegistrationReplay,
     createBroadcastState,
+    findNonterminalBroadcastForContext,
     getBroadcastFenceForContext,
     getBroadcastFenceForPair,
     getBroadcastIntentOutcome,
     getBroadcastStopOutcome,
-    getNonterminalBroadcastStateForContext,
+    getLastBroadcastProgressAtMsInTransaction,
     getBroadcastState as getPersistentBroadcastState,
     isPermanentDeviceDecommissioned,
     listPermanentDeviceDecommissions,
@@ -954,10 +955,18 @@ BROADCAST_AUTHORITY_DISCONNECT_TIMEOUT_MS = 30000
 
 
 class BroadcastConflictError(Exception):
-    def __init__(self, message, current_version=None, current_control_version=None):
+    def __init__(
+        self,
+        message: str,
+        current_version: Optional[int] = None,
+        current_control_version: Optional[int] = None,
+        *,
+        retryable: bool = False,
+    ) -> None:
         super().__init__(message)
         self.current_version = current_version
         self.current_control_version = current_control_version
+        self.retryable = retryable
 
 
 class BroadcastRateLimitedError(Exception):
@@ -6295,6 +6304,19 @@ def _commit_r18_source_playback_update(
     playback_context = result["playbackContext"]
     canonical = result["canonicalUpdate"]
     previous_snapshot = persisted["snapshot"]
+    if (
+        previous_snapshot["lifecycleState"] == "active"
+        and canonical["origin"] == "passive"
+        and (
+            canonical["appliedControlVersion"] < playback_context["controlVersion"]
+            or (
+                canonical["state"] != "idle"
+                and canonical.get("trackId") != playback_context["trackId"]
+            )
+        )
+    ):
+        # Keep the actual device observation without undoing a newer distributed target.
+        return None
     if previous_snapshot["lifecycleState"] == "waitingForSource":
         if _server_time_ms() >= persisted["authorityDisconnectDeadlineMs"]:
             raise BroadcastConflictError("Source reconnect deadline expired")
@@ -6397,13 +6419,8 @@ def _commit_r18_source_playback_update(
         return None
 
     if action == "broadcast.progress":
-        last_progress_ms = max(
-            (
-                revision["createdAtMs"]
-                for revision in persisted.get("revisions", ())
-                if revision.get("action") == "progress"
-            ),
-            default=0,
+        last_progress_ms = getLastBroadcastProgressAtMsInTransaction(
+            persisted["broadcastId"]
         )
         if server_time_ms - last_progress_ms < 1000:
             return None
@@ -10834,6 +10851,32 @@ def _require_fresh_broadcast_position(sampled_at_ms, server_time_ms, source):
         raise BroadcastConflictError("%s position sample is not fresh" % source)
 
 
+@contextmanager
+def _locked_source_broadcast(
+    user_name: str,
+    playback_context_id: str,
+    candidate: Optional[Tuple[str, str]],
+) -> Iterator[Optional[Dict[str, object]]]:
+    if candidate is None:
+        # broadcast.start acquires the source Context lock before installing its fence.
+        with strictPlaybackContextLockSet((playback_context_id,)):
+            if findNonterminalBroadcastForContext(user_name, playback_context_id):
+                raise BroadcastConflictError(
+                    "Broadcast started during source update", retryable=True
+                )
+            yield None
+        return
+
+    broadcast_id, lifecycle = candidate
+    with broadcastMutationLock(broadcast_id):
+        current = getPersistentBroadcastState(broadcast_id, include_ledger=False)
+        if current is None or current["lifecycleState"] != lifecycle:
+            raise BroadcastConflictError(
+                "Broadcast lifecycle changed during source update", retryable=True
+            )
+        yield current
+
+
 def _handle_queue_context_sync(current_user_name, current_client, payload, request_id):
     if current_client is None:
         raise PermissionError("Register the device before syncing context queue")
@@ -10872,18 +10915,11 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
     queue_song_ids, current_index, position_ms = _validate_playback_context_queue_payload(
         payload
     )
-    server_time_ms = _server_time_ms()
-    if payload["positionSampledAtServerMs"] > server_time_ms + 1000:
+    if payload["positionSampledAtServerMs"] > _server_time_ms() + 1000:
         raise ValueError("positionSampledAtServerMs is too far in the future")
-    persisted_broadcast = getNonterminalBroadcastStateForContext(
+    candidate = findNonterminalBroadcastForContext(
         current_user_name,
         playback_context_id,
-    )
-    waiting = (
-        persisted_broadcast["snapshot"]
-        if persisted_broadcast is not None
-        and persisted_broadcast["lifecycleState"] == "waitingForSource"
-        else None
     )
     next_track_id = (
         queue_song_ids[current_index]
@@ -10948,7 +10984,38 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
         )
 
     try:
-        if persisted_broadcast is None:
+        generation_lock = (
+            strictPhysicalGenerationLockSet(
+                (_physical_generation_key(current_user_name, current_client["clientId"]),)
+            )
+            if candidate is not None
+            else nullcontext()
+        )
+        with generation_lock, _locked_source_broadcast(
+            current_user_name, playback_context_id, candidate
+        ) as persisted_broadcast:
+            waiting = (
+                persisted_broadcast["snapshot"]
+                if persisted_broadcast
+                and persisted_broadcast["lifecycleState"] == "waitingForSource"
+                else None
+            )
+            if persisted_broadcast:
+                generation = state.get_current_physical_generation(
+                    current_user_name,
+                    current_client["clientId"],
+                    device_session_id,
+                    expected_sid=request.sid,
+                )
+                if (
+                    not generation
+                    or generation["connectionNonce"] != connection_nonce
+                    or not socketio.server.manager.is_connected(
+                        request.sid, namespace="/emo"
+                    )
+                ):
+                    raise PermissionError("Source queue physical generation changed")
+            server_time_ms = _server_time_ms()
             updated_context = mutateStrictPlaybackContextQueue(
                 playback_context_id,
                 current_user_name,
@@ -10963,57 +11030,12 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
                     "positionSampledAtServerMs"
                 ],
                 connection_nonce=connection_nonce,
+                post_mutation_hook=projection_hook if persisted_broadcast else None,
+                waiting_broadcast=waiting,
             )
-        else:
-            generation_lock = (
-                strictPhysicalGenerationLockSet(
-                    (
-                        _physical_generation_key(
-                            current_user_name, current_client["clientId"]
-                        ),
-                    )
-                )
-                if waiting
-                else nullcontext()
-            )
-            with generation_lock, broadcastMutationLock(
-                persisted_broadcast["broadcastId"]
-            ):
-                if waiting:
-                    generation = state.get_current_physical_generation(
-                        current_user_name,
-                        current_client["clientId"],
-                        device_session_id,
-                        expected_sid=request.sid,
-                    )
-                    if (
-                        not generation
-                        or generation["connectionNonce"] != connection_nonce
-                        or not socketio.server.manager.is_connected(
-                            request.sid, namespace="/emo"
-                        )
-                    ):
-                        raise PermissionError(
-                            "Source queue physical generation changed"
-                        )
-                updated_context = mutateStrictPlaybackContextQueue(
-                    playback_context_id,
-                    current_user_name,
-                    current_client.get("clientId"),
-                    device_session_id,
-                    queue_song_ids,
-                    current_index,
-                    position_ms,
-                    _get_base_queue_revision(payload),
-                    payload.get("baseControlVersion"),
-                    position_sampled_at_server_ms=payload["positionSampledAtServerMs"],
-                    connection_nonce=connection_nonce,
-                    post_mutation_hook=projection_hook,
-                    waiting_broadcast=waiting,
-                )
-                broadcast_mutation = updated_context.pop(
-                    "_broadcastMutation"
-                )
+            if updated_context is not None:
+                broadcast_mutation = updated_context.pop("_broadcastMutation", None)
+                state.restore_playback_context(playback_context_id, updated_context)
     except (
         BroadcastNotFoundError,
         BroadcastResourceConflictError,
@@ -11031,7 +11053,6 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
             updated_context["controlVersion"],
         )
 
-    state.restore_playback_context(playback_context_id, updated_context)
     if broadcast_mutation is not None:
         _emit_r18_broadcast_projection(broadcast_mutation)
     _send_ack(request_id)
@@ -11072,13 +11093,12 @@ def _handle_strict_v2_playback_update(
         raise PermissionError("Registered connection provenance is missing")
     authority_client_id = current_client.get("clientId")
     authority_device_session_id = payload["deviceSessionId"]
-    server_time_ms = _server_time_ms()
-    persisted_broadcast = getNonterminalBroadcastStateForContext(
+    candidate = findNonterminalBroadcastForContext(
         current_user_name,
         payload["playbackContextId"],
     )
     track_duration_ms = (
-        getTrackDurationMs(payload.get("trackId")) if persisted_broadcast is not None else None
+        getTrackDurationMs(payload.get("trackId")) if candidate is not None else None
     )
 
     def projection_hook(
@@ -11118,7 +11138,7 @@ def _handle_strict_v2_playback_update(
                 resolve_update_handoffs,
                 base_keys=(lifecycle_key,),
             )
-            if persisted_broadcast is None
+            if candidate is None
             else strictPhysicalGenerationLockSet((lifecycle_key,))
         )
         with lifecycle_scope:
@@ -11150,8 +11170,10 @@ def _handle_strict_v2_playback_update(
             with _ordinary_control_dispatch_barrier(
                 payload["playbackContextId"]
             ):
-                server_time_ms = _server_time_ms()
-                if persisted_broadcast is None:
+                with _locked_source_broadcast(
+                    current_user_name, payload["playbackContextId"], candidate
+                ) as persisted_broadcast:
+                    server_time_ms = _server_time_ms()
                     result = applyStrictPlaybackUpdate(
                         payload["playbackContextId"],
                         current_user_name,
@@ -11160,28 +11182,20 @@ def _handle_strict_v2_playback_update(
                         connection_nonce,
                         payload,
                         server_time_ms,
+                        post_mutation_hook=(
+                            projection_hook if persisted_broadcast else None
+                        ),
+                        waiting_broadcast=(
+                            persisted_broadcast["snapshot"]
+                            if persisted_broadcast
+                            and persisted_broadcast["lifecycleState"] == "waitingForSource"
+                            else None
+                        ),
                         require_execution_eligible=True,
                     )
-                else:
-                    with broadcastMutationLock(
-                        persisted_broadcast["broadcastId"]
-                    ):
-                        result = applyStrictPlaybackUpdate(
-                            payload["playbackContextId"],
-                            current_user_name,
-                            current_client.get("clientId"),
-                            payload["deviceSessionId"],
-                            connection_nonce,
-                            payload,
-                            server_time_ms,
-                            post_mutation_hook=projection_hook,
-                            waiting_broadcast=(
-                                persisted_broadcast["snapshot"]
-                                if persisted_broadcast["lifecycleState"]
-                                == "waitingForSource"
-                                else None
-                            ),
-                            require_execution_eligible=True,
+                    if result is not None:
+                        state.restore_playback_context(
+                            payload["playbackContextId"], result["playbackContext"]
                         )
                 if result is not None:
                     refreshFollowSourceGeneration(
@@ -11241,10 +11255,6 @@ def _handle_strict_v2_playback_update(
             playback_context["epoch"],
             command_control_version,
         )
-    state.restore_playback_context(
-        playback_context["playbackContextId"],
-        playback_context,
-    )
     confirmation = _build_v2_playback_update_message(
         result["canonicalUpdate"]
     )
@@ -15150,6 +15160,8 @@ class EmoNamespace(Namespace):
                 ),
             )
             error_payload = {"code": "conflict", "message": str(exc)}
+            if exc.retryable:
+                error_payload["retryable"] = True
             if exc.current_version is not None:
                 error_payload["currentVersion"] = exc.current_version
             if exc.current_control_version is not None:

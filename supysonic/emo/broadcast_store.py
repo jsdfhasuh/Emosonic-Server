@@ -1232,14 +1232,14 @@ def getBroadcastState(
         close_connection()
 
 
-def getNonterminalBroadcastStateForContext(
+def findNonterminalBroadcastForContext(
     user_name: str,
     playback_context_id: str,
-) -> Optional[Dict[str, object]]:
+) -> Optional[Tuple[str, str]]:
     open_connection(reuse=True)
     try:
-        record = (
-            EmoBroadcast.select(EmoBroadcast.broadcast_id)
+        return (
+            EmoBroadcast.select(EmoBroadcast.broadcast_id, EmoBroadcast.lifecycle_state)
             .where(
                 (EmoBroadcast.user_name == user_name)
                 & (
@@ -1249,14 +1249,30 @@ def getNonterminalBroadcastStateForContext(
                 & (EmoBroadcast.lifecycle_state != "stopped")
             )
             .order_by(EmoBroadcast.created_at.desc())
+            .tuples()
             .first()
         )
-        broadcast_id = None if record is None else record.broadcast_id
     finally:
         close_connection()
-    if broadcast_id is None:
-        return None
-    return getBroadcastState(broadcast_id)
+
+
+def getNonterminalBroadcastStateForContext(
+    user_name: str,
+    playback_context_id: str,
+) -> Optional[Dict[str, object]]:
+    candidate = findNonterminalBroadcastForContext(user_name, playback_context_id)
+    return getBroadcastState(candidate[0]) if candidate is not None else None
+
+
+def getLastBroadcastProgressAtMsInTransaction(broadcast_id: str) -> int:
+    return (
+        EmoBroadcastRevision.select(fn.MAX(EmoBroadcastRevision.created_at_ms))
+        .where(
+            (EmoBroadcastRevision.broadcast_id == broadcast_id)
+            & (EmoBroadcastRevision.canonical_action == "progress")
+        )
+        .scalar()
+    ) or 0
 
 
 def getBroadcastFenceForContext(

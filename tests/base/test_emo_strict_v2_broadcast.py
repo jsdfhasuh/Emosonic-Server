@@ -1894,7 +1894,7 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
 
     def test_two_concurrent_source_reports_create_one_resume_revision(self):
         source, participant, broadcast_id, waiting, _ = self._stage_source_reconnect()
-        read_broadcast = emo_ws.getNonterminalBroadcastStateForContext
+        read_broadcast = emo_ws.findNonterminalBroadcastForContext
         both_read_waiting = threading.Barrier(2)
 
         def read_before_either_commit(*args):
@@ -1908,7 +1908,7 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             )
 
         with mock.patch.object(
-            emo_ws, "getNonterminalBroadcastStateForContext", read_before_either_commit
+            emo_ws, "findNonterminalBroadcastForContext", read_before_either_commit
         ), ThreadPoolExecutor(max_workers=2) as pool:
             list(pool.map(report, (1, 2)))
         resumes = [
@@ -1921,6 +1921,22 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             committed["broadcastRevision"], waiting["broadcastRevision"] + 1
         )
         self.assertEqual(committed["snapshot"]["trackId"], waiting["trackId"])
+        conflicts = [
+            message
+            for message in self.get_messages(source)
+            if message["action"] == "system.error"
+        ]
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0]["payload"]["code"], "conflict")
+        self.assertIs(conflicts[0]["payload"]["retryable"], True)
+        self.assertIn(conflicts[0]["requestId"], {"source-update-1", "source-update-2"})
+        report(3)
+        self.assertEqual(
+            getDevicePlaybackState("context-broadcast-source", "authority-1")[
+                "clientSeq"
+            ],
+            3,
+        )
 
     def test_position_only_sync_while_waiting_resumes_after_actual_feedback(self):
         source, participant, _, stored, _ = self._stage_source_reconnect(index=0)
@@ -5581,6 +5597,283 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
         self.assertEqual(target["trackId"], "source-song-2")
         self.assertEqual(target["state"], "paused")
         self.assertEqual(target["positionMs"], 0)
+
+    def _start_source_race(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        receipt = self.get_ack(
+            self.start_strict_broadcast(controller, participants=["participant-1"]),
+            "broadcast-start-1",
+        )["payload"]
+        for device in (authority, participant, controller):
+            self.get_messages(device)
+        return authority, participant, controller, receipt["broadcastId"]
+
+    def _broadcast_events(self, client):
+        return [
+            message
+            for message in self.get_messages(client)
+            if message["action"].startswith("broadcast.")
+        ]
+
+    def _commit_while_source_request_waits(self, delayed_request, competing_request):
+        # Both requests run through the Socket.IO handlers. Hold only the first
+        # result of discovery, before it enters the mutation critical section.
+        read_broadcast = emo_ws.findNonterminalBroadcastForContext
+        discovered = threading.Event()
+        release = threading.Event()
+
+        def hold_first_discovery(*args):
+            result = read_broadcast(*args)
+            if not discovered.is_set():
+                discovered.set()
+                self.assertTrue(release.wait(timeout=5))
+            return result
+
+        with mock.patch.object(
+            emo_ws, "findNonterminalBroadcastForContext", hold_first_discovery
+        ), ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(delayed_request)
+            try:
+                self.assertTrue(discovered.wait(timeout=5))
+                competing_request()
+            finally:
+                release.set()
+            pending.result(timeout=5)
+
+    def test_queue_projection_after_concurrent_source_pause_uses_current_revision(self):
+        authority, participant, _, broadcast_id = self._start_source_race()
+        self._commit_while_source_request_waits(
+            lambda: self.sync_source_queue(
+                authority, ["source-song-1", "source-song-2"], current_index=1
+            ),
+            lambda: self.update_source_playback(
+                authority, 2, int(time.time() * 1000), state="paused"
+            ),
+        )
+        events = self._broadcast_events(participant)
+        self.assertEqual(
+            [m["action"] for m in events], ["broadcast.pause", "broadcast.queue.sync"]
+        )
+        self.get_ack(self.get_messages(authority), "source-queue-sync-1")
+        pause, advance = (m["payload"] for m in events)
+        self.assertEqual(pause["trackId"], "source-song-1")
+        self.assertEqual(advance["trackId"], "source-song-2")
+        self.assertEqual(advance["state"], "paused")
+        self.assertEqual(advance["broadcastRevision"], pause["broadcastRevision"] + 1)
+        current = getPlaybackContextState("context-broadcast-source")
+        snapshot = emo_ws.getPersistentBroadcastState(broadcast_id)["snapshot"]
+        self.assertEqual(current["currentIndex"], snapshot["currentIndex"])
+        self.assertEqual(snapshot["sourceQueueRevision"], current["queueRevision"])
+        self.assertEqual(snapshot["sourceControlVersion"], current["controlVersion"])
+
+    def test_playback_projection_after_concurrent_source_pause_uses_current_state(self):
+        authority, participant, _, broadcast_id = self._start_source_race()
+        self._commit_while_source_request_waits(
+            lambda: self.update_source_playback(authority, 3, int(time.time() * 1000)),
+            lambda: self.update_source_playback(
+                authority, 2, int(time.time() * 1000), state="paused"
+            ),
+        )
+        events = self._broadcast_events(participant)
+        self.assertEqual(
+            [m["action"] for m in events], ["broadcast.pause", "broadcast.play"]
+        )
+        self.assertEqual(
+            events[1]["payload"]["broadcastRevision"],
+            events[0]["payload"]["broadcastRevision"] + 1,
+        )
+        self.assertEqual(
+            emo_ws.getPersistentBroadcastState(broadcast_id)["snapshot"]["state"],
+            "playing",
+        )
+        device = getDevicePlaybackState("context-broadcast-source", "authority-1")
+        self.assertEqual(device["clientSeq"], 3)
+
+    def test_source_playback_does_not_revive_a_concurrently_stopped_broadcast(self):
+        authority, participant, controller, broadcast_id = self._start_source_race()
+        self._commit_while_source_request_waits(
+            lambda: self.update_source_playback(
+                authority, 2, int(time.time() * 1000), state="paused"
+            ),
+            lambda: controller.emit(
+                "message",
+                {
+                    "type": "command",
+                    "action": "broadcast.stop",
+                    "requestId": "competing-stop",
+                    "payload": {
+                        "playbackContextId": "context-broadcast-source",
+                        "broadcastId": broadcast_id,
+                    },
+                },
+                namespace="/emo",
+            ),
+        )
+        self.get_ack(self.get_messages(controller), "competing-stop")
+        error = self.get_error(self.get_messages(authority), "source-update-2")[
+            "payload"
+        ]
+        self.assertEqual(error["code"], "conflict")
+        self.assertIs(error["retryable"], True)
+        self.assertEqual(
+            getDevicePlaybackState("context-broadcast-source", "authority-1")[
+                "clientSeq"
+            ],
+            1,
+        )
+        events = self._broadcast_events(participant)
+        self.assertEqual([m["action"] for m in events], ["broadcast.stop"])
+        terminal = emo_ws.getPersistentBroadcastState(broadcast_id)["snapshot"]
+        self.assertEqual(terminal["lifecycleState"], "stopped")
+        self.assertEqual(
+            terminal["broadcastRevision"], events[0]["payload"]["broadcastRevision"]
+        )
+
+    def test_queue_projection_still_rejects_a_concurrently_stale_base_control(self):
+        authority, participant, _, broadcast_id = self._start_source_race()
+        self._commit_while_source_request_waits(
+            lambda: self.sync_source_queue(
+                authority, ["source-song-1", "source-song-2"], current_index=1
+            ),
+            lambda: self.update_source_playback(
+                authority,
+                2,
+                int(time.time() * 1000),
+                origin="localUser",
+                executionStatus="committed",
+                intentId="interleaved-seek",
+                epoch=1,
+                observedControlVersion=1,
+                queueIndex=0,
+                positionMs=5000,
+            ),
+        )
+        error = self.get_error(self.get_messages(authority), "source-queue-sync-1")[
+            "payload"
+        ]
+        self.assertEqual(error["code"], "stale_version")
+        events = self._broadcast_events(participant)
+        self.assertEqual([m["action"] for m in events], ["broadcast.seek"])
+        snapshot = emo_ws.getPersistentBroadcastState(broadcast_id)["snapshot"]
+        self.assertEqual(snapshot["currentIndex"], 0)
+        self.assertEqual(snapshot["sourceControlVersion"], 2)
+
+    def test_queue_projection_still_rejects_a_concurrently_stale_base_queue(self):
+        authority, participant, _, broadcast_id = self._start_source_race()
+        old_queue = ["source-song-1", "source-song-2"]
+        new_queue = old_queue + ["source-song-3"]
+        self._commit_while_source_request_waits(
+            lambda: self.sync_source_queue(
+                authority, old_queue, current_index=1, request_id="losing-queue"
+            ),
+            lambda: self.sync_source_queue(
+                authority, new_queue, current_index=0, request_id="winning-queue"
+            ),
+        )
+        replies = self.get_messages(authority)
+        self.get_ack(replies, "winning-queue")
+        error = self.get_error(replies, "losing-queue")["payload"]
+        self.assertEqual(error["code"], "stale_version")
+        events = self._broadcast_events(participant)
+        self.assertEqual([m["action"] for m in events], ["broadcast.queue.sync"])
+        snapshot = emo_ws.getPersistentBroadcastState(broadcast_id)["snapshot"]
+        self.assertEqual(snapshot["queueSongIds"], new_queue)
+        self.assertEqual(snapshot["currentIndex"], 0)
+        self.assertEqual(snapshot["sourceQueueRevision"], 2)
+        self.assertEqual(snapshot["sourceControlVersion"], 1)
+
+    def test_new_broadcast_rejects_a_pre_start_source_request_until_retried(self):
+        authority, participant, controller = self.connect_broadcast_devices()
+        self._commit_while_source_request_waits(
+            lambda: self.update_source_playback(
+                authority, 2, int(time.time() * 1000), state="paused"
+            ),
+            lambda: self.start_strict_broadcast(
+                controller, participants=["participant-1"]
+            ),
+        )
+        error = self.get_error(self.get_messages(authority), "source-update-2")[
+            "payload"
+        ]
+        self.assertEqual(error["code"], "conflict")
+        self.assertIs(error["retryable"], True)
+        events = self._broadcast_events(participant)
+        self.assertEqual([m["action"] for m in events], ["broadcast.start"])
+        self.assertEqual(events[0]["payload"]["state"], "playing")
+        device = getDevicePlaybackState("context-broadcast-source", "authority-1")
+        self.assertEqual(device["clientSeq"], 1)
+
+        self.update_source_playback(
+            authority, 3, int(time.time() * 1000), state="paused"
+        )
+        pause = self._push(self.get_messages(participant), "broadcast.pause")["payload"]
+        self.assertEqual(pause["broadcastId"], events[0]["payload"]["broadcastId"])
+        self.assertEqual(
+            pause["broadcastRevision"], events[0]["payload"]["broadcastRevision"] + 1
+        )
+
+    def test_pending_pause_keeps_older_passive_version_as_device_observation(self):
+        authority, participant, controller, broadcast_id = self._start_source_race()
+        self._commit_while_source_request_waits(
+            lambda: self.update_source_playback(
+                authority, 2, int(time.time() * 1000), appliedControlVersion=1
+            ),
+            lambda: controller.emit(
+                "message",
+                {
+                    "type": "command",
+                    "action": "broadcast.pause",
+                    "requestId": "competing-pause",
+                    "payload": {
+                        "playbackContextId": "context-broadcast-source",
+                        "broadcastId": broadcast_id,
+                        "baseControlVersion": 1,
+                    },
+                },
+                namespace="/emo",
+            ),
+        )
+        self.get_ack(self.get_messages(controller), "competing-pause")
+        events = self._broadcast_events(participant)
+        self.assertEqual([m["action"] for m in events], ["broadcast.pause"])
+        device = getDevicePlaybackState("context-broadcast-source", "authority-1")
+        self.assertEqual(device["clientSeq"], 2)
+        self.assertEqual(device["appliedControlVersion"], 1)
+        self.assertEqual(device["state"], "playing")
+        snapshot = emo_ws.getPersistentBroadcastState(broadcast_id)["snapshot"]
+        self.assertEqual(snapshot["state"], "paused")
+        self.assertEqual(
+            snapshot["broadcastRevision"], events[0]["payload"]["broadcastRevision"]
+        )
+        self.assertEqual(snapshot["sourceControlVersion"], 2)
+
+    def test_passive_observation_of_previous_track_keeps_current_broadcast(self):
+        authority, participant, _, broadcast_id = self._start_source_race()
+        self.sync_source_queue(
+            authority, ["source-song-1", "source-song-2"], current_index=1
+        )
+        self.get_ack(self.get_messages(authority), "source-queue-sync-1")
+        target = self._push(self.get_messages(participant), "broadcast.queue.sync")[
+            "payload"
+        ]
+        self.assertEqual(target["trackId"], "source-song-2")
+        self.update_source_playback(
+            authority,
+            2,
+            int(time.time() * 1000),
+            trackId="source-song-1",
+            state="paused",
+            appliedControlVersion=target["sourceControlVersion"],
+        )
+        device = getDevicePlaybackState("context-broadcast-source", "authority-1")
+        self.assertEqual(device["clientSeq"], 2)
+        self.assertEqual(device["trackId"], "source-song-1")
+        self.assertEqual(device["state"], "paused")
+        self.assertEqual(self._broadcast_events(participant), [])
+        snapshot = emo_ws.getPersistentBroadcastState(broadcast_id)["snapshot"]
+        self.assertEqual(snapshot["trackId"], "source-song-2")
+        self.assertEqual(snapshot["broadcastRevision"], target["broadcastRevision"])
+        self.assertEqual(snapshot["state"], target["state"])
 
     def test_source_queue_clear_atomically_terminals_with_pre_idle_snapshot(self):
         authority, participant, controller = self.connect_broadcast_devices()
