@@ -38,6 +38,7 @@ from .broadcast_store import (
     buildTerminalBroadcastSnapshot,
     broadcastMutationLock,
     commitBroadcastRevisionInTransaction,
+    commitWaitingBroadcastInTransaction,
     compactExpiredBroadcastStates,
     createBroadcastRegistrationReplay,
     createBroadcastState,
@@ -6294,6 +6295,19 @@ def _commit_r18_source_playback_update(
     playback_context = result["playbackContext"]
     canonical = result["canonicalUpdate"]
     previous_snapshot = persisted["snapshot"]
+    if previous_snapshot["lifecycleState"] == "waitingForSource":
+        if _server_time_ms() >= persisted["authorityDisconnectDeadlineMs"]:
+            raise BroadcastConflictError("Source reconnect deadline expired")
+        if (
+            canonical["state"] != "idle"
+            and canonical.get("trackId") != playback_context["trackId"]
+        ):
+            raise BroadcastConflictError(
+                "Source playback does not match the current queue occurrence"
+            )
+        _require_fresh_broadcast_position(
+            canonical["positionSampledAtServerMs"], server_time_ms, "Source resume"
+        )
     if canonical["state"] == "idle":
         return _commit_r18_broadcast_terminal(persisted, server_time_ms)
 
@@ -6323,13 +6337,6 @@ def _commit_r18_source_playback_update(
         position_ms = canonical["positionMs"]
         if actual_state == "playing":
             sampled_at_ms = canonical["positionSampledAtServerMs"]
-            if (
-                sampled_at_ms > server_time_ms + 50
-                or server_time_ms - sampled_at_ms > 2000
-            ):
-                raise BroadcastConflictError(
-                    "Source resume position sample is not fresh"
-                )
             position_ms = projectBroadcastPositionMs(
                 position_ms,
                 sampled_at_ms,
@@ -10822,6 +10829,11 @@ def _handle_playback_context_close(current_user_name, current_client, payload, r
     return closed_context
 
 
+def _require_fresh_broadcast_position(sampled_at_ms, server_time_ms, source):
+    if sampled_at_ms > server_time_ms + 50 or server_time_ms - sampled_at_ms > 2000:
+        raise BroadcastConflictError("%s position sample is not fresh" % source)
+
+
 def _handle_queue_context_sync(current_user_name, current_client, payload, request_id):
     if current_client is None:
         raise PermissionError("Register the device before syncing context queue")
@@ -10867,14 +10879,12 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
         current_user_name,
         playback_context_id,
     )
-    if (
-        persisted_broadcast is not None
-        and persisted_broadcast["snapshot"]["lifecycleState"]
-        == "waitingForSource"
-    ):
-        raise BroadcastConflictError(
-            "Source queue mutation is blocked while waiting for playback state"
-        )
+    waiting = (
+        persisted_broadcast["snapshot"]
+        if persisted_broadcast is not None
+        and persisted_broadcast["lifecycleState"] == "waitingForSource"
+        else None
+    )
     next_track_id = (
         queue_song_ids[current_index]
         if queue_song_ids and current_index is not None
@@ -10884,6 +10894,25 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
     broadcast_mutation = None
 
     def projection_hook(_record, result, _previous):
+        if waiting:
+            if (
+                _server_time_ms()
+                >= persisted_broadcast["authorityDisconnectDeadlineMs"]
+            ):
+                raise BroadcastConflictError("Source reconnect deadline expired")
+            _require_fresh_broadcast_position(
+                payload["positionSampledAtServerMs"], server_time_ms, "Source queue"
+            )
+            snapshot = _build_r18_broadcast_snapshot(
+                persisted_broadcast,
+                result,
+                result["positionMs"],
+                "paused",
+                waiting["playbackRate"],
+                server_time_ms,
+            )
+            snapshot["lifecycleState"] = "waitingForSource"
+            return commitWaitingBroadcastInTransaction(snapshot, server_time_ms)
         if not queue_song_ids:
             return _commit_r18_broadcast_terminal(
                 persisted_broadcast,
@@ -10897,13 +10926,9 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
         projected_position_ms = result["positionMs"]
         if state_name == "playing":
             sampled_at_ms = payload["positionSampledAtServerMs"]
-            if (
-                sampled_at_ms > server_time_ms + 50
-                or server_time_ms - sampled_at_ms > 2000
-            ):
-                raise BroadcastConflictError(
-                    "Source queue position sample is not fresh"
-                )
+            _require_fresh_broadcast_position(
+                sampled_at_ms, server_time_ms, "Source queue"
+            )
             projected_position_ms = projectBroadcastPositionMs(
                 result["positionMs"],
                 sampled_at_ms,
@@ -10940,7 +10965,37 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
                 connection_nonce=connection_nonce,
             )
         else:
-            with broadcastMutationLock(persisted_broadcast["broadcastId"]):
+            generation_lock = (
+                strictPhysicalGenerationLockSet(
+                    (
+                        _physical_generation_key(
+                            current_user_name, current_client["clientId"]
+                        ),
+                    )
+                )
+                if waiting
+                else nullcontext()
+            )
+            with generation_lock, broadcastMutationLock(
+                persisted_broadcast["broadcastId"]
+            ):
+                if waiting:
+                    generation = state.get_current_physical_generation(
+                        current_user_name,
+                        current_client["clientId"],
+                        device_session_id,
+                        expected_sid=request.sid,
+                    )
+                    if (
+                        not generation
+                        or generation["connectionNonce"] != connection_nonce
+                        or not socketio.server.manager.is_connected(
+                            request.sid, namespace="/emo"
+                        )
+                    ):
+                        raise PermissionError(
+                            "Source queue physical generation changed"
+                        )
                 updated_context = mutateStrictPlaybackContextQueue(
                     playback_context_id,
                     current_user_name,
@@ -10951,11 +11006,10 @@ def _handle_queue_context_sync(current_user_name, current_client, payload, reque
                     position_ms,
                     _get_base_queue_revision(payload),
                     payload.get("baseControlVersion"),
-                    position_sampled_at_server_ms=payload[
-                        "positionSampledAtServerMs"
-                    ],
+                    position_sampled_at_server_ms=payload["positionSampledAtServerMs"],
                     connection_nonce=connection_nonce,
                     post_mutation_hook=projection_hook,
+                    waiting_broadcast=waiting,
                 )
                 broadcast_mutation = updated_context.pop(
                     "_broadcastMutation"
@@ -11121,6 +11175,12 @@ def _handle_strict_v2_playback_update(
                             payload,
                             server_time_ms,
                             post_mutation_hook=projection_hook,
+                            waiting_broadcast=(
+                                persisted_broadcast["snapshot"]
+                                if persisted_broadcast["lifecycleState"]
+                                == "waitingForSource"
+                                else None
+                            ),
                             require_execution_eligible=True,
                         )
                 if result is not None:

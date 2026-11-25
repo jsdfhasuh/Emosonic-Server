@@ -1480,9 +1480,13 @@ def commitBroadcastRevisionInTransaction(
     record.lifecycle_state = lifecycle_state
     record.broadcast_revision = next_revision
     record.snapshot_json = _canonical_json(snapshot)
-    record.authority_disconnect_deadline_ms = snapshot.get(
-        "authorityDisconnectDeadlineMs"
-    )
+    if (
+        lifecycle_state != "waitingForSource"
+        or record.authority_disconnect_deadline_ms is None
+    ):
+        record.authority_disconnect_deadline_ms = snapshot.get(
+            "authorityDisconnectDeadlineMs"
+        )
     record.updated_at = now()
     record.save()
     _prune_revision_ledger(
@@ -2689,6 +2693,44 @@ def createBroadcastRegistrationReplay(
         close_connection()
 
 
+def commitWaitingBroadcastInTransaction(snapshot, server_time_ms):
+    broadcast_id = snapshot["broadcastId"]
+    deliveries = []
+    participants = EmoBroadcastParticipant.select().where(
+        EmoBroadcastParticipant.broadcast_id == broadcast_id
+    )
+    for participant in participants:
+        delivery_id = "delivery:%s" % uuid.uuid4()
+        deliveries.append(
+            {
+                "deliveryId": delivery_id,
+                "clientId": participant.client_id,
+                "deviceSessionId": participant.device_session_id,
+                "action": "waiting",
+                "deliveryPositionMs": snapshot["positionMs"],
+                "feedbackDeadlineAtServerMs": server_time_ms + 8000,
+                "payload": dict(snapshot, deliveryId=delivery_id),
+                "connectionNonce": None,
+                "createdAtMs": server_time_ms,
+            }
+        )
+    committed = commitBroadcastRevisionInTransaction(
+        broadcast_id,
+        snapshot["broadcastRevision"] - 1,
+        snapshot,
+        "waiting",
+        deliveries,
+        server_time_ms,
+    )
+    return {
+        "broadcast": committed,
+        "snapshot": snapshot,
+        "deliveries": deliveries,
+        "action": "broadcast.waiting",
+        "serverTimeMs": server_time_ms,
+    }
+
+
 def suspendBroadcastForAuthorityDisconnect(
     user_name: str,
     client_id: str,
@@ -2746,48 +2788,15 @@ def suspendBroadcastForAuthorityDisconnect(
                         "serverUpdatedAtMs": server_time_ms,
                     }
                 )
-                deliveries = []
-                participants = EmoBroadcastParticipant.select().where(
-                    EmoBroadcastParticipant.broadcast_id == broadcast_id
-                )
-                for participant in participants:
-                    delivery_id = "delivery:%s" % uuid.uuid4()
-                    payload = dict(snapshot, deliveryId=delivery_id)
-                    deliveries.append(
-                        {
-                            "deliveryId": delivery_id,
-                            "clientId": participant.client_id,
-                            "deviceSessionId": participant.device_session_id,
-                            "action": "waiting",
-                            "deliveryPositionMs": position_ms,
-                            "feedbackDeadlineAtServerMs": server_time_ms + 8000,
-                            "payload": payload,
-                            "connectionNonce": None,
-                            "createdAtMs": server_time_ms,
-                        }
-                    )
-                committed = commitBroadcastRevisionInTransaction(
-                    broadcast_id,
-                    int(record.broadcast_revision),
-                    snapshot,
-                    "waiting",
-                    deliveries,
-                    server_time_ms,
-                )
+                mutation = commitWaitingBroadcastInTransaction(snapshot, server_time_ms)
                 EmoBroadcast.update(
                     authority_disconnect_deadline_ms=deadline_ms,
                     updated_at=now(),
                 ).where(
                     EmoBroadcast.broadcast_id == broadcast_id
                 ).execute()
-                committed["authorityDisconnectDeadlineMs"] = deadline_ms
-                return {
-                    "broadcast": committed,
-                    "snapshot": snapshot,
-                    "deliveries": deliveries,
-                    "action": "broadcast.waiting",
-                    "serverTimeMs": server_time_ms,
-                }
+                mutation["broadcast"]["authorityDisconnectDeadlineMs"] = deadline_ms
+                return mutation
     finally:
         close_connection()
 

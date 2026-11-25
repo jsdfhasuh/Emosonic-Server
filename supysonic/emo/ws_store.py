@@ -3786,6 +3786,7 @@ def applyStrictPlaybackUpdate(
     server_updated_at_ms,
     post_mutation_hook=None,
     require_execution_eligible=False,
+    waiting_broadcast=None,
 ):
     payload = dict(payload)
     payload.setdefault("positionSampledAtServerMs", 0)
@@ -3874,6 +3875,28 @@ def applyStrictPlaybackUpdate(
                 if has_applied_baseline
                 else None
             )
+            staged_queue = _waiting_broadcast_queue_proof(record, waiting_broadcast)
+            if staged_queue and (
+                staged_queue["connectionNonce"] != connection_nonce
+                or (
+                    payload["origin"] == "passive"
+                    and payload["appliedControlVersion"] < record.control_version
+                )
+            ):
+                raise PlaybackControlTransactionConflictError(
+                    "Source queue occurrence must be confirmed on this connection"
+                )
+            if (
+                staged_queue
+                and payload["origin"] == "passive"
+                and (
+                    payload.get("trackId") == record.track_id
+                    or payload["state"] == "idle"
+                )
+            ):
+                # The queue acknowledgement proves the cursor on this connection.
+                # Keep the previous actual device observation until a report arrives.
+                last_applied = record.control_version
             origin = payload["origin"]
             dependency_records = []
             eligible_dependency_records = []
@@ -4315,6 +4338,11 @@ def applyStrictPlaybackUpdate(
                     previous_context,
                     previous_device_state,
                 )
+            if staged_queue:
+                playback = json.loads(record.playback_json)
+                playback.pop("_waitingBroadcastQueue", None)
+                record.playback_json = json.dumps(playback)
+                record.save(only=(EmoPlaybackContext.playback_json,))
             return result
     finally:
         close_connection()
@@ -5001,6 +5029,7 @@ def savePlaybackState(session_id, user_name, client_id, playback_state):
 
 def _playback_context_payload(record):
     payload = json.loads(record.playback_json) if record.playback_json else {}
+    payload.pop("_waitingBroadcastQueue", None)
     _strip_transient_playback_fields(payload)
     queue_song_ids = json.loads(record.queue_json)
     payload.update(
@@ -5886,6 +5915,25 @@ def _advance_queue_sync_authority_device_state(
     return existing
 
 
+def _context_cursors(record):
+    return [record.epoch, record.version, record.queue_revision, record.control_version]
+
+
+def _waiting_broadcast_queue_proof(record, waiting_broadcast):
+    if waiting_broadcast is None:
+        return None
+    playback = json.loads(record.playback_json) if record.playback_json else {}
+    proof = playback.get("_waitingBroadcastQueue")
+    if (
+        isinstance(proof, dict)
+        and proof.get("cursors") == _context_cursors(record)
+        and proof.get("broadcastId") == waiting_broadcast["broadcastId"]
+        and proof.get("broadcastRevision") == waiting_broadcast["broadcastRevision"]
+    ):
+        return proof
+    return None
+
+
 @_serialize_strict_playback_context_mutation
 def mutateStrictPlaybackContextQueue(
     playback_context_id,
@@ -5900,6 +5948,7 @@ def mutateStrictPlaybackContextQueue(
     position_sampled_at_server_ms=None,
     connection_nonce=None,
     post_mutation_hook=None,
+    waiting_broadcast=None,
 ):
     queue_song_ids = list(queue_song_ids)
     open_connection(reuse=True)
@@ -5920,6 +5969,36 @@ def mutateStrictPlaybackContextQueue(
             _require_queue_replacement_lane(record)
             previous_queue = json.loads(record.queue_json)
             previous_index = record.current_index if previous_queue else None
+            if waiting_broadcast:
+                source_cursors = [
+                    waiting_broadcast[key]
+                    for key in (
+                        "sourceEpoch",
+                        "sourceVersion",
+                        "sourceQueueRevision",
+                        "sourceControlVersion",
+                    )
+                ]
+                if _context_cursors(record) != source_cursors:
+                    raise PlaybackControlTransactionConflictError(
+                        "Source Context cursors changed while waiting"
+                    )
+                if not previous_queue or queue_song_ids != previous_queue:
+                    raise PlaybackControlTransactionConflictError(
+                        "Source queue mutation is blocked while waiting for playback state"
+                    )
+                if not _waiting_broadcast_queue_proof(record, waiting_broadcast):
+                    applied = EmoDevicePlaybackState.get_or_none(
+                        playback_context_id=playback_context_id,
+                        owner_client_id=authority_client_id,
+                        device_session_id=authority_device_session_id,
+                        context_epoch=record.epoch,
+                        applied_control_version=record.control_version,
+                    )
+                    if applied is None:
+                        raise PlaybackControlTransactionConflictError(
+                            "Source control reconciliation is not settled"
+                        )
             previous_track = record.track_id
             next_index = current_index if queue_song_ids else None
             next_track = (
@@ -5947,7 +6026,7 @@ def mutateStrictPlaybackContextQueue(
                 and base_control_version != record.control_version
             ):
                 raise PlaybackContextStaleVersionError(current, "controlVersion")
-            if control_changed:
+            if control_changed or waiting_broadcast:
                 has_pending_control = (
                     EmoPlaybackControlTransaction.select()
                     .where(
@@ -6002,9 +6081,17 @@ def mutateStrictPlaybackContextQueue(
             record.queue_revision += 1
             if control_changed:
                 record.control_version += 1
+            if waiting_broadcast:
+                playback_json["_waitingBroadcastQueue"] = {
+                    "broadcastId": waiting_broadcast["broadcastId"],
+                    "broadcastRevision": waiting_broadcast["broadcastRevision"] + 1,
+                    "connectionNonce": connection_nonce,
+                    "cursors": _context_cursors(record),
+                }
+                record.playback_json = json.dumps(playback_json)
             record.updated_at = updated_at
             record.save()
-            if (
+            if not waiting_broadcast and (
                 control_changed
                 or position_changed
                 or (isinstance(connection_nonce, str) and connection_nonce)
