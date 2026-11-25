@@ -45,7 +45,7 @@ class FakeMpv:
                       "seeking": False, "idle-active": True, "current-ao": "alsa", "time-pos": 0, "duration": 10, "volume": 100}
         self.entry = 0
         self.writer = None
-        self.ignore = False
+        self.ignore = lambda cmd: False
         self.commands = []
 
     async def serve(self, reader, writer):
@@ -55,7 +55,7 @@ class FakeMpv:
                 req = json.loads(line)
                 cmd = req["command"]
                 self.commands.append(cmd)
-                if self.ignore:
+                if self.ignore(cmd):
                     continue
                 result = None
                 error = "success"
@@ -161,7 +161,7 @@ class MpvTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mpv_rejects_seek_reply_after_reporting_eof(self):
         await self.player.load('old', 'first')
-        self.fake.ignore = True
+        self.fake.ignore = lambda cmd: cmd[0] == 'seek'
         seek = asyncio.create_task(self.player.seek(2200))
         async with asyncio.timeout(1):
             while self.fake.commands[-1][0] != 'seek':
@@ -170,13 +170,13 @@ class MpvTests(unittest.IsolatedAsyncioTestCase):
         await self.fake.event('command-reply', request_id=self.player._request_id, error='error')
         with self.assertRaisesRegex(MpvError, 'mpv_command_failed'):
             await seek
-        self.fake.ignore = False
+        self.fake.ignore = lambda cmd: False
         await self.player.load('new', 'second')
         self.assertEqual((await self.player.snapshot())['run_id'], 'second')
 
     async def test_eof_arrives_just_after_mpv_rejects_seek(self):
         await self.player.load('old', 'first')
-        self.fake.ignore = True
+        self.fake.ignore = lambda cmd: cmd[0] == 'seek' or cmd == ['get_property', 'idle-active']
         seek = asyncio.create_task(self.player.seek(2200))
         async with asyncio.timeout(1):
             while self.fake.commands[-1][0] != 'seek':
@@ -191,7 +191,7 @@ class MpvTests(unittest.IsolatedAsyncioTestCase):
         await self.fake.event('command-reply', request_id=self.player._request_id, error='success', data=False)
         with self.assertRaisesRegex(MpvError, 'mpv_command_failed'):
             await seek
-        self.fake.ignore = False
+        self.fake.ignore = lambda cmd: False
         await self.player.load('new', 'second')
         self.assertEqual((await self.player.snapshot())['run_id'], 'second')
 
@@ -248,9 +248,41 @@ class MpvTests(unittest.IsolatedAsyncioTestCase):
         await self.player.load('next', 'second')
         self.assertEqual((await self.player.snapshot())['run_id'], 'second')
 
+    async def test_delayed_eof_for_an_accepted_tail_seek_preserves_its_event(self):
+        command = self.player._command
+        async def observe_near_tail(args):
+            if args == ['get_property', 'time-pos']:
+                raise MpvError('mpv_command_failed')
+            if args == ['get_property', 'idle-active']:
+                loop = asyncio.get_running_loop()
+                loop.call_later(.015, self.player._event, {
+                    'event': 'end-file', 'reason': 'eof', 'playlist_entry_id': self.fake.entry}, 1)
+                return False
+            return await command(args)
+
+        with patch.object(self.player, '_command', observe_near_tail):
+            with self.assertRaisesRegex(MpvError, 'mpv_command_failed'):
+                await self.player.load('old', 'near-tail', 9997)
+        self.assertIsNotNone(self.player._writer)
+        event = await asyncio.wait_for(self.player.events.get(), 1)
+        self.assertEqual((event.kind, event.run_id), ('eof', 'near-tail'))
+        await self.player.load('next', 'second')
+        self.assertEqual((await self.player.snapshot())['run_id'], 'second')
+
+    async def test_accepted_tail_seek_without_matching_eof_still_closes_mpv(self):
+        command = self.player._command
+        async def reject_observation(args):
+            if args == ['get_property', 'time-pos']:
+                raise MpvError('mpv_command_failed')
+            return await command(args)
+        with patch.object(self.player, '_command', reject_observation):
+            with self.assertRaisesRegex(MpvError, 'mpv_command_failed'):
+                await self.player.load('old', 'near-tail', 9997)
+        self.assertIsNone(self.player._writer)
+
     async def test_timeout_closes_channel_and_clears_pending(self):
         await self.player.load("url", "r")
-        self.fake.ignore = True
+        self.fake.ignore = lambda cmd: True
         with self.assertRaisesRegex(MpvError, "mpv_command_interrupted"):
             await self.player.pause()
         self.assertIsNone(self.player._writer)

@@ -12,6 +12,9 @@ import tempfile
 from .config import validate_audio_device
 
 
+_SEEK_TOLERANCE_MS = 250
+
+
 class MpvError(RuntimeError):
     """Safe error category; deliberately excludes mpv response/URL text."""
 
@@ -45,6 +48,7 @@ class MpvPlayer:
         self._entries: dict[int, str] = {}
         self._run_id: str | None = None
         self._eof_run: str | None = None
+        self._eof_notice = asyncio.Event()
         self._entry: int | None = None
         self._event_entry: int | None = None
         self._loaded: set[int] = set()
@@ -152,12 +156,14 @@ class MpvPlayer:
             reason = message.get("reason")
             if reason == "eof":
                 self._eof_run = run
+                self._eof_notice.set()
             if reason in ("eof", "error"):
                 self.events.put_nowait(PlaybackEvent(reason, run, generation))
 
     def _invalidate(self) -> None:
         self._run_id = None
         self._eof_run = None
+        self._eof_notice.clear()
         self._entry = None
         self._entries.clear()
         self._loaded.clear()
@@ -259,13 +265,24 @@ class MpvPlayer:
         if not math.isfinite(position_ms) or position_ms < 0:
             raise ValueError("invalid seek position")
         run = self._run_id
+        try:
+            duration = await self._command(["get_property", "duration"])
+        except MpvError as error:
+            if str(error) != "mpv_command_failed":
+                raise
+            duration = None
+        near_end = (type(duration) in (int, float) and duration > 0
+                    and abs(duration * 1000 - position_ms) <= _SEEK_TOLERANCE_MS)
+        accepted = False
         async def reached():
             self._require_run()
             seeking = await self._command(["get_property", "seeking"])
             position = await self._command(["get_property", "time-pos"])
-            return not seeking and isinstance(position, (int, float)) and abs(position * 1000 - position_ms) <= 250
+            return (not seeking and isinstance(position, (int, float))
+                    and abs(position * 1000 - position_ms) <= _SEEK_TOLERANCE_MS)
         try:
             await self._command(["seek", position_ms / 1000, "absolute+exact"])
+            accepted = True
             await self._until(reached)
         except MpvError as error:
             if str(error) == "mpv_command_failed":
@@ -273,6 +290,12 @@ class MpvPlayer:
                 # before mpv updates idle-active. Only that matching event proves EOF.
                 if self._run_id == run:
                     await self._command(["get_property", "idle-active"])
+                if accepted and near_end and self._run_id == run:
+                    # The tail position can disappear just before mpv emits end-file.
+                    try:
+                        await asyncio.wait_for(self._eof_notice.wait(), min(.1, self.timeout))
+                    except TimeoutError:
+                        pass
                 if self._eof_run == run:
                     raise _NaturalEnd("mpv_command_failed") from error
             raise
