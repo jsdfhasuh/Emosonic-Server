@@ -155,6 +155,46 @@ class MpvTests(unittest.IsolatedAsyncioTestCase):
         event = await asyncio.wait_for(self.player.events.get(), 1)
         self.assertEqual(event.kind, "error")
         self.assertNotIn("SECRET", repr(event))
+        with self.assertRaisesRegex(MpvError, 'mpv_no_active_run'):
+            await self.player.seek(1000)
+        self.assertIsNone(self.player._writer)
+
+    async def test_mpv_rejects_seek_reply_after_reporting_eof(self):
+        await self.player.load('old', 'first')
+        self.fake.ignore = True
+        seek = asyncio.create_task(self.player.seek(2200))
+        async with asyncio.timeout(1):
+            while self.fake.commands[-1][0] != 'seek':
+                await asyncio.sleep(0)
+        await self.fake.event('end-file', playlist_entry_id=self.fake.entry, reason='eof')
+        await self.fake.event('command-reply', request_id=self.player._request_id, error='error')
+        with self.assertRaisesRegex(MpvError, 'mpv_command_failed'):
+            await seek
+        self.fake.ignore = False
+        await self.player.load('new', 'second')
+        self.assertEqual((await self.player.snapshot())['run_id'], 'second')
+
+    async def test_eof_during_seek_or_snapshot_rejects_operation_but_keeps_idle_mpv(self):
+        command = self.player._command
+
+        for trigger, operation, expected_error in (
+                (['seek', 2.2, 'absolute+exact'], lambda: self.player.seek(2200), 'mpv_no_active_run'),
+                (['get_property', 'duration'], self.player.snapshot, 'mpv_snapshot_superseded')):
+            with self.subTest(error=expected_error):
+                await self.player.load('old', 'first')
+                async def end_during_command(args):
+                    result = await command(args)
+                    if args == trigger:
+                        await self.fake.event('end-file', playlist_entry_id=self.fake.entry, reason='eof')
+                        event = await asyncio.wait_for(self.player.events.get(), 1)
+                        self.assertEqual((event.kind, event.run_id), ('eof', 'first'))
+                    return result
+
+                with patch.object(self.player, '_command', end_during_command):
+                    with self.assertRaisesRegex(MpvError, expected_error):
+                        await operation()
+                await self.player.load('new', 'second')
+                self.assertEqual((await self.player.snapshot())['run_id'], 'second')
 
     async def test_timeout_closes_channel_and_clears_pending(self):
         await self.player.load("url", "r")

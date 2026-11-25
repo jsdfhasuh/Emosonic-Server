@@ -16,6 +16,10 @@ class MpvError(RuntimeError):
     """Safe error category; deliberately excludes mpv response/URL text."""
 
 
+class _NaturalEnd(MpvError):
+    """The requested run reached EOF while its IPC channel was still healthy."""
+
+
 @dataclass(frozen=True)
 class PlaybackEvent:
     kind: str
@@ -40,6 +44,7 @@ class MpvPlayer:
         self._pending: dict[int, asyncio.Future] = {}
         self._entries: dict[int, str] = {}
         self._run_id: str | None = None
+        self._eof_run: str | None = None
         self._entry: int | None = None
         self._event_entry: int | None = None
         self._loaded: set[int] = set()
@@ -141,11 +146,14 @@ class MpvPlayer:
                 return
             self._invalidate()
             reason = message.get("reason")
+            if reason == "eof":
+                self._eof_run = run
             if reason in ("eof", "error"):
                 self.events.put_nowait(PlaybackEvent(reason, run, generation))
 
     def _invalidate(self) -> None:
         self._run_id = None
+        self._eof_run = None
         self._entry = None
         self._entries.clear()
         self._loaded.clear()
@@ -159,6 +167,7 @@ class MpvPlayer:
     async def _command(self, command: list):
         if self._writer is None or self._writer.is_closing():
             raise MpvError("mpv_not_connected")
+        run = self._run_id
         self._request_id += 1
         request_id = self._request_id
         future = asyncio.get_running_loop().create_future()
@@ -167,6 +176,10 @@ class MpvPlayer:
             self._writer.write(json.dumps({"command": command, "request_id": request_id}).encode() + b"\n")
             await asyncio.wait_for(self._writer.drain(), self.timeout)
             return await asyncio.wait_for(future, self.timeout)
+        except MpvError as error:
+            if run is not None and run == self._eof_run and str(error) == "mpv_command_failed":
+                raise _NaturalEnd("mpv_command_failed") from error
+            raise
         except (TimeoutError, asyncio.CancelledError, OSError):
             # Closing/killing the owned process also fences a late successful seek/load.
             await self.close()
@@ -187,6 +200,8 @@ class MpvPlayer:
         async with self._operations:
             try:
                 yield
+            except _NaturalEnd:
+                raise
             except (MpvError, asyncio.CancelledError):
                 await self.close()
                 raise
@@ -284,6 +299,8 @@ class MpvPlayer:
 
     def _require_run(self) -> None:
         if self._run_id is None:
+            if self._eof_run is not None:
+                raise _NaturalEnd("mpv_no_active_run")
             raise MpvError("mpv_no_active_run")
 
     async def snapshot(self) -> dict:
@@ -311,6 +328,8 @@ class MpvPlayer:
                     result["position_sampled_monotonic"] = (before + asyncio.get_running_loop().time()) / 2
                 result[key] = value
             if run != self._run_id:
+                if run is not None and run == self._eof_run:
+                    raise _NaturalEnd("mpv_snapshot_superseded")
                 raise MpvError("mpv_snapshot_superseded")
             return result
 

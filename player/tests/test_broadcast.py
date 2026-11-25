@@ -7,7 +7,9 @@ import unittest
 from unittest.mock import AsyncMock
 
 from emosonic_player.broadcast import Broadcast
+from emosonic_player.mpv import MpvPlayer
 from emosonic_player.playback import Player
+from test_mpv import FakeMpv, MemoryWriter
 from test_playback import FakeEngine, FakeMedia, FakeWire, context
 
 
@@ -72,6 +74,51 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.engine.loads), 1)
         self.assertEqual(self.wire.emitted, [])
 
+    async def test_late_pause_after_eof_keeps_mpv_for_the_next_queue_item(self):
+        fake = FakeMpv()
+        reader, peer_reader = asyncio.StreamReader(), asyncio.StreamReader()
+        writer = MemoryWriter(peer_reader)
+        peer = asyncio.create_task(fake.serve(peer_reader, MemoryWriter(reader)))
+        engine = MpvPlayer('alsa/test', self.temp.name, timeout=1)
+        engine._writer = writer
+        engine._generation = 1
+        engine._reader_task = asyncio.create_task(engine._read(reader, 1))
+        async def close_peer():
+            await engine.close()
+            await peer
+        self.addAsyncCleanup(close_peer)
+        self.player.engine = engine
+        await engine.load('ordinary', self.player.run_id, 980)
+
+        queue = ['mirror', 'next']
+        await self.b.on_event(self.event('start', 119, queueSongIds=queue))
+        self.assertEqual(self.wire.emitted[-1]['appliedBroadcastRevision'], 119)
+        fake.props.pop('time-pos')
+        fake.props['idle-active'] = True
+        await fake.event('end-file', playlist_entry_id=fake.entry, reason='eof')
+        ended = await asyncio.wait_for(engine.events.get(), 1)
+        self.assertEqual((ended.kind, ended.run_id), ('eof', self.b.run))
+        await self.b.on_event(self.event('pause', 121, state='paused', queueSongIds=queue,
+                                         positionMs=192756))
+        failed = self.wire.emitted[-1]
+        self.assertEqual((failed['deliveryId'], failed['executionStatus'], failed['errorCode']),
+                         ('pause121', 'failed', 'execution_failed'))
+        self.assertEqual(failed['lastAppliedBroadcastRevision'], 119)
+        self.assertFalse(self.player.needs_engine_restart)
+        self.assertIs(engine._writer, writer)
+
+        fake.props['time-pos'] = 0
+        next_item = dict(queueSongIds=queue, currentIndex=1, trackId='next', positionMs=0)
+        await self.b.on_event(self.event('queue.sync', 122, state='paused', **next_item))
+        await self.b.on_event(self.event('play', 123, **next_item))
+        applied = self.wire.emitted[-1]
+        self.assertEqual((applied['appliedBroadcastRevision'], applied['trackId'], applied['state']),
+                         (123, 'next', 'playing'))
+        actual = await engine.snapshot()
+        self.assertEqual((actual['run_id'], actual['paused']), (self.b.run, False))
+        self.assertNotEqual(actual['run_id'], ended.run_id)
+        self.assertIs(engine._writer, writer)
+
     async def test_participant_recovers_original_on_terminal_even_after_process_restart(self):
         await self.b.on_event(self.event('start', 1))
         self.assertTrue(self.b.blocks_core)
@@ -108,6 +155,19 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         replacement = Broadcast(self.player, self.temp.name)
         self.assertFalse(replacement.blocks_core)
         self.assertFalse(await replacement.recover())
+
+    async def test_next_occurrence_of_same_song_loads_a_new_run_after_eof(self):
+        queue = ['mirror', 'mirror']
+        await self.b.on_event(self.event('start', 1, queueSongIds=queue))
+        ended = self.b.run
+        self.engine.run = None
+        self.engine.sample.update(run_id=None, position_ms=None)
+        await self.b.on_event(self.event('queue.sync', 2, queueSongIds=queue, currentIndex=1,
+                                         state='paused', positionMs=0))
+        applied = self.wire.emitted[-1]
+        self.assertEqual((applied['executionStatus'], applied.get('queueIndex')), ('applied', 1))
+        self.assertNotEqual(self.b.run, ended)
+        self.assertEqual(self.b.run, self.engine.run)
 
     async def test_same_revision_late_delivery_cannot_replace_the_newer_resync_attempt(self):
         first = self.event('start', 1)

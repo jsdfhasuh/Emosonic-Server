@@ -60,7 +60,7 @@ class Broadcast:
         self.terminal = False
         self.restored = False
         self.retired = set()
-        self.track = None
+        self._queue_item: tuple[int, str] | None = None
         self.run = None
         self.mirror = {}
         self.sequence = 0
@@ -104,7 +104,7 @@ class Broadcast:
         self.revision = 0
         self.attempts.clear()
         self.terminal = self.restored = False
-        self.delivery = self.track = self.run = self.error = None
+        self.delivery = self._queue_item = self.run = self.error = None
         self.mirror = {}
 
     def _replace_delivery(self, key):
@@ -118,7 +118,7 @@ class Broadcast:
         self.pending_event = None
         self.revision = self.sequence = 0
         self.attempts.clear()
-        self.track = self.run = None
+        self._queue_item = self.run = None
         self.mirror = {}
         self.terminal = self.restored = False
         if self.blocks_core:
@@ -282,7 +282,7 @@ class Broadcast:
                     async with self.player.lock:
                         if current():
                             await self.player._safe_stop()
-                            self.track = self.run = None
+                            self._queue_item = self.run = None
                 result = {'executionStatus': 'failed', 'failedBroadcastRevision': revision,
                           'lastAppliedBroadcastRevision': self.record.get('lastApplied', 0),
                           'errorCode': self.error}
@@ -361,7 +361,7 @@ class Broadcast:
         self.player.context = canonical
         self.player.executed = context
         self.player.applied = canonical['controlVersion']
-        self.run = self.track = None
+        self.run = self._queue_item = None
 
     @staticmethod
     def _terminal_proof(p):
@@ -390,15 +390,15 @@ class Broadcast:
             return round(p['positionMs'] + delta)
         clock = now()
         engine = self.player.engine
-        changed_track = self.track != song or self.run is None
+        item = (idx, song)
         self.player._interrupt_announcement()
-        if changed_track and state != 'stopped':
+        if state != 'stopped' and (self._queue_item != item or self.run is None):
             run = uuid.uuid4().hex
             try:
                 await engine.load(self.player.media.stream_url(song), run, position_ms=position(at or clock))
             except Exception:
                 raise BroadcastError('track_load_failed') from None
-            self.track, self.run = song, run
+            self._queue_item, self.run = item, run
         if not current():
             return None
         if at is not None:
@@ -414,12 +414,14 @@ class Broadcast:
         target = position(now())
         if state == 'stopped':
             await engine.stop()
-            self.track = self.run = None
+            self._queue_item = self.run = None
             actual = target
         else:
             sample = await engine.snapshot()
             if not current():
                 return None
+            if sample['run_id'] != self.run:
+                raise BroadcastError('execution_failed')
             if state == 'paused' and not sample['paused']:
                 await engine.pause()
             if not current():
