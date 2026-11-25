@@ -15,6 +15,8 @@ import os.path
 import tempfile
 import threading
 from time import time
+from typing import Callable
+from weakref import WeakValueDictionary
 
 
 logger = logging.getLogger(__name__)
@@ -62,6 +64,7 @@ class Cache:
         self.max_size = max_size
         self._auto_prune = auto_prune
         self._lock = threading.RLock()
+        self._generation_locks = WeakValueDictionary()
 
         # Create the cache directory
         try:
@@ -168,6 +171,23 @@ class Cache:
         with self.set_fileobj(key) as f:
             f.write(value)
         return self._filepath(key)
+
+    def get_or_create_file(self, key: str, write_file: Callable[[str], None]) -> str:
+        """Generate a missing entry once, publishing it after the writer returns."""
+        with self._lock:
+            lock = self._generation_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._generation_locks[key] = lock
+
+        with lock:
+            try:
+                return self.get(key)
+            except CacheMiss:
+                pass
+            with self.set_fileobj(key) as output:
+                write_file(output.name)
+            return self._filepath(key)
 
     def set_generated(self, key, gen_function):
         """Pass the values yielded from the generator function through and set

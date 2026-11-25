@@ -15,6 +15,7 @@ import shlex
 import shutil
 import subprocess
 import zlib
+from functools import partial
 from io import BytesIO
 from typing import Dict, Optional, Tuple
 from xml.etree import ElementTree
@@ -23,6 +24,7 @@ import mediafile
 import requests
 from flask import current_app
 from flask import request, Response, send_file
+from gevent import get_hub, monkey
 from mutagen import MutagenError
 from mutagen.flac import FLAC
 from PIL import Image
@@ -403,24 +405,33 @@ def _sanitized_cache_key(track: Track) -> str:
     return "{}-{}.flac".format(track.id, digest[:16])
 
 
+def _write_flac_no_picture(source_path: str, output_path: str) -> None:
+    shutil.copyfile(source_path, output_path)
+    sanitized = FLAC(output_path)
+    sanitized.clear_pictures()
+    sanitized.save()
+
+
+def _generate_flac_no_picture(source_path: str, output_path: str) -> None:
+    if not monkey.is_module_patched("threading"):
+        _write_flac_no_picture(source_path, output_path)
+        return
+
+    job = get_hub().threadpool.spawn(_write_flac_no_picture, source_path, output_path)
+    try:
+        job.get()
+    finally:
+        # A cancelled request still owns the temporary file until its writer exits.
+        if not job.ready():
+            job.wait()
+
+
 def _get_or_create_flac_no_picture(track: Track) -> str:
     cache = current_app.transcode_cache
-    cache_key = _sanitized_cache_key(track)
-
     try:
-        return cache.get(cache_key)
-    except CacheMiss:
-        pass
-
-    try:
-        with cache.set_fileobj(cache_key) as output:
-            with open(track.path, "rb") as source:
-                shutil.copyfileobj(source, output)
-            output.flush()
-
-            sanitized = FLAC(output.name)
-            sanitized.clear_pictures()
-            sanitized.save()
+        return cache.get_or_create_file(
+            _sanitized_cache_key(track), partial(_generate_flac_no_picture, track.path)
+        )
     except (OSError, MutagenError) as exc:
         _log_media_event(
             logging.ERROR,
@@ -430,8 +441,6 @@ def _get_or_create_flac_no_picture(track: Track) -> str:
             reason=exc.__class__.__name__,
         )
         raise
-
-    return cache.get(cache_key)
 
 
 def _is_range_probe() -> bool:
