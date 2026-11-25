@@ -18,6 +18,7 @@ from .broadcast import Broadcast
 from .errors import PlaybackError
 from .follow import Follow
 from .handoff import Handoff
+from .volume import SpeakerVolume
 
 
 @dataclass
@@ -35,6 +36,7 @@ class Player:
         self.applied = 0
         self.sequence = 0
         self.volume_sequence = 0
+        self.volume = SpeakerVolume(state_dir)
         self.run_id = None
         self.lock = asyncio.Lock()
         self.commands = asyncio.Queue(maxsize=128)
@@ -61,6 +63,12 @@ class Player:
     async def start(self):
         self._tasks = [asyncio.create_task(self._commands()), asyncio.create_task(self._engine_events()),
                        asyncio.create_task(self._progress())]
+
+    async def start_engine(self, initial_volume: float) -> None:
+        async with self.lock:
+            await self.engine.start()
+            volume = self.volume.value
+            await self.engine.set_volume(initial_volume if volume is None else volume)
 
     async def close(self):
         self._interrupt_announcement()
@@ -313,6 +321,7 @@ class Player:
             actual = (await self.engine.snapshot())['volume']
             if actual is None or not math.isfinite(actual) or abs(actual - p['volume']) > .1:
                 raise PlaybackError('volume confirmation mismatch')
+            self.volume.remember(round(actual))
             if self.announcement:
                 self.announcement.music_sample['volume'] = actual
             seq = self.volume_sequence

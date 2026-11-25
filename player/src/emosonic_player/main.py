@@ -137,8 +137,7 @@ async def run(config):
         loop.add_signal_handler(sig, stop.set)
     sockets = AsyncExitStack()
     try:
-        await engine.start()
-        await engine.set_volume(config['initial_volume'])
+        await player.start_engine(config['initial_volume'])
         await player.start()
         await sockets.enter_async_context(control_socket(runtime / 'control.sock', player))
         if 'ha_socket' in config:
@@ -158,8 +157,7 @@ async def run(config):
             try:
                 if player.needs_engine_restart:
                     await engine.close()
-                    await engine.start()
-                    await engine.set_volume(config['initial_volume'])
+                    await player.start_engine(config['initial_volume'])
                     player.needs_engine_restart = False
                 await wire.connect()
                 await player.reconcile()

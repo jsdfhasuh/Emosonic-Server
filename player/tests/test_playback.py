@@ -1,6 +1,8 @@
 """State machine tests using fake protocol and engine, not physical acceptance."""
 import asyncio
 import copy
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -111,6 +113,8 @@ class FakeWire:
         self.emitted.append((action, copy.deepcopy(payload)))
         if self.auto_confirm:
             canonical = dict(payload, controlVersion=payload.get('appliedControlVersion', 0))
+            if action == 'device.volume.update':
+                canonical['sourceClientId'] = self.client_id
             await self.deliver(action, canonical)
 
     async def send_confirmed(self, action, payload, confirmation_action, predicate, **kwargs):
@@ -175,6 +179,57 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
+
+    async def test_confirmed_device_volume_survives_engine_and_daemon_restarts(self):
+        with tempfile.TemporaryDirectory() as state:
+            player = Player(self.wire, self.engine, FakeMedia(), state)
+            await player.start_engine(10)
+            self.assertEqual(self.engine.sample['volume'], 10)
+            await player.cli('volume', {'value': 47})
+            self.assertFalse((Path(state) / 'volume.json').exists())
+            self.assertEqual(self.wire.requests[-1][0], 'device.setVolume')
+            await player._execute(self.command('device.setVolume', volume=47), 1)
+            await self.engine.close()
+            await player.start_engine(10)
+            self.assertEqual(self.engine.sample['volume'], 47)
+
+            restarted = Player(self.wire, FakeEngine(), FakeMedia(), state)
+            await restarted.start_engine(10)
+            self.assertEqual(restarted.engine.sample['volume'], 47)
+            await restarted._execute(self.command('device.setVolume', volume=0), 1)
+            muted = Player(self.wire, FakeEngine(), FakeMedia(), state)
+            await muted.start_engine(20)
+            self.assertEqual(muted.engine.sample['volume'], 0)
+
+    async def test_failed_readback_leaves_saved_volume_and_disk_failure_retries(self):
+        with tempfile.TemporaryDirectory() as state:
+            path = Path(state) / 'volume.json'
+            path.write_text('36\n')
+            player = Player(self.wire, self.engine, FakeMedia(), state)
+            await player.start_engine(10)
+            with patch.object(self.engine, 'set_volume', new_callable=AsyncMock):
+                with self.assertRaisesRegex(PlaybackError, 'confirmation mismatch'):
+                    await player._execute(self.command('device.setVolume', volume=47), 1)
+            self.assertEqual(path.read_text(), '36\n')
+
+            with patch('emosonic_player.volume.os.replace', side_effect=OSError('disk full')):
+                with self.assertLogs('emosonic_player.volume', 'WARNING'):
+                    await player._execute(self.command('device.setVolume', volume=0), 1)
+            self.assertEqual(path.read_text(), '36\n')
+            await player.start_engine(10)
+            self.assertEqual(self.engine.sample['volume'], 0)
+            await player._execute(self.command('device.setVolume', volume=0), 1)
+            self.assertEqual(path.read_text(), '0\n')
+
+    async def test_invalid_volume_file_uses_configured_default(self):
+        with tempfile.TemporaryDirectory() as state:
+            for invalid in ('broken', 'true', '[]', '101', '-1'):
+                with self.subTest(invalid=invalid):
+                    (Path(state) / 'volume.json').write_text(invalid)
+                    with self.assertLogs('emosonic_player.volume', 'WARNING'):
+                        player = Player(self.wire, self.engine, FakeMedia(), state)
+                    await player.start_engine(25)
+                    self.assertEqual(self.engine.sample['volume'], 25)
 
     async def test_same_session_reconnect_preserves_stopped_queue_until_play(self):
         self.wire.canonical.update(state='stopped', currentIndex=1, positionMs=420,
@@ -279,9 +334,13 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
     async def test_announcement_failure_restores_original_pause(self):
         self.engine.sample.update(paused=True, position_ms=987)
         request, speech = await self.start_announcement()
+        await self.player._execute(self.command('device.setVolume', volume=0), 1)
         await self.engine.events.put(PlaybackEvent('error', speech, 1))
         with self.assertRaisesRegex(PlaybackError, 'announcement playback failed'):
             await request
+        self.assertEqual(self.engine.sample['volume'], 0)
+        await self.player.start_engine(10)
+        self.assertEqual(self.engine.sample['volume'], 0)
         self.assertEqual(self.engine.loads[-1][0], 'https://music.test/first')
         self.assertEqual(self.engine.sample['position_ms'], 987)
         self.assertTrue(self.engine.sample['paused'])

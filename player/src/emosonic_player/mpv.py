@@ -63,15 +63,18 @@ class MpvPlayer:
         socket = self._private_dir / "ipc"
         self._generation += 1
         self._closing = False
+        output_args = (["--ao=null"] if self.expected_ao == "null" else
+                       ["--audio-device=" + self.audio_device])
+        if self.audio_device.partition(":")[0] == "alsa/plughw":
+            # Keep mpv's low-volume gain in float; ALSA plug converts to the hardware format.
+            output_args.append("--audio-format=float")
         try:
             self._process = await asyncio.create_subprocess_exec(
                 self.executable, "--idle=yes", "--pause=yes", "--no-video",
                 "--no-config", "--load-scripts=no", "--terminal=no",
                 "--input-default-bindings=no", "--input-terminal=no",
                 "--audio-fallback-to-null=no",
-                # The alsa/ prefix selects ALSA and the PCM in one option.
-                *(["--ao=null"] if self.expected_ao == "null" else
-                  ["--audio-device=" + self.audio_device]),
+                *output_args,
                 "--input-ipc-server=" + str(socket),
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,

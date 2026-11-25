@@ -133,7 +133,10 @@ App 和 SSH CLI 仍走同一个 playerd 与服务端队列。没有 MPD、PulseA
 `client_id_file` 保存稳定设备身份；`state_dir` 的数据应随升级保留，不能将
 含同一 clientId 的卷复制给另一个同时运行的播放器。`runtime_dir` 存放本机
 控制 socket 和 mpv IPC，权限 0700，不公开 TCP 端口，不挂载到其他容器。
-`initial_volume` 默认 20，但仍需确认硬件混音器、功放与音箱音量。
+`initial_volume` 默认 20，供首次启动时使用。通过 App、Home Assistant 或 CLI
+成功设置的音量会保存在 `state_dir`，包括 0。下次启动或重建 mpv 时恢复该音量。
+在 AB13X 使用的 `alsa/plughw` 上，mpv 以浮点精度调节音量，再由 ALSA
+转换为声卡支持的格式，低音量档也能保留微弱的音乐信号。
 
 ## App 和 CLI
 

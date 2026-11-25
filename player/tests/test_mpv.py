@@ -2,10 +2,13 @@ import asyncio
 import json
 import os
 import shutil
+import struct
+import sys
 import wave
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from emosonic_player.mpv import MpvError, MpvPlayer
 
@@ -205,10 +208,62 @@ class MpvTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 MpvPlayer(value, self.temp.name)
 
+    async def test_float_output_only_for_plughw(self):
+        devices = (
+            ("alsa/plughw:CARD=Audio,DEV=0", True),
+            ("alsa/plughw", True),
+            ("alsa/hw:CARD=Audio,DEV=0", False),
+            ("alsa/test", False),
+            ("null", False),
+        )
+        for device, expect_float in devices:
+            with self.subTest(device=device):
+                player = MpvPlayer(device, self.temp.name, allow_null_output_for_tests=True)
+                with patch("asyncio.create_subprocess_exec", side_effect=OSError) as launch:
+                    with self.assertRaisesRegex(MpvError, "mpv_start_failed"):
+                        await player.start()
+                arguments = launch.await_args.args
+                route = "--ao=null" if device == "null" else "--audio-device=" + device
+                self.assertIn(route, arguments)
+                self.assertEqual("--audio-format=float" in arguments, expect_float)
+
 
 @unittest.skipUnless(shutil.which("mpv") and os.environ.get("EMOSONIC_REAL_MPV_TESTS") == "1",
                      "requires mpv and explicit non-physical integration opt-in")
 class RealMpvTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires ALSA plug/file plugins")
+    async def test_plughw_low_volume_reaches_s16_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media = root / "signal.wav"
+            capture = root / "capture.s16"
+            config = root / "alsa.conf"
+            config.write_text(
+                "pcm.null { type null }\n"
+                "pcm.plughw { type plug slave { pcm capture format S16_LE rate 48000 channels 2 } }\n"
+                f'pcm.capture {{ type file slave.pcm null file "{capture}" format raw }}\n'
+            )
+            with wave.open(str(media), "wb") as stream:
+                stream.setparams((2, 2, 44100, 0, "NONE", ""))
+                stream.writeframes((b"\x00\x40" * 128 + b"\x00\xc0" * 128) * 384)
+            player = MpvPlayer("alsa/plughw", directory, timeout=5)
+            try:
+                with patch.dict(os.environ, ALSA_CONFIG_PATH=str(config)):
+                    await player.start()
+                await player.set_volume(10)
+                await player.load(str(media), "low-volume")
+                # ALSA's null slave can drain the file before play() samples the live state.
+                await player._command(["set_property", "pause", False])
+                event = await asyncio.wait_for(player.events.get(), 8)
+                self.assertEqual((event.kind, event.run_id), ("eof", "low-volume"))
+            finally:
+                await player.close()
+            samples = struct.iter_unpack("<h", capture.read_bytes())
+            peak = max(abs(sample) for (sample,) in samples)
+            # Half-scale signal with mpv's cubic gain at 10% is about 16 S16 counts.
+            self.assertGreater(peak, 8)
+            self.assertLess(peak, 32)
+
     async def test_real_process_load_seek_and_eof(self):
         # Null audio validates process/IPC, never claims USB output or audible sound.
         with tempfile.TemporaryDirectory() as directory:
