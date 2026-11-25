@@ -29,6 +29,7 @@ from ..managers.user import UserManager
 from .browser_auth import BROWSER_OTP_PREFIX, browser_one_time_passwords
 from .broadcast_store import (
     BroadcastFeedbackSequenceConflictError,
+    BroadcastFeedbackTailDurationRequired,
     BroadcastIntentConflictError,
     BroadcastLimitError,
     BroadcastNotFoundError,
@@ -91,6 +92,7 @@ from .strict_v2_contract import (
 from .strict_v2_effective_at import (
     EffectiveAtEligibilityError,
     getTrackDurationMs,
+    getVerifiedTrackTailDurationMs,
     isClockGateReady,
     projectBroadcastPositionMs,
     requireEffectiveAtPlayer,
@@ -6783,7 +6785,7 @@ def _handle_strict_broadcast_feedback(
     connection_epoch = session_info.get("connectionEpoch", 1)
     if not isinstance(connection_nonce, str) or not connection_nonce:
         raise PermissionError("Registered connection provenance is missing")
-    persisted = getPersistentBroadcastState(payload["broadcastId"])
+    persisted = getPersistentBroadcastState(payload["broadcastId"], include_ledger=False)
     if persisted is not None and (
         persisted["userName"] != current_user_name
         or persisted["playbackContextId"] != payload["playbackContextId"]
@@ -6795,8 +6797,9 @@ def _handle_strict_broadcast_feedback(
         "broadcast.feedback",
         payload,
     )
-    try:
-        result = settleBroadcastFeedback(
+
+    def settle_feedback(verified_tail_duration_ms=None):
+        return settleBroadcastFeedback(
             current_user_name,
             payload["playbackContextId"],
             payload["broadcastId"],
@@ -6808,7 +6811,18 @@ def _handle_strict_broadcast_feedback(
             fingerprint,
             _server_time_ms(),
             track_duration_ms=track_duration_ms,
+            verified_tail_duration_ms=verified_tail_duration_ms,
         )
+
+    try:
+        try:
+            result = settle_feedback()
+        except BroadcastFeedbackTailDurationRequired:
+            # The store has released the transaction and mutation lock. Recheck
+            # the delivery in case the broadcast changed during the file read.
+            result = settle_feedback(
+                getVerifiedTrackTailDurationMs(payload["trackId"], track_duration_ms)
+            )
     except BroadcastNotFoundError as exc:
         raise LookupError("Broadcast not found") from exc
     except (
@@ -7848,7 +7862,7 @@ def _strict_terminal_drain_allowed(
 ):
     if action not in {"broadcast.status", "broadcast.feedback"}:
         return False
-    persisted = getPersistentBroadcastState(payload.get("broadcastId"))
+    persisted = getPersistentBroadcastState(payload.get("broadcastId"), include_ledger=False)
     if persisted is not None:
         snapshot = persisted["snapshot"]
         if (
@@ -13237,11 +13251,10 @@ class EmoNamespace(Namespace):
         g.emo_request_action = action
         session_info = state.get_session(request.sid)
         current_client = state.get_client_for_sid(request.sid)
-        # Source facts and their consumers cross several stores. Reuse the same
-        # physical DB connection, including the durable device revocation check.
-        scoped = action in {"playback.update", "follow.start", "broadcast.start"} and (
-            _is_strict_playback_context_v2(current_client)
-        )
+        # These handlers cross stores, starting with the durable device revocation check.
+        scoped = action in {
+            "playback.update", "follow.start", "broadcast.start", "broadcast.feedback"
+        } and _is_strict_playback_context_v2(current_client)
         with connection_scope(reuse=True) if scoped else nullcontext():
             return self._dispatch_message(message, action, request_id, session_info, current_client)
 

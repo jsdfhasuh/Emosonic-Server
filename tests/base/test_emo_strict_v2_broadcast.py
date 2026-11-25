@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from contextlib import contextmanager
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -2292,6 +2293,124 @@ class StrictV2BroadcastTestCase(EmoWebSocketTestCase):
             status["timedOutBroadcastRevision"],
             status["deadlineBroadcastRevision"],
         )
+
+    def test_active_feedback_uses_flac_samples_at_the_end_of_the_track(self):
+        _, participant, controller = self.connect_broadcast_devices()
+        receipt = self.get_ack(
+            self.start_strict_broadcast(controller, participants=["participant-1"]),
+            "broadcast-start-1",
+        )["payload"]
+        delivery = self._push(self.get_messages(participant))["payload"]
+        path = Path(__file__).resolve().parents[1] / "assets/formats/silence.flac"
+        # This real FLAC has 214272 samples at 44100 Hz (4858.775... ms).
+        track = mock.Mock(duration=4, path=str(path))
+        with mock.patch.object(
+            db.Track, "get_or_none", return_value=track
+        ), mock.patch.object(
+            emo_ws,
+            "getVerifiedTrackTailDurationMs",
+            wraps=emo_ws.getVerifiedTrackTailDurationMs,
+        ) as verify:
+            self.send_broadcast_feedback(
+                participant,
+                receipt["broadcastId"],
+                delivery,
+                positionMs=4000,
+            )
+            self._push(self.get_messages(participant), "broadcast.feedback")
+            verify.assert_not_called()
+            self.send_broadcast_feedback(
+                participant,
+                receipt["broadcastId"],
+                delivery,
+                positionMs=4859,
+                client_seq=2,
+                request_id="at-eof",
+            )
+            accepted = self._push(self.get_messages(participant), "broadcast.feedback")
+            self.assertEqual(accepted["payload"]["positionMs"], 4859)
+            self.send_broadcast_feedback(
+                participant,
+                receipt["broadcastId"],
+                delivery,
+                client_seq=3,
+                request_id="beyond-eof",
+                positionMs=4860,
+            )
+            error = self.get_error(self.get_messages(participant), "beyond-eof")
+            self.assertEqual(error["payload"]["code"], "bad_request")
+            verify.reset_mock()
+            self.send_broadcast_feedback(
+                participant,
+                receipt["broadcastId"],
+                delivery,
+                client_seq=4,
+                request_id="beyond-catalog-second",
+                positionMs=5001,
+            )
+            error = self.get_error(
+                self.get_messages(participant), "beyond-catalog-second"
+            )
+            self.assertEqual(error["payload"]["code"], "bad_request")
+            verify.assert_not_called()
+        participant_state = emo_ws.getPersistentBroadcastState(
+            receipt["broadcastId"], include_ledger=False
+        )["participantStates"][0]
+        self.assertEqual(participant_state["appliedPositionMs"], 4859)
+
+    def test_terminal_transition_during_tail_check_preserves_the_terminal_boundary(
+        self,
+    ):
+        _, participant, controller = self.connect_broadcast_devices()
+        receipt = self.get_ack(
+            self.start_strict_broadcast(controller, participants=["participant-1"]),
+            "broadcast-start-1",
+        )["payload"]
+        broadcast_id = receipt["broadcastId"]
+        delivery = self._push(self.get_messages(participant))["payload"]
+
+        def stop_broadcast():
+            controller.emit(
+                "message",
+                {
+                    "type": "command",
+                    "action": "broadcast.stop",
+                    "requestId": "stop-during-file-read",
+                    "payload": {
+                        "playbackContextId": "context-broadcast-source",
+                        "broadcastId": broadcast_id,
+                    },
+                },
+                namespace="/emo",
+            )
+
+        def verify_after_stop(track_id, catalog_duration_ms):
+            self.assertFalse(db.db.in_transaction())
+            # A different thread must be able to acquire the broadcast lock.
+            pool.submit(stop_broadcast).result(timeout=5)
+            self.get_ack(self.get_messages(controller), "stop-during-file-read")
+            return 192881
+
+        with ThreadPoolExecutor(max_workers=1) as pool, mock.patch.object(
+            emo_ws, "getTrackDurationMs", return_value=192000
+        ), mock.patch.object(
+            emo_ws, "getVerifiedTrackTailDurationMs", side_effect=verify_after_stop
+        ) as verify:
+            self.send_broadcast_feedback(
+                participant, broadcast_id, delivery, positionMs=192148
+            )
+            verify.assert_called_once_with(delivery["trackId"], 192000)
+        messages = self.get_messages(participant)
+        self.assertEqual(
+            self.get_error(messages, "broadcast-feedback-1")["payload"]["code"],
+            "bad_request",
+        )
+        self.assertFalse(any(m["action"] == "broadcast.feedback" for m in messages))
+        terminal = emo_ws.getPersistentBroadcastState(
+            broadcast_id, include_ledger=False
+        )
+        self.assertEqual(terminal["lifecycleState"], "stopped")
+        self.assertTrue(terminal["participantStates"][0]["restorePending"])
 
     def test_source_cannot_send_broadcast_feedback(self):
         authority, participant, controller = self.connect_broadcast_devices()

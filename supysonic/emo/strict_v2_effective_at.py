@@ -1,6 +1,11 @@
 import math
 import time
+from fractions import Fraction
 from typing import Dict, Optional
+
+from gevent import get_hub, monkey
+from mutagen import MutagenError
+from mutagen.flac import StreamInfo
 
 from ..db import Track, close_connection, open_connection
 
@@ -293,20 +298,66 @@ def projectBroadcastPositionMs(
     return projected
 
 
-def getTrackDurationMs(track_id: str) -> Optional[int]:
+def _find_track(track_id: str) -> Optional[Track]:
     if not isinstance(track_id, str) or not track_id:
         return None
     open_connection(reuse=True)
     try:
         try:
-            track = Track.get_or_none(Track.id == track_id)
+            return Track.get_or_none(Track.id == track_id)
         except (TypeError, ValueError):
             return None
-        if track is None or track.duration is None:
-            return None
-        return max(0, int(track.duration) * 1000)
     finally:
         close_connection()
+
+
+def getTrackDurationMs(track_id: str) -> Optional[int]:
+    track = _find_track(track_id)
+    if track is None or track.duration is None:
+        return None
+    return max(0, int(track.duration) * 1000)
+
+
+def _read_flac_duration_ms(path: str, catalog_duration_ms: int) -> Optional[int]:
+    try:
+        # STREAMINFO must be the first metadata block. Skip cover art and tags.
+        with open(path, "rb", buffering=0) as source:
+            header = source.read(42)
+        if (
+            len(header) != 42
+            or header[:4] != b"fLaC"
+            or (header[4] & 0x7F) != 0
+            or int.from_bytes(header[5:8], "big") != 34
+        ):
+            return None
+        info = StreamInfo(header[8:])
+    except (OSError, MutagenError):
+        return None
+    # The scanner truncates seconds. A different whole second could describe
+    # a replaced file. The player's integer-ms receipt rounds ties to even.
+    if (
+        not info.total_samples
+        or info.total_samples // info.sample_rate != catalog_duration_ms // 1000
+    ):
+        return None
+    return round(Fraction(info.total_samples * 1000, info.sample_rate))
+
+
+def getVerifiedTrackTailDurationMs(track_id: str, catalog_duration_ms: int) -> int:
+    track = _find_track(track_id)
+    if (
+        track is None
+        or track.duration != catalog_duration_ms // 1000
+        or not track.path.lower().endswith(".flac")
+    ):
+        return catalog_duration_ms
+    if monkey.is_module_patched("threading"):
+        duration_ms = get_hub().threadpool.apply(
+            _read_flac_duration_ms, (track.path, catalog_duration_ms)
+        )
+    else:
+        duration_ms = _read_flac_duration_ms(track.path, catalog_duration_ms)
+    return catalog_duration_ms if duration_ms is None else duration_ms
 
 
 def validateFeedbackPositionMs(

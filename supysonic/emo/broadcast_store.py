@@ -67,6 +67,10 @@ class BroadcastResourceConflictError(BroadcastStoreError):
     pass
 
 
+class BroadcastFeedbackTailDurationRequired(ValueError):
+    """The active delivery needs its exact media length checked outside the lock."""
+
+
 class PermanentDeviceDecommissionedError(
     BroadcastResourceConflictError,
     PermissionError,
@@ -2125,6 +2129,7 @@ def settleBroadcastFeedback(
     request_fingerprint: str,
     server_time_ms: int,
     track_duration_ms: Optional[int] = None,
+    verified_tail_duration_ms: Optional[int] = None,
 ) -> Dict[str, object]:
     client_seq = int(payload["clientSeq"])
     scope = (
@@ -2357,6 +2362,21 @@ def settleBroadcastFeedback(
                             raise BroadcastResourceConflictError(
                                 "Broadcast feedback state does not match target"
                             )
+                    if (
+                        track_duration_ms is not None
+                        and track_duration_ms < payload["positionMs"] <= track_duration_ms + 1000
+                        and broadcast.lifecycle_state == "active"
+                    ):
+                        current = _load_json(broadcast.snapshot_json, {})
+                        if (
+                            current.get("trackId") == payload["trackId"]
+                            and current.get("currentIndex") == payload["queueIndex"]
+                        ):
+                            if verified_tail_duration_ms is None:
+                                raise BroadcastFeedbackTailDurationRequired(
+                                    "Broadcast feedback positionMs exceeds catalog duration"
+                                )
+                            track_duration_ms = verified_tail_duration_ms
                     _validate_feedback_position(
                         payload["positionMs"],
                         track_duration_ms,

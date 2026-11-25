@@ -108,3 +108,23 @@ class SourceFactLatencyTestCase(unittest.TestCase):
         with slow_handshakes(now):
             messages = h.start_strict_broadcast(controller, participants=["participant-1"])
         self.assertIsNotNone(h.get_ack(messages, "broadcast-start-1"))
+
+    def test_broadcast_feedback_reuses_one_connection_without_loading_history(self):
+        h = self.harness(broadcast_tests.StrictV2BroadcastTestCase)
+        _, participant, controller = h.connect_broadcast_devices()
+        ack = h.get_ack(
+            h.start_strict_broadcast(controller, participants=["participant-1"]),
+            "broadcast-start-1",
+        )
+        broadcast_id = ack["payload"]["broadcastId"]
+        delivery = h._push(h.get_messages(participant), "broadcast.start")["payload"]
+        self.assertTrue(db.db.is_closed())
+        with slow_handshakes(ws._server_time_ms()) as opened, mock.patch.object(
+            ws, "getPersistentBroadcastState", wraps=ws.getPersistentBroadcastState
+        ) as state_read:
+            h.send_broadcast_feedback(participant, broadcast_id, delivery)
+        self.assertTrue(db.db.is_closed())
+        confirmed = h._push(h.get_messages(participant), "broadcast.feedback")
+        self.assertEqual(confirmed["payload"]["deliveryId"], delivery["deliveryId"])
+        self.assertEqual(opened.call_count, 1)
+        state_read.assert_called_once_with(broadcast_id, include_ledger=False)
