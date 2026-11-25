@@ -2,6 +2,7 @@
 import asyncio
 import copy
 import json
+import math
 import os
 from pathlib import Path
 import uuid
@@ -20,6 +21,10 @@ _MIRROR = {
     'broadcast.state.sync', 'broadcast.waiting', 'broadcast.resume', 'broadcast.resync',
 }
 _TERMINAL = {'broadcast.stop', 'broadcast.restore'}
+# Only correct repeatable phase error, for less than half a progress interval.
+_PROGRESS_DEADBAND_MS = 20
+_PROGRESS_SLEW_LIMIT = .04
+_PROGRESS_SLEW_SECONDS = .45
 _CURSORS = ('playbackContextId', 'authorityClientId', 'authorityDeviceSessionId',
             'epoch', 'version', 'queueRevision', 'controlVersion')
 
@@ -63,6 +68,7 @@ class Broadcast:
         self._queue_item: tuple[int, str] | None = None
         self.run = None
         self.mirror = {}
+        self._previous_progress = None
         self.sequence = 0
         self.error = None
         self._cli_lock = asyncio.Lock()
@@ -225,6 +231,8 @@ class Broadcast:
             return True
         self.attempts.add(delivery)
         self._replace_delivery(delivery)
+        if action != 'broadcast.progress':
+            self._previous_progress = None
         self.terminal = is_terminal
         if is_terminal:
             self.mirror = {}
@@ -257,7 +265,7 @@ class Broadcast:
                         self._persist()
                     result = self._terminal_proof(p)
                 else:
-                    result = await self._mirror(p, current)
+                    result = await self._mirror(p, current, action)
                     if current() and result:
                         self.mirror = {'mirrorTrackId': result['trackId'],
                                        'mirrorContext': {
@@ -370,7 +378,42 @@ class Broadcast:
                 'queueIndex': p.get('queueIndex', p.get('currentIndex')), 'trackId': p['trackId'],
                 'positionMs': p['positionMs'], 'state': 'stopped', 'playbackRate': p['playbackRate']}
 
-    async def _mirror(self, p, current):
+    async def _correct_progress(self, p, sample, drift, stamp):
+        rate = p['playbackRate']
+        scope = (self.run, self.wire.generation, p['sourceEpoch'], p['sourceControlVersion'], rate)
+        previous = self._previous_progress
+        self._previous_progress = None
+        if (abs(drift) <= _PROGRESS_DEADBAND_MS or sample.get('buffering') or sample.get('paused')
+                or sample.get('position_sampled_monotonic') is None or abs(sample['speed'] - rate) > .001):
+            return
+        self._previous_progress = (scope, drift, stamp)
+        if (not previous or previous[0] != scope or drift * previous[1] <= 0
+                or not 0 < stamp - previous[2] <= 5000):
+            return
+
+        # Move toward the deadband while staying within the supported speed range.
+        speed = max(.5, min(2., rate * (1 - math.copysign(_PROGRESS_SLEW_LIMIT, drift))))
+        change = abs(speed - rate)
+        if change <= .001:
+            return
+        # Leave at least half of the remaining execution window to restore and verify the rate.
+        remaining_ms = p['effectiveAtServerMs'] + 1000 - stamp
+        duration = min(_PROGRESS_SLEW_SECONDS, remaining_ms / 2000,
+                       (abs(drift) - _PROGRESS_DEADBAND_MS / 2) / (1000 * change))
+        if duration * change * 1000 < 1:
+            return
+        changed = self.changed
+        engine = self.player.engine
+        await engine.set_speed(speed)
+        try:
+            await asyncio.wait_for(changed.wait(), duration)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            # Restore under the same player lock, even with no subsequent delivery.
+            await engine.set_speed(rate)
+
+    async def _mirror(self, p, current, action):
         rate, idx, song, state = p['playbackRate'], p['currentIndex'], p['trackId'], p['state']
         if type(rate) not in (int, float) or not 0.5 <= rate <= 2.0:
             raise BroadcastError('rate_unsupported')
@@ -391,6 +434,7 @@ class Broadcast:
         clock = now()
         engine = self.player.engine
         item = (idx, song)
+        prepared = None
         self.player._interrupt_announcement()
         if state != 'stopped' and (self._queue_item != item or self.run is None):
             run = uuid.uuid4().hex
@@ -399,6 +443,9 @@ class Broadcast:
             except Exception:
                 raise BroadcastError('track_load_failed') from None
             self._queue_item, self.run = item, run
+            if current():
+                await engine.set_speed(rate)
+                prepared = await engine.snapshot()
         if not current():
             return None
         if at is not None:
@@ -411,26 +458,41 @@ class Broadcast:
                     pass
         if not current():
             return None
-        target = position(now())
         if state == 'stopped':
+            target = position(now())
             await engine.stop()
             self._queue_item = self.run = None
             actual = target
         else:
-            sample = await engine.snapshot()
+            sample = prepared if prepared is not None else await engine.snapshot()
             if not current():
                 return None
             if sample['run_id'] != self.run:
                 raise BroadcastError('execution_failed')
             if state == 'paused' and not sample['paused']:
                 await engine.pause()
+                sample = await engine.snapshot()
             if not current():
                 return None
-            if abs((sample.get('position_ms') or 0) - target) > (200 if state == 'playing' else 40):
+            stamp = now()
+            target = position(stamp)
+            observed = sample.get('position_ms')
+            if observed is None or not math.isfinite(observed):
+                raise BroadcastError('execution_failed')
+            sampled_at = sample.get('position_sampled_monotonic')
+            if not sample['paused'] and not sample.get('buffering') and sampled_at is not None:
+                age = max(0., asyncio.get_running_loop().time() - sampled_at)
+                observed += age * 1000 * sample['speed']
+            drift = observed - target
+            if abs(drift) > (200 if state == 'playing' else 40):
+                self._previous_progress = None
                 await engine.seek(target)
+            elif action == 'broadcast.progress' and state == 'playing':
+                await self._correct_progress(p, sample, drift, stamp)
             if not current():
                 return None
-            await engine.set_speed(rate)
+            if abs(sample['speed'] - rate) > .001:
+                await engine.set_speed(rate)
             if not current():
                 return None
             now()
@@ -442,6 +504,7 @@ class Broadcast:
                     sample.get('run_id') != self.run):
                 raise BroadcastError('execution_failed')
             actual = max(0, round(sample['position_ms']))
+        now()
         return {'executionStatus': 'applied', 'appliedBroadcastRevision': p['broadcastRevision'],
                 'queueIndex': idx, 'trackId': song, 'state': state,
                 'positionMs': actual, 'playbackRate': rate}

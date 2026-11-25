@@ -4,7 +4,7 @@ import copy
 import tempfile
 import time
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from emosonic_player.broadcast import Broadcast
 from emosonic_player.mpv import MpvPlayer
@@ -73,6 +73,137 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.player.run_id, run)
         self.assertEqual(len(self.engine.loads), 1)
         self.assertEqual(self.wire.emitted, [])
+
+    async def test_progress_closes_measured_drift_and_restores_the_users_rate(self):
+        stamp = 100000
+        self.wire.server_time_ms = lambda: stamp
+        loop = asyncio.get_running_loop()
+        self.engine.seek = AsyncMock(wraps=self.engine.seek)
+        revision = 0
+        for initial, rate in [(-94, 1.), (-49, 1.25), (65, .75)]:
+            revision += 1
+            await self.b.on_event(self.event('play', revision, playbackRate=rate))
+            error = initial
+            pulses = []
+            self.engine.seek.reset_mock()
+
+            async def pass_time(waiter, seconds):
+                nonlocal error
+                waiter.close()
+                speed = self.engine.sample['speed']
+                self.assertLessEqual(abs(speed / rate - 1), .040001)
+                self.assertLessEqual(seconds, .45)
+                error += (speed - rate) * seconds * 1000
+                pulses.append(seconds)
+                raise asyncio.TimeoutError
+
+            for i in range(12):
+                stamp += 1000
+                revision += 1
+                target = 5000 + i * 1000 * rate
+                # Position is the IPC midpoint, 60 ms earlier than snapshot completion.
+                self.engine.sample.update(position_ms=target + error - 60 * rate,
+                    position_sampled_monotonic=loop.time() - .060)
+                with patch('asyncio.wait_for', pass_time):
+                    await self.b.on_event(self.event('progress', revision, positionMs=target, playbackRate=rate))
+                self.assertEqual(self.wire.emitted[-1]['appliedBroadcastRevision'], revision)
+                self.assertEqual(self.wire.emitted[-1]['playbackRate'], rate)
+                self.assertEqual(self.engine.sample['speed'], rate)
+                if i == 0:
+                    self.assertFalse(pulses)
+                if i == 9:
+                    count = len(pulses)
+            self.assertTrue(pulses)
+            self.assertEqual(len(pulses), count)
+            self.assertLessEqual(abs(error), 20)
+            self.engine.seek.assert_not_awaited()
+
+    async def test_progress_ignores_jitter_and_does_not_exceed_rate_limits(self):
+        stamp = 100000
+        self.wire.server_time_ms = lambda: stamp
+        revision = 0
+        for rate, errors in [(1., (55, -55, 55, 12)), (2., (-95, -95)), (.5, (81, 81))]:
+            revision += 1
+            await self.b.on_event(self.event('play', revision, playbackRate=rate))
+            for drift in errors:
+                stamp += 1000
+                revision += 1
+                self.engine.sample.update(position_ms=500 + drift,
+                    position_sampled_monotonic=asyncio.get_running_loop().time())
+                with patch('asyncio.wait_for', side_effect=AssertionError('unneeded speed change')):
+                    await self.b.on_event(self.event('progress', revision, playbackRate=rate))
+                self.assertEqual(self.wire.emitted[-1]['executionStatus'], 'applied')
+                self.assertEqual(self.engine.sample['speed'], rate)
+
+    async def test_late_progress_leaves_time_to_restore_and_checks_actual_completion(self):
+        stamp = 100000
+        self.wire.server_time_ms = lambda: stamp
+        loop = asyncio.get_running_loop()
+        rate = 1.
+        await self.b.on_event(self.event('start', 1, playbackRate=rate))
+        for rev, extra_delay in [(2, 0), (4, 240)]:
+            stamp += 1000
+            self.engine.sample.update(position_ms=410, position_sampled_monotonic=loop.time())
+            await self.b.on_event(self.event('progress', rev, playbackRate=rate))
+            stamp += 1000
+            self.engine.sample.update(position_ms=1210, position_sampled_monotonic=loop.time())
+            async def pass_time(waiter, duration):
+                nonlocal stamp
+                waiter.close()
+                self.assertEqual(self.engine.sample['speed'], 1.04)
+                self.assertAlmostEqual(duration, .1)
+                stamp += round(1000 * duration) + extra_delay
+                raise asyncio.TimeoutError
+            with patch('asyncio.wait_for', pass_time):
+                await self.b.on_event(self.event('progress', rev + 1, lead=-800, playbackRate=rate))
+            result = self.wire.emitted[-1]
+            self.assertEqual(self.engine.sample['speed'], rate)
+            if extra_delay:
+                self.assertEqual((result['executionStatus'], result['errorCode']), ('failed', 'effective_at_missed'))
+            else:
+                self.assertEqual(result['appliedBroadcastRevision'], rev + 1)
+
+    async def test_late_final_paused_observation_fails_delivery(self):
+        stamp = 100000
+        self.wire.server_time_ms = lambda: stamp
+        await self.b.on_event(self.event('start', 1, state='paused'))
+        original = self.engine.snapshot
+        reads = 0
+        async def slow_snapshot():
+            nonlocal stamp, reads
+            reads += 1
+            if reads == 2:
+                stamp += 1001
+            return await original()
+        self.engine.snapshot = slow_snapshot
+        await self.b.on_event(self.event('pause', 2, state='paused'))
+        result = self.wire.emitted[-1]
+        self.assertEqual((result['executionStatus'], result['errorCode']), ('failed', 'effective_at_missed'))
+        self.assertEqual(result['lastAppliedBroadcastRevision'], 1)
+
+    async def test_terminal_interrupts_progress_slew_before_feedback(self):
+        stamp = 100000
+        self.wire.server_time_ms = lambda: stamp
+        rate = 1.25
+        await self.b.on_event(self.event('start', 1, playbackRate=rate))
+        self.engine.sample.update(position_ms=410, position_sampled_monotonic=asyncio.get_running_loop().time())
+        await self.b.on_event(self.event('progress', 2, playbackRate=rate))
+        entered = asyncio.Event()
+        set_speed = self.engine.set_speed
+        async def observe(speed):
+            await set_speed(speed)
+            if speed > rate:
+                entered.set()
+        self.engine.set_speed = observe
+        stamp += 1000
+        applying = asyncio.create_task(self.b.on_event(self.event('progress', 3, playbackRate=rate)))
+        async with asyncio.timeout(1):
+            await entered.wait()
+            await self.b.on_event(self.event('stop', 4))
+            await applying
+        self.assertEqual([p['appliedBroadcastRevision'] for p in self.wire.emitted], [1, 2, 4])
+        self.assertTrue(self.engine.sample['paused'])
+        self.assertEqual(self.engine.sample['speed'], 1.)
 
     async def test_late_pause_after_eof_keeps_mpv_for_the_next_queue_item(self):
         fake = FakeMpv()
