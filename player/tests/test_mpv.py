@@ -187,7 +187,8 @@ class MpvTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0)
         self.assertFalse(seek.done(), 'unclassified seek failure closed the IPC before checking EOF')
         await self.fake.event('end-file', playlist_entry_id=self.fake.entry, reason='eof')
-        await self.fake.event('command-reply', request_id=self.player._request_id, error='success', data=True)
+        # mpv can still report not-idle even after it delivered this entry's end-file.
+        await self.fake.event('command-reply', request_id=self.player._request_id, error='success', data=False)
         with self.assertRaisesRegex(MpvError, 'mpv_command_failed'):
             await seek
         self.fake.ignore = False
@@ -229,6 +230,23 @@ class MpvTests(unittest.IsolatedAsyncioTestCase):
                         await operation()
                 await self.player.load('new', 'second')
                 self.assertEqual((await self.player.snapshot())['run_id'], 'second')
+
+    async def test_initial_seek_can_hit_natural_eof_without_closing_mpv(self):
+        command = self.player._command
+        async def finish_at_seek(args):
+            if args[0] == 'seek':
+                await self.fake.event('end-file', playlist_entry_id=self.fake.entry, reason='eof')
+                event = await asyncio.wait_for(self.player.events.get(), 1)
+                self.assertEqual((event.kind, event.run_id), ('eof', 'near-tail'))
+                raise MpvError('mpv_command_failed')
+            return await command(args)
+
+        with patch.object(self.player, '_command', finish_at_seek):
+            with self.assertRaisesRegex(MpvError, 'mpv_command_failed'):
+                await self.player.load('old', 'near-tail', 997)
+        await self.player.stop()
+        await self.player.load('next', 'second')
+        self.assertEqual((await self.player.snapshot())['run_id'], 'second')
 
     async def test_timeout_closes_channel_and_clears_pending(self):
         await self.player.load("url", "r")

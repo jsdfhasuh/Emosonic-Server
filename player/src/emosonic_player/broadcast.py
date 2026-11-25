@@ -80,6 +80,10 @@ class Broadcast:
             self.pending_event is not None and bool(self.pending_event['payload'].get('deliveryId')))
 
     @property
+    def _run_ended(self):
+        return self.run is not None and self.player.engine.eof_run_id == self.run
+
+    @property
     def occupied(self):
         return bool(self.record or self.pending_event)
 
@@ -288,7 +292,7 @@ class Broadcast:
                 self.mirror = {}
                 if self.record.get('original'):
                     async with self.player.lock:
-                        if current():
+                        if current() and (is_terminal or not self._run_ended):
                             await self.player._safe_stop()
                             self._queue_item = self.run = None
                 result = {'executionStatus': 'failed', 'failedBroadcastRevision': revision,
@@ -436,11 +440,17 @@ class Broadcast:
         item = (idx, song)
         prepared = None
         self.player._interrupt_announcement()
-        if state != 'stopped' and (self._queue_item != item or self.run is None):
+        ended = self._run_ended
+        if state != 'stopped' and (self._queue_item != item or self.run is None or ended):
+            if ended and self._queue_item == item and action in {'broadcast.progress', 'broadcast.pause'}:
+                # mpv already finished this occurrence. Only a fresh playback intent can reopen it.
+                raise BroadcastError('execution_failed')
             run = uuid.uuid4().hex
             try:
                 await engine.load(self.player.media.stream_url(song), run, position_ms=position(at or clock))
             except Exception:
+                if engine.eof_run_id == run:
+                    self._queue_item, self.run = item, run
                 raise BroadcastError('track_load_failed') from None
             self._queue_item, self.run = item, run
             if current():

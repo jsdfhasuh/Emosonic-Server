@@ -18,6 +18,8 @@ def context():
 
 
 class FakeEngine:
+    eof_run_id = None
+
     def __init__(self):
         self.events = asyncio.Queue()
         self.run = None

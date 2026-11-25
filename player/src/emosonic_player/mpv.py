@@ -56,6 +56,10 @@ class MpvPlayer:
         self._closing = False
 
     @property
+    def eof_run_id(self) -> str | None:
+        return self._eof_run
+
+    @property
     def process_generation(self) -> int:
         return self._generation
 
@@ -206,29 +210,25 @@ class MpvPlayer:
             raise ValueError("invalid playback identity or position")
         async with self._operation():
             self._invalidate()
-            try:
-                await self._command(["set_property", "pause", True])
-                await self._command(["loadfile", url, "replace"])
-                playlist = await self._command(["get_property", "playlist"])
-                if not isinstance(playlist, list):
-                    raise MpvError("mpv_load_identity_missing")
-                current = [item for item in playlist if isinstance(item, dict) and item.get("current")]
-                if len(current) != 1 or not isinstance(current[0].get("id"), int):
-                    raise MpvError("mpv_load_identity_missing")
-                self._entry = current[0]["id"]
-                self._run_id = run_id
-                self._entries[self._entry] = run_id
+            await self._command(["set_property", "pause", True])
+            await self._command(["loadfile", url, "replace"])
+            playlist = await self._command(["get_property", "playlist"])
+            if not isinstance(playlist, list):
+                raise MpvError("mpv_load_identity_missing")
+            current = [item for item in playlist if isinstance(item, dict) and item.get("current")]
+            if len(current) != 1 or not isinstance(current[0].get("id"), int):
+                raise MpvError("mpv_load_identity_missing")
+            self._entry = current[0]["id"]
+            self._run_id = run_id
+            self._entries[self._entry] = run_id
 
-                async def loaded():
-                    return self._entry is not None and self._entry in self._loaded
-                await self._until(loaded)
-                if position_ms:
-                    await self._seek(position_ms)
-                if not await self._command(["get_property", "pause"]):
-                    raise MpvError("mpv_load_not_paused")
-            except (MpvError, asyncio.CancelledError):
-                await self.close()
-                raise
+            async def loaded():
+                return self._entry is not None and self._entry in self._loaded
+            await self._until(loaded)
+            if position_ms:
+                await self._seek(position_ms)
+            if not await self._command(["get_property", "pause"]):
+                raise MpvError("mpv_load_not_paused")
 
     async def play(self) -> None:
         async with self._operation():
@@ -269,9 +269,10 @@ class MpvPlayer:
             await self._until(reached)
         except MpvError as error:
             if str(error) == "mpv_command_failed":
-                # A rejected seek reply and end-file can arrive in either order.
-                if self._run_id == run and await self._command(["get_property", "idle-active"]) is not True:
-                    raise
+                # An end-file for this run can arrive during the IPC round trip,
+                # before mpv updates idle-active. Only that matching event proves EOF.
+                if self._run_id == run:
+                    await self._command(["get_property", "idle-active"])
                 if self._eof_run == run:
                     raise _NaturalEnd("mpv_command_failed") from error
             raise

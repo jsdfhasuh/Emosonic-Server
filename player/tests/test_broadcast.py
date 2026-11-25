@@ -206,6 +206,7 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.engine.sample['speed'], 1.)
 
     async def test_late_pause_after_eof_keeps_mpv_for_the_next_queue_item(self):
+        self.wire.server_time_ms = lambda: 100000
         fake = FakeMpv()
         reader, peer_reader = asyncio.StreamReader(), asyncio.StreamReader()
         writer = MemoryWriter(peer_reader)
@@ -229,6 +230,9 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         await fake.event('end-file', playlist_entry_id=fake.entry, reason='eof')
         ended = await asyncio.wait_for(engine.events.get(), 1)
         self.assertEqual((ended.kind, ended.run_id), ('eof', self.b.run))
+        last_entry = fake.entry
+        await self.b.on_event(self.event('progress', 120, queueSongIds=queue, positionMs=192720))
+        self.assertEqual(self.wire.emitted[-1]['executionStatus'], 'failed')
         await self.b.on_event(self.event('pause', 121, state='paused', queueSongIds=queue,
                                          positionMs=192756))
         failed = self.wire.emitted[-1]
@@ -237,6 +241,7 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed['lastAppliedBroadcastRevision'], 119)
         self.assertFalse(self.player.needs_engine_restart)
         self.assertIs(engine._writer, writer)
+        self.assertEqual(fake.entry, last_entry, 'late reports must not reload the ended occurrence')
 
         fake.props['time-pos'] = 0
         next_item = dict(queueSongIds=queue, currentIndex=1, trackId='next', positionMs=0)
@@ -287,10 +292,21 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(replacement.blocks_core)
         self.assertFalse(await replacement.recover())
 
+    async def test_explicit_play_and_seek_can_reopen_the_same_ended_occurrence(self):
+        await self.b.on_event(self.event('start', 1))
+        for revision, action in [(2, 'seek'), (3, 'play')]:
+            self.engine.eof_run_id = self.b.run
+            self.engine.sample.update(run_id=None, position_ms=None)
+            await self.b.on_event(self.event(action, revision, positionMs=0))
+            self.assertEqual(self.wire.emitted[-1]['appliedBroadcastRevision'], revision)
+            self.assertNotEqual(self.b.run, self.engine.eof_run_id)
+            self.assertEqual(self.b.run, self.engine.run)
+
     async def test_next_occurrence_of_same_song_loads_a_new_run_after_eof(self):
         queue = ['mirror', 'mirror']
         await self.b.on_event(self.event('start', 1, queueSongIds=queue))
         ended = self.b.run
+        self.engine.eof_run_id = ended
         self.engine.run = None
         self.engine.sample.update(run_id=None, position_ms=None)
         await self.b.on_event(self.event('queue.sync', 2, queueSongIds=queue, currentIndex=1,
