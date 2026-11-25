@@ -174,6 +174,40 @@ class MpvTests(unittest.IsolatedAsyncioTestCase):
         await self.player.load('new', 'second')
         self.assertEqual((await self.player.snapshot())['run_id'], 'second')
 
+    async def test_eof_arrives_just_after_mpv_rejects_seek(self):
+        await self.player.load('old', 'first')
+        self.fake.ignore = True
+        seek = asyncio.create_task(self.player.seek(2200))
+        async with asyncio.timeout(1):
+            while self.fake.commands[-1][0] != 'seek':
+                await asyncio.sleep(0)
+        await self.fake.event('command-reply', request_id=self.player._request_id, error='error')
+        async with asyncio.timeout(1):
+            while self.fake.commands[-1] != ['get_property', 'idle-active'] and not seek.done():
+                await asyncio.sleep(0)
+        self.assertFalse(seek.done(), 'unclassified seek failure closed the IPC before checking EOF')
+        await self.fake.event('end-file', playlist_entry_id=self.fake.entry, reason='eof')
+        await self.fake.event('command-reply', request_id=self.player._request_id, error='success', data=True)
+        with self.assertRaisesRegex(MpvError, 'mpv_command_failed'):
+            await seek
+        self.fake.ignore = False
+        await self.player.load('new', 'second')
+        self.assertEqual((await self.player.snapshot())['run_id'], 'second')
+
+    async def test_rejected_seek_without_matching_eof_still_closes_mpv(self):
+        await self.player.load('old', 'first')
+        self.fake.props['idle-active'] = True
+        command = self.player._command
+        async def reject_seek(args):
+            if args[0] == 'seek':
+                raise MpvError('mpv_command_failed')
+            return await command(args)
+
+        with patch.object(self.player, '_command', reject_seek):
+            with self.assertRaisesRegex(MpvError, 'mpv_command_failed'):
+                await self.player.seek(2200)
+        self.assertIsNone(self.player._writer)
+
     async def test_eof_during_seek_or_snapshot_rejects_operation_but_keeps_idle_mpv(self):
         command = self.player._command
 
@@ -321,8 +355,14 @@ class RealMpvTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue((await player.snapshot())["paused"])
                 await player.seek(500)
                 await player.play()
+                process = player._process
                 event = await asyncio.wait_for(player.events.get(), 8)
                 self.assertEqual((event.kind, event.run_id), ("eof", "real-run"))
+                with self.assertRaisesRegex(MpvError, "mpv_no_active_run"):
+                    await player.seek(1500)
+                await player.load(str(media), "next-run")
+                self.assertIs(player._process, process)
+                self.assertEqual((await player.snapshot())["run_id"], "next-run")
             finally:
                 await player.close()
 

@@ -167,7 +167,6 @@ class MpvPlayer:
     async def _command(self, command: list):
         if self._writer is None or self._writer.is_closing():
             raise MpvError("mpv_not_connected")
-        run = self._run_id
         self._request_id += 1
         request_id = self._request_id
         future = asyncio.get_running_loop().create_future()
@@ -176,10 +175,6 @@ class MpvPlayer:
             self._writer.write(json.dumps({"command": command, "request_id": request_id}).encode() + b"\n")
             await asyncio.wait_for(self._writer.drain(), self.timeout)
             return await asyncio.wait_for(future, self.timeout)
-        except MpvError as error:
-            if run is not None and run == self._eof_run and str(error) == "mpv_command_failed":
-                raise _NaturalEnd("mpv_command_failed") from error
-            raise
         except (TimeoutError, asyncio.CancelledError, OSError):
             # Closing/killing the owned process also fences a late successful seek/load.
             await self.close()
@@ -263,13 +258,23 @@ class MpvPlayer:
         self._require_run()
         if not math.isfinite(position_ms) or position_ms < 0:
             raise ValueError("invalid seek position")
-        await self._command(["seek", position_ms / 1000, "absolute+exact"])
+        run = self._run_id
         async def reached():
             self._require_run()
             seeking = await self._command(["get_property", "seeking"])
             position = await self._command(["get_property", "time-pos"])
             return not seeking and isinstance(position, (int, float)) and abs(position * 1000 - position_ms) <= 250
-        await self._until(reached)
+        try:
+            await self._command(["seek", position_ms / 1000, "absolute+exact"])
+            await self._until(reached)
+        except MpvError as error:
+            if str(error) == "mpv_command_failed":
+                # A rejected seek reply and end-file can arrive in either order.
+                if self._run_id == run and await self._command(["get_property", "idle-active"]) is not True:
+                    raise
+                if self._eof_run == run:
+                    raise _NaturalEnd("mpv_command_failed") from error
+            raise
 
     async def set_speed(self, rate: float) -> None:
         if not math.isfinite(rate) or rate <= 0:
