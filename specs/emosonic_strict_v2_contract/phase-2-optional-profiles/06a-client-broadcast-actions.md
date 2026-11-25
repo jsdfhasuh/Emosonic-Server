@@ -25,7 +25,8 @@ participants 并同步播放，不是为 source 创建或切换到另一份播�
 自己的任务；ordinary participants 才使用临时音频覆盖层。停止 Broadcast 只终止复制/同步关系，
 不得对 source transport 隐式执行 pause、stop、seek 或 queue replacement。
 同步承诺固定为 soft sync：`syncStatus:"applied"` 只证明设备应用了所报告 revision 的 target，不证明
-此后持续 drift 小于任何固定毫秒阈值。feedback.positionMs 只按类型、非负和已知媒体 duration 校验。
+此后持续 drift 小于任何固定毫秒阈值。普通 feedback.positionMs 只按类型、非负和已知媒体 duration 校验；
+结束回执按恢复规则确认已交付的终止位置。
 
 本节中的 `participants` 只表示接收镜像的 ordinary participants，不包含 source authority。source 由
 `authorityClientId` / `authorityDeviceSessionId` 唯一标识，并通过普通 PlaybackContext command 与

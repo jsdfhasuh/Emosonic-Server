@@ -368,7 +368,8 @@ delivery 是可执行输入。客户端可以用新 requestId 查询 `broadcast.
 
 `syncStatus:"applied"` 只表示该 frozen participant 已应用所报告 revision 的 target；Broadcast 是
 soft sync，不保证随后与 source 的 drift 持续小于固定毫秒数。由于 feedback 没有 position sample
-time，positionMs 只能验证 int、非负和已知 duration 范围，不能用于构造 drift SLA。
+time，普通回执的 positionMs 只能验证 int、非负和已知 duration 范围，不能用于构造 drift SLA。
+结束回执确认历史越界位置时适用恢复章节的精确回传例外。
 
 full ACK 顶层 payload 的 `serverTimeMs:int>=0` 是本次 status 读取的服务端时刻，不属于
 BroadcastSnapshot，也不增加 broadcastRevision。`broadcast.positionMs` 与

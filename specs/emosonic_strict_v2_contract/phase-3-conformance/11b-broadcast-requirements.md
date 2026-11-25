@@ -22,7 +22,8 @@ position 投影到 effectiveAtServerMs，并令 Snapshot.serverUpdatedAtMs 等�
 client/device/Socket、membership/lifecycle、applied/failed 条件 revision、track/queue 证明和独立
 clientSeq 及所报告 revision ledger 的当前 deliveryId，只更新该 participant 的 participantStates，并只向请求 Socket 发送 canonical confirmation。source authority
 发送该 action 必须 forbidden；任何 feedback 都不得修改 BroadcastSnapshot、PlaybackContext、control
-transaction 或 cursor。feedback.positionMs 只校验 int、非负和媒体有效时长范围并保存为设备实际
+transaction 或 cursor。历史 terminal 回执可确认本次交付已保存的精确越界位置（见第 5.5.2 节）。普通
+feedback.positionMs 只校验 int、非负和媒体有效时长范围并保存为设备实际
 观测值；因无位置采样时间，不得做精确时间位置比对。revision、deliveryId、track/queue、state 与
 playbackRate 仍必须严格匹配 delivery target。syncStatus=applied 只证明 revision target 已应用，
 不得解释为持续 drift 小于固定毫秒阈值。

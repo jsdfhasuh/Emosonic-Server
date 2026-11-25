@@ -122,7 +122,7 @@ class EmoBroadcastStoreTestCase(unittest.TestCase):
         payload.update(extra)
         return payload
 
-    def _settle(self, payload, fingerprint, server_time_ms):
+    def _settle(self, payload, fingerprint, server_time_ms, track_duration_ms=None):
         return settleBroadcastFeedback(
             "alice",
             "context-source",
@@ -134,6 +134,7 @@ class EmoBroadcastStoreTestCase(unittest.TestCase):
             payload,
             fingerprint,
             server_time_ms,
+            track_duration_ms=track_duration_ms,
         )
 
     def test_create_read_and_intent_replay(self):
@@ -295,6 +296,7 @@ class EmoBroadcastStoreTestCase(unittest.TestCase):
             "participant-1", "device:participant-1",
             "nonce-terminal-3", 1, compact_feedback,
             "compact-feedback", 33000,
+            track_duration_ms=210000,
         )
         self.assertEqual(settled["action"], "broadcast.feedback")
         self.assertEqual(listTerminalRecoveries("alice"), [])
@@ -702,10 +704,41 @@ class EmoBroadcastStoreTestCase(unittest.TestCase):
         self.assertEqual(persisted["snapshot"]["positionMs"], 3200)
         self.assertEqual(stopNonterminalBroadcastsForRestart(14000), [])
 
+    def test_disconnect_bounds_waiting_and_terminal_positions_to_known_duration(self):
+        self._create()
+        # First song's anchor is 1200 ms at t=10000. At t=260169 it would
+        # extrapolate to 251369 ms, although the track lasts only 210000 ms.
+        disconnected_at = 260169
+        deadline = disconnected_at + 30000
+        with mock.patch.object(
+            db.Track, "get_or_none", return_value=mock.Mock(duration=210),
+        ) as lookup:
+            waiting = suspendBroadcastForAuthorityDisconnect(
+                "alice", "source-1", "device:source-1", disconnected_at, deadline,
+            )
+            self.assertEqual(waiting["snapshot"]["positionMs"], 210000)
+            delivery = waiting["deliveries"][0]
+            self.assertEqual(delivery["payload"]["positionMs"], 210000)
+            [terminal] = sweepBroadcastAuthorityDisconnectDeadlines(deadline)
+            self.assertEqual(terminal["snapshot"]["positionMs"], 210000)
+            self.assertEqual(terminal["deliveries"][0]["deliveryPositionMs"], 210000)
+            lookup.assert_called_once()
+
     def test_terminal_snapshot_projects_only_a_playing_anchor(self):
-        playing = buildTerminalBroadcastSnapshot(self._snapshot(), 13000)
-        self.assertEqual(playing["positionMs"], 4200)
-        self.assertEqual(playing["serverUpdatedAtMs"], 13000)
+        for duration, target_ms, expected in (
+            (210, 13000, 4200),
+            (210, 260169, 210000),
+            (None, 260169, 251369),
+        ):
+            with self.subTest(duration=duration, target_ms=target_ms):
+                with mock.patch.object(
+                    db.Track, "get_or_none", return_value=mock.Mock(duration=duration),
+                ):
+                    playing = buildTerminalBroadcastSnapshot(
+                        self._snapshot(), target_ms,
+                    )
+                self.assertEqual(playing["positionMs"], expected)
+                self.assertEqual(playing["serverUpdatedAtMs"], target_ms)
 
         for state_name in ("paused", "stopped"):
             with self.subTest(state=state_name):
@@ -1072,7 +1105,7 @@ class EmoBroadcastStoreTestCase(unittest.TestCase):
             restoreCompleted=True,
         )
 
-        self._settle(feedback, "terminal-applied", 21000)
+        self._settle(feedback, "terminal-applied", 21000, track_duration_ms=210000)
 
         participant = getBroadcastState("broadcast-1")[
             "participantStates"
@@ -1088,6 +1121,71 @@ class EmoBroadcastStoreTestCase(unittest.TestCase):
             ),
             None,
         )
+
+    def _check_terminal_anchor_beyond_duration(self, compact):
+        self._create()
+        duration_ms = 210000
+        anchor_ms = 251369
+        terminal = self._snapshot(revision=2, lifecycle="stopped", updated_at_ms=20000)
+        terminal.update(positionMs=anchor_ms, state="paused")
+        delivery = self._delivery("terminal", 2, "stop", 20000)
+        delivery["deliveryPositionMs"] = anchor_ms
+        delivery["payload"].update(positionMs=anchor_ms, state="paused")
+        terminalBroadcastState(
+            "broadcast-1", terminal, {"stopped": True}, [delivery],
+            expected_broadcast_revision=1, terminal_at_ms=20000,
+        )
+        if compact:
+            compactExpiredBroadcastStates(now_ms=9999999999999)
+        replay = createBroadcastRegistrationReplay(
+            "alice", "participant-1", "device:participant-1", "nonce-1", 22000
+        )["delivery"]
+        self.assertEqual(replay["action"], "restore" if compact else "stop")
+        self.assertEqual(replay["payload"]["positionMs"], anchor_ms)
+
+        feedback = self._applied_feedback(
+            revision=2, delivery_id=replay["deliveryId"], state="stopped",
+            restoreCompleted=True, positionMs=anchor_ms,
+        )
+        with self.assertRaises(ValueError):
+            self._settle(
+                dict(feedback, positionMs=anchor_ms - 1), "wrong", 23000, duration_ms
+            )
+        self.assertIsNotNone(getBroadcastFenceForContext("alice", "context-participant-1"))
+        self.assertIsNotNone(
+            getBroadcastFenceForPair("alice", "participant-1", "device:participant-1")
+        )
+
+        confirmed = self._settle(feedback, "restored", 24000, duration_ms)
+        self.assertEqual(confirmed["canonicalResult"]["positionMs"], anchor_ms)
+        self.assertTrue(confirmed["canonicalResult"]["restoreCompleted"])
+        self.assertIsNone(getBroadcastFenceForContext("alice", "context-participant-1"))
+        self.assertIsNone(
+            getBroadcastFenceForPair("alice", "participant-1", "device:participant-1")
+        )
+        duplicate = self._settle(feedback, "restored", 25000, duration_ms)
+        self.assertFalse(duplicate["created"])
+        self.assertEqual(duplicate["canonicalResult"], confirmed["canonicalResult"])
+
+    def test_full_terminal_restoration_accepts_exact_anchor_beyond_duration(self):
+        self._check_terminal_anchor_beyond_duration(compact=False)
+
+    def test_compact_terminal_restoration_accepts_exact_anchor_beyond_duration(self):
+        self._check_terminal_anchor_beyond_duration(compact=True)
+
+    def test_nonterminal_feedback_rejects_exact_anchor_beyond_duration(self):
+        self._create()
+        snapshot = self._snapshot(revision=2, updated_at_ms=20000)
+        snapshot["positionMs"] = 251369
+        delivery = self._delivery("progress", 2, "progress", 20000)
+        delivery["deliveryPositionMs"] = 251369
+        delivery["payload"]["positionMs"] = 251369
+        commitBroadcastRevision("broadcast-1", 1, snapshot, "progress", [delivery])
+        feedback = self._applied_feedback(revision=2, delivery_id="progress", positionMs=251369)
+        with self.assertRaises(ValueError):
+            self._settle(feedback, "oversized-progress", 21000, 210000)
+        participant = getBroadcastState("broadcast-1")["participantStates"][0]
+        self.assertIsNone(participant["appliedBroadcastRevision"])
 
     def test_20_and_256_limits(self):
         participants = [self._participant(

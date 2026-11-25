@@ -25,6 +25,7 @@ from ..db import (
     EmoPlaybackContext,
     EmoPermanentDeviceDecommission,
     close_connection,
+    connection_scope,
     db,
     now,
     open_connection,
@@ -37,7 +38,7 @@ from .ws_store import (
     strictAuthorityPairLockSet,
     strictPlaybackContextLockSet,
 )
-from .strict_v2_effective_at import projectBroadcastPositionMs
+from .strict_v2_effective_at import getTrackDurationMs, projectBroadcastPositionMs
 
 
 MAX_BROADCAST_PARTICIPANTS = 20
@@ -1522,18 +1523,28 @@ def commitBroadcastRevision(
         close_connection()
 
 
+def _broadcast_position_at(snapshot: Dict[str, object], target_ms: int) -> int:
+    position_ms = int(snapshot["positionMs"])
+    if snapshot["state"] != "playing":
+        return position_ms
+    # This lookup also runs inside the transaction that freezes the target.
+    # Keep its connection open until the revision and deliveries are committed.
+    with connection_scope(reuse=True):
+        duration_ms = getTrackDurationMs(snapshot["trackId"])
+    return projectBroadcastPositionMs(
+        position_ms,
+        int(snapshot["serverUpdatedAtMs"]),
+        target_ms,
+        float(snapshot["playbackRate"]),
+        duration_ms=duration_ms,
+    )
+
+
 def buildTerminalBroadcastSnapshot(
     previous: Dict[str, object],
     terminal_at_ms: int,
 ) -> Dict[str, object]:
-    position_ms = int(previous["positionMs"])
-    if previous["state"] == "playing":
-        position_ms = projectBroadcastPositionMs(
-            position_ms,
-            int(previous["serverUpdatedAtMs"]),
-            terminal_at_ms,
-            float(previous["playbackRate"]),
-        )
+    position_ms = _broadcast_position_at(previous, terminal_at_ms)
     snapshot = dict(previous)
     snapshot.update(
         {
@@ -1925,6 +1936,21 @@ def _serialize_compact_recovery_delivery(
     }
 
 
+def _validate_feedback_position(
+    position_ms: int,
+    track_duration_ms: Optional[int],
+    terminal_target_ms: Optional[int],
+) -> None:
+    # Older servers could project a terminal target past the end of its track.
+    # A participant can still acknowledge the exact position it was sent.
+    if (
+        track_duration_ms is not None
+        and position_ms > track_duration_ms
+        and position_ms != terminal_target_ms
+    ):
+        raise ValueError("Broadcast feedback positionMs exceeds media duration")
+
+
 def _settle_compact_broadcast_feedback(
     recovery: EmoBroadcastTerminalRecovery,
     payload: Dict[str, object],
@@ -2004,13 +2030,9 @@ def _settle_compact_broadcast_feedback(
             raise BroadcastResourceConflictError(
                 "Compact terminal feedback does not match recovery target"
             )
-        if (
-            track_duration_ms is not None
-            and payload["positionMs"] > track_duration_ms
-        ):
-            raise ValueError(
-                "Broadcast feedback positionMs exceeds media duration"
-            )
+        _validate_feedback_position(
+            payload["positionMs"], track_duration_ms, recovery.terminal_position_ms
+        )
     elif payload["lastAppliedBroadcastRevision"] != last_applied:
         raise BroadcastRevisionConflictError(last_applied)
     canonical = {
@@ -2319,13 +2341,11 @@ def settleBroadcastFeedback(
                             raise BroadcastResourceConflictError(
                                 "Broadcast feedback state does not match target"
                             )
-                    if (
-                        track_duration_ms is not None
-                        and payload["positionMs"] > track_duration_ms
-                    ):
-                        raise ValueError(
-                            "Broadcast feedback positionMs exceeds media duration"
-                        )
+                    _validate_feedback_position(
+                        payload["positionMs"],
+                        track_duration_ms,
+                        target.get("positionMs") if terminal else None,
+                    )
 
                     participant.applied_broadcast_revision = revision
                     participant.applied_queue_index = payload["queueIndex"]
@@ -2770,14 +2790,7 @@ def suspendBroadcastForAuthorityDisconnect(
                 ):
                     return None
                 previous = _load_json(record.snapshot_json, {})
-                position_ms = int(previous["positionMs"])
-                if previous["state"] == "playing":
-                    position_ms = projectBroadcastPositionMs(
-                        position_ms,
-                        int(previous["serverUpdatedAtMs"]),
-                        server_time_ms,
-                        float(previous["playbackRate"]),
-                    )
+                position_ms = _broadcast_position_at(previous, server_time_ms)
                 snapshot = dict(previous)
                 snapshot.update(
                     {
