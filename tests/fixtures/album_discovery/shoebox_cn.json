@@ -1,0 +1,23 @@
+{
+  "provenance": "Regression data from the recorded CN result. Non-representative song IDs, titles, durations and file contents are synthetic.",
+  "album_id": "1695484960",
+  "album_url": "https://music.apple.com/cn/album/%EC%8B%A0%EB%B0%9C%EC%9E%A5/1695484960",
+  "title": "신발장",
+  "artist": "EPIK HIGH",
+  "representative_song_id": "1695485211",
+  "previous_day": "2026-11-26",
+  "placement_day": "2026-11-27",
+  "tracks": [
+    {"song_id": "801", "disc_number": 1, "track_number": 1, "title": "Fixture track 1", "duration_ms": 182000},
+    {"song_id": "802", "disc_number": 1, "track_number": 2, "title": "Fixture track 2", "duration_ms": 187000},
+    {"song_id": "803", "disc_number": 1, "track_number": 3, "title": "Fixture track 3", "duration_ms": 188000},
+    {"song_id": "804", "disc_number": 1, "track_number": 4, "title": "Fixture track 4", "duration_ms": 184000},
+    {"song_id": "805", "disc_number": 1, "track_number": 5, "title": "Fixture track 5", "duration_ms": 179000},
+    {"song_id": "806", "disc_number": 1, "track_number": 6, "title": "Fixture track 6", "duration_ms": 191000},
+    {"song_id": "808", "disc_number": 1, "track_number": 8, "title": "Fixture track 8", "duration_ms": 192000},
+    {"song_id": "809", "disc_number": 1, "track_number": 9, "title": "Fixture track 9", "duration_ms": 204000},
+    {"song_id": "810", "disc_number": 1, "track_number": 10, "title": "Fixture track 10", "duration_ms": 198000},
+    {"song_id": "1695485211", "disc_number": 1, "track_number": 11, "title": "EYES NOSE LIPS", "duration_ms": 213408},
+    {"song_id": "812", "disc_number": 1, "track_number": 12, "title": "Fixture track 12", "duration_ms": 188000}
+  ]
+}

@@ -1,9 +1,12 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import mock
 
 from supysonic.emo.strict_v2_effective_at import (
     EffectiveAtEligibilityError,
     getTrackDurationMs,
+    getVerifiedTrackTailDurationMs,
     isClockGateReady,
     projectBroadcastPositionMs,
     requireEffectiveAtPlayer,
@@ -238,6 +241,48 @@ class StrictV2EffectiveAtTestCase(unittest.TestCase):
         self.assertEqual(getTrackDurationMs("track-1"), 123000)
         get_or_none.return_value = None
         self.assertIsNone(getTrackDurationMs("track-unknown"))
+
+    def test_verified_tail_uses_complete_samples_and_fails_closed_on_unknown_headers(
+        self,
+    ):
+        # The source FLAC reported 8,506,069 samples at 44,100 Hz. Build just
+        # its STREAMINFO block and check integer-ms wire quantization.
+        def streaminfo(sample_rate, count):
+            packed = (sample_rate << 44) | (1 << 41) | (15 << 36) | count
+            return (
+                b"fLaC\x80\x00\x00\x22"
+                + bytes(10)
+                + packed.to_bytes(8, "big")
+                + bytes(16)
+            )
+
+        header = streaminfo(44100, 8506069)
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "source.flac"
+            track = mock.Mock(duration=192, path=str(path))
+            with mock.patch(
+                "supysonic.emo.strict_v2_effective_at._find_track", return_value=track
+            ):
+                path.write_bytes(header)
+                self.assertEqual(getVerifiedTrackTailDurationMs("song", 192000), 192881)
+                self.assertEqual(getVerifiedTrackTailDurationMs("song", 191000), 191000)
+                # 192880.5, 192881.5, and 192999.875 milliseconds respectively.
+                for samples, expected in (
+                    (1543044, 192880),
+                    (1543052, 192882),
+                    (1543999, 193000),
+                ):
+                    path.write_bytes(streaminfo(8000, samples))
+                    self.assertEqual(
+                        getVerifiedTrackTailDurationMs("song", 192000), expected
+                    )
+                for bad_header in (header[:-1], b"not a FLAC", header[:18] + bytes(24)):
+                    path.write_bytes(bad_header)
+                    self.assertEqual(
+                        getVerifiedTrackTailDurationMs("song", 192000), 192000
+                    )
+                path.unlink()
+                self.assertEqual(getVerifiedTrackTailDurationMs("song", 192000), 192000)
 
 
 if __name__ == "__main__":

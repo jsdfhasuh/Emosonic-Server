@@ -9,7 +9,7 @@ from supysonic.db_layer.core import Meta, db
 from supysonic.metadata_budget import MetadataBudget
 from supysonic.metadata_pricing import PROFILE_MODEL
 from supysonic.openai_recommendations import (
-    OpenAIRecommendationError, PROFILE_STATE_KEY, STATE_KEY, recommendation_lease,
+    DISCOVERY_STATE_KEY, OpenAIRecommendationError, PROFILE_STATE_KEY, STATE_KEY, recommendation_lease,
     recommendation_settings, request_recommendation_json,
 )
 
@@ -59,13 +59,16 @@ class OpenAIRecommendationsTestCase(unittest.TestCase):
         ], SCHEMA, workload=workload)
 
     def test_each_workload_uses_one_shared_ledger_and_settles(self):
-        for workload in ("profile", "daily", "chat"):
+        for workload in ("profile", "daily", "chat", "album_discovery"):
             self.assertEqual(self.call(workload), {"ok": True})
         snapshot = self.budget.snapshot()
-        self.assertEqual(snapshot["month_spent_micro_usd"], 105)
+        self.assertEqual(snapshot["month_spent_micro_usd"], 140)
         self.assertEqual(snapshot["month_reserved_micro_usd"], 0)
         kinds = {json.loads(row.value)["k"] for row in Meta.select().where(Meta.key.startswith("mb:r:"))}
-        self.assertEqual(kinds, {"recommendation_profile", "recommendation_daily", "recommendation_chat"})
+        self.assertEqual(kinds, {
+            "recommendation_profile", "recommendation_daily", "recommendation_chat",
+            "recommendation_album_discovery",
+        })
         payload = self.post.call_args.kwargs["json"]
         self.assertEqual(payload["max_completion_tokens"], 4096)
         self.assertEqual(payload["response_format"]["type"], "json_schema")
@@ -219,3 +222,98 @@ class OpenAIRecommendationsTestCase(unittest.TestCase):
         self.assertEqual(caught.exception.reason, "busy")
         self.post.assert_not_called()
         self.assertEqual(self.budget.snapshot()["month_reserved_micro_usd"], 0)
+
+    def test_discovery_hard_upstream_error_only_pauses_discovery(self):
+        rejected = Mock(status_code=400, headers={})
+        rejected.json.return_value = {"error": {"message": "request refused"}}
+        self.post.side_effect = [rejected, self.response]
+        with self.assertRaises(OpenAIRecommendationError) as caught:
+            self.call("album_discovery")
+        self.assertEqual(caught.exception.reason, "upstream")
+        state = json.loads(Meta.get_by_id(DISCOVERY_STATE_KEY).value)
+        self.assertEqual((state["hard"], state["accounting"]), (True, False))
+        self.assertIsNone(Meta.get_or_none(Meta.key == STATE_KEY))
+        self.assertEqual(self.call("daily"), {"ok": True})
+        with self.assertRaises(OpenAIRecommendationError) as caught:
+            self.call("album_discovery")
+        self.assertEqual(caught.exception.reason, "paused")
+        self.assertEqual(self.post.call_count, 2)
+        self.assertGreater(self.budget.snapshot()["month_reserved_micro_usd"], 0)
+
+    def test_discovery_network_failure_only_pauses_discovery(self):
+        self.post.side_effect = [requests.Timeout(), self.response]
+        with self.assertRaises(OpenAIRecommendationError) as caught:
+            self.call("album_discovery")
+        self.assertEqual(caught.exception.reason, "network")
+        self.assertIsNone(Meta.get_or_none(Meta.key == STATE_KEY))
+        self.assertEqual(self.call("daily"), {"ok": True})
+        with self.assertRaises(OpenAIRecommendationError) as caught:
+            self.call("album_discovery")
+        self.assertEqual(caught.exception.reason, "paused")
+        self.assertEqual(self.post.call_count, 2)
+
+    def test_discovery_inflight_can_overlap_daily_but_not_another_discovery(self):
+        def request(*args, **kwargs):
+            name = kwargs["json"]["response_format"]["json_schema"]["name"]
+            if name == "music_album_discovery":
+                with self.assertRaises(OpenAIRecommendationError) as caught:
+                    self.call("album_discovery")
+                self.assertEqual(caught.exception.reason, "busy")
+                self.assertEqual(self.call("daily"), {"ok": True})
+            return self.response
+
+        self.post.side_effect = request
+        self.assertEqual(self.call("album_discovery"), {"ok": True})
+        self.assertEqual(self.post.call_count, 2)
+        self.assertEqual(self.budget.snapshot()["month_spent_micro_usd"], 70)
+
+    def test_inflight_daily_success_cannot_clear_discovery_accounting_stop(self):
+        expired = json.dumps({"n": 1, "u": 0, "hard": False})
+        Meta.create(key=STATE_KEY, value=expired)
+        unverifiable = Mock(status_code=200)
+        unverifiable.json.return_value = completion(usage=None)
+
+        def request(*args, **kwargs):
+            name = kwargs["json"]["response_format"]["json_schema"]["name"]
+            if name == "music_album_discovery":
+                return unverifiable
+            with self.assertRaises(OpenAIRecommendationError) as caught:
+                self.call("album_discovery")
+            self.assertEqual(caught.exception.reason, "accounting")
+            return self.response
+
+        self.post.side_effect = request
+        self.assertEqual(self.call("daily"), {"ok": True})
+        state = json.loads(Meta.get_by_id(STATE_KEY).value)
+        self.assertTrue(state["accounting"])
+        self.assertGreater(self.budget.snapshot()["month_reserved_micro_usd"], 0)
+        for workload in ("daily", "album_discovery"):
+            with self.assertRaises(OpenAIRecommendationError) as caught:
+                self.call(workload)
+            self.assertEqual(caught.exception.reason, "paused")
+        self.assertEqual(self.post.call_count, 2)
+
+    def test_inflight_daily_network_failure_cannot_replace_discovery_accounting_stop(self):
+        expired = json.dumps({"n": 1, "u": 0, "hard": False})
+        Meta.create(key=STATE_KEY, value=expired)
+        unverifiable = Mock(status_code=200)
+        unverifiable.json.return_value = completion(usage=None)
+
+        def request(*args, **kwargs):
+            name = kwargs["json"]["response_format"]["json_schema"]["name"]
+            if name == "music_album_discovery":
+                return unverifiable
+            with self.assertRaises(OpenAIRecommendationError) as caught:
+                self.call("album_discovery")
+            self.assertEqual(caught.exception.reason, "accounting")
+            raise requests.Timeout()
+
+        self.post.side_effect = request
+        with self.assertRaises(OpenAIRecommendationError) as caught:
+            self.call("daily")
+        self.assertEqual(caught.exception.reason, "network")
+        self.assertTrue(json.loads(Meta.get_by_id(STATE_KEY).value)["accounting"])
+        with self.assertRaises(OpenAIRecommendationError) as caught:
+            self.call("daily")
+        self.assertEqual(caught.exception.reason, "paused")
+        self.assertEqual(self.post.call_count, 2)

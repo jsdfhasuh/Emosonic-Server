@@ -14,6 +14,9 @@
 {% block page_title %}<span data-i18n-en="Recommendations" data-i18n-zh="推荐">Recommendations</span>{% endblock %}
 {% block page_subtitle %}<span data-i18n-en="AI-assisted outside-library artist discovery from playback history." data-i18n-zh="基于播放记录发现曲库外歌手。">AI-assisted outside-library artist discovery from playback history.</span>{% endblock %}
 {% block body %}
+{% if request.user and request.user.name == config["ALBUM_DISCOVERY"].get("target_user") %}
+<p><a class="btn btn-outline-primary" href="{{ url_for('frontend.album_discovery_index') }}"><span data-i18n-en="China album discovery" data-i18n-zh="国区专辑发现">China album discovery</span></a></p>
+{% endif %}
 <div class="recommendation-workspace console-section-spacer">
   <div class="recommendation-summary-strip" aria-label="Recommendation summary">
     <div class="recommendation-summary-item">

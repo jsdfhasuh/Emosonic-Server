@@ -63,8 +63,10 @@ waitingForSource、terminal status 和所有 push 中保持不变。
 `lifecycleState` 只允许 `active|waitingForSource|stopped`：
 
 - active：state/position/playbackRate 是当前 source target 或最近已结算实际 anchor；
-- waitingForSource：source Context/cursors 不变，state 必须为 paused，positionMs 是 source 断线时计算的
-  安全 pause anchor；它只暂停 ordinary mirror，不声称 source Context 已暂停；
+- waitingForSource：进入等待时保留 source Context/cursors，并以断线位置暂停 ordinary mirror。同一播放源
+  在原 30 秒窗口内重连，可用 `queue.context.sync` 对账同一队列的当前索引和实际进度。服务端原子更新
+  Context 和 waiting Snapshot 的队列索引、位置及游标，保存新的 broadcastRevision。成员继续暂停；
+  只有新连接对该曲实际状态的有效 `playback.update` 可以恢复群播。
 - stopped：terminal lifecycle。state/position/playbackRate 保留停止前最后 mirror anchor；手工 stop 时
   source 仍可能是 playing。禁止用 `state:"stopped"` 代替 lifecycle terminal，也禁止因 stop 修改
   source Context。ordinary terminal applied feedback 的 `state:"stopped"` 是镜像 execution 已销毁的
@@ -72,8 +74,9 @@ waitingForSource、terminal status 和所有 push 中保持不变。
 
 `sourceVersion/sourceQueueRevision/sourceControlVersion/sourceEpoch` 在 active/waitingForSource 期间必须精确
 等于 snapshot 所引用 source Context 的 canonical cursors。接受 source playback mutation 时，服务端在
-同一事务更新 source Context、这些带名副本和 broadcastRevision；waiting/resume 只递增
-broadcastRevision，不改变 source cursors。stop 将这些字段冻结为 terminal 提交时所引用的
+同一事务更新 source Context、这些带名副本和 broadcastRevision，等待期间接受的 `queue.context.sync`
+也遵守此规则。仅因断线进入等待或收到真实播放状态恢复 active 时，只递增 broadcastRevision。
+stop 将这些字段冻结为 terminal 提交时所引用的
 source cursor 历史值；后续 source Context mutation 不更新 terminal snapshot。任何 push 禁止旧的无前缀
 `version/queueRevision/controlVersion/epoch`，避免把
 Broadcast 误实现为第二套播放时间线。
@@ -365,7 +368,8 @@ delivery 是可执行输入。客户端可以用新 requestId 查询 `broadcast.
 
 `syncStatus:"applied"` 只表示该 frozen participant 已应用所报告 revision 的 target；Broadcast 是
 soft sync，不保证随后与 source 的 drift 持续小于固定毫秒数。由于 feedback 没有 position sample
-time，positionMs 只能验证 int、非负和已知 duration 范围，不能用于构造 drift SLA。
+time，普通回执的 positionMs 只能验证 int、非负和已知 duration 范围，不能用于构造 drift SLA。
+结束回执确认历史越界位置时适用恢复章节的精确回传例外。
 
 full ACK 顶层 payload 的 `serverTimeMs:int>=0` 是本次 status 读取的服务端时刻，不属于
 BroadcastSnapshot，也不增加 broadcastRevision。`broadcast.positionMs` 与

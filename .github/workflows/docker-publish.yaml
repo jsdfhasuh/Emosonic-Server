@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - "**"
+      - "!test/server-follow-actual-rate-20261025"
     tags:
       - "v*.*.*"
     paths:

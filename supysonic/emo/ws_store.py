@@ -1710,16 +1710,37 @@ def getPlaybackControlTransaction(
         close_connection()
 
 
+def _pending_context_controls(playback_context_id, epoch):
+    return EmoPlaybackControlTransaction.select().where(
+        (EmoPlaybackControlTransaction.playback_context_id == playback_context_id)
+        & (EmoPlaybackControlTransaction.epoch == epoch)
+        & (EmoPlaybackControlTransaction.status == "pending")
+    )
+
+
+def _require_queue_replacement_lane(record, *, replacing=False):
+    pending = _pending_context_controls(record.playback_context_id, record.epoch)
+    if replacing:
+        conflict = pending.exists()
+    else:
+        selections = pending.select(
+            EmoPlaybackControlTransaction.accepted_target_json
+        ).where(EmoPlaybackControlTransaction.action == "queue.playItem")
+        conflict = any(
+            json.loads(row.accepted_target_json).get("replaceQueue")
+            for row in selections
+        )
+    if conflict:
+        raise PlaybackControlTransactionConflictError(
+            "A queue replacement requires exclusive control of the playback context"
+        )
+
+
 def listPendingPlaybackControlTransactions(playback_context_id, epoch):
     open_connection(reuse=True)
     try:
         query = (
-            EmoPlaybackControlTransaction.select()
-            .where(
-                (EmoPlaybackControlTransaction.playback_context_id == playback_context_id)
-                & (EmoPlaybackControlTransaction.epoch == epoch)
-                & (EmoPlaybackControlTransaction.status == "pending")
-            )
+            _pending_context_controls(playback_context_id, epoch)
             .order_by(EmoPlaybackControlTransaction.command_control_version)
         )
         return [serializePlaybackControlTransaction(record) for record in query]
@@ -3573,13 +3594,23 @@ def _reconcile_terminal_control_gap(
 
     queue_song_ids = json.loads(record.queue_json)
     actual_track_id = payload.get("trackId")
-    if (
-        not isinstance(actual_track_id, str)
-        or not actual_track_id
-        or queue_song_ids.count(actual_track_id) != 1
+    if queue_song_ids and queue_song_ids.count(actual_track_id) == 1:
+        actual_index = queue_song_ids.index(actual_track_id)
+    elif (
+        not queue_song_ids
+        and actual_track_id is None
+        and payload["state"] == "idle"
+        and payload["positionMs"] == 0
+        and all(
+            row.action == "queue.playItem"
+            and json.loads(row.accepted_target_json).get("replaceQueue")
+            for row in gap_records
+        )
     ):
+        # An unsuccessful first selection can confirm the original empty queue.
+        actual_index = 0
+    else:
         return None
-    actual_index = queue_song_ids.index(actual_track_id)
 
     reconciliation_control_version = through_control_version + 1
     if record.current_index != actual_index:
@@ -3712,6 +3743,38 @@ def _apply_passive_natural_terminal(
     return True
 
 
+def _commit_staged_queue(record, transaction, feedback):
+    if transaction.action != "queue.playItem":
+        return False
+    target = json.loads(transaction.accepted_target_json)
+    if not target.get("replaceQueue"):
+        return False
+    if (
+        record.control_version != transaction.command_control_version
+        or target["queueRevision"] != record.queue_revision + 1
+        or feedback["appliedControlVersion"] != transaction.command_control_version
+        or feedback.get("trackId") != target["trackId"]
+        or feedback["state"] != "playing"
+    ):
+        raise PlaybackControlTransactionConflictError(
+            "Playback feedback does not confirm the staged queue selection"
+        )
+    record.queue_json = json.dumps(target["queueSongIds"], ensure_ascii=True)
+    record.queue_revision = target["queueRevision"]
+    record.current_index = target["queueIndex"]
+    record.track_id = target["trackId"]
+    record.state = feedback["state"]
+    record.position_ms = feedback["positionMs"]
+    playback = json.loads(record.playback_json or "{}")
+    playback["positionSampledAtServerMs"] = feedback["positionSampledAtServerMs"]
+    record.playback_json = json.dumps(playback, ensure_ascii=True)
+    record.origin_client_id = transaction.requesting_client_id
+    record.version += 1
+    record.updated_at = now()
+    record.save()
+    return True
+
+
 @_serialize_strict_playback_context_mutation
 def applyStrictPlaybackUpdate(
     playback_context_id,
@@ -3723,6 +3786,7 @@ def applyStrictPlaybackUpdate(
     server_updated_at_ms,
     post_mutation_hook=None,
     require_execution_eligible=False,
+    waiting_broadcast=None,
 ):
     payload = dict(payload)
     payload.setdefault("positionSampledAtServerMs", 0)
@@ -3811,12 +3875,35 @@ def applyStrictPlaybackUpdate(
                 if has_applied_baseline
                 else None
             )
+            staged_queue = _waiting_broadcast_queue_proof(record, waiting_broadcast)
+            if staged_queue and (
+                staged_queue["connectionNonce"] != connection_nonce
+                or (
+                    payload["origin"] == "passive"
+                    and payload["appliedControlVersion"] < record.control_version
+                )
+            ):
+                raise PlaybackControlTransactionConflictError(
+                    "Source queue occurrence must be confirmed on this connection"
+                )
+            if (
+                staged_queue
+                and payload["origin"] == "passive"
+                and (
+                    payload.get("trackId") == record.track_id
+                    or payload["state"] == "idle"
+                )
+            ):
+                # The queue acknowledgement proves the cursor on this connection.
+                # Keep the previous actual device observation until a report arrives.
+                last_applied = record.control_version
             origin = payload["origin"]
             dependency_records = []
             eligible_dependency_records = []
             terminal_control_versions = []
             control_reconciliation = None
             natural_terminal = False
+            queue_replaced = False
             handoff_settlement = None
             handoff_source_changes = False
             handoff_record, handoff_role = _active_handoff_for_context(
@@ -4033,6 +4120,9 @@ def applyStrictPlaybackUpdate(
                 )
                 terminal_control_versions.append(command_version)
 
+                if terminal_changed and terminal_status == "committed":
+                    queue_replaced = _commit_staged_queue(record, transaction, payload)
+
                 if terminal_changed:
                     (
                         eligible_dependencies,
@@ -4239,6 +4329,8 @@ def applyStrictPlaybackUpdate(
                 result["handoffSettlement"] = handoff_settlement
             if natural_terminal:
                 result["naturalTerminal"] = True
+            if queue_replaced:
+                result["queueReplaced"] = True
             if post_mutation_hook is not None:
                 result["_broadcastMutation"] = post_mutation_hook(
                     record,
@@ -4246,6 +4338,11 @@ def applyStrictPlaybackUpdate(
                     previous_context,
                     previous_device_state,
                 )
+            if staged_queue:
+                playback = json.loads(record.playback_json)
+                playback.pop("_waitingBroadcastQueue", None)
+                record.playback_json = json.dumps(playback)
+                record.save(only=(EmoPlaybackContext.playback_json,))
             return result
     finally:
         close_connection()
@@ -4368,6 +4465,8 @@ def createPlaybackPrepareTransaction(
                         "controlVersion",
                     )
                 context_ready = bool(json.loads(context_record.queue_json))
+                if not context_ready:
+                    _require_queue_replacement_lane(context_record)
             active = EmoPlaybackPrepareTransaction.get_or_none(
                 (EmoPlaybackPrepareTransaction.playback_context_id == playback_context_id)
                 & (EmoPlaybackPrepareTransaction.epoch == epoch)
@@ -4930,6 +5029,7 @@ def savePlaybackState(session_id, user_name, client_id, playback_state):
 
 def _playback_context_payload(record):
     payload = json.loads(record.playback_json) if record.playback_json else {}
+    payload.pop("_waitingBroadcastQueue", None)
     _strip_transient_playback_fields(payload)
     queue_song_ids = json.loads(record.queue_json)
     payload.update(
@@ -5269,6 +5369,7 @@ def ensureStrictPlaybackContextState(
                                 json.loads(record.queue_json)
                             )
                             if rebind or would_initialize:
+                                _require_queue_replacement_lane(record)
                                 requireFollowSafetyLeaseResourceAvailable(
                                     playback_context_id=(
                                         record.playback_context_id
@@ -5814,6 +5915,25 @@ def _advance_queue_sync_authority_device_state(
     return existing
 
 
+def _context_cursors(record):
+    return [record.epoch, record.version, record.queue_revision, record.control_version]
+
+
+def _waiting_broadcast_queue_proof(record, waiting_broadcast):
+    if waiting_broadcast is None:
+        return None
+    playback = json.loads(record.playback_json) if record.playback_json else {}
+    proof = playback.get("_waitingBroadcastQueue")
+    if (
+        isinstance(proof, dict)
+        and proof.get("cursors") == _context_cursors(record)
+        and proof.get("broadcastId") == waiting_broadcast["broadcastId"]
+        and proof.get("broadcastRevision") == waiting_broadcast["broadcastRevision"]
+    ):
+        return proof
+    return None
+
+
 @_serialize_strict_playback_context_mutation
 def mutateStrictPlaybackContextQueue(
     playback_context_id,
@@ -5828,6 +5948,7 @@ def mutateStrictPlaybackContextQueue(
     position_sampled_at_server_ms=None,
     connection_nonce=None,
     post_mutation_hook=None,
+    waiting_broadcast=None,
 ):
     queue_song_ids = list(queue_song_ids)
     open_connection(reuse=True)
@@ -5845,8 +5966,39 @@ def mutateStrictPlaybackContextQueue(
             if base_queue_revision != record.queue_revision:
                 raise PlaybackContextStaleVersionError(current, "queueRevision")
 
+            _require_queue_replacement_lane(record)
             previous_queue = json.loads(record.queue_json)
             previous_index = record.current_index if previous_queue else None
+            if waiting_broadcast:
+                source_cursors = [
+                    waiting_broadcast[key]
+                    for key in (
+                        "sourceEpoch",
+                        "sourceVersion",
+                        "sourceQueueRevision",
+                        "sourceControlVersion",
+                    )
+                ]
+                if _context_cursors(record) != source_cursors:
+                    raise PlaybackControlTransactionConflictError(
+                        "Source Context cursors changed while waiting"
+                    )
+                if not previous_queue or queue_song_ids != previous_queue:
+                    raise PlaybackControlTransactionConflictError(
+                        "Source queue mutation is blocked while waiting for playback state"
+                    )
+                if not _waiting_broadcast_queue_proof(record, waiting_broadcast):
+                    applied = EmoDevicePlaybackState.get_or_none(
+                        playback_context_id=playback_context_id,
+                        owner_client_id=authority_client_id,
+                        device_session_id=authority_device_session_id,
+                        context_epoch=record.epoch,
+                        applied_control_version=record.control_version,
+                    )
+                    if applied is None:
+                        raise PlaybackControlTransactionConflictError(
+                            "Source control reconciliation is not settled"
+                        )
             previous_track = record.track_id
             next_index = current_index if queue_song_ids else None
             next_track = (
@@ -5874,7 +6026,7 @@ def mutateStrictPlaybackContextQueue(
                 and base_control_version != record.control_version
             ):
                 raise PlaybackContextStaleVersionError(current, "controlVersion")
-            if control_changed:
+            if control_changed or waiting_broadcast:
                 has_pending_control = (
                     EmoPlaybackControlTransaction.select()
                     .where(
@@ -5929,9 +6081,17 @@ def mutateStrictPlaybackContextQueue(
             record.queue_revision += 1
             if control_changed:
                 record.control_version += 1
+            if waiting_broadcast:
+                playback_json["_waitingBroadcastQueue"] = {
+                    "broadcastId": waiting_broadcast["broadcastId"],
+                    "broadcastRevision": waiting_broadcast["broadcastRevision"] + 1,
+                    "connectionNonce": connection_nonce,
+                    "cursors": _context_cursors(record),
+                }
+                record.playback_json = json.dumps(playback_json)
             record.updated_at = updated_at
             record.save()
-            if (
+            if not waiting_broadcast and (
                 control_changed
                 or position_changed
                 or (isinstance(connection_nonce, str) and connection_nonce)
@@ -5985,7 +6145,12 @@ def mutateStrictPlaybackContextControl(
     effective_at_server_ms=None,
     pre_mutation_validator=None,
     deterministic_dependency_admission=False,
+    replacement_queue=None,
 ):
+    if replacement_queue is not None and (
+        action != "queue.playItem" or requesting_client_id is None
+    ):
+        raise ValueError("Replacing a queue requires a routed queue.playItem")
     if type(deterministic_dependency_admission) is not bool:
         raise ValueError("deterministicDependencyAdmission must be a boolean")
     if (
@@ -6047,7 +6212,12 @@ def mutateStrictPlaybackContextControl(
             ]
             if active_context_ids != [playback_context_id]:
                 raise PlaybackContextAuthorityAmbiguousError(current)
-            if not json.loads(record.queue_json):
+            queue_song_ids = (
+                json.loads(record.queue_json)
+                if replacement_queue is None
+                else replacement_queue
+            )
+            if not queue_song_ids:
                 raise PlaybackContextQueueRequiredError(current)
             if base_control_version != record.control_version:
                 raise PlaybackContextStaleVersionError(current, "controlVersion")
@@ -6057,8 +6227,22 @@ def mutateStrictPlaybackContextControl(
             ):
                 raise PlaybackContextStaleVersionError(current, "queueRevision")
 
-            queue_song_ids = json.loads(record.queue_json)
-            previous_current_index = record.current_index
+            if replacement_queue is not None:
+                # Broadcast source projection has its own queue and control
+                # transaction. The replacement extension is for ordinary controls.
+                fences = _broadcast_fences_for_context(playback_context_id)
+                if fences:
+                    _raise_broadcast_fence(fences[0], playback_context_id)
+                preparing = EmoPlaybackPrepareTransaction.select().where(
+                    (EmoPlaybackPrepareTransaction.playback_context_id == playback_context_id)
+                    & (EmoPlaybackPrepareTransaction.epoch == record.epoch)
+                    & (EmoPlaybackPrepareTransaction.status == "preparing")
+                )
+                if preparing.exists():
+                    raise PlaybackPrepareAlreadyActiveError("Queue preparation is active")
+            _require_queue_replacement_lane(
+                record, replacing=replacement_queue is not None
+            )
             terminal_next = False
             if action == "queue.playItem":
                 if current_index is None or current_index >= len(queue_song_ids):
@@ -6090,50 +6274,58 @@ def mutateStrictPlaybackContextControl(
                 )
             if pre_mutation_validator is not None:
                 pre_mutation_validator(dict(current))
-            if current_index is not None:
-                record.current_index = current_index
-                record.track_id = queue_song_ids[current_index]
+            target_index = record.current_index if current_index is None else current_index
+            target_track = record.track_id if current_index is None else queue_song_ids[current_index]
+            target_state = record.state
             if terminal_next:
-                record.state = "stopped"
+                target_state = "stopped"
             elif action in {
                 "player.play",
                 "queue.playItem",
                 "player.next",
                 "player.prev",
             }:
-                record.state = "playing"
+                target_state = "playing"
             elif action == "player.pause":
-                record.state = "paused"
-            if position_ms is not None:
-                record.position_ms = position_ms
-            record.origin_client_id = updated_by_client_id
-            record.version += 1
-            record.control_version += 1
+                target_state = "paused"
+            target_position = record.position_ms if position_ms is None else position_ms
+            target_revision = record.queue_revision
             if action == "queue.playItem" or (
                 action in {"player.next", "player.prev"}
-                and record.current_index != previous_current_index
+                and target_index != record.current_index
             ):
-                record.queue_revision += 1
+                target_revision += 1
+            if replacement_queue is None:
+                record.current_index = target_index
+                record.track_id = target_track
+                record.state = target_state
+                record.position_ms = target_position
+                record.queue_revision = target_revision
+                record.origin_client_id = updated_by_client_id
+            record.version += 1
+            record.control_version += 1
             record.updated_at = now()
             record.save()
             result = _playback_context_payload(record)
             if requesting_client_id is not None:
                 accepted_target = {
                     "action": action,
-                    "state": record.state,
-                    "positionMs": record.position_ms,
+                    "state": target_state,
+                    "positionMs": target_position,
                 }
-                if record.track_id is not None:
-                    accepted_target["trackId"] = record.track_id
+                if target_track is not None:
+                    accepted_target["trackId"] = target_track
                 if action in {
                     "queue.playItem",
                     "player.next",
                     "player.prev",
                 }:
-                    accepted_target["queueIndex"] = record.current_index
-                    accepted_target["queueRevision"] = record.queue_revision
+                    accepted_target["queueIndex"] = target_index
+                    accepted_target["queueRevision"] = target_revision
                 if action == "queue.playItem":
                     accepted_target["queueSongIds"] = list(queue_song_ids)
+                if replacement_queue is not None:
+                    accepted_target["replaceQueue"] = True
                 if accepted_target_extra:
                     accepted_target.update(dict(accepted_target_extra))
                 transaction_record, _created = _create_playback_control_transaction_record(

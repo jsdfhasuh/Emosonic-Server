@@ -1,0 +1,36 @@
+# Disposable, web-only TEST configuration. Never use for production.
+[base]
+database_uri = sqlite:////tmp/emosonic-test/server.db
+tempdatafolder = /tmp/emosonic-test
+follow_symlinks = no
+
+[webapp]
+cache_dir = /tmp/emosonic-test/cache
+cache_size = 16
+transcode_cache_size = 16
+log_level = WARNING
+mount_webui = on
+mount_api = on
+mount_emosonic = on
+mount_client_releases = off
+allow_user_registration = off
+emo_log_upload_dir = /tmp/emosonic-test/diagnostics
+emo_ws_enabled = on
+emo_allowed_origins = http://127.0.0.1:5000
+emo_development_mode = on
+emo_strict_v2_allow_local_test_evidence = on
+emo_strict_v2_core_enabled = on
+emo_strict_v2_follow_enabled = on
+emo_strict_v2_handoff_enabled = on
+emo_strict_v2_broadcast_enabled = off
+online_lyrics = off
+
+[daemon]
+run_watcher = no
+recommend_daily_refresh = off
+mood_scene_playlists_daily_refresh = off
+review_task_maintenance = off
+track_metadata_enrichment = off
+
+[recommendation_agent]
+enabled = off

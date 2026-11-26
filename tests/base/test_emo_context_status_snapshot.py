@@ -248,6 +248,17 @@ class ContextStatusSnapshotTestCase(unittest.TestCase):
         self.assertEqual(payload["deviceStates"][0]["clientSeq"], 1)
         self.assertEqual(payload["deviceStates"][0]["positionMs"], 300)
 
+    def test_epochless_durable_fact_wins_by_sequence_within_same_control_and_nonce(self):
+        self.harness.report_strict_playback_context(
+            self.phone, "new-sample", self.context_id, "device:phone", position_ms=325, client_seq=3,
+        )
+        durable = ws_store.getDevicePlaybackState(self.context_id, "phone")
+        self.assertNotIn("_connectionEpoch", durable)
+        self.runtime_fact("phone", "device:phone", clientSeq=2)
+        response = self.harness.get_direct_response(self.status(), "playback.context.status", "status")
+        device, = self.assert_snapshot(response, 1)["deviceStates"]
+        self.assertEqual((device["clientSeq"], device["positionMs"]), (3, 325))
+
     def test_current_runtime_low_sequence_replaces_retired_durable_nonce(self):
         self.harness.report_strict_playback_context(
             self.phone, "old-high-sequence", self.context_id, "device:phone",

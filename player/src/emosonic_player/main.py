@@ -1,0 +1,248 @@
+"""Owned-process lifecycle; no SSH, host configuration or deployment actions."""
+import argparse
+import asyncio
+from contextlib import AsyncExitStack, asynccontextmanager
+import fcntl
+import json
+import logging
+import math
+import os
+from pathlib import Path
+import signal
+import socket
+import stat
+import struct
+import tempfile
+import uuid
+import wave
+
+from .broadcast import Broadcast
+from .config import client_identity, load_config, read_password, validate_audio_device
+from .follow import Follow
+from .mpv import MpvError, MpvPlayer
+from .playback import Player, PlaybackError
+from .protocol import ProtocolClient, ProtocolError
+from .stream import MediaClient, MediaError
+
+logger = logging.getLogger(__name__)
+
+
+def private_directory(path):
+    directory = Path(path)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError('runtime directory must be owned by this user and mode 0700')
+    return directory
+
+
+async def serve_cli(reader, writer, player, ha_audio=None):
+    try:
+        peer = writer.get_extra_info('socket')
+        _, uid, _ = struct.unpack('3i', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        if uid != os.getuid() and not (ha_audio is not None and uid == 0):
+            raise ValueError('different user')
+        async with asyncio.timeout(40) as deadline:
+            line = await reader.readline()
+            if len(line) > 16384:
+                raise ValueError('request too large')
+            request = json.loads(line)
+            if set(request) != {'action', 'params'} or not isinstance(request['params'], dict):
+                raise ValueError('invalid request')
+            action, params = request['action'], request['params']
+            if ha_audio is not None and action == 'announce':
+                deadline.reschedule(asyncio.get_running_loop().time() + 165)
+                if set(params) != {'file'}:
+                    raise PlaybackError('expected one WAV filename')
+                result = await player.announce_file(ha_audio, params['file'])
+            elif ha_audio is not None and action == 'status':
+                result = await player.ha_status()
+            else:
+                result = await player.cli(action, params)
+        response = {'ok': True, 'result': result}
+    except asyncio.CancelledError:
+        writer.close()
+        raise
+    except (PlaybackError, ProtocolError, MediaError) as exc:
+        # These exception classes contain authored categories, not raw server text.
+        response = {'ok': False, 'error': str(exc)}
+    except Exception:
+        response = {'ok': False, 'error': 'request_failed'}
+    try:
+        writer.write((json.dumps(response) + '\n').encode())
+        await writer.drain()
+    except (OSError, ConnectionError):
+        pass
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+@asynccontextmanager
+async def control_socket(path, player, ha_audio=None):
+    if path.exists() or path.is_symlink():
+        info = path.lstat()
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError('unsafe existing control socket path')
+        if ha_audio is not None:
+            try:
+                _, writer = await asyncio.open_unix_connection(path)
+            except ConnectionRefusedError:
+                pass  # Socket left behind by a previous process.
+            else:
+                writer.close()
+                await writer.wait_closed()
+                raise ValueError('HA control socket is in use')
+        path.unlink()
+    server = await asyncio.start_unix_server(
+        lambda r, w: serve_cli(r, w, player, ha_audio), path=path, limit=16385)
+    bound = path.lstat()
+    try:
+        os.chmod(path, 0o600)
+        yield
+    finally:
+        server.close()
+        await server.wait_closed()
+        if path.exists() and os.path.samestat(bound, path.lstat()):
+            path.unlink()
+
+
+async def run(config):
+    runtime = private_directory(config['runtime_dir'])
+    lockfd = os.open(runtime / 'daemon.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lockfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(lockfd)
+        raise ValueError('another player daemon is running') from None
+    password = read_password(config['password_file'])
+    identity = client_identity(config['client_id_file'])
+    state_dir = Path(config['state_dir'])
+    recovery_sessions = {sid for profile in (Follow, Broadcast)
+                         if (sid := profile.recovery_session(
+                             state_dir, config['server_url'], config['username'], identity))}
+    if len(recovery_sessions) > 1:
+        raise ValueError('inconsistent synchronized playback recovery sessions')
+    session = recovery_sessions.pop() if recovery_sessions else 'instance-' + uuid.uuid4().hex
+    wire = ProtocolClient(config['server_url'], config['username'], password, identity,
+                          session, config['device_name'])
+    media = MediaClient(config['server_url'], config['username'], password)
+    engine = MpvPlayer(config['audio_device'], str(runtime))
+    player = Player(wire, engine, media, state_dir)
+    wire.on_event = player.on_event
+    wire.on_disconnect = player.disconnected
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop.set)
+    sockets = AsyncExitStack()
+    try:
+        await player.start_engine(config['initial_volume'])
+        await player.start()
+        await sockets.enter_async_context(control_socket(runtime / 'control.sock', player))
+        if 'ha_socket' in config:
+            ha_path = Path(config['ha_socket'])
+            parent = ha_path.parent.resolve()
+            if (not ha_path.is_absolute() or parent.is_relative_to(runtime.resolve())
+                    or runtime.resolve().is_relative_to(parent) or ha_path.name == 'audio'):
+                raise ValueError('HA socket needs a separate absolute directory')
+            private_directory(ha_path.parent)
+            audio = parent / 'audio'
+            audio.mkdir(mode=0o700, exist_ok=True)
+            if not stat.S_ISDIR(audio.lstat().st_mode):
+                raise ValueError('invalid HA audio directory')
+            await sockets.enter_async_context(control_socket(ha_path, player, audio))
+        delay = 1
+        while not stop.is_set():
+            try:
+                if player.needs_engine_restart:
+                    await engine.close()
+                    await player.start_engine(config['initial_volume'])
+                    player.needs_engine_restart = False
+                await wire.connect()
+                await player.reconcile()
+                delay = 1
+                logger.info('player registered and reconciled')
+                while wire.ready and not stop.is_set() and not player.needs_engine_restart:
+                    try:
+                        await asyncio.wait_for(stop.wait(), timeout=1)
+                    except TimeoutError:
+                        pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning('player connection or reconciliation failed')
+            await player.disconnected()
+            await wire.close()
+            if not stop.is_set():
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=delay)
+                except TimeoutError:
+                    pass
+                delay = min(30, delay * 2)
+    finally:
+        await sockets.aclose()
+        await wire.close()
+        await player.close()
+        await media.close()
+        os.close(lockfd)
+
+
+async def check_audio(audio_device: str) -> None:
+    """Exercise the selected PCM through the same private IPC as playback."""
+    validate_audio_device(audio_device)
+    with tempfile.TemporaryDirectory(prefix='emo-audio-') as directory:
+        sample = Path(directory) / 'tone.wav'
+        rate = 48000
+        # Two seconds, stereo, low-amplitude and smoothly faded at each end.
+        frames = bytearray()
+        for i in range(2 * rate):
+            gain = min(1.0, i / 480, (2 * rate - 1 - i) / 480)
+            value = int(3000 * gain * math.sin(2 * math.pi * 440 * i / rate))
+            frames.extend(struct.pack('<hh', value, value))
+        with wave.open(str(sample), 'wb') as stream:
+            stream.setparams((2, 2, rate, 0, 'NONE', 'not compressed'))
+            stream.writeframes(frames)
+        engine = MpvPlayer(audio_device, directory)
+        try:
+            await engine.start()
+            await engine.set_volume(10)
+            await engine.load(str(sample), 'audio-check')
+            await engine.play()
+            async with asyncio.timeout(6):
+                event = await engine.events.get()
+            if (event.kind, event.run_id) != ('eof', 'audio-check'):
+                raise MpvError('audio_check_did_not_complete')
+        finally:
+            await engine.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description='EmoSonic Core-only audio daemon')
+    parser.add_argument('--config', default='/etc/emosonic-player/config.json')
+    parser.add_argument('--check-audio', metavar='ALSA_PCM',
+                        help='play a brief low-volume local test tone; no account or network needed')
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
+    for name in ('socketio', 'engineio', 'aiohttp'):
+        logging.getLogger(name).setLevel(logging.CRITICAL)
+    try:
+        if args.check_audio is not None:
+            asyncio.run(check_audio(args.check_audio))
+            logger.info('ALSA test tone completed via mpv; verify audible output at the speaker')
+        else:
+            asyncio.run(run(load_config(args.config)))
+    except MpvError as exc:
+        logger.error('mpv failed: %s; check the selected ALSA device and access', exc)
+        return 1
+    except TimeoutError:
+        logger.error('audio check timed out')
+        return 1
+    except (ValueError, OSError):
+        logger.error('daemon startup failed; check configuration and device permissions')
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

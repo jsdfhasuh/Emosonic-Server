@@ -28,7 +28,7 @@ applications or recommendation-chat calls sharing the same API credential.
   searches. A terminal inconclusive result stays unknown and does not loop.
 - Automatically back off text failures; stop a failing batch promptly. Web
   attempts are terminal for the unchanged recording, including unknown outcomes.
-  preserve good existing fields, and never alter the global recommendation gate
+  Preserve good existing fields, and never alter the global recommendation gate
   or daily recommendation ranking in this task.
 - Skip expensive full-library statistics in the background path. Keep existing
   CLI behavior and non-budgeted legacy installations compatible.
@@ -57,4 +57,7 @@ uncertain charges, and do not claim exact invoice reconciliation.
 - [x] Background integration and regression coverage: 159 focused tests run on
   Windows; 158 passed, with the previously reproduced baseline child-folder
   deletion test failing. All new budget/provider/background/routing tests pass.
-- [ ] Deployment and bounded background verification.
+- [x] Deployed `a8b5fcf`; full Linux CI passed, active settings matched, and the
+  first scheduled batch settled all three charges. Two text candidates completed;
+  one web result was rejected without overwriting existing metadata or globally
+  pausing the queue. See `2026-11-12-metadata-budget-deployment.md` for evidence.

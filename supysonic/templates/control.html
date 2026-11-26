@@ -9,6 +9,9 @@
 {% block page_title %}<span data-i18n-en="Realtime control console" data-i18n-zh="实时控制台">Realtime control console</span>{% endblock %}
 {% block page_subtitle %}<span data-i18n-en="Control live players, route queues, and inspect device state from the realtime playback workspace inside Emosonic." data-i18n-zh="在 Emosonic 实时播放工作区，掌控播放器、调度队列并查看设备状态。">Control live players, route queues, and inspect device state from the realtime playback workspace inside Emosonic.</span>{% endblock %}
 {% block body %}
+{% if strict_control_available %}
+<p><a class="btn btn-outline-secondary btn-sm" href="{{ url_for('frontend.control_index', protocol='strict_v2') }}"><span data-i18n-en="Control strict-v2 players" data-i18n-zh="控制新版播放器">Control strict-v2 players</span></a></p>
+{% endif %}
 <div class="row row-cols-1 row-cols-md-4 g-3 mb-3">
   <div class="col">
     <div class="card text-center h-100 console-metric-card console-control-accent">

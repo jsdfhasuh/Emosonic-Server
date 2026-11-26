@@ -11,7 +11,7 @@
 
 | executionStatus | 必需字段 | 禁止/条件规则 |
 | --- | --- | --- |
-| `applied` | `appliedBroadcastRevision:int>=1`、`queueIndex:int>=0`、`trackId:string`、`state:playing\|paused\|stopped`、`positionMs:int>=0`、`playbackRate:number 0.5..2.0` | 禁止 failed/error 字段；revision/deliveryId/queueIndex/trackId/state/playbackRate 必须严格匹配该 delivery target。positionMs 只校验 int、非负和媒体有效时长范围并作为设备实际观测值保存，不做精确时间位置比对。terminal revision 还必须 `state:"stopped"`、`restoreCompleted:true`；非 terminal 禁止 restoreCompleted。 |
+| `applied` | `appliedBroadcastRevision:int>=1`、`queueIndex:int>=0`、`trackId:string`、`state:playing\|paused\|stopped`、`positionMs:int>=0`、`playbackRate:number 0.5..2.0` | 禁止 failed/error 字段；revision/deliveryId/queueIndex/trackId/state/playbackRate 必须严格匹配该 delivery target。positionMs 按下文的媒体时长和历史结束记录规则校验。terminal revision 还必须 `state:"stopped"`、`restoreCompleted:true`；非 terminal 禁止 restoreCompleted。 |
 | `failed` | `failedBroadcastRevision:int>=1`、`lastAppliedBroadcastRevision:int>=0`、`errorCode:string` | `lastAppliedBroadcastRevision < failedBroadcastRevision`；`errorMessage:O string`；禁止 applied revision、queue/track/state/position/rate/restoreCompleted。 |
 
 failed errorCode 必须是 `track_load_failed|queue_apply_failed|effective_at_missed|clock_unsynchronized|rate_unsupported|restore_failed|execution_failed` 之一；errorMessage 遵守第 4.2 节脱敏与长度限制。
@@ -35,7 +35,7 @@ TerminalRecoveryRecord.terminalBroadcastRevision，failed.lastAppliedBroadcastRe
 Snapshot anchor 投影出的 `deliveryPositionMs`。这些都是 per-delivery ledger，不写回
 BroadcastSnapshot，也不改变 revision identity；同 revision resync 只替换该 pair 的 delivery ledger。
 feedback 必须匹配其所报告 revision 的该值；queueIndex/trackId/state/playbackRate 按该 delivery target
-严格校验。feedback.positionMs 是设备应用后的实际观测值；服务端只校验它是 int、非负并位于服务端
+严格校验。非 terminal 的 feedback.positionMs 是设备应用后的实际观测值；服务端只校验它是 int、非负并位于服务端
 已知的当前媒体有效时长范围内，然后原样保存。因 feedback 没有位置采样时间，服务端不得使用 delivery
 计划时间、position 差值或网络到达时间做精确时间位置比对，也不得反过来改写 canonical anchor。
 因此 Broadcast 是 soft sync：`syncStatus:"applied"` 只证明 participant 已应用所报告 revision 的完整
@@ -110,6 +110,10 @@ playbackRate 描述被销毁前的 terminal mirror target，不描述已经恢�
 Snapshot 使用 `lifecycleState:"stopped"` 且 `Snapshot.state` 保留 terminal 前最后 source/mirror anchor，
 而 terminal applied feedback 的 `state:"stopped"` 只表示镜像 execution 已销毁。terminal 校验不得要求
 feedback.state 等于 terminal Snapshot.state。
+
+服务端生成断线或结束位置时，应将按播放时间推算的位置限制在已知曲长内。终止回执仍接受曲长范围内的
+非负整数进度。若已下发的结束位置超过当前已知曲长，只允许确认本次有效 `broadcast.stop` 交付或
+压缩 `broadcast.restore` 记录中保存的那个精确越界值。这样旧记录无需改写即可完成恢复，其他越界进度仍被拒绝。
 
 服务端接受 start 时，必须为每个 ordinary participant 记录其当前唯一 authority PlaybackContext 为
 `suspendedPlaybackContextId`，并在 active 与 waitingForSource 期间建立覆盖 Context 与

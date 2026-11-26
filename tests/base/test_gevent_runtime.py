@@ -7,6 +7,65 @@ import unittest
 
 
 class GeventRuntimeTestCase(unittest.TestCase):
+    def test_flac_cache_writer_yields_to_other_requests_and_builds_once(self):
+        self.run_isolated(
+            """
+            from supysonic.server.gevent import GeventServer
+            GeventServer.prepare_runtime()
+
+            from pathlib import Path
+            from tempfile import TemporaryDirectory
+            from threading import get_native_id
+            from types import SimpleNamespace
+            from unittest.mock import patch
+
+            import gevent
+            from flask import Flask, has_app_context
+            from gevent import monkey
+            from gevent.event import Event
+            from mutagen.flac import FLAC
+            from supysonic.api import media
+            from supysonic.cache import Cache
+
+            app = Flask(__name__)
+            started = Event()
+            release = monkey.get_original("_thread", "allocate_lock")()
+            release.acquire()
+            hub_thread = get_native_id()
+            loop = gevent.get_hub().loop
+            source = Path("tests/assets/formats/silence.flac")
+            track = SimpleNamespace(path=str(source), id="track")
+            write_flac = media._write_flac_no_picture
+
+            def fetch():
+                with app.app_context():
+                    return media._get_or_create_flac_no_picture(track)
+
+            def delayed_write(source_path, output_path):
+                assert get_native_id() != hub_thread
+                assert not has_app_context()
+                loop.run_callback_threadsafe(started.set)
+                assert release.acquire(timeout=5), "request hub blocked by FLAC writer"
+                write_flac(source_path, output_path)
+
+            with TemporaryDirectory() as cache_dir:
+                app.transcode_cache = Cache(cache_dir, 1000000)
+                with patch.object(media, "_write_flac_no_picture", side_effect=delayed_write) as writer:
+                    first = gevent.spawn(fetch)
+                    assert started.wait(timeout=5)
+                    second = gevent.spawn(fetch)
+                    gevent.sleep(0)
+                    assert not first.ready() and not second.ready()
+                    release.release()
+                    path = first.get(timeout=5)
+                    assert path == second.get(timeout=5)
+                    writer.assert_called_once()
+                    assert not FLAC(path).pictures
+                    assert FLAC(source).pictures
+                    assert list(Path(cache_dir).iterdir()) == [Path(path)]
+            """
+        )
+
     def run_isolated(self, source: str, timeout: int = 30) -> str:
         env = os.environ.copy()
         env["NO_PROXY"] = "127.0.0.1,localhost"

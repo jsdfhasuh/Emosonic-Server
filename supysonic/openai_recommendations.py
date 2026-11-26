@@ -1,4 +1,4 @@
-"""Budgeted OpenAI calls shared by music profiles, daily selection and chat."""
+"""Budgeted OpenAI calls for music profiles, daily selection, chat and discovery."""
 
 from contextlib import contextmanager
 import hashlib
@@ -7,7 +7,7 @@ import logging
 import math
 import time
 from types import SimpleNamespace
-from typing import Mapping
+from typing import Mapping, Optional, Tuple
 from uuid import uuid4
 
 import requests
@@ -25,6 +25,7 @@ from .track_metadata_config import get_track_metadata_llm_config
 logger = logging.getLogger(__name__)
 STATE_KEY = "openai_recommendation_backoff"
 PROFILE_STATE_KEY = "openai_profile_sol_backoff"
+DISCOVERY_STATE_KEY = "openai_album_discovery_backoff"
 BUDGET_FIELDS = (
     "monthly_budget_usd", "budget_safety_buffer_usd", "daily_budget_usd",
     "budget_timezone",
@@ -126,28 +127,46 @@ def recommendation_lease(key: str, ttl_seconds: int = 600):
                 logger.warning("openai_recommendation_lease_release_failed")
 
 
-def _read_state(key: str) -> dict:
+def _read_state(key: str) -> Tuple[dict, Optional[str]]:
     row = Meta.get_or_none(Meta.key == key)
     if row is None:
-        return {"n": 0, "u": 0, "hard": False}
+        return {"n": 0, "u": 0, "hard": False, "accounting": False}, None
     try:
         state = json.loads(row.value)
-        if (set(state) != {"n", "u", "hard"} or type(state["n"]) is not int
+        required = {"n", "u", "hard"}
+        if (not isinstance(state, dict) or not required <= set(state) <= required | {"accounting"}
+                or type(state["n"]) is not int
                 or not 0 <= state["n"] <= 4 or type(state["u"]) is not int
-                or type(state["hard"]) is not bool):
+                or type(state["hard"]) is not bool
+                or type(state.get("accounting", False)) is not bool
+                or (state.get("accounting") and not state["hard"])):
             raise ValueError
-        return state
+        # A legacy hard pause may have been caused by uncertain accounting.
+        state.setdefault("accounting", key == STATE_KEY and state["hard"])
+        return state, row.value
     except (TypeError, ValueError):
         raise OpenAIRecommendationError("Recommendation backoff state is invalid.", reason="storage") from None
 
 
-def _pause(key: str, state: dict, *, hard: bool = False, retry_after: int = 0) -> int:
+def _pause(
+    key: str, state: dict, observed: Optional[str], *,
+    hard: bool = False, retry_after: int = 0, accounting: bool = False,
+) -> int:
     count = min(4, state["n"] + 1)
     deadline = int(time.time()) + max(min(300 * 2 ** (count - 1), 1800), retry_after)
-    value = json.dumps({"n": count, "u": deadline, "hard": hard}, separators=(",", ":"))
-    row, created = Meta.get_or_create(key=key, defaults={"value": value})
-    if not created:
-        Meta.update(value=value).where(Meta.key == key).execute()
+    value = json.dumps(
+        {"n": count, "u": deadline, "hard": hard or accounting, "accounting": accounting},
+        separators=(",", ":"),
+    )
+    if accounting:
+        (_, created) = Meta.get_or_create(key=key, defaults={"value": value})
+        if not created:
+            Meta.update(value=value).where(Meta.key == key).execute()
+    elif observed is None:
+        Meta.insert(key=key, value=value).on_conflict_ignore().execute()
+    else:
+        # A failure reported during another workload's accounting stop cannot replace it.
+        Meta.update(value=value).where(Meta.key == key, Meta.value == observed).execute()
     return deadline
 
 
@@ -187,11 +206,10 @@ def _validate_json(value: object, schema: Mapping[str, object]) -> None:
 def request_recommendation_json(config: object, messages: list, schema: dict, *,
                                 workload: str, max_output_tokens: int = 4096) -> dict:
     """Authorize exactly one HTTP call; settle before parsing or exposing content."""
-    if workload not in ("profile", "daily", "chat"):
+    if workload not in ("profile", "daily", "chat", "album_discovery"):
         raise OpenAIRecommendationError("Invalid recommendation workload.", reason="config")
     settings = validate_recommendation_settings(config, workload=workload)
     model = settings["model"]
-    state_key = PROFILE_STATE_KEY if model == PROFILE_MODEL else STATE_KEY
     wrapped = dict(schema) if "schema" in schema else {
         "name": "music_" + workload, "strict": True, "schema": schema,
     }
@@ -204,10 +222,22 @@ def request_recommendation_json(config: object, messages: list, schema: dict, *,
     try:
         allowance = reserve_request_micro_usd(payload, model=model)
         budget = MetadataBudget(settings["_budget_config"])
-        with recommendation_lease("provider") as acquired:
+        discovery = workload == "album_discovery"
+        state_key = PROFILE_STATE_KEY if model == PROFILE_MODEL else STATE_KEY
+        if discovery:
+            state_key = DISCOVERY_STATE_KEY
+        provider_lease = "provider/album-discovery" if discovery else "provider"
+        with recommendation_lease(provider_lease) as acquired:
             if not acquired:
                 raise OpenAIRecommendationError("OpenAI recommendations are busy.", reason="busy")
-            state = _read_state(state_key)
+            shared_state, shared_version = _read_state(STATE_KEY)
+            if shared_state["accounting"]:
+                raise OpenAIRecommendationError(
+                    "OpenAI recommendations are paused.", reason="paused", retry_at=shared_state["u"],
+                )
+            state, state_version = (
+                _read_state(state_key) if state_key != STATE_KEY else (shared_state, shared_version)
+            )
             if state["hard"] or state["u"] > int(time.time()):
                 raise OpenAIRecommendationError("OpenAI recommendations are paused.", reason="paused", retry_at=state["u"])
             reservation = budget.reserve("recommendation_" + workload, allowance)
@@ -220,7 +250,7 @@ def request_recommendation_json(config: object, messages: list, schema: dict, *,
                     allow_redirects=False,
                 )
             except requests.RequestException:
-                deadline = _pause(state_key, state)
+                deadline = _pause(state_key, state, state_version)
                 raise OpenAIRecommendationError("OpenAI request failed; its reservation was retained.", reason="network", retry_at=deadline) from None
             try:
                 if response.status_code != 200:
@@ -229,7 +259,7 @@ def request_recommendation_json(config: object, messages: list, schema: dict, *,
                     hard = details.get("quotaExhausted", False) or not details.get("retryable", False)
                     retry_hint = details.get("retryAfterSeconds", 0)
                     retry_hint = min(86400, max(0, int(retry_hint))) if isinstance(retry_hint, (int, float)) and math.isfinite(retry_hint) else 0
-                    deadline = _pause(state_key, state, hard=hard, retry_after=retry_hint)
+                    deadline = _pause(state_key, state, state_version, hard=hard, retry_after=retry_hint)
                     raise OpenAIRecommendationError("OpenAI rejected the recommendation request.", reason="upstream", retry_at=deadline)
                 try:
                     result = response.json()
@@ -239,21 +269,20 @@ def request_recommendation_json(config: object, messages: list, schema: dict, *,
                 response.close()
             cost = response_cost_micro_usd(result, model=model) if isinstance(result, dict) else None
             if cost is None:
-                _pause(state_key, state, hard=True)
+                _pause(STATE_KEY, shared_state, shared_version, accounting=True)
                 raise OpenAIRecommendationError("OpenAI usage could not be verified; reservation retained.", reason="accounting")
             try:
                 budget.settle(reservation, cost)
             except BudgetUnavailable:
-                _pause(state_key, state, hard=True)
+                _pause(STATE_KEY, shared_state, shared_version, accounting=True)
                 raise
             if cost > allowance:
-                _pause(state_key, state, hard=True)
+                _pause(STATE_KEY, shared_state, shared_version, accounting=True)
                 raise OpenAIRecommendationError("OpenAI usage exceeded its reservation.", reason="accounting")
-            Meta.delete().where(Meta.key == state_key).execute()
-            logger.info(
-                "openai_recommendation_accounted workload=%s cost_micro_usd=%s model=%s",
-                workload, cost, model,
-            )
+            if state_version is not None:
+                Meta.delete().where(Meta.key == state_key, Meta.value == state_version).execute()
+            logger.info("openai_recommendation_accounted workload=%s cost_micro_usd=%s model=%s",
+                        workload, cost, model)
             try:
                 choice = result["choices"][0]
                 if choice.get("finish_reason") != "stop" or choice["message"].get("refusal"):

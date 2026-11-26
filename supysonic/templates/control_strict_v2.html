@@ -9,10 +9,11 @@
 {% block page_title %}<span data-i18n-en="Realtime control console" data-i18n-zh="实时控制台">Realtime control console</span>{% endblock %}
 {% block page_subtitle %}<span data-i18n-en="Control strict-v2 players, inspect PlaybackContext state, and coordinate broadcast or handoff from one focused workspace." data-i18n-zh="在统一工作区中控制 strict-v2 播放器、检查 PlaybackContext，并协调群播与播放迁移。">Control strict-v2 players, inspect PlaybackContext state, and coordinate broadcast or handoff from one focused workspace.</span>{% endblock %}
 {% block body %}
-<main class="strict-control-workspace" id="strict-control-root" data-meta-url="{{ url_for('frontend.control_track_meta') }}">
+<main class="strict-control-workspace" id="strict-control-root" data-meta-url="{{ url_for('frontend.control_track_meta') }}" data-search-url="{{ url_for('frontend.player_search') }}">
   <div class="strict-control-toolbar mb-3">
     <div class="d-flex flex-wrap align-items-center gap-2">
       <span class="console-scope-badge scope-device">PlaybackContext strict-v2 2.9.0</span>
+      <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('frontend.control_index', protocol='legacy') }}"><span data-i18n-en="Control legacy players" data-i18n-zh="控制旧版播放器">Control legacy players</span></a>
       <span class="strict-control-state-pill" id="strict-control-context">no context</span>
       <span class="strict-control-state-pill" id="strict-control-broadcast">no broadcast</span>
       <span class="strict-control-state-pill" id="strict-control-handoff">no handoff</span>
@@ -134,6 +135,20 @@
               </div>
             </div>
             <ul class="strict-queue" id="strict-control-queue"></ul>
+            <section class="mt-3 d-none" id="strict-initial-queue">
+              <h4 class="h6" data-i18n-en="Choose songs for this player" data-i18n-zh="为这台设备选曲">Choose songs for this player</h4>
+              <form class="input-group" id="strict-library-search">
+                <input class="form-control" id="strict-library-query" aria-label="Search songs / 搜索歌曲">
+                <button class="btn btn-outline-secondary" data-i18n-en="Search library" data-i18n-zh="搜索曲库">Search library</button>
+              </form>
+              <div class="input-group my-2">
+                <select class="form-select" id="strict-library-results" aria-label="Search results / 搜索结果"></select>
+                <button class="btn btn-outline-secondary" id="strict-library-add" type="button" data-i18n-en="Add song" data-i18n-zh="添加歌曲">Add song</button>
+              </div>
+              <ol id="strict-initial-tracks" class="mb-2"></ol>
+              <button class="btn btn-primary btn-sm" type="button" id="strict-initial-submit" disabled data-i18n-en="Create queue" data-i18n-zh="建立队列">Create queue</button>
+              <span class="console-muted ms-2" id="strict-initial-status" role="status"></span>
+            </section>
           </div>
         </div>
       </section>
@@ -256,6 +271,14 @@
   };
   let refreshBindingsPromise = null;
   let refreshBindingsQueued = false;
+  const picker = document.getElementById('strict-initial-queue');
+  const draftList = document.getElementById('strict-initial-tracks');
+  const searchResults = document.getElementById('strict-library-results');
+  let draftContextId = null;
+  let pendingPrepare = null;
+  let libraryRequest = 0;
+  // Allow the server's 10-second prepare transaction to settle before a status check.
+  const prepareConfirmationTimeoutMs = 12000;
   const capabilities = {
     playbackContextV2: true,
     playbackPrepare: false,
@@ -355,6 +378,22 @@
     const selected = selectedDevice();
     const targetCapabilities = selected?.capabilities || {};
     const hasPlayableQueue = Boolean(state.context?.queueSongIds?.length);
+    const canChoose = Boolean(state.context && !hasPlayableQueue && targetCapabilities.canPlay);
+    picker.classList.toggle('d-none', !canChoose);
+    if (pendingPrepare && (hasPlayableQueue || pendingPrepare.contextId !== state.selectedContextId)) {
+      clearPendingPrepare();
+    }
+    if (draftContextId !== state.selectedContextId || (hasPlayableQueue && draftList.children.length)) {
+      draftContextId = state.selectedContextId;
+      ++libraryRequest;
+      draftList.replaceChildren();
+      searchResults.replaceChildren();
+      document.getElementById('strict-library-query').value = '';
+      text('strict-initial-status', '');
+    }
+    document.getElementById('strict-initial-submit').disabled = !canChoose ||
+      !draftList.children.length || state.client?.state !== 'ready' || state.controlBusy ||
+      pendingPrepare?.contextId === state.selectedContextId;
     const actionCapability = {
       'player.play': 'canPlay',
       'player.pause': 'canPause',
@@ -429,6 +468,92 @@
       const response = await fetch(`${root.dataset.metaUrl}?${params}`, { credentials: 'same-origin' });
       if (!response.ok) throw new Error(`曲目元数据加载失败 (${response.status})`);
       Object.assign(state.trackMeta, await response.json());
+    }
+  }
+
+  async function searchLibrary() {
+    const requestNumber = ++libraryRequest;
+    const url = new URL(root.dataset.searchUrl, window.location.href);
+    url.searchParams.set('q', document.getElementById('strict-library-query').value.trim());
+    try {
+      const response = await fetch(url, { credentials: 'same-origin' });
+      if (!response.ok) throw new Error(i18n('Library search failed', '曲库搜索失败'));
+      const data = await response.json();
+      if (requestNumber !== libraryRequest) return;
+      searchResults.replaceChildren(...data.tracks.map(track => new Option(track.label, track.id)));
+      text('strict-initial-status', data.tracks.length ? '' : i18n('No songs found', '未找到歌曲'));
+    } catch (error) {
+      if (requestNumber === libraryRequest) showError(error.message);
+    }
+  }
+
+  function addInitialTrack() {
+    const track = searchResults.selectedOptions[0];
+    if (!track || Array.from(draftList.children).some(item => item.dataset.trackId === track.value)) return;
+    const item = document.createElement('li');
+    item.dataset.trackId = track.value;
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'btn btn-link btn-sm';
+    remove.textContent = i18n('Remove', '移除');
+    remove.onclick = () => { item.remove(); updateCapabilityUi(); };
+    item.append(document.createTextNode(track.text), remove);
+    draftList.append(item);
+    updateCapabilityUi();
+  }
+
+  function clearPendingPrepare() {
+    if (pendingPrepare) clearTimeout(pendingPrepare.timer);
+    pendingPrepare = null;
+  }
+
+  async function checkUnconfirmedPrepare(intent) {
+    if (pendingPrepare !== intent) return;
+    try {
+      await refreshSelected();
+      if (pendingPrepare === intent) {
+        text('strict-initial-status', i18n('Player has not confirmed the queue. Try again.', '播放器尚未确认队列，可以重试。'));
+      }
+    } catch (error) {
+      if (pendingPrepare === intent) {
+        text('strict-initial-status', '');
+        showError(error.message);
+      }
+    } finally {
+      if (pendingPrepare === intent) {
+        clearPendingPrepare();
+        updateCapabilityUi();
+      }
+    }
+  }
+
+  async function prepareInitialQueue() {
+    const context = state.context;
+    if (!context || context.queueSongIds.length || pendingPrepare?.contextId === context.playbackContextId) return;
+    const ids = Array.from(draftList.children, item => item.dataset.trackId);
+    api.validateQueue(ids, 0);
+    const intent = { contextId: context.playbackContextId, id: api.uuid(), timer: null };
+    pendingPrepare = intent;
+    text('strict-initial-status', i18n('Waiting for player…', '正在等待播放器确认…'));
+    updateCapabilityUi();
+    try {
+      await state.client.request('playback.context.prepare', {
+        playbackContextId: intent.contextId, intentId: intent.id,
+        baseControlVersion: context.controlVersion, initialQueueSongIds: ids,
+        currentIndex: 0, positionMs: 0,
+      });
+      // The ACK accepts the request. Only the authority can publish the new queue.
+      if (pendingPrepare === intent) {
+        intent.timer = setTimeout(() => checkUnconfirmedPrepare(intent), prepareConfirmationTimeoutMs);
+        await refreshSelected();
+      }
+    } catch (error) {
+      if (pendingPrepare === intent) {
+        clearPendingPrepare();
+        text('strict-initial-status', '');
+        showError(error.message);
+        updateCapabilityUi();
+      }
     }
   }
 
@@ -781,6 +906,7 @@
       state.selectedContextId = null;
       state.context = null;
       state.deviceStates = [];
+      updateCapabilityUi();
       await state.client.unsubscribe(previousContextId).catch(() => {});
       if (generation !== state.selectionGeneration) return;
     }
@@ -1142,6 +1268,15 @@
       }
     } else if (action === 'playback.context.status' && message.payload.playbackContext.playbackContextId === state.selectedContextId) {
       applyStatus(message.payload);
+    } else if (action === 'playback.context.prepared' && pendingPrepare &&
+        message.payload.playbackContextId === pendingPrepare.contextId && message.payload.intentId === pendingPrepare.id) {
+      clearPendingPrepare();
+      if (message.payload.playbackContextId === state.selectedContextId) {
+        text('strict-initial-status', '');
+        if (!message.payload.ready) showError(message.payload.errorCode);
+        updateCapabilityUi();
+        refreshSelected().catch(error => showError(error.message));
+      }
     } else if (action === 'queue.context.sync' && message.payload.playbackContextId === state.selectedContextId) {
       const cursor = state.client.cursor(state.selectedContextId);
       if (cursor) {
@@ -1153,6 +1288,12 @@
       const next = { ...message.payload, clientId: message.payload.sourceClientId };
       if (index >= 0) state.deviceStates[index] = next; else state.deviceStates.push(next);
       renderContext().catch((error) => showError(error.message));
+      if (next.sourceClientId === state.context?.authorityClientId &&
+          (next.appliedControlVersion > state.context.controlVersion ||
+           (next.trackId && next.trackId !== currentTrackId()) ||
+           next.state !== state.context.state)) {
+        refreshSelected().catch(error => showError(error.message));
+      }
     } else if (action === 'playback.context.closed' && message.payload.playbackContextId === state.selectedContextId) {
       state.client.forgetSubscription(message.payload.playbackContextId);
       unsubscribeSelected(true).then(refreshBindings);
@@ -1186,6 +1327,14 @@
   }
 
   function bindUi() {
+    document.getElementById('strict-library-search').addEventListener('submit', event => {
+      event.preventDefault();
+      searchLibrary();
+    });
+    document.getElementById('strict-library-add').addEventListener('click', addInitialTrack);
+    document.getElementById('strict-initial-submit').addEventListener('click', () => {
+      prepareInitialQueue().catch(error => showError(error.message));
+    });
     text('strict-control-client-id', clientId);
     text('strict-control-device-id', deviceSessionId);
     document.getElementById('strict-device-volume').addEventListener('input', (event) => {
@@ -1255,6 +1404,10 @@
         capabilities,
       },
       onState(connectionState, detail) {
+        if (['offline', 'disconnected', 'protocol_error'].includes(connectionState)) {
+          clearPendingPrepare();
+          text('strict-initial-status', '');
+        }
         const connection = document.getElementById('strict-control-connection');
         connection.textContent = connectionState;
         connection.dataset.state = connectionState;

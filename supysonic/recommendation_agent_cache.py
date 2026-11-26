@@ -117,6 +117,7 @@ def clear_recommendation_agent_cache(user) -> int:
             ~RecommendationAgentCache.message.in_((
                 "__openai_profile_v1__", "__openai_profile_attempt_v1__",
                 "__openai_daily_v1__", "__openai_daily_attempt_v1__",
+                "__cn_album_discovery_v1__",
             )),
         )
         .execute()

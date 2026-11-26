@@ -8,10 +8,16 @@
 import logging
 import time
 
-from multiprocessing.connection import Listener, Client
+from multiprocessing.connection import Client, Listener, answer_challenge, deliver_challenge
 from threading import Thread, Event
 
 from .client import DaemonCommand
+from ..album_discovery_service import AlbumDiscoveryError, AlbumDiscoveryService
+from ..album_discovery_settings import (
+    AlbumDiscoverySettingsError,
+    album_discovery_target_user,
+    load_album_discovery_settings,
+)
 from ..db import Folder, open_connection, close_connection
 from ..jukebox import Jukebox
 from ..logging_utils import format_log_event
@@ -50,6 +56,7 @@ class Daemon:
     def __init__(self, config):
         self.__config = config
         self.__listener = None
+        self.__authkey = None
         self.__watcher = None
         self.__scanner = None
         self.__jukebox = None
@@ -80,9 +87,8 @@ class Daemon:
             )
 
     def run(self):
-        self.__listener = Listener(
-            address=self.__config.DAEMON["socket"], authkey=get_secret_key("daemon_key")
-        )
+        self.__authkey = get_secret_key("daemon_key")
+        self.__listener = Listener(address=self.__config.DAEMON["socket"])
         logger.info(format_log_event("daemon", "listening", socket=self.__listener.address))
 
         if self.__config.DAEMON["run_watcher"]:
@@ -111,11 +117,28 @@ class Daemon:
             time.sleep(1)
 
     def __listen(self):
-        while not self.__stopped.is_set():
-            conn = self.__listener.accept()
-            self.__handle_connection(conn)
-
-        self.__listener.close()
+        try:
+            while not self.__stopped.is_set():
+                try:
+                    conn = self.__listener.accept()
+                except ConnectionError as exc:
+                    logger.warning(format_log_event(
+                        "daemon", "rpc_connection_rejected", error_type=type(exc).__name__,
+                    ))
+                    continue
+                with conn:
+                    try:
+                        # Authenticate inside the accepted connection's lifetime.
+                        # These are the two checks normally made by Listener.accept().
+                        deliver_challenge(conn, self.__authkey)
+                        answer_challenge(conn, self.__authkey)
+                        self.__handle_connection(conn)
+                    except Exception as exc:
+                        logger.warning(format_log_event(
+                            "daemon", "rpc_client_failed", error_type=type(exc).__name__,
+                        ))
+        finally:
+            self.__listener.close()
 
     def __get_recommend_refresh_interval(self):
         return max(60, int(self.__config.DAEMON.get("recommend_refresh_interval", 300)))
@@ -200,6 +223,38 @@ class Daemon:
             self.__get_recommend_refresh_interval(),
             enabled=openai_profile_enabled(self.__config),
         )
+        discovery_configured = bool(album_discovery_target_user(self.__config))
+        self.__scheduler.register(
+            "album-discovery-nightly",
+            self.__run_album_discovery,
+            self.__get_recommend_refresh_interval(),
+            enabled=discovery_configured,
+        )
+        self.__scheduler.register(
+            "album-discovery-reconcile",
+            self.__reconcile_album_discovery,
+            self.__get_recommend_refresh_interval(),
+            enabled=discovery_configured,
+        )
+
+    def __run_album_discovery(self) -> dict:
+        try:
+            settings = load_album_discovery_settings(self.__config)
+            if not settings.auto_submit:
+                return {"status": "paused"}
+            return AlbumDiscoveryService.from_config(self.__config).run_nightly()
+        except (AlbumDiscoveryError, AlbumDiscoverySettingsError) as exc:
+            logger.warning("Album discovery scheduling unavailable: %s", exc)
+            return {"status": "unavailable"}
+
+    def __reconcile_album_discovery(self) -> dict:
+        try:
+            return AlbumDiscoveryService.from_config(
+                self.__config, with_catalog=False
+            ).reconcile_orders()
+        except (AlbumDiscoveryError, AlbumDiscoverySettingsError) as exc:
+            logger.warning("Album discovery reconciliation unavailable: %s", exc)
+            return {"status": "unavailable"}
 
     def __run_review_task_maintenance(self):
         return runReviewTaskMaintenance()
@@ -523,7 +578,7 @@ class Daemon:
             self.__watcher.remove_folder(folder.path)
 
     def terminate(self):
-        with Client(self.__listener.address, authkey=self.__listener._authkey) as c:
+        with Client(self.__listener.address, authkey=self.__authkey) as c:
             self.__stopped.set()
             c.send(None)
 

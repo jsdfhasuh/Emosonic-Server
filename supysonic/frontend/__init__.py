@@ -60,6 +60,10 @@ from ..emo.browser_auth import (
     browser_one_time_passwords,
 )
 from ..emo.follow_store import getFollowSafetyLeaseForFollower
+from ..emo.strict_v2_readiness import (
+    get_effective_profile_readiness,
+    is_local_test_evidence_allowed,
+)
 from ..emo.ws_store import listUserPlaybackContexts
 from ..home_smart_cards import build_home_smart_cards
 from ..managers.user import UserManager
@@ -895,7 +899,7 @@ def _build_recommendation_context(user, count: int) -> Dict[str, object]:
         if getattr(track, "album_id", None) is not None
     }
     total_duration = sum(track.duration or 0 for track in tracks)
-    track_reasons = buildRecommendationReasonMap(user, tracks)
+    track_reasons = buildRecommendationReasonMap(user, tracks, playlist=playlist)
 
     return {
         "playlist": playlist,
@@ -1598,12 +1602,24 @@ def admin_tasks_data():
 @login_only
 def control_index() -> str:
     bootstrap = _emo_browser_bootstrap()
+    config = current_app.config["WEBAPP"]
+    core_ready = get_effective_profile_readiness(
+        config,
+        allow_local_test_evidence=is_local_test_evidence_allowed(config, current_app.testing),
+    )["core"]
+    strict_available = core_ready or bootstrap["protocol"] == "strict_v2"
+    protocol = request.args.get("protocol")
+    if protocol not in ("legacy", "strict_v2"):
+        protocol = "strict_v2" if core_ready else bootstrap["protocol"]
+    bootstrap["protocol"] = protocol if strict_available else "legacy"
     template = (
         "control_strict_v2.html"
         if bootstrap["protocol"] == "strict_v2"
         else "control.html"
     )
-    return render_template(template, emo_web_bootstrap=bootstrap)
+    return render_template(
+        template, emo_web_bootstrap=bootstrap, strict_control_available=strict_available
+    )
 
 
 PLAYER_SEARCH_LIMIT = 50
@@ -1821,3 +1837,4 @@ from .mood_playlists import *
 from .music_requests import *
 from .metadata import *
 from .share import *
+from .album_discovery import *

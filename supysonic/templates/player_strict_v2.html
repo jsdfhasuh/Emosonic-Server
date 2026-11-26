@@ -909,6 +909,7 @@
         queueSongIds: state.queue.slice(),
         currentIndex: state.index,
         positionMs,
+        positionSampledAtServerMs: Math.round(state.client.serverNowMs()),
         baseQueueRevision: cursor.queueRevision,
         baseControlVersion: cursor.controlVersion,
       });

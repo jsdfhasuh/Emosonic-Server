@@ -9,7 +9,7 @@ import logging
 import time
 import uuid
 from types import SimpleNamespace
-from typing import Any, Iterable, List, Set
+from typing import Any, Iterable, List, Optional, Set
 
 from flask import current_app, request
 
@@ -246,8 +246,10 @@ def _get_filtered_recommended_tracks(
     return recommended_tracks
 
 
-def _as_recommended_track_entries(user, client, tracks: List[Track]) -> List[dict]:
-    reason_map = buildRecommendationReasonMap(user, tracks)
+def _as_recommended_track_entries(
+    user, client, tracks: List[Track], *, playlist: Optional[Playlist] = None
+) -> List[dict]:
+    reason_map = buildRecommendationReasonMap(user, tracks, playlist=playlist)
     entries = []
     for track in tracks:
         entry = track.as_subsonic_child(user, client)
@@ -467,6 +469,7 @@ def get_recommended_playlists():
             request.user,
             request.client,
             recommended_tracks,
+            playlist=recommended_playlist,
         )
         _log_recommended_playlist_served(
             user,

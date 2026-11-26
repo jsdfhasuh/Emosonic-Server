@@ -200,6 +200,30 @@ class MediaTestCase(ApiTestBase):
             self.assertEqual(len(FLAC(BytesIO(rv.data)).pictures), 0)
         self.assertEqual(Track[trackid].play_count, 1)
 
+    def test_flac_no_picture_retry_and_cached_range(self):
+        track_id = self.format_trackids["flac"]
+        args = {
+            "u": "alice", "p": "Alic3", "c": "tests", "v": self.apiVersion,
+            "id": str(track_id), "variant": "flac_no_picture",
+        }
+        endpoint = "/rest/stream.view"
+        with patch("supysonic.api.media._write_flac_no_picture", side_effect=OSError):
+            with closing(self.client.head(endpoint, query_string=args)) as response:
+                self.assertEqual(response.status_code, 500)
+
+        with closing(self.client.head(endpoint, query_string=args)) as response:
+            self.assertEqual(response.status_code, 200)
+            length = int(response.headers["Content-Length"])
+        with patch("supysonic.api.media._write_flac_no_picture") as writer:
+            with closing(self.client.get(
+                endpoint, query_string=args, headers={"Range": "bytes=0-0"}
+            )) as response:
+                self.assertEqual(response.status_code, 206)
+                self.assertEqual(response.headers["Content-Range"], f"bytes 0-0/{length}")
+                self.assertEqual(response.data, b"f")
+            writer.assert_not_called()
+        self.assertEqual(Track[track_id].play_count, 0)
+
     def test_stream_media_headers_tolerate_none_images(self):
         trackid = self.format_trackids["mp3"]
         args = {

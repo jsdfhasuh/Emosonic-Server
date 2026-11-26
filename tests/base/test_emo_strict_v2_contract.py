@@ -396,6 +396,22 @@ class StrictV2ContractTestCase(unittest.TestCase):
         with self.assertRaises(StrictRequestValidationError):
             validate_strict_request(disabled_context)
 
+    def test_queue_replacement_requires_a_bounded_distinct_list_and_valid_index(self):
+        request = {
+            "type": "command", "action": "queue.playItem", "requestId": "replace",
+            "payload": {"playbackContextId": "context", "baseQueueRevision": 1,
+                        "baseControlVersion": 1, "queueIndex": 0},
+        }
+        validate_strict_request(request)
+        for songs, index in (([], 0), (["one", "one"], 0), (["one"], 1),
+                             ("one", 0), ([""], 0), ([str(n) for n in range(1001)], 0)):
+            with self.subTest(size=len(songs), index=index):
+                request["payload"].update(queueSongIds=songs, queueIndex=index)
+                with self.assertRaises(StrictRequestValidationError):
+                    validate_strict_request(request)
+        request["payload"].update(queueSongIds=["one", "two"], queueIndex=1)
+        validate_strict_request(request)
+
     def test_rejects_business_and_transport_limits(self):
         request = {
             "type": "command",
