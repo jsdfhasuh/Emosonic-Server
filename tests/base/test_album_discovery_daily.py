@@ -52,7 +52,9 @@ class AlbumDiscoveryDailyTestCase(TestBase):
         super().setUp()
         self.user = User.get(User.name == "alice")
         self.other = User.get(User.name == "bob")
-        self.root = Folder.create(root=True, name="Root", path="/discovery-library")
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Folder.create(root=True, name="Root", path=str(Path(directory.name).resolve()))
         self.number = 0
         self.clock = patch(
             "supysonic.album_discovery_daily.database_now",
@@ -70,6 +72,10 @@ class AlbumDiscoveryDailyTestCase(TestBase):
     ) -> Track:
         self.number += 1
         album = album or self._album(f"Artist {self.number}", f"Album {self.number}")
+        if path is None:
+            path = Path(self.root.path) / album.artist.name / album.name / f"{self.number}.flac"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(title.encode("utf-8"))
         return Track.create(
             title=title,
             disc=1,
@@ -77,7 +83,7 @@ class AlbumDiscoveryDailyTestCase(TestBase):
             duration=duration,
             artist=album.artist,
             album=album,
-            path=str(path) if path is not None else f"/discovery-library/{self.number}.flac",
+            path=str(path),
             bitrate=320,
             last_modification=1,
             root_folder=self.root,
@@ -109,7 +115,12 @@ class AlbumDiscoveryDailyTestCase(TestBase):
                 {"song_id": catalog_id} for catalog_id, _ in song_tracks
             ]}),
             reconciliation=json.dumps({"tracks": [
-                {"song_id": catalog_id, "track_id": str(item.id), "status": "verified"}
+                {
+                    "song_id": catalog_id, "track_id": str(item.id), "status": "verified",
+                    "path": Path(item.path).relative_to(self.root.path).as_posix(),
+                    "size": Path(item.path).stat().st_size,
+                    "sha256": sha256(Path(item.path).read_bytes()).hexdigest(),
+                }
                 for catalog_id, item in song_tracks
             ]}),
             ready_at=ready_at,
@@ -240,7 +251,8 @@ class AlbumDiscoveryDailyTestCase(TestBase):
         # The ordinary daily rank already selected the representative at a lower slot.
         ordinary_rank = regular[:49]
         ordinary_rank.insert(41, representative)
-        self.assertEqual(self._create_daily(fixture["placement_day"], ordinary_rank), 1)
+        with patch("supysonic.album_discovery_delivery._stream_sha256", side_effect=AssertionError):
+            self.assertEqual(self._create_daily(fixture["placement_day"], ordinary_rank), 1)
         actual = getRecommendedPlaylistForDay(self.user, fixture["placement_day"])
         actual_ids = [track.id for track in actual.get_tracks()]
         expected = regular[:3] + [representative] + regular[3:49]
@@ -310,6 +322,27 @@ class AlbumDiscoveryDailyTestCase(TestBase):
         self.assertEqual(tracks, ordinary)
         self.assertEqual(playlist.get_tracks(), ordinary)
         self.assertFalse(AlbumDiscoveryPlacement.select().exists())
+
+    def test_missing_or_replaced_album_file_skips_placement_with_index_intact(self) -> None:
+        ordinary = self._ordinary(4)
+        representative = self._track("Representative")
+        sibling = self._track("Other recording", representative.album, number=2)
+        self._store_ready_selection("307", representative, album_tracks=[representative, sibling])
+        path = Path(sibling.path)
+        original = path.read_bytes()
+        path.unlink()
+
+        for day in ("2026-11-27", "2026-11-28"):
+            _, created, tracks = _save_new_recommended_playlist(self.user, day, ordinary, 4, 3)
+            self.assertTrue(created)
+            self.assertEqual(tracks, ordinary)
+            self.assertFalse(AlbumDiscoveryPlacement.select().exists())
+            path.write_bytes(b"x" * len(original))
+
+        # A legacy receipt (SHA-256 but no timestamps) can verify restored content.
+        path.write_bytes(original)
+        _, _, tracks = _save_new_recommended_playlist(self.user, "2026-11-29", ordinary, 4, 3)
+        self.assertEqual(tracks[3], representative)
 
     def test_preserves_artist_cap_and_shifts_other_ready_albums_to_future_days(self) -> None:
         ordinary = self._ordinary(10)

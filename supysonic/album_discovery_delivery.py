@@ -8,7 +8,7 @@ import unicodedata
 from dataclasses import asdict, dataclass, replace
 from os import stat_result
 from pathlib import Path, PurePosixPath
-from typing import Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import BinaryIO, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from mediafile import MediaFile, UnreadableFileError
 
@@ -40,6 +40,8 @@ class ReconciledTrack:
     sha256: Optional[str] = None
     size: Optional[int] = None
     batch_id: Optional[str] = None
+    verified_path: Optional[str] = None
+    file_identity: Optional[List[int]] = None
 
 
 @dataclass(frozen=True)
@@ -180,15 +182,48 @@ def _same_duration(seconds: object, milliseconds: int) -> bool:
 
 
 def _sha256(file: Path) -> str:
-    digest = hashlib.sha256()
     with file.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
+        return _stream_sha256(stream)
+
+
+def _stream_sha256(stream: BinaryIO) -> str:
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
     return digest.hexdigest()
 
 
-def _file_identity(value: stat_result) -> tuple:
-    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
+def _file_identity(value: stat_result) -> List[int]:
+    return [value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns]
+
+
+def verified_file_is_current(indexed_path: str, evidence: Mapping[str, object]) -> bool:
+    """Check this indexed audio file against its last successful reconciliation."""
+    relative = parse_delivery_path(evidence.get("path"))
+    digest = evidence.get("sha256")
+    size = evidence.get("size")
+    if relative is None or not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+        return False
+    file = Path(indexed_path)
+    if (
+        type(size) is not int or size <= 0 or not file.is_absolute()
+        or file.parts[-len(relative.parts):] != relative.parts
+        or evidence.get("verified_path") not in (None, str(file))
+    ):
+        return False
+    try:
+        before = file.stat()
+        if not stat.S_ISREG(before.st_mode) or before.st_size != size or file.resolve() != file:
+            return False
+        identity = _file_identity(before)
+        with file.open("rb") as stream:
+            if evidence.get("file_identity") != identity:
+                # Older receipts and changed files must prove they contain the verified audio.
+                if _stream_sha256(stream) != digest:
+                    return False
+        return _file_identity(file.stat()) == identity
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 def _result(
@@ -282,7 +317,10 @@ def _inspect_path(
         or not _same_duration(indexed.duration, track.duration_ms)
     ):
         return _result(track, "index_conflict", path, receipt=receipt)
-    return _result(track, "", path, indexed, receipt)
+    return replace(
+        _result(track, "", path, indexed, receipt),
+        verified_path=str(file), file_identity=_file_identity(before),
+    )
 
 
 def _select_tracks(

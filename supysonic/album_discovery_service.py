@@ -495,7 +495,7 @@ class AlbumDiscoveryService:
         if current.hour < self.runtime.auto_submit_hour:
             return {"status": "waiting"}
         settings = load_album_discovery_settings(self.config)
-        if not settings.auto_submit or settings.max_albums_per_day == 0:
+        if not settings.auto_submit:
             return {"status": "paused"}
         with connection_scope():
             user = User.get_or_none(User.name == self.runtime.target_user)
@@ -530,7 +530,8 @@ class AlbumDiscoveryService:
                 logger.info("Album discovery skipped album %s: %s", candidate.album.album_id, exc)
                 continue
             counts[outcome.status] = counts.get(outcome.status, 0) + 1
-            if outcome.status in ("limit_reached", "submission_disabled", "wait_oracle"):
+            # Later candidates may already be local or in flight and need no new slot.
+            if outcome.status == "submission_disabled":
                 break
         return {"status": "complete", **counts}
 

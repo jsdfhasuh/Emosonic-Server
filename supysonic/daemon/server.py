@@ -223,7 +223,7 @@ class Daemon:
     def __run_album_discovery(self) -> dict:
         try:
             settings = load_album_discovery_settings(self.__config)
-            if not settings.auto_submit or settings.max_albums_per_day == 0:
+            if not settings.auto_submit:
                 return {"status": "paused"}
             return AlbumDiscoveryService.from_config(self.__config).run_nightly()
         except (AlbumDiscoveryError, AlbumDiscoverySettingsError) as exc:

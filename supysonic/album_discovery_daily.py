@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Sequence, Set
 from uuid import UUID
 
+from .album_discovery_delivery import verified_file_is_current
 from .album_discovery_quota import SHANGHAI, STOREFRONT, SUBMITTED
 from .db import (
     AlbumDiscoveryOrder,
@@ -192,8 +193,7 @@ def get_playlist_discovery_reason(
     return {str(placement.track_id): reason}
 
 
-def _matched_track_ids(reconciliation: str) -> Dict[str, UUID]:
-    data = _read_json(reconciliation)
+def _matched_track_ids(data: object) -> Dict[str, UUID]:
     matches = data.get("tracks") if isinstance(data, dict) else None
     if not isinstance(matches, list):
         return {}
@@ -223,18 +223,27 @@ def _matches_current_library(selection: AlbumDiscoverySelection, representative:
         item["song_id"] for item in expected
         if isinstance(item, dict) and isinstance(item.get("song_id"), str)
     }
-    matched = _matched_track_ids(release.reconciliation)
+    evidence = _read_json(release.reconciliation)
+    matched = _matched_track_ids(evidence)
     if (
         len(expected_ids) != len(expected)
         or matched.keys() != expected_ids
+        or len(evidence["tracks"]) != len(expected)
         or matched.get(selection.representative_song_id) != representative.id
         or len(set(matched.values())) != len(expected)
     ):
         return False
-    # A previously verified release may have changed since the last library scan.
-    return Track.select().where(
-        (Track.album == representative.album_id) & Track.id.in_(tuple(matched.values()))
-    ).count() == len(expected)
+    indexed = dict(
+        Track.select(Track.id, Track.path).where(
+            (Track.album == representative.album_id) & Track.id.in_(tuple(matched.values()))
+        ).tuples()
+    )
+    if len(indexed) != len(expected):
+        return False
+    return all(
+        verified_file_is_current(indexed[matched[item["song_id"]]], item)
+        for item in evidence["tracks"]
+    )
 
 
 def _observe_listening(
@@ -257,7 +266,7 @@ def _observe_listening(
         repeat = representative_plays.where(
             (activity.time > first_time) & (activity.time <= last_time)
         ).exists()
-        eligible_ids = set(_matched_track_ids(placement.selection.release.reconciliation).values())
+        eligible_ids = set(_matched_track_ids(_read_json(placement.selection.release.reconciliation)).values())
         eligible_ids.discard(placement.track_id)
         if eligible_ids:
             other_ids = sorted(

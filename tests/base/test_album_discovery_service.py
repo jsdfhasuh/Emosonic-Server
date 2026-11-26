@@ -174,13 +174,49 @@ class AlbumDiscoveryServiceTestCase(unittest.TestCase):
         self.assertEqual(self.service.run_nightly(now=self.now), {"status": "paused"})
         self.assertEqual(self.confirm(preview, "103").status, "submitted")
         self.write_policy(3, True)
+        self.oracle.external["105"] = "subscription-105"
         first = self.service.run_nightly(now=self.now)
         self.assertEqual(first["submitted"], 2)
         self.assertEqual(first["limit_reached"], 1)
+        self.assertEqual(first["associated"], 1)
         self.service.run_nightly(now=self.now + timedelta(minutes=5))
-        self.assertEqual(self.confirm(preview, "105").status, "limit_reached")
+        self.assertEqual(self.confirm(preview, "104").status, "limit_reached")
         self.assertEqual([call[0] for call in self.oracle.attempts], ["103", "101", "102"])
         self.assertEqual(get_album_download_quota("main", 3, now=self.now).remaining, 0)
+
+    def test_zero_quota_reuses_later_local_and_inflight_albums(self) -> None:
+        item = self.candidates[3]
+        source = Path(__file__).parents[1] / "assets" / "formats" / "silence.flac"
+        duration = MediaFile(str(source)).length
+        expected = replace(item.album.tracks[0], duration_ms=round(duration * 1000))
+        album = replace(item.album, tracks=(expected,))
+        self.candidates = (*self.candidates[:3], replace(item, album=album), self.candidates[4])
+        self.catalog.releases[album.album_id] = album
+        path = self.root / album.artist / album.title / "01 track.flac"
+        path.parent.mkdir(parents=True)
+        shutil.copyfile(source, path)
+        media = MediaFile(str(path))
+        media.title, media.album = expected.title, album.title
+        media.artist = media.albumartist = album.artist
+        media.disc, media.track = 1, 1
+        media.save()
+        folder = db.Folder.create(name="Test library", path=str(self.root), root=True)
+        artist = db.Artist.create(name=album.artist)
+        local_album = db.Album.create(name=album.title, artist=artist)
+        db.Track.create(
+            title=expected.title, disc=1, number=1, album=local_album, artist=artist,
+            root_folder=folder, folder=folder, path=str(path), duration=round(duration),
+            bitrate=320, last_modification=1,
+        )
+        self.oracle.external["105"] = "subscription-105"
+        self.preview()
+        self.write_policy(0, True)
+        result = self.service.run_nightly(now=self.now)
+        self.assertEqual(result, {"status": "complete", "limit_reached": 3, "ready": 1, "associated": 1})
+        self.assertFalse(self.oracle.attempts)
+        self.assertIsNone(get_album_download_order("main", album.album_id))
+        self.assertEqual(get_album_download_order("main", "105").status, "associated")
+        self.assertEqual(db.AlbumDiscoverySelection.select().count(), 2)
 
     def test_nightly_and_manual_race_can_send_only_one_new_oracle_request(self) -> None:
         preview = self.preview()
@@ -292,7 +328,7 @@ class AlbumDiscoveryServiceTestCase(unittest.TestCase):
         self.service = self.make_service()
         self.write_policy(0, True)
         next_day = self.now + timedelta(days=1)
-        self.assertEqual(self.service.run_nightly(now=next_day), {"status": "paused"})
+        self.assertEqual(self.service.run_nightly(now=next_day), {"status": "no_seeds"})
         self.assertEqual(self.service.reconcile_orders()["checked"], 1)
         settled = get_album_download_order("main", "101")
         self.assertEqual((settled.id, settled.status, settled.quota_date), (
