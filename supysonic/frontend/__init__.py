@@ -895,7 +895,7 @@ def _build_recommendation_context(user, count: int) -> Dict[str, object]:
         if getattr(track, "album_id", None) is not None
     }
     total_duration = sum(track.duration or 0 for track in tracks)
-    track_reasons = buildRecommendationReasonMap(user, tracks)
+    track_reasons = buildRecommendationReasonMap(user, tracks, playlist=playlist)
 
     return {
         "playlist": playlist,
@@ -1821,3 +1821,4 @@ from .mood_playlists import *
 from .music_requests import *
 from .metadata import *
 from .share import *
+from .album_discovery import *

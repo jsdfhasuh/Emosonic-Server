@@ -134,18 +134,33 @@ def _order_from_row(row: AlbumDiscoveryOrder) -> AlbumDownloadOrder:
     )
 
 
+def _validate_release(library_key: str, album_id: str) -> None:
+    _validate_text(library_key, "library_key", 128)
+    _validate_text(album_id, "album_id", 64)
+    if not album_id.isascii() or not album_id.isdecimal() or album_id.startswith("0"):
+        raise ValueError("album_id must be a canonical Apple Music album ID")
+
+
+def get_album_download_order(library_key: str, album_id: str) -> Optional[AlbumDownloadOrder]:
+    with connection_scope():
+        row = AlbumDiscoveryOrder.get_or_none(
+            (AlbumDiscoveryOrder.library_key == library_key)
+            & (AlbumDiscoveryOrder.storefront == STOREFRONT)
+            & (AlbumDiscoveryOrder.album_id == album_id)
+        )
+        return _order_from_row(row) if row is not None else None
+
+
 def reserve_album_download(
     library_key: str,
     album_id: str,
     load_policy: Callable[[], Tuple[int, bool]],
     *,
     now: Optional[datetime] = None,
+    persist_selection: Optional[Callable[[], None]] = None,
 ) -> AlbumReservationResult:
     """Reserve a slot before dispatch. Only a new reservation permits dispatch."""
-    _validate_text(library_key, "library_key", 128)
-    _validate_text(album_id, "album_id", 64)
-    if not album_id.isascii() or not album_id.isdecimal() or album_id.startswith("0"):
-        raise ValueError("album_id must be a canonical Apple Music album ID")
+    _validate_release(library_key, album_id)
 
     with _write_transaction(library_key):
         max_albums_per_day, allow_new = load_policy()
@@ -154,13 +169,11 @@ def reserve_album_download(
             raise ValueError("allow_new must be a boolean")
         quota_date = _shanghai_date(now)
         quota = _get_quota(library_key, quota_date, max_albums_per_day)
-        existing = AlbumDiscoveryOrder.get_or_none(
-            (AlbumDiscoveryOrder.library_key == library_key)
-            & (AlbumDiscoveryOrder.storefront == STOREFRONT)
-            & (AlbumDiscoveryOrder.album_id == album_id)
-        )
+        existing = get_album_download_order(library_key, album_id)
         if existing is not None:
-            return AlbumReservationResult("existing", _order_from_row(existing), quota)
+            if persist_selection is not None:
+                persist_selection()
+            return AlbumReservationResult("existing", existing, quota)
         if not allow_new:
             return AlbumReservationResult("submission_disabled", None, quota)
         if quota.remaining == 0:
@@ -173,6 +186,8 @@ def reserve_album_download(
             quota_date=quota_date,
             status=RESERVED,
         )
+        if persist_selection is not None:
+            persist_selection()
         return AlbumReservationResult(
             RESERVED,
             _order_from_row(order),
@@ -183,6 +198,52 @@ def reserve_album_download(
                 quota.reserved + 1,
                 quota.submitted,
             ),
+        )
+
+
+def record_album_discovery_reuse(
+    library_key: str,
+    album_id: str,
+    persist_selection: Callable[[], None],
+    *,
+    oracle_task_id: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> Optional[AlbumDownloadOrder]:
+    """Record a local complete album or an independently accepted Oracle task."""
+    _validate_release(library_key, album_id)
+    if oracle_task_id is not None:
+        _validate_text(oracle_task_id, "oracle_task_id", 128)
+    with _write_transaction(library_key):
+        order = get_album_download_order(library_key, album_id)
+        if order is None and oracle_task_id is not None:
+            order = _order_from_row(AlbumDiscoveryOrder.create(
+                library_key=library_key,
+                storefront=STOREFRONT,
+                album_id=album_id,
+                quota_date=_shanghai_date(now),
+                status=ASSOCIATED,
+                oracle_task_id=oracle_task_id,
+            ))
+        persist_selection()
+        return order
+
+
+def update_album_download_task(
+    order: AlbumDownloadOrder, oracle_task_id: str
+) -> bool:
+    """Advance a verified retry under the same accepted order and original quota date."""
+    _validate_text(oracle_task_id, "oracle_task_id", 128)
+    with _write_transaction(order.library_key):
+        return bool(
+            AlbumDiscoveryOrder.update(oracle_task_id=oracle_task_id)
+            .where(
+                (AlbumDiscoveryOrder.id == order.id)
+                & (AlbumDiscoveryOrder.library_key == order.library_key)
+                & (AlbumDiscoveryOrder.status == order.status)
+                & (AlbumDiscoveryOrder.oracle_task_id == order.oracle_task_id)
+                & AlbumDiscoveryOrder.status.in_((SUBMITTED, ASSOCIATED))
+            )
+            .execute()
         )
 
 

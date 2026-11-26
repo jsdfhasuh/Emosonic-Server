@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 from .album_discovery_quota import (
     AlbumDownloadQuota,
@@ -45,6 +45,7 @@ def reserve_discovered_album(
     *,
     automatic: bool,
     now: Optional[datetime] = None,
+    persist_selection: Optional[Callable[[], None]] = None,
 ) -> AlbumReservationResult:
     """Reload settings and reserve a slot before submitting a verified album.
 
@@ -55,4 +56,6 @@ def reserve_discovered_album(
         settings = load_album_discovery_settings(config)
         return settings.max_albums_per_day, not automatic or settings.auto_submit
 
-    return reserve_album_download(library_key, album_id, load_policy, now=now)
+    return reserve_album_download(
+        library_key, album_id, load_policy, now=now, persist_selection=persist_selection
+    )

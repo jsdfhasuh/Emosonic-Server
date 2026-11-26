@@ -152,7 +152,17 @@ class DefaultConfig:
         "cache_ttl_seconds": 900,
     }
     TRACK_METADATA_LLM = {}
-    ALBUM_DISCOVERY = {"settings_file": None}
+    ALBUM_DISCOVERY = {
+        "settings_file": None,
+        "target_user": None,
+        "library_key": "main",
+        "library_root": None,
+        "apple_music_developer_token_file": None,
+        "oracle_url": None,
+        "oracle_access_token_file": None,
+        "oracle_delivery_token_file": None,
+        "auto_submit_hour": 20,
+    }
     TRANSCODING = {}
     MIMETYPES = {}
 
@@ -188,7 +198,7 @@ class IniConfig(DefaultConfig):
             options = {
                 key: (
                     value
-                    if (attribute, key) == ("ALBUM_DISCOVERY", "settings_file")
+                    if attribute == "ALBUM_DISCOVERY" and key != "auto_submit_hour"
                     else self.__try_parse(value)
                 )
                 for key, value in parser.items(section)

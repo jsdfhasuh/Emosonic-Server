@@ -247,6 +247,23 @@ track_metadata_enrichment_log_payload = off
 ; Mounting the directory lets an atomic file replacement take effect on the
 ; next submission. An invalid or unreadable file pauses new submissions.
 ;settings_file = /var/supysonic/album-discovery/settings.json
+; Configure the existing Supysonic account allowed to use discovery, and the
+; existing received music directory as seen by Web and daemon. Leave target_user
+; unset until the components below are configured.
+;target_user = my-library-user
+;library_key = main
+;library_root = /downloads/music/completed
+; Apple developer token and authenticated Oracle control/manifest API secrets.
+; Mount secret files read-only. Environment alternatives are
+; APPLE_MUSIC_DEVELOPER_TOKEN, ALBUM_DISCOVERY_ORACLE_ACCESS_TOKEN and
+; ALBUM_DISCOVERY_ORACLE_DELIVERY_TOKEN.
+;apple_music_developer_token_file = /run/secrets/apple-music-developer-token
+;oracle_url = https://oracle-downloader.example
+;oracle_access_token_file = /run/secrets/oracle-web-access-key
+;oracle_delivery_token_file = /run/secrets/oracle-delivery-api-key
+; Nightly automatic submission starts at this hour in Asia/Shanghai when
+; aiDiscovery.autoSubmit is explicitly true in settings.json.
+;auto_submit_hour = 20
 
 [musicbrainz]
 ; MusicBrainz is the default structured album enrichment source.

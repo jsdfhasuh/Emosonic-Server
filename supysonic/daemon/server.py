@@ -12,6 +12,12 @@ from multiprocessing.connection import Listener, Client
 from threading import Thread, Event
 
 from .client import DaemonCommand
+from ..album_discovery_service import AlbumDiscoveryError, AlbumDiscoveryService
+from ..album_discovery_settings import (
+    AlbumDiscoverySettingsError,
+    album_discovery_target_user,
+    load_album_discovery_settings,
+)
 from ..db import Folder, open_connection, close_connection
 from ..jukebox import Jukebox
 from ..logging_utils import format_log_event
@@ -200,6 +206,38 @@ class Daemon:
             self.__get_recommend_refresh_interval(),
             enabled=openai_profile_enabled(self.__config),
         )
+        discovery_configured = bool(album_discovery_target_user(self.__config))
+        self.__scheduler.register(
+            "album-discovery-nightly",
+            self.__run_album_discovery,
+            self.__get_recommend_refresh_interval(),
+            enabled=discovery_configured,
+        )
+        self.__scheduler.register(
+            "album-discovery-reconcile",
+            self.__reconcile_album_discovery,
+            self.__get_recommend_refresh_interval(),
+            enabled=discovery_configured,
+        )
+
+    def __run_album_discovery(self) -> dict:
+        try:
+            settings = load_album_discovery_settings(self.__config)
+            if not settings.auto_submit or settings.max_albums_per_day == 0:
+                return {"status": "paused"}
+            return AlbumDiscoveryService.from_config(self.__config).run_nightly()
+        except (AlbumDiscoveryError, AlbumDiscoverySettingsError) as exc:
+            logger.warning("Album discovery scheduling unavailable: %s", exc)
+            return {"status": "unavailable"}
+
+    def __reconcile_album_discovery(self) -> dict:
+        try:
+            return AlbumDiscoveryService.from_config(
+                self.__config, with_catalog=False
+            ).reconcile_orders()
+        except (AlbumDiscoveryError, AlbumDiscoverySettingsError) as exc:
+            logger.warning("Album discovery reconciliation unavailable: %s", exc)
+            return {"status": "unavailable"}
 
     def __run_review_task_maintenance(self):
         return runReviewTaskMaintenance()

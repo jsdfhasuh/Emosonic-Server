@@ -7,12 +7,19 @@ import time
 
 from collections import Counter
 from datetime import datetime, timedelta
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-from peewee import fn
+from peewee import SqliteDatabase, fn
 
+from .album_discovery_daily import (
+    get_playlist_discovery_reason,
+    get_ready_discovery_selections,
+    record_daily_discovery,
+    select_daily_discovery,
+)
+from .album_discovery_settings import album_discovery_target_user
 from .config import DefaultConfig
-from .db import Playlist, Track, TrackMetadata, User, User_Play_Activity
+from .db import Playlist, Track, TrackMetadata, User, User_Play_Activity, db
 from .recommendation_feedback import (
     get_recommendation_feedback_preferences,
     track_matches_negative_recommendation_feedback,
@@ -253,6 +260,8 @@ def getRecommendationReason(
 def buildRecommendationReasonMap(
     user,
     tracks: Sequence[object],
+    *,
+    playlist: Optional[Playlist] = None,
 ) -> Dict[str, str]:
     profile = _buildRecommendationReasonProfile(user)
     trackIds = [track.id for track in tracks]
@@ -260,8 +269,9 @@ def buildRecommendationReasonMap(
         str(metadata.track_id): metadata
         for metadata in TrackMetadata.select().where(TrackMetadata.track.in_(trackIds))
     } if trackIds else {}
+    discoveries = get_playlist_discovery_reason(user, playlist) if playlist is not None else {}
     return {
-        str(track.id): getRecommendationReason(user, track, profile)
+        str(track.id): discoveries.get(str(track.id)) or getRecommendationReason(user, track, profile)
         for track in tracks
     }
 
@@ -711,7 +721,7 @@ def _build_recommend_playlist_archive_path(playlist, archiveRoot):
 
 def _archive_recommended_playlist(playlist, archiveRoot):
     tracks = playlist.get_tracks()
-    reasonMap = buildRecommendationReasonMap(playlist.user, tracks)
+    reasonMap = buildRecommendationReasonMap(playlist.user, tracks, playlist=playlist)
     archivePath, recommendationDay = _build_recommend_playlist_archive_path(
         playlist, archiveRoot
     )
@@ -818,6 +828,7 @@ def _createRecommendPlaylistForUserUnlocked(
     user: User, numSongs: int, recommendationDay: str, config: Optional[object]
 ):
     useOpenAI = openai_daily_selection_enabled(config)
+    provider = "openai" if useOpenAI else "local"
     recentRecommendationCounts = _get_recent_recommendation_counts(
         user,
         recommendationDay,
@@ -849,24 +860,40 @@ def _createRecommendPlaylistForUserUnlocked(
         recentRecommendationCounts=recentRecommendationCounts,
     )
     if useOpenAI and recommendedTracks:
-        recommendedTracks = select_openai_daily_tracks(
-            config, user, recommendedTracks, numSongs, recommendationDay,
-            recent_track_ids=recentTrackIds,
-            minimum_fresh_tracks=_get_minimum_fresh_track_count(numSongs, config),
-        )
+        from .openai_recommendations import OpenAIRecommendationError
+
+        minimum_fresh = _get_minimum_fresh_track_count(numSongs, config)
+        try:
+            recommendedTracks = select_openai_daily_tracks(
+                config, user, recommendedTracks, numSongs, recommendationDay,
+                recent_track_ids=recentTrackIds, minimum_fresh_tracks=minimum_fresh,
+            )
+        except OpenAIRecommendationError as exc:
+            if not album_discovery_target_user(config) or exc.reason not in {
+                "accounting", "budget", "busy", "invalid_response", "network", "paused", "upstream",
+            }:
+                raise
+            recommendedTracks = select_diverse_recommendations(
+                recommendedTracks, numSongs,
+                recent_track_ids=recentTrackIds, minimum_fresh_tracks=minimum_fresh,
+            )
+            provider = "local"
+            logger.info("Daily recommendation used local ranking for %s: %s", user.name, exc.reason)
         existingPlaylist = getRecommendedPlaylistForDay(user, recommendationDay)
         if existingPlaylist is not None:
             return existingPlaylist, False
     if not recommendedTracks:
         return None, False
 
-    playlist = Playlist.create(
-        user=user,
-        name=getRecommendPlaylistName(user, recommendationDay),
-        comment=RECOMMENDED_PLAYLIST_COMMENT,
+    playlist, wasCreated, recommendedTracks = _save_new_recommended_playlist(
+        user,
+        recommendationDay,
+        recommendedTracks,
+        numSongs,
+        _get_recommend_playlist_rotation_lookback_days(config),
     )
-    _setPlaylistTracks(playlist, recommendedTracks)
-    playlist.save()
+    if not wasCreated:
+        return playlist, False
     if useOpenAI:
         _archive_old_recommended_playlists_for_user(
             user, recommendationDay, config=config
@@ -892,9 +919,52 @@ def _createRecommendPlaylistForUserUnlocked(
         len(artistCounts),
         max(artistCounts.values(), default=0),
         _get_minimum_fresh_track_count(numSongs, config),
-        "openai" if useOpenAI else "local",
+        provider,
     )
     return playlist, True
+
+
+def _save_new_recommended_playlist(
+    user: User,
+    recommendation_day: str,
+    tracks: List[Track],
+    requested_count: int,
+    lookback_days: int,
+) -> Tuple[Optional[Playlist], bool, List[Track]]:
+    sqlite = isinstance(db.obj, SqliteDatabase)
+    with db.atomic(*(("IMMEDIATE",) if sqlite else ())):
+        # Serialize the first save per user without holding locks during AI or catalog calls.
+        locked_user = User.select(User.id).where(User.id == user.id)
+        if not sqlite:
+            locked_user = locked_user.for_update()
+        if locked_user.first() is None:
+            return None, False, tracks
+        existing = getRecommendedPlaylistForDay(user, recommendation_day)
+        if existing is not None:
+            return existing, False, tracks
+
+        day = _parse_recommendation_date(recommendation_day)
+        selections = get_ready_discovery_selections(user, day) if day is not None else []
+        discovery = select_daily_discovery(
+            user,
+            selections,
+            tracks,
+            requested_count,
+            _get_recent_recommended_track_ids(user, recommendation_day, lookback_days),
+        ) if selections else None
+        if discovery is not None:
+            tracks = discovery.tracks
+
+        playlist = Playlist.create(
+            user=user,
+            name=getRecommendPlaylistName(user, recommendation_day),
+            comment=RECOMMENDED_PLAYLIST_COMMENT,
+        )
+        _setPlaylistTracks(playlist, tracks)
+        playlist.save()
+        if discovery is not None:
+            record_daily_discovery(user, playlist, day, discovery)
+        return playlist, True, tracks
 
 
 def refreshDailyRecommendPlaylists(

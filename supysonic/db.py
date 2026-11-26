@@ -5,7 +5,14 @@
 #
 # Distributed under terms of the GNU AGPLv3 license.
 
-from .db_layer.album_discovery import AlbumDiscoveryOrder, AlbumDiscoveryQuotaLock
+from .db_layer.album_discovery import (
+    AlbumDiscoveryOrder,
+    AlbumDiscoveryPlacement,
+    AlbumDiscoveryPreview,
+    AlbumDiscoveryQuotaLock,
+    AlbumDiscoveryRelease,
+    AlbumDiscoverySelection,
+)
 from .db_layer.annotations import (
     RatingFolder,
     RatingTrack,

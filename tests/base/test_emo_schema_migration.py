@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 from threading import Barrier
 import unittest
+from uuid import uuid4
 
 from playhouse.db_url import connect as connect_database
 
@@ -426,6 +427,24 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
         self.assertEqual(
             (snapshot.reserved, snapshot.submitted, snapshot.remaining), (0, 1, 0)
         )
+        user = db.User.create(name="album-discovery-ci", password="test", salt="test")
+        preview = db.AlbumDiscoveryPreview.create(
+            user=user, library_key="migration-test", day=now.date(), payload="{}",
+        )
+        release = db.AlbumDiscoveryRelease.create(
+            library_key="migration-test", album_id=order.album_id,
+            album_url="https://music.apple.com/cn/album/" + order.album_id,
+            title="Test release", artist="Test artist", expected_tracks='{"tracks":[]}',
+        )
+        selection = db.AlbumDiscoverySelection.create(
+            user=user, release=release, representative_song_id="10101", evidence="[]", priority=0,
+        )
+        placement = db.AlbumDiscoveryPlacement.create(
+            user=user, selection=selection, playlist_id=uuid4(),
+            day=now.date(), track_id=uuid4(), position=4,
+        )
+        self.assertEqual(db.AlbumDiscoveryPlacement[placement.id].selection_id, selection.id)
+        self.assertEqual(db.AlbumDiscoveryPreview[preview.id].payload, "{}")
 
     def _assert_external_discovery_index(self, provider: str) -> None:
         if provider == "postgres":
