@@ -8,6 +8,7 @@ from supysonic.db import (
     Album, Artist, Folder, RecommendationAgentCache, Track, TrackMetadata,
     User, User_Play_Activity, now,
 )
+from supysonic.metadata_pricing import MODEL, PROFILE_MODEL
 from supysonic.recommendation_openai_profile import (
     PROFILE_ATTEMPT_HASH, PROFILE_CONTEXT_HASH, PROFILE_SCHEMA, build_openai_profile_facts,
     get_cached_openai_profile, openai_profile_enabled, refresh_openai_profile,
@@ -142,8 +143,22 @@ class OpenAIProfileTestCase(TestBase):
         self.assertEqual(cached["summary"], self.analysis["summary"])
         self.assertFalse(cached["stale"])
         self.assertEqual(cached["provider"], "openai")
+        self.assertEqual(cached["model"], PROFILE_MODEL)
         self.assertEqual(User_Play_Activity.select().count(), 1)
         self.assertIsNone(get_cached_openai_profile(User.get(User.name == "bob")))
+
+    def test_model_change_regenerates_same_facts_at_next_eligible_refresh(self):
+        self.config.RECOMMENDATION_AGENT["profile_model"] = MODEL
+        with self.request() as request:
+            self.assertEqual(refresh_openai_profile(self.config, self.user), "updated")
+            self.assertEqual(get_cached_openai_profile(self.user)["model"], MODEL)
+            self.config.RECOMMENDATION_AGENT["profile_model"] = PROFILE_MODEL
+            self.assertEqual(refresh_openai_profile(self.config, self.user), "cached")
+            self.assertEqual(get_cached_openai_profile(self.user)["model"], MODEL)
+            self.expire()
+            self.assertEqual(refresh_openai_profile(self.config, self.user), "updated")
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(get_cached_openai_profile(self.user)["model"], PROFILE_MODEL)
 
     def test_unchanged_fingerprint_extends_cache_without_paid_call(self):
         with self.request() as request:

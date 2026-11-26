@@ -1,0 +1,213 @@
+{% set is_owner = request.user.id == user.id %}
+{% set profile_uid = 'me' if is_owner else user.id %}
+{% set home = profile_home %}
+
+{% macro number(value) -%}
+{{ '{:,}'.format(value) }}
+{%- endmacro %}
+
+{% macro tags(items) %}
+<ul class="listening-tags">
+  {% for item in items %}
+  <li><span>{{ item.value }}</span><small>{{ number(item.playCount) }}</small></li>
+  {% else %}
+  <li class="listening-tags-empty" data-i18n-en="No labels in this period" data-i18n-zh="这段时间暂无标签">No labels in this period</li>
+  {% endfor %}
+</ul>
+{% endmacro %}
+
+{% macro audio_score(label, chinese, value) %}
+{% if value is not none %}
+<li>
+  <div><span data-i18n-en="{{ label }}" data-i18n-zh="{{ chinese }}">{{ label }}</span><strong>{{ value|round|int }}</strong></div>
+  <meter aria-label="{{ label }}" data-i18n-en="{{ label }}" data-i18n-zh="{{ chinese }}" data-i18n-attr="aria-label" min="0" max="100" value="{{ value }}">{{ value }} / 100</meter>
+</li>
+{% endif %}
+{% endmacro %}
+
+{% set art_tracks = home.top_tracks|selectattr('has_art')|list %}
+<section class="listening-hero" aria-labelledby="listening-profile-title">
+  <div class="listening-hero-copy">
+    <div class="listening-identity">
+      <span class="listening-avatar" aria-hidden="true">
+        {% if avatar_exists %}
+        <img src="{{ url_for('frontend.user_avatar', uid=profile_uid) }}" width="56" height="56" alt="">
+        {% else %}
+        {{ user.name[:1]|upper }}
+        {% endif %}
+      </span>
+      <strong>{{ user.name }}</strong>
+    </div>
+    <h2 id="listening-profile-title" data-i18n-en="Listening Profile" data-i18n-zh="听歌画像">Listening Profile</h2>
+    {% if is_owner and avatar_csrf %}
+    <details class="listening-avatar-editor">
+      <summary data-i18n-en="Edit avatar" data-i18n-zh="编辑头像">Edit avatar</summary>
+      <form action="{{ url_for('frontend.user_avatar_update', period=home.period) }}" method="post" enctype="multipart/form-data" class="listening-avatar-upload">
+        <input type="hidden" name="csrf_token" value="{{ avatar_csrf }}">
+        <label for="listening-avatar-file" data-i18n-en="Choose an image" data-i18n-zh="选择图片">Choose an image</label>
+        <input id="listening-avatar-file" name="avatar" type="file" accept="image/jpeg,image/png,image/webp" required aria-describedby="listening-avatar-help">
+        <p id="listening-avatar-help" data-i18n-en="JPG, PNG or WebP, up to 4 MB" data-i18n-zh="支持 JPG、PNG 或 WebP，最大 4 MB">JPG, PNG or WebP, up to 4 MB</p>
+        <button type="submit" data-i18n-en="Save avatar" data-i18n-zh="保存头像">Save avatar</button>
+      </form>
+      {% if avatar_exists %}
+      <form action="{{ url_for('frontend.user_avatar_remove', period=home.period) }}" method="post">
+        <input type="hidden" name="csrf_token" value="{{ avatar_csrf }}">
+        <button type="submit" class="listening-avatar-reset" data-i18n-en="Restore default" data-i18n-zh="恢复默认头像">Restore default</button>
+      </form>
+      {% endif %}
+    </details>
+    {% endif %}
+  </div>
+  <div class="listening-art" aria-hidden="true">
+    <div class="listening-record"></div>
+    {% for track in art_tracks[:2] %}
+    <img class="listening-art-cover" src="{{ url_for('frontend.player_cover', eid=track.id) }}" width="154" height="154" alt="">
+    {% endfor %}
+  </div>
+</section>
+
+<div class="listening-overview">
+  <nav class="listening-periods" aria-label="Listening period" data-i18n-en="Listening period" data-i18n-zh="统计时间" data-i18n-attr="aria-label">
+    {% for period, label, chinese in [('7', 'Last 7 days', '近 7 天'), ('30', 'Last 30 days', '近 30 天'), ('all', 'All time', '全部')] %}
+    <a href="{{ url_for('frontend.user_profile', uid=profile_uid, period=period) }}"{% if home.period == period %} aria-current="page"{% endif %} data-i18n-en="{{ label }}" data-i18n-zh="{{ chinese }}">{{ label }}</a>
+    {% endfor %}
+  </nav>
+  {% if home.last_play %}
+  <p class="listening-last-play"><span data-i18n-en="Last recorded play" data-i18n-zh="最近一条播放记录">Last recorded play</span>
+    <time datetime="{{ home.last_play.isoformat() }}">{{ home.last_play.strftime('%Y-%m-%d %H:%M') }}</time>
+  </p>
+  {% endif %}
+</div>
+
+<dl class="listening-metrics">
+  <div>
+    <dt data-i18n-en="Plays" data-i18n-zh="播放次数">Plays</dt>
+    <dd>{{ number(home.play_count) }}</dd>
+  </div>
+  <div>
+    <dt data-i18n-en="Track count" data-i18n-zh="听过的曲目">Track count</dt>
+    <dd>{{ number(home.track_count) }}</dd>
+  </div>
+  <div>
+    <dt data-i18n-en="Song label coverage" data-i18n-zh="歌曲标签覆盖率">Song label coverage</dt>
+    <dd>
+      {{ home.coverage if home.play_count else '—' }}{% if home.play_count %}<span>%</span>{% endif %}
+      <small>{{ number(home.covered_plays) }} / {{ number(home.play_count) }} <span data-i18n-en="plays" data-i18n-zh="次播放">plays</span></small>
+    </dd>
+  </div>
+</dl>
+
+{% if home.play_count %}
+<div class="listening-grid">
+  <section class="listening-panel" aria-labelledby="listening-tracks">
+    <h3 id="listening-tracks" data-i18n-en="Most played tracks" data-i18n-zh="最常听的歌">Most played tracks</h3>
+    <ol class="listening-track-list">
+    {% for track in home.top_tracks %}
+      <li>
+        <div class="listening-track-art" aria-hidden="true">
+          {% if track.has_art %}
+          <img src="{{ url_for('frontend.player_cover', eid=track.id) }}" alt="" width="44" height="44" loading="lazy">
+          {% else %}
+          <img src="{{ url_for('static', filename='img/vinyl.svg') }}" alt="" width="44" height="44" loading="lazy">
+          {% endif %}
+        </div>
+        <div class="listening-track-title"><strong>{{ track.title }}</strong><small>{{ track.artist }}</small></div>
+        <div class="listening-track-plays">{{ number(track.plays) }} <small data-i18n-en="plays" data-i18n-zh="次">plays</small></div>
+      </li>
+    {% endfor %}
+    </ol>
+  </section>
+  <section class="listening-panel" aria-labelledby="listening-languages">
+    <h3 id="listening-languages" data-i18n-en="Languages" data-i18n-zh="常听语言">Languages</h3>
+    {% if home.languages %}
+    <p class="listening-panel-note" data-i18n-en="Share of plays with a language label" data-i18n-zh="按有语言标签的播放计算">Share of plays with a language label</p>
+    <ul class="listening-language-list">
+      {% for language in home.languages %}
+      <li>
+        <div><span data-i18n-en="{{ language.label }}" data-i18n-zh="{{ language.label_zh }}">{{ language.label }}</span><strong>{{ '%g'|format(language.share) }}%</strong></div>
+        <meter aria-hidden="true" min="0" max="100" value="{{ language.share }}">{{ language.share }}%</meter>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="listening-panel-note" data-i18n-en="No language labels in this period." data-i18n-zh="这段时间的播放暂无语言标签。">No language labels in this period.</p>
+    {% endif %}
+  </section>
+
+  <section class="listening-panel" aria-labelledby="listening-mood">
+    <h3 id="listening-mood" data-i18n-en="Moods and sounds" data-i18n-zh="听过的氛围与风格">Moods and sounds</h3>
+    <dl class="listening-tag-groups">
+      <div><dt data-i18n-en="Moods" data-i18n-zh="情绪">Moods</dt><dd>{{ tags(home.moods) }}</dd></div>
+      <div><dt data-i18n-en="Scenes" data-i18n-zh="场景">Scenes</dt><dd>{{ tags(home.scenes) }}</dd></div>
+      <div><dt data-i18n-en="Styles" data-i18n-zh="风格">Styles</dt><dd>{{ tags(home.tags) }}</dd></div>
+    </dl>
+    {% if home.energy is not none or home.danceability is not none or home.valence is not none %}
+    <ul class="listening-audio-scores">
+      {{ audio_score('Energy', '能量', home.energy) }}
+      {{ audio_score('Danceability', '舞动性', home.danceability) }}
+      {{ audio_score('Musical positivity', '音乐明快度', home.valence) }}
+    </ul>
+    {% endif %}
+  </section>
+  <section class="listening-panel" aria-labelledby="listening-artists">
+    <h3 id="listening-artists" data-i18n-en="Most played artists" data-i18n-zh="最常听的歌手">Most played artists</h3>
+    <ol class="listening-artist-list">
+      {% for artist in home.top_artists %}
+      <li>
+        <strong>{{ artist.name }}</strong>
+        <span>{{ number(artist.plays) }} <small data-i18n-en="plays" data-i18n-zh="次">plays</small></span>
+      </li>
+      {% endfor %}
+    </ol>
+  </section>
+</div>
+{% else %}
+<section class="listening-panel listening-empty">
+  <h3 data-i18n-en="No plays in this period" data-i18n-zh="这段时间没有播放记录">No plays in this period</h3>
+  <p data-i18n-en="Choose another period to see more of your listening history." data-i18n-zh="可以切换时间范围，查看其他听歌记录。">Choose another period to see more of your listening history.</p>
+</section>
+{% endif %}
+
+{% if openai_profile_enabled %}
+<section class="listening-panel listening-analysis" aria-labelledby="openai-profile-heading">
+  <div class="listening-analysis-heading">
+    <h3 id="openai-profile-heading" data-i18n-en="OpenAI Music Preferences" data-i18n-zh="OpenAI 音乐偏好">OpenAI Music Preferences</h3>
+    {% if openai_profile %}
+    <div class="listening-analysis-meta">
+      {% if openai_profile.stale %}
+      <span class="listening-analysis-stale" data-i18n-en="Last available analysis" data-i18n-zh="最近一次有效分析">Last available analysis</span>
+      {% endif %}
+      {% if openai_profile.model %}<span>{{ openai_profile.model }}</span>{% endif %}
+      {% if openai_profile.generatedAt %}
+      <time datetime="{{ openai_profile.generatedAt }}">{{ openai_profile.generatedAt|replace('T', ' ') }}</time>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+  {% if openai_profile %}
+  <div class="listening-analysis-text">
+    <div>
+      <h4 data-i18n-en="Long-term taste" data-i18n-zh="长期口味">Long-term taste</h4>
+      <p lang="zh-Hans">{{ openai_profile.summary }}</p>
+    </div>
+    {% if openai_profile.recentTrend %}
+    <div>
+      <h4 data-i18n-en="Recent listening" data-i18n-zh="近期变化">Recent listening</h4>
+      <p lang="zh-Hans">{{ openai_profile.recentTrend }}</p>
+    </div>
+    {% endif %}
+  </div>
+  {% if openai_profile.discoveryDirections or openai_profile.cautions %}
+  <details class="listening-analysis-details">
+    <summary data-i18n-en="Discovery ideas and limitations" data-i18n-zh="探索方向和分析局限">Discovery ideas and limitations</summary>
+    {% if openai_profile.discoveryDirections %}
+    <ul lang="zh-Hans">{% for direction in openai_profile.discoveryDirections %}<li>{{ direction }}</li>{% endfor %}</ul>
+    {% endif %}
+    {% if openai_profile.cautions %}<p lang="zh-Hans">{{ openai_profile.cautions }}</p>{% endif %}
+  </details>
+  {% endif %}
+  {% else %}
+  <p class="listening-panel-note" data-i18n-en="No analysis available yet." data-i18n-zh="暂无可用分析。">No analysis available yet.</p>
+  {% endif %}
+</section>
+{% endif %}

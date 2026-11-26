@@ -324,6 +324,8 @@ cache_ttl_seconds = 900
 ; See docs/openai-recommendations.md. No API calls are made by profile page reads.
 provider = compatible
 profile_enabled = off
+; Only used for OpenAI profile analysis. Set gpt-6-luna to use Luna here.
+profile_model = gpt-6.2-sol
 daily_selection_enabled = off
 profile_refresh_interval_seconds = 21600
 profile_batch_size = 2

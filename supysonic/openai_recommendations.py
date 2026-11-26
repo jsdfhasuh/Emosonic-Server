@@ -17,13 +17,14 @@ from .db import Meta
 from .llm_client import LlmConfigError, _extract_upstream_error
 from .metadata_budget import BudgetExceeded, BudgetUnavailable, MetadataBudget
 from .metadata_pricing import (
-    MODEL, reserve_request_micro_usd, response_cost_micro_usd,
+    MODEL, PROFILE_MODEL, reserve_request_micro_usd, response_cost_micro_usd,
 )
 from .track_metadata_config import get_track_metadata_llm_config
 
 
 logger = logging.getLogger(__name__)
 STATE_KEY = "openai_recommendation_backoff"
+PROFILE_STATE_KEY = "openai_profile_sol_backoff"
 BUDGET_FIELDS = (
     "monthly_budget_usd", "budget_safety_buffer_usd", "daily_budget_usd",
     "budget_timezone",
@@ -54,13 +55,24 @@ def recommendation_settings(config: object) -> dict:
     return settings
 
 
-def validate_recommendation_settings(config: object) -> dict:
+def profile_request_model(settings: Mapping) -> str:
+    return str(settings.get("profile_model") or settings.get("model") or "").strip()
+
+
+def validate_recommendation_settings(config: object, *, workload: str = "chat") -> dict:
     settings = recommendation_settings(config)
     if settings.get("provider") != "openai" or settings.get("enabled") is not True:
         raise OpenAIRecommendationError("OpenAI recommendations are disabled.", reason="config")
     if str(settings.get("api_base_url", "")).rstrip("/") != "https://api.openai.com/v1":
         raise OpenAIRecommendationError("OpenAI recommendations require the official endpoint.", reason="config")
-    if settings.get("model") != MODEL:
+    if workload == "profile":
+        settings["model"] = profile_request_model(settings)
+        supported_models = (MODEL, PROFILE_MODEL)
+        if settings["model"] == PROFILE_MODEL and settings.get("reasoning_effort") == "none":
+            settings["reasoning_effort"] = "low"
+    else:
+        supported_models = (MODEL,)
+    if settings.get("model") not in supported_models:
         raise OpenAIRecommendationError("Unsupported budgeted recommendation model.", reason="config")
     try:
         settings = get_track_metadata_llm_config(SimpleNamespace(TRACK_METADATA_LLM=settings))
@@ -114,8 +126,8 @@ def recommendation_lease(key: str, ttl_seconds: int = 600):
                 logger.warning("openai_recommendation_lease_release_failed")
 
 
-def _read_state() -> dict:
-    row = Meta.get_or_none(Meta.key == STATE_KEY)
+def _read_state(key: str) -> dict:
+    row = Meta.get_or_none(Meta.key == key)
     if row is None:
         return {"n": 0, "u": 0, "hard": False}
     try:
@@ -129,13 +141,13 @@ def _read_state() -> dict:
         raise OpenAIRecommendationError("Recommendation backoff state is invalid.", reason="storage") from None
 
 
-def _pause(state: dict, *, hard: bool = False, retry_after: int = 0) -> int:
+def _pause(key: str, state: dict, *, hard: bool = False, retry_after: int = 0) -> int:
     count = min(4, state["n"] + 1)
     deadline = int(time.time()) + max(min(300 * 2 ** (count - 1), 1800), retry_after)
     value = json.dumps({"n": count, "u": deadline, "hard": hard}, separators=(",", ":"))
-    row, created = Meta.get_or_create(key=STATE_KEY, defaults={"value": value})
+    row, created = Meta.get_or_create(key=key, defaults={"value": value})
     if not created:
-        Meta.update(value=value).where(Meta.key == STATE_KEY).execute()
+        Meta.update(value=value).where(Meta.key == key).execute()
     return deadline
 
 
@@ -177,23 +189,25 @@ def request_recommendation_json(config: object, messages: list, schema: dict, *,
     """Authorize exactly one HTTP call; settle before parsing or exposing content."""
     if workload not in ("profile", "daily", "chat"):
         raise OpenAIRecommendationError("Invalid recommendation workload.", reason="config")
-    settings = validate_recommendation_settings(config)
+    settings = validate_recommendation_settings(config, workload=workload)
+    model = settings["model"]
+    state_key = PROFILE_STATE_KEY if model == PROFILE_MODEL else STATE_KEY
     wrapped = dict(schema) if "schema" in schema else {
         "name": "music_" + workload, "strict": True, "schema": schema,
     }
     payload = {
-        "model": settings["model"], "service_tier": "default", "store": False,
+        "model": model, "service_tier": "default", "store": False,
         "messages": messages, "max_completion_tokens": max_output_tokens,
         "reasoning_effort": settings.get("reasoning_effort", "low"),
         "response_format": {"type": "json_schema", "json_schema": wrapped},
     }
     try:
-        allowance = reserve_request_micro_usd(payload)
+        allowance = reserve_request_micro_usd(payload, model=model)
         budget = MetadataBudget(settings["_budget_config"])
         with recommendation_lease("provider") as acquired:
             if not acquired:
                 raise OpenAIRecommendationError("OpenAI recommendations are busy.", reason="busy")
-            state = _read_state()
+            state = _read_state(state_key)
             if state["hard"] or state["u"] > int(time.time()):
                 raise OpenAIRecommendationError("OpenAI recommendations are paused.", reason="paused", retry_at=state["u"])
             reservation = budget.reserve("recommendation_" + workload, allowance)
@@ -206,7 +220,7 @@ def request_recommendation_json(config: object, messages: list, schema: dict, *,
                     allow_redirects=False,
                 )
             except requests.RequestException:
-                deadline = _pause(state)
+                deadline = _pause(state_key, state)
                 raise OpenAIRecommendationError("OpenAI request failed; its reservation was retained.", reason="network", retry_at=deadline) from None
             try:
                 if response.status_code != 200:
@@ -215,7 +229,7 @@ def request_recommendation_json(config: object, messages: list, schema: dict, *,
                     hard = details.get("quotaExhausted", False) or not details.get("retryable", False)
                     retry_hint = details.get("retryAfterSeconds", 0)
                     retry_hint = min(86400, max(0, int(retry_hint))) if isinstance(retry_hint, (int, float)) and math.isfinite(retry_hint) else 0
-                    deadline = _pause(state, hard=hard, retry_after=retry_hint)
+                    deadline = _pause(state_key, state, hard=hard, retry_after=retry_hint)
                     raise OpenAIRecommendationError("OpenAI rejected the recommendation request.", reason="upstream", retry_at=deadline)
                 try:
                     result = response.json()
@@ -223,20 +237,23 @@ def request_recommendation_json(config: object, messages: list, schema: dict, *,
                     result = None
             finally:
                 response.close()
-            cost = response_cost_micro_usd(result) if isinstance(result, dict) else None
+            cost = response_cost_micro_usd(result, model=model) if isinstance(result, dict) else None
             if cost is None:
-                _pause(state, hard=True)
+                _pause(state_key, state, hard=True)
                 raise OpenAIRecommendationError("OpenAI usage could not be verified; reservation retained.", reason="accounting")
             try:
                 budget.settle(reservation, cost)
             except BudgetUnavailable:
-                _pause(state, hard=True)
+                _pause(state_key, state, hard=True)
                 raise
             if cost > allowance:
-                _pause(state, hard=True)
+                _pause(state_key, state, hard=True)
                 raise OpenAIRecommendationError("OpenAI usage exceeded its reservation.", reason="accounting")
-            Meta.delete().where(Meta.key == STATE_KEY).execute()
-            logger.info("openai_recommendation_accounted workload=%s cost_micro_usd=%s", workload, cost)
+            Meta.delete().where(Meta.key == state_key).execute()
+            logger.info(
+                "openai_recommendation_accounted workload=%s cost_micro_usd=%s model=%s",
+                workload, cost, model,
+            )
             try:
                 choice = result["choices"][0]
                 if choice.get("finish_reason") != "stop" or choice["message"].get("refusal"):

@@ -2,7 +2,7 @@ import unittest
 
 from supysonic.llm_client import LlmConfigError
 from supysonic.metadata_pricing import (
-    reserve_request_micro_usd, response_cost_micro_usd,
+    PROFILE_MODEL, reserve_request_micro_usd, response_cost_micro_usd,
 )
 
 
@@ -30,6 +30,14 @@ class MetadataPricingTestCase(unittest.TestCase):
         reserved = reserve_request_micro_usd(self.payload())
         self.assertGreater(reserved, 768)
         self.assertLess(reserved, 20000)
+
+    def test_sol_text_reservation_covers_completion_and_padded_input(self):
+        payload = self.payload()
+        payload["model"] = PROFILE_MODEL
+        reserved = reserve_request_micro_usd(payload, model=PROFILE_MODEL)
+        self.assertGreater(reserved, 4096 * 5 + 1536 * 10)
+        with self.assertRaises(LlmConfigError):
+            reserve_request_micro_usd(payload)
 
     def test_request_model_tier_size_and_output_fail_closed(self):
         for update in ({"model": "unknown"}, {"service_tier": "fast"},

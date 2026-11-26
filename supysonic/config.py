@@ -138,6 +138,7 @@ class DefaultConfig:
         "enabled": False,
         "provider": "compatible",
         "profile_enabled": False,
+        "profile_model": "gpt-6.2-sol",
         "daily_selection_enabled": False,
         "profile_refresh_interval_seconds": 21600,
         "profile_batch_size": 2,

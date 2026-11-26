@@ -7,8 +7,9 @@ from peewee import SqliteDatabase
 
 from supysonic.db_layer.core import Meta, db
 from supysonic.metadata_budget import MetadataBudget
+from supysonic.metadata_pricing import PROFILE_MODEL
 from supysonic.openai_recommendations import (
-    OpenAIRecommendationError, STATE_KEY, recommendation_lease,
+    OpenAIRecommendationError, PROFILE_STATE_KEY, STATE_KEY, recommendation_lease,
     recommendation_settings, request_recommendation_json,
 )
 
@@ -78,6 +79,37 @@ class OpenAIRecommendationsTestCase(unittest.TestCase):
         })
         self.assertEqual(result["_budget_config"], BUDGET)
         self.assertNotIn("do-not-copy", str(result))
+
+    def test_profile_model_and_pricing_are_independent_of_daily_and_chat(self):
+        settings = dict(SETTINGS, profile_model=PROFILE_MODEL, reasoning_effort="none")
+        self.response.json.return_value = completion(model=PROFILE_MODEL)
+        self.assertTrue(self.call("profile", settings)["ok"])
+        payload = self.post.call_args.kwargs["json"]
+        self.assertEqual(payload["model"], PROFILE_MODEL)
+        self.assertEqual(payload["reasoning_effort"], "low")
+        self.assertEqual(self.budget.snapshot()["month_spent_micro_usd"], 700)
+
+        self.response.json.return_value = completion()
+        for workload in ("daily", "chat"):
+            self.assertTrue(self.call(workload, settings)["ok"])
+            payload = self.post.call_args.kwargs["json"]
+            self.assertEqual(payload["model"], SETTINGS["model"])
+            self.assertEqual(payload["reasoning_effort"], "none")
+        self.assertEqual(self.budget.snapshot()["month_spent_micro_usd"], 770)
+
+    def test_profile_model_failure_does_not_pause_luna(self):
+        self.response.status_code = 404
+        self.response.json.return_value = {"error": {"code": "model_not_found"}}
+        settings = dict(SETTINGS, profile_model=PROFILE_MODEL)
+        with self.assertRaises(OpenAIRecommendationError):
+            self.call("profile", settings)
+        self.assertTrue(json.loads(Meta.get_by_id(PROFILE_STATE_KEY).value)["hard"])
+        self.assertIsNone(Meta.get_or_none(Meta.key == STATE_KEY))
+
+        self.response.status_code = 200
+        self.response.json.return_value = completion()
+        self.assertTrue(self.call("daily", settings)["ok"])
+        self.assertGreater(self.budget.snapshot()["month_reserved_micro_usd"], 0)
 
     def test_admission_occurs_before_http(self):
         self.budget.reserve("web", 2_000_000)

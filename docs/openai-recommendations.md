@@ -1,9 +1,9 @@
 # OpenAI music profiles and recommendations
 
-The opt-in `recommendation_agent.provider = openai` path uses the official API
-and the supported `gpt-6-luna` model. Playback history, counts, favorites and
-negative feedback remain authoritative database facts. AI produces musical
-interpretation and ordering, not replacements for those facts.
+The opt-in `recommendation_agent.provider = openai` path uses the official API.
+Music profiles default to `gpt-6.2-sol`. Daily selection and chat use
+`gpt-6-luna`. The analysis and song ordering use playback history, counts,
+favorites and negative feedback from the database.
 
 ## Configuration
 
@@ -18,6 +18,7 @@ model = gpt-6-luna
 timeout_seconds = 120
 reasoning_effort = low
 profile_enabled = on
+profile_model = gpt-6.2-sol
 daily_selection_enabled = on
 profile_refresh_interval_seconds = 21600
 profile_batch_size = 2
@@ -40,7 +41,9 @@ provider mode is unchanged and is not covered by this OpenAI budget path.
 
 - A separate daemon profile job checks bounded users each tick. Successful
   profiles refresh no sooner than six hours; unchanged music facts are reused.
-  Failed attempts back off per user and retain the previous profile.
+  A model change takes effect at the next eligible refresh. Failed attempts
+  back off per user and retain the previous profile. Set
+  `profile_model = gpt-6-luna` to use Luna for profiles.
 - Daily playlists first recall at most 150 eligible local tracks. OpenAI ranks
   request-local IDs. Repeated IDs keep their first position, and omitted IDs
   caused by repeats are appended in local candidate order. Wrong lengths and
@@ -65,14 +68,13 @@ are retained. Prices are conservative software estimates, not a provider invoice
 
 No hidden retries, repair requests, browsing tools or fallback providers are used
 by the OpenAI recommendation path. A shared recommendation provider lease prevents
-concurrent calls. Transient failures persist a separate 5/10/20/30-minute backoff;
-an accounted success resets that streak. Metadata-only pauses do not disable
-recommendations. Authentication, quota and accounting errors pause fail-closed
-until the cause and exact persisted state are reviewed. Do not clear reservations
-or unrelated metadata pauses to recover a recommendation failure.
+concurrent calls. Transient failures persist a 5/10/20/30-minute backoff for the
+configured model. An accounted success resets that model's streak. The shared
+ledger still limits admission across models. Authentication, quota and accounting
+errors pause the affected model until the cause and persisted state are reviewed.
 
 Logs use `openai_recommendation_accounted workload=profile|daily|chat` with
-micro-USD cost, without credentials or prompts. Local deterministic tests mock
+the model and micro-USD cost. Local deterministic tests mock
 OpenAI; a live deployment still requires bounded profile/daily/chat probes and
 separate user listening acceptance.
 

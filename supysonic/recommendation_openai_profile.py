@@ -17,7 +17,8 @@ from .db import (
     User_Play_Activity, UserRecommendationFeedback, now,
 )
 from .openai_recommendations import (
-    OpenAIRecommendationError, recommendation_lease, request_recommendation_json,
+    OpenAIRecommendationError, profile_request_model, recommendation_lease,
+    request_recommendation_json,
 )
 from .recommendation_agent_cache import save_recommendation_agent_cache_payload
 from .user_listening_profile import build_track_count_listening_profile
@@ -61,7 +62,10 @@ PROFILE_SYSTEM_PROMPT = (
     "with reliable metadata, NOT all listening. Missing data is unknown, not "
     "dislike. Give recent7Days more influence on current preference than lifetime, "
     "while distinguishing a short-term change from a stable taste. Do not invent "
-    "counts, artists, or evidence. preferredLanguages must use only language codes "
+    "counts, artists, or evidence. Support the summary and recentTrend with the "
+    "most relevant supplied counts, naming the time window. Treat play counts as "
+    "observed listening rather than proof of explicit likes or dislikes. "
+    "preferredLanguages must use only language codes "
     "present in metadataCovered topLanguages; return [] if none. Do not mistake "
     "artist nationality or title script for song language. Keep discoveryDirections "
     "musical and cautions explicit about sparse or missing coverage. For example, "
@@ -246,7 +250,7 @@ def refresh_openai_profile(config: object, user: User) -> str:
     settings = _settings(config)
     interval = _bounded_int(settings.get("profile_refresh_interval_seconds"),
                             DEFAULT_PROFILE_REFRESH_SECONDS, 21600, 86400)
-    model = str(settings.get("model", ""))
+    model = profile_request_model(settings)
     with recommendation_lease(f"profile:{user.id}", ttl_seconds=600) as acquired:
         if not acquired:
             return "busy"

@@ -1,4 +1,4 @@
-"""Conservative software accounting for the supported metadata model only."""
+"""Conservative software accounting for supported OpenAI workloads."""
 
 import json
 from decimal import Decimal, ROUND_CEILING
@@ -8,10 +8,20 @@ from .llm_client import LlmConfigError
 
 
 MODEL = "gpt-6-luna"
+PROFILE_MODEL = "gpt-6.2-sol"
 MAX_REQUEST_BYTES = 65536
 MAX_OUTPUT_TOKENS = 4096
 WEB_RESERVATION_MICRO_USD = 1000000
 PRICE_VERSION = "gpt-6-luna-standard-2026-11-12"
+
+# Standard rates in micro-USD per token. Input accounts for the most
+# expensive cache-write rate documented for each model.
+_TOKEN_RATES = {
+    MODEL: ((Decimal("0.25"), Decimal("0.50")),
+            (Decimal("0.50"), Decimal("0.75"))),
+    PROFILE_MODEL: ((Decimal("5"), Decimal("10")),
+                    (Decimal("10"), Decimal("15"))),
+}
 
 
 def _integer(value: object, minimum: int = 0) -> Optional[int]:
@@ -20,9 +30,10 @@ def _integer(value: object, minimum: int = 0) -> Optional[int]:
     return value
 
 
-def _validate_request(payload: Mapping[str, object], kind: str) -> int:
-    if payload.get("model") != MODEL or kind not in ("text", "web"):
-        raise LlmConfigError("Metadata pricing supports gpt-6-luna only.")
+def _validate_request(payload: Mapping[str, object], kind: str, model: str) -> int:
+    if (model not in _TOKEN_RATES or payload.get("model") != model
+            or kind not in ("text", "web") or (kind == "web" and model != MODEL)):
+        raise LlmConfigError("Unsupported budgeted model or request type.")
     if payload.get("service_tier") != "default":
         raise LlmConfigError("Budgeted metadata requires standard processing.")
     try:
@@ -48,23 +59,24 @@ def _validate_request(payload: Mapping[str, object], kind: str) -> int:
 
 
 def reserve_request_micro_usd(
-    payload: Mapping[str, object], kind: str = "text"
+    payload: Mapping[str, object], kind: str = "text", *, model: str = MODEL
 ) -> int:
     """Reserve before I/O; web allowance is deliberately above sampled costs.
 
     The web allowance is a conservative application limit, not an assertion
     about a provider invoice. Missing usage must never release this allowance.
     """
-    size = _validate_request(payload, kind)
+    size = _validate_request(payload, kind, model)
     if kind == "web":
         return WEB_RESERVATION_MICRO_USD
     # UTF-8 bytes overestimate visible input tokens; leave room for framing and
     # bill all input at the higher 12-hour cache-write price, without discounts.
     tokens = size + 4096
     output = payload["max_completion_tokens"]
-    return int((Decimal(tokens) * Decimal("0.25") +
-                Decimal(output) * Decimal("0.50")).to_integral_value(
-                    rounding=ROUND_CEILING))
+    input_rate, output_rate = _TOKEN_RATES[model][0]
+    return int((tokens * input_rate + output * output_rate).to_integral_value(
+        rounding=ROUND_CEILING
+    ))
 
 
 def response_cost_micro_usd(
@@ -76,7 +88,8 @@ def response_cost_micro_usd(
     ordinary input at the maximum cache-write rate to avoid under-accounting.
     """
     if (
-        model != MODEL or kind not in ("text", "web")
+        model not in _TOKEN_RATES or kind not in ("text", "web")
+        or (kind == "web" and model != MODEL)
         or response.get("model") != model
         or response.get("service_tier") != "default"
     ):
@@ -115,8 +128,7 @@ def response_cost_micro_usd(
         searches = _integer(search_usage.get("num_requests"))
         if searches is None:
             return None
-    long_context = inputs > 272000
-    input_rate = Decimal("0.50" if long_context else "0.25")
-    output_rate = Decimal("0.75" if long_context else "0.50")
+    short_rates, long_rates = _TOKEN_RATES[model]
+    input_rate, output_rate = long_rates if inputs > 272000 else short_rates
     return int((Decimal(inputs) * input_rate + Decimal(outputs) * output_rate +
                 Decimal(searches) * 10000).to_integral_value(rounding=ROUND_CEILING))

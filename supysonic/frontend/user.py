@@ -14,10 +14,12 @@ from ..db import ClientPrefs, User
 from ..lastfm import LastFm, is_configured
 from ..listenbrainz import ListenBrainz
 from ..managers.user import UserManager
+from ..profile_home import build_profile_home
 from ..recommendation_openai_profile import get_cached_openai_profile, openai_profile_enabled
 from ..user_listening_profile import build_user_listening_profile
 
 from . import admin_only, frontend
+from .user_avatar import avatar_path, get_avatar_csrf_token
 
 logger = logging.getLogger(__name__)
 
@@ -148,17 +150,20 @@ def user_index():
 @frontend.route("/user/<uid>")
 @me_or_uuid
 def user_profile(uid, user):
-    listening_profile = build_user_listening_profile(user)
-    return render_template(
+    own_profile = request.user.id == user.id
+    ai_enabled = openai_profile_enabled(current_app.config)
+    html = render_template(
         "profile.html",
         user=user,
         api_key=_get_lastfm_api_key(),
         clients=user.clients,
-        listening_profile=listening_profile,
-        openai_profile_enabled=openai_profile_enabled(current_app.config),
-        openai_profile=(get_cached_openai_profile(user)
-                        if openai_profile_enabled(current_app.config) else None),
+        profile_home=build_profile_home(user, request.args.get("period", "7")),
+        avatar_exists=avatar_path(user).is_file(),
+        avatar_csrf=get_avatar_csrf_token() if own_profile else None,
+        openai_profile_enabled=ai_enabled,
+        openai_profile=get_cached_openai_profile(user) if ai_enabled else None,
     )
+    return html, 200, {"Cache-Control": "private, no-store"}
 
 
 @frontend.route("/api/me/listening-profile")
