@@ -16,7 +16,7 @@ Emosonic Server 是基于 Flask 的音乐流媒体与运维平台，脱胎于 [s
 - 从 Spotify、Last.fm 等渠道补全缺失的艺术家封面、专辑封面和专辑年份
 - 通过本地 NFO 文件组织艺术家信息、专辑信息和曲目信息
 - Web 端艺术家信息维护
-- Emosonic 扩展 API 与 Socket.IO 能力
+- Emosonic 扩展 API 与 Socket.IO 能力，支持[接入第三方遥控器](docs/third-party-remote-controller.zh-CN.md)
 
 ## Docker 镜像
 
