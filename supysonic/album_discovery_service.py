@@ -565,8 +565,11 @@ class AlbumDiscoveryService:
             order = get_album_download_order(self.library_key, album.album_id)
             remote = self._read_oracle(album, order) if order else None
             if order and order.status == RESERVED and remote and remote.status == "absent":
-                # Use the already reserved order ID after an interrupted submission.
-                remote = self.oracle.submit(album.album_id, album.url, str(order.id))
+                if release.oracle_status == "unknown":
+                    remote = self.oracle.close_if_unaccepted(album.album_id, album.url, str(order.id))
+                else:
+                    # Recover a reservation interrupted before an outcome was recorded.
+                    remote = self.oracle.submit(album.album_id, album.url, str(order.id))
             if remote:
                 self._save_remote_state(release, remote, order)
             inventory = self._inventory(

@@ -178,6 +178,21 @@ class OracleClientTestCase(unittest.TestCase):
         return {**body, "state": "cleaned",
                 "manifestSha256": hashlib.sha256(canonical.encode()).hexdigest()}
 
+    def test_only_matching_durable_nonacceptance_releases_an_order(self) -> None:
+        proof = {**self.state("rejected"), "decision": "closed_without_acceptance"}
+        for response in (
+            self.response(401, proof), self.response(404, proof),
+            self.response(200, self.state("absent")),
+            self.response(200, self.state("rejected")),
+            self.response(200, {**proof, "orderId": "different"}),
+            self.response(200, {**proof, "albumId": "999"}),
+        ):
+            self.session.request.return_value = response
+            self.assertEqual(self.client.close_if_unaccepted("100", ALBUM_URL, "order").status, "unknown")
+        self.session.request.return_value = self.response(200, proof)
+        self.assertEqual(self.client.close_if_unaccepted("100", ALBUM_URL, "order").status, "rejected")
+        self.assertTrue(self.session.request.call_args.args[1].endswith("/100/close-if-unaccepted"))
+
     def test_lost_response_keeps_unknown_then_reports_owned_task_after_restart(self) -> None:
         self.session.request.side_effect = (
             requests.Timeout(),
@@ -203,7 +218,7 @@ class OracleClientTestCase(unittest.TestCase):
         self.assertEqual(self.client.inspect("100", ALBUM_URL).status, "unknown")
         self.session.request.reset_mock()
         for url in (ALBUM_URL + "?i=101", ALBUM_URL.replace("/cn/", "/hk/")):
-            self.assertEqual(self.client.submit("100", url, "order").status, "rejected")
+            self.assertEqual(self.client.submit("100", url, "order").status, "unknown")
         self.session.request.assert_not_called()
 
     def test_batches_require_cn_edition_canonical_digest_and_safe_paths(self) -> None:

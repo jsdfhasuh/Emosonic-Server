@@ -178,6 +178,10 @@ class OracleAlbumClient:
             or (status in ("submitted", "associated") and task_id is None)
             or (status == "submitted" and order_id is None)
             or (status in ("absent", "rejected") and (task_id is not None or batch_ids))
+            or (status == "rejected" and (
+                order_id is None or task_status is not None
+                or payload.get("decision") != "closed_without_acceptance"
+            ))
         ):
             return OracleAlbumState("unknown", detail="oracle_response_invalid")
         manifests = []
@@ -207,7 +211,7 @@ class OracleAlbumClient:
         order_id: Optional[str] = None,
     ) -> OracleAlbumState:
         if cn_album_id(album_url) != album_id:
-            return OracleAlbumState("rejected", detail="invalid_cn_release_url")
+            return OracleAlbumState("unknown", detail="invalid_cn_release_url")
         params = {}
         if order_id is not None:
             params["orderId"] = order_id
@@ -219,10 +223,22 @@ class OracleAlbumClient:
         return self._state(response, album_id, order_id)
 
     def submit(self, album_id: str, album_url: str, order_id: str) -> OracleAlbumState:
+        return self._post_order(album_id, album_url, order_id, "")
+
+    def close_if_unaccepted(self, album_id: str, album_url: str, order_id: str) -> OracleAlbumState:
+        """Ask Oracle to fence a never-accepted order before releasing its reservation."""
+        state = self._post_order(album_id, album_url, order_id, "/close-if-unaccepted")
+        if state.status == "absent":
+            return OracleAlbumState("unknown", detail="order_closure_unconfirmed")
+        return state
+
+    def _post_order(
+        self, album_id: str, album_url: str, order_id: str, suffix: str,
+    ) -> OracleAlbumState:
         if cn_album_id(album_url) != album_id or not isinstance(order_id, str) or not _TASK_ID.fullmatch(order_id):
-            return OracleAlbumState("rejected", detail="invalid_cn_release_or_order")
+            return OracleAlbumState("unknown", detail="invalid_cn_release_or_order")
         payload: Mapping[str, str] = {"url": album_url, "orderId": order_id}
         response = self._request(
-            "POST", "/api/discovery/albums/" + album_id, self._token, json=payload
+            "POST", "/api/discovery/albums/" + album_id + suffix, self._token, json=payload
         )
         return self._state(response, album_id, order_id)
