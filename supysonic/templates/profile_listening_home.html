@@ -1,9 +1,7 @@
 {% set is_owner = request.user.id == user.id %}
 {% set profile_uid = 'me' if is_owner else user.id %}
+{% set portrait = nav_avatar if is_owner else account_avatar_info(user) %}
 {% set home = profile_home %}
-{% if daily_avatar_enabled or avatar_generation_enabled %}
-<script defer src="{{ url_for('static', filename='js/profile-avatar.js') }}"></script>
-{% endif %}
 
 {% macro number(value) -%}
 {{ '{:,}'.format(value) }}
@@ -32,20 +30,14 @@
 <section class="listening-hero" aria-labelledby="listening-profile-title">
   <div class="listening-hero-copy">
     <div class="listening-identity">
-      <span class="listening-avatar" aria-hidden="true"{% if daily_avatar_enabled %} data-daily-avatar="{{ url_for('frontend.user_avatar', uid=profile_uid) }}" data-initial="{{ user.name[:1]|upper }}"{% endif %}>
-        {% if avatar_exists %}
-        <img src="{{ url_for('frontend.user_avatar', uid=profile_uid) }}" width="56" height="56" alt="">
-        {% else %}
-        {{ user.name[:1]|upper }}
-        {% endif %}
-      </span>
+      {{ account_avatar(portrait, "listening-avatar", 56) }}
       <strong>{{ user.name }}</strong>
     </div>
     <h2 id="listening-profile-title" data-i18n-en="Listening Profile" data-i18n-zh="听歌画像">Listening Profile</h2>
     {% if is_owner and avatar_csrf %}
     <details class="listening-avatar-editor"{% if request.args.get('avatar') %} open{% endif %}>
       <summary data-i18n-en="Edit avatar" data-i18n-zh="编辑头像">Edit avatar</summary>
-      {% if daily_avatar_enabled %}
+      {% if portrait.daily %}
       <p data-i18n-en="A new music portrait is applied daily after 08:00 Shanghai time. Previous portraits are saved on the server." data-i18n-zh="每天北京时间 08:00 后自动换上新的音乐头像，旧头像保存在服务器本地。">A new music portrait is applied daily after 08:00 Shanghai time. Previous portraits are saved on the server.</p>
       {% endif %}
       {% if avatar_generation_enabled %}
@@ -80,7 +72,7 @@
         <p id="listening-avatar-help" data-i18n-en="JPG, PNG or WebP, up to 4 MB" data-i18n-zh="支持 JPG、PNG 或 WebP，最大 4 MB">JPG, PNG or WebP, up to 4 MB</p>
         <button type="submit" data-i18n-en="Save avatar" data-i18n-zh="保存头像">Save avatar</button>
       </form>
-      {% if avatar_exists %}
+      {% if portrait.exists %}
       <form action="{{ url_for('frontend.user_avatar_remove', period=home.period) }}" method="post">
         <input type="hidden" name="csrf_token" value="{{ avatar_csrf }}">
         <button type="submit" class="listening-avatar-reset" data-i18n-en="Restore default" data-i18n-zh="恢复默认头像">Restore default</button>

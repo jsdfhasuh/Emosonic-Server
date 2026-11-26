@@ -5,6 +5,7 @@
  Distributed under terms of the GNU AGPLv3 license.
 -#}
 <!DOCTYPE html>
+{% from "account_avatar.html" import account_avatar %}
 <html lang="en">
   <head>
     <meta charset="utf-8">
@@ -16,6 +17,9 @@
     <link rel="icon" href="{{ url_for('static', filename='img/vinyl.svg') }}" type="image/svg+xml">
     <link href="{{ url_for('static', filename='css/bootstrap.min.css') }}" rel="stylesheet">
     <link href="{{ url_for('static', filename='css/supysonic.css') }}" rel="stylesheet">
+    {% if session.userid %}
+    <script defer src="{{ url_for('static', filename='js/profile-avatar.js') }}"></script>
+    {% endif %}
   </head>
   <body>
     <script>
@@ -147,7 +151,8 @@
               </div>
               <div class="dropdown">
                 <a class="console-user dropdown-toggle" href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false">
-                  <span class="console-user-badge">{{ request.user.name[0]|upper }}</span>
+                  {% set nav_avatar = account_avatar_info(request.user) %}
+                  {{ account_avatar(nav_avatar, "console-user-badge", 38) }}
                   <span class="console-user-meta">
                     <strong>{{ request.user.name }}</strong>
                     <small>{% if request.user.admin %}<span data-i18n-en="Administrator" data-i18n-zh="管理员">Administrator</span>{% else %}<span data-i18n-en="Operator" data-i18n-zh="使用者">Operator</span>{% endif %}</small>

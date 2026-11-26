@@ -186,6 +186,13 @@ body[data-bs-theme="dark"] .console-navbar {
   font-weight: 700;
 }
 
+.console-user-badge img {
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  object-fit: cover;
+}
+
 .console-main {
   padding-bottom: 3rem;
 }

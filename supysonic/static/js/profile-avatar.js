@@ -1,7 +1,11 @@
 (() => {
-  const portrait = document.querySelector("[data-daily-avatar]");
-  if (portrait) {
-    const url = portrait.dataset.dailyAvatar;
+  const groups = new Map();
+  for (const badge of document.querySelectorAll("[data-daily-avatar]")) {
+    const url = badge.dataset.dailyAvatar;
+    if (!groups.has(url)) groups.set(url, []);
+    groups.get(url).push(badge);
+  }
+  for (const [url, badges] of groups) {
     let version = "";
     let checking = false;
     const refresh = async () => {
@@ -11,16 +15,16 @@
         const response = await fetch(url, {method: "HEAD", cache: "no-store",
           headers: version ? {"If-None-Match": version} : {}});
         if (response.status === 404) {
-          portrait.textContent = portrait.dataset.initial;
+          for (const badge of badges) badge.textContent = badge.dataset.initial;
           version = "";
         } else if (response.ok && response.headers.get("Content-Type") === "image/png") {
           const next = response.headers.get("ETag");
           if (next && next !== version) {
-            const img = new Image(56, 56);
+            const img = new Image();
             img.alt = "";
             img.src = url + "?v=" + encodeURIComponent(next);
             await img.decode();
-            portrait.replaceChildren(img);
+            for (const badge of badges) badge.replaceChildren(img.cloneNode());
             version = next;
           }
         }

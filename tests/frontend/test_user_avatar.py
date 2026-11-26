@@ -1,5 +1,6 @@
 import io
 
+from lxml import html
 from PIL import Image, PngImagePlugin
 
 from supysonic.db import User
@@ -73,6 +74,34 @@ class UserAvatarTestCase(FrontendTestBase):
         self.assertEqual(rejected.location, "/user/me?period=30&avatar=1")
         self.assertEqual(self._upload(token, self._png(size=(4097, 1))).status_code, 303)
         self.assertEqual(self._image_bytes(), previous)
+
+    def test_navbar_and_profile_use_the_appropriate_account_avatar(self):
+        def badge(page, css_class):
+            return page.xpath(f'//span[@class="{css_class}"]')[0]
+
+        self._login("alice", "Alic3")
+        bob = User.get(User.name == "bob")
+        own = "/user/me/avatar"
+        cfg = self.client.application.config["RECOMMENDATION_AGENT"]
+        self.client.application.config["RECOMMENDATION_AGENT"] = dict(
+            cfg, enabled=True, provider="openai", daily_avatar_username="alice",
+        )
+        self.assertEqual(self._upload(self._token(), self._png()).status_code, 303)
+        page = html.fromstring(self.client.get("/user/me").data)
+        for css_class in ("console-user-badge", "listening-avatar"):
+            portrait = badge(page, css_class)
+            self.assertEqual(portrait.get("data-daily-avatar"), own)
+            self.assertEqual(portrait.xpath("img/@src"), [own])
+        self.assertEqual(len(page.xpath('//script[contains(@src,"profile-avatar.js")]')), 1)
+        users = html.fromstring(self.client.get("/user").data)
+        self.assertEqual(badge(users, "console-user-badge").xpath("img/@src"), [own])
+        other = html.fromstring(self.client.get(f"/user/{bob.id}").data)
+        self.assertEqual(badge(other, "console-user-badge").xpath("img/@src"), [own])
+        self.assertEqual(badge(other, "listening-avatar").text_content().strip(), "B")
+        self._logout()
+        self._login("bob", "B0b")
+        page = html.fromstring(self.client.get("/user/me").data)
+        self.assertEqual(badge(page, "console-user-badge").text_content().strip(), "B")
 
     def test_only_current_account_can_write_and_auth_is_required(self):
         alice = User.get(User.name == "alice")

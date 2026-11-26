@@ -20,7 +20,7 @@ from ..recommendation_openai_profile import get_cached_openai_profile, openai_pr
 from ..user_listening_profile import build_user_listening_profile
 
 from . import admin_only, frontend
-from .user_avatar import avatar_path, get_avatar_csrf_token
+from .user_avatar import get_avatar_csrf_token
 
 logger = logging.getLogger(__name__)
 
@@ -159,10 +159,6 @@ def user_profile(uid, user):
         api_key=_get_lastfm_api_key(),
         clients=user.clients,
         profile_home=build_profile_home(user, request.args.get("period", "7")),
-        avatar_exists=avatar_path(user).is_file(),
-        daily_avatar_enabled=generation_enabled(current_app.config) and (
-            current_app.config["RECOMMENDATION_AGENT"].get("daily_avatar_username") == user.name
-        ),
         avatar_csrf=get_avatar_csrf_token() if own_profile else None,
         avatar_generation_enabled=own_profile and generation_enabled(current_app.config),
         openai_profile_enabled=ai_enabled,

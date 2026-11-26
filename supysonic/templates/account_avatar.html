@@ -1,0 +1,9 @@
+{% macro account_avatar(portrait, css_class, size) -%}
+<span class="{{ css_class }}" aria-hidden="true"{% if portrait.daily %} data-daily-avatar="{{ portrait.src }}" data-initial="{{ portrait.initial }}"{% endif %}>
+  {%- if portrait.exists -%}
+  <img src="{{ portrait.src }}" width="{{ size }}" height="{{ size }}" alt="">
+  {%- else -%}
+  {{ portrait.initial }}
+  {%- endif -%}
+</span>
+{%- endmacro %}

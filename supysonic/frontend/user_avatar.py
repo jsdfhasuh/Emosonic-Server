@@ -9,7 +9,7 @@ from PIL import Image
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from ..account_avatars import AVATAR_MAX_BYTES, account_avatar_path, avatar_png, publish_avatar
-from ..avatar_generation import AvatarGenerationError, generate_avatar
+from ..avatar_generation import AvatarGenerationError, generate_avatar, generation_enabled
 from ..db import User
 from ..managers.user import UserManager
 from ..openai_recommendations import OpenAIRecommendationError, recommendation_lease
@@ -23,6 +23,18 @@ _CSRF_KEY = "profile_avatar_csrf"
 
 def avatar_path(user: User) -> Path:
     return account_avatar_path(current_app.config, user)
+
+
+@frontend.app_template_global()
+def account_avatar_info(user: User) -> dict:
+    config = current_app.config
+    return {
+        "src": url_for("frontend.user_avatar", uid="me" if user.id == request.user.id else user.id),
+        "initial": user.name[:1].upper(),
+        "exists": avatar_path(user).is_file(),
+        "daily": config["RECOMMENDATION_AGENT"].get("daily_avatar_username") == user.name
+                 and generation_enabled(config),
+    }
 
 
 def get_avatar_csrf_token() -> str:
