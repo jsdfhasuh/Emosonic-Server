@@ -18,6 +18,7 @@ from supysonic.album_discovery_quota import (
     mark_album_download_submitted,
     reserve_album_download,
 )
+from supysonic.db_layer.schema import get_resource_text
 from supysonic.emo.ws_store import (
     listCoreStartupRecoveries,
     recoverPendingPlaybackControlsForStartup,
@@ -215,6 +216,15 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             database.close()
 
     @staticmethod
+    def _create_library_tables(provider: str, database) -> None:
+        # These tables predate the playback fixtures and are now referenced by
+        # the discovery migration. Use the real provider DDL for types and collations.
+        core = re.compile(r'CREATE TABLE IF NOT EXISTS "?(?:folder|artist|album|track|user)"?\s*\(')
+        for statement in get_resource_text(f"schema/{provider}.sql").split(";"):
+            if core.match(statement.strip()):
+                database.execute_sql(statement)
+
+    @staticmethod
     def _create_external_upgrade_fixture(
         provider: str,
         database_uri: str,
@@ -222,6 +232,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
         database = connect_database(database_uri)
         database.connect()
         try:
+            EmoSchemaMigrationTestCase._create_library_tables(provider, database)
             key_column = '"key"' if provider == "postgres" else "`key`"
             database.execute_sql(
                 "CREATE TABLE meta ("
@@ -855,6 +866,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
         return "00000000-0000-0000-0000-%012d" % number
 
     def _create_20260728_fixture(self, provider: str, database) -> None:
+        self._create_library_tables(provider, database)
         key_column = '"key"' if provider == "postgres" else "`key`" if provider == "mysql" else "key"
         id_type = "UUID" if provider == "postgres" else "CHAR(32)" if provider == "mysql" else "CHAR(36)"
         timestamp_type = "TIMESTAMP" if provider == "postgres" else "DATETIME"
