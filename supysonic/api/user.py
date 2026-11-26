@@ -5,14 +5,17 @@
 #
 # Distributed under terms of the GNU AGPLv3 license.
 
-from flask import request
+from flask import current_app, request
 from functools import wraps
 
+from ..account_avatars import send_account_avatar
 from ..db import User
 from ..managers.user import UserManager
+from ..profile_home import PROFILE_PERIODS, build_profile_home
+from ..recommendation_openai_profile import get_cached_openai_profile, openai_profile_enabled
 
 from . import decode_password, api_routing
-from .exceptions import Forbidden
+from .exceptions import Forbidden, NotFound, UnsupportedParameter
 
 
 def admin_only(f):
@@ -42,6 +45,44 @@ def users_info():
     return request.formatter(
         "users", {"user": [u.as_subsonic_user() for u in User.select()]}
     )
+
+
+@api_routing("/getAvatar")
+def user_avatar():
+    username = request.values.get("username", request.user.name)
+    user = request.user
+    if username != user.name:
+        if not user.admin:
+            raise Forbidden()
+        user = User.get_or_none(User.name == username)
+        if user is None:
+            raise NotFound("User")
+    try:
+        return send_account_avatar(user)
+    except FileNotFoundError:
+        raise NotFound("Avatar") from None
+
+
+@api_routing("/getEmoListeningProfile")
+def listening_profile():
+    period = request.values.get("period", "7")
+    if period not in PROFILE_PERIODS:
+        raise UnsupportedParameter("period")
+    home = build_profile_home(request.user, period)
+    profile = {
+        "period": period, "playCount": home["play_count"], "trackCount": home["track_count"],
+        "mood": [item["value"] for item in home["moods"]],
+        "tag": [item["value"] for item in home["tags"]],
+        "song": [{"title": row["title"], "artist": row["artist"], "playCount": row["plays"]}
+                 for row in home["top_tracks"]],
+    }
+    if openai_profile_enabled(current_app.config):
+        analysis = get_cached_openai_profile(request.user)
+        if analysis:
+            profile["summary"] = analysis["summary"]
+    response = request.formatter("listeningProfile", profile)
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
 
 
 def get_roles_dict():

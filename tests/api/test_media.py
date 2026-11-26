@@ -427,7 +427,8 @@ class MediaTestCase(ApiTestBase):
                 self.__assert_image_data(rv, "PNG", 120)
 
     def test_get_avatar(self):
-        self._make_request("getAvatar", error=0)
+        self._make_request("getAvatar", error=70)
+        self._make_request("getAvatar", {"u": "bob", "p": "B0b", "username": "alice"}, error=50)
 
     def test_get_cover_art_does_not_print_debug_output(self):
         args = {"u": "alice", "p": "Alic3", "c": "tests", "id": str(self.folderid)}

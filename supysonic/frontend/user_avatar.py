@@ -4,11 +4,11 @@ import logging
 import secrets
 from pathlib import Path
 
-from flask import Response, abort, current_app, flash, jsonify, redirect, request, send_file, session, url_for
+from flask import Response, abort, current_app, flash, jsonify, redirect, request, session, url_for
 from PIL import Image
 from werkzeug.exceptions import RequestEntityTooLarge
 
-from ..account_avatars import AVATAR_MAX_BYTES, account_avatar_path, avatar_png, publish_avatar
+from ..account_avatars import AVATAR_MAX_BYTES, account_avatar_path, avatar_png, publish_avatar, send_account_avatar
 from ..avatar_generation import AvatarGenerationError, generate_avatar, generation_enabled
 from ..db import User
 from ..managers.user import UserManager
@@ -74,12 +74,9 @@ def user_avatar(uid):
             abort(404)
 
     try:
-        response = send_file(avatar_path(user), mimetype="image/png", conditional=True)
+        return send_account_avatar(user)
     except FileNotFoundError:
         abort(404)
-    response.headers["Cache-Control"] = "private, no-store"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    return response
 
 
 @frontend.route("/user/me/avatar", methods=["POST"])

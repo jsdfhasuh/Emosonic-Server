@@ -10,7 +10,6 @@ from .exceptions import GenericError
 
 methods = (
     "getVideos",
-    "getAvatar",
     "getShares",
     "createShare",
     "updateShare",

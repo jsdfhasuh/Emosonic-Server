@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 
+from flask import Response, current_app, send_file
 from PIL import Image, ImageOps
 
 from .metadata_budget import SHANGHAI
@@ -24,6 +25,13 @@ def account_avatar_path(config, user) -> Path:
     web = config["WEBAPP"] if isinstance(config, Mapping) else config.WEBAPP
     folder = base.get("tempdatafolder") or web["cache_dir"]
     return (Path(folder) / "account-avatars" / f"{user.id}.png").absolute()
+
+
+def send_account_avatar(user) -> Response:
+    response = send_file(account_avatar_path(current_app.config, user), mimetype="image/png", conditional=True)
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
 def avatar_png(data: bytes) -> bytes:
