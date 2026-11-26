@@ -19,6 +19,7 @@ timeout_seconds = 120
 reasoning_effort = low
 profile_enabled = on
 profile_model = gpt-6.2-sol
+avatar_generation_enabled = on
 daily_selection_enabled = on
 profile_refresh_interval_seconds = 21600
 profile_batch_size = 2
@@ -36,6 +37,18 @@ Exactly one recommendation key source (`api_key`, `api_key_file`, `api_key_env`)
 must be nonempty. Both services may reference the same private key file, but
 credentials are never inherited from a different provider. Legacy compatible
 provider mode is unchanged and is not covered by this OpenAI budget path.
+
+## Music avatars
+
+The web profile's avatar editor offers GPT Image 2.6 Flare when the OpenAI provider and
+`avatar_generation_enabled` are enabled. The user can edit the description suggested by
+their listening tags and choose an art style. Clicking Generate sends the description
+and style to the Images API for one square image. The preview stays in the browser
+until the user chooses to save it through the account's avatar upload form.
+
+Each generation reserves funds from the same daily and monthly ledger. A verified
+response settles the reported token usage and logs `avatar_generation_accounted`.
+An interrupted request or an unverifiable usage report retains the reservation.
 
 ## Background behavior
 
@@ -60,7 +73,7 @@ provider mode is unchanged and is not covered by this OpenAI budget path.
 
 ## Budget and failures
 
-All three workloads reserve spending through the existing `mb:*` ledger before
+These workloads reserve spending through the existing `mb:*` ledger before
 HTTP and settle before using output. Metadata and recommendations together have
 USD 57 admission capacity within the USD 60 monthly limit, and USD 2 daily pacing
 in Asia/Shanghai. Existing counters are not reset; unknown-outcome reservations

@@ -40,8 +40,34 @@
     </div>
     <h2 id="listening-profile-title" data-i18n-en="Listening Profile" data-i18n-zh="听歌画像">Listening Profile</h2>
     {% if is_owner and avatar_csrf %}
-    <details class="listening-avatar-editor">
+    <details class="listening-avatar-editor"{% if request.args.get('avatar') %} open{% endif %}>
       <summary data-i18n-en="Edit avatar" data-i18n-zh="编辑头像">Edit avatar</summary>
+      {% if avatar_generation_enabled %}
+      <div class="listening-avatar-generator" hidden>
+        <form class="listening-avatar-upload" method="post" action="{{ url_for('frontend.user_avatar_generate') }}" data-avatar-generate>
+          <input type="hidden" name="csrf_token" value="{{ avatar_csrf }}">
+          <label for="avatar-description" data-i18n-en="Describe your music avatar" data-i18n-zh="描述你想画的音乐头像">Describe your music avatar</label>
+          <input id="avatar-description" name="description" type="text" maxlength="160" required value="{{ (home.moods[:2] + home.tags[:2])|map(attribute='value')|join(' · ')|truncate(150, true, '') }}" placeholder="A piano by a rainy window" data-i18n-en="A piano by a rainy window" data-i18n-zh="比如，雨夜窗边的一架钢琴" data-i18n-attr="placeholder">
+          <label for="avatar-style" data-i18n-en="Art style" data-i18n-zh="画风">Art style</label>
+          <select name="style" id="avatar-style">
+            <option value="print" data-i18n-en="Vintage record sleeve" data-i18n-zh="复古唱片">Vintage record sleeve</option>
+            <option value="neon" data-i18n-en="Neon illustration" data-i18n-zh="霓虹插画">Neon illustration</option>
+            <option value="watercolor" data-i18n-en="Watercolor" data-i18n-zh="水彩">Watercolor</option>
+          </select>
+          <p data-i18n-en="Each generation sends this description and style to OpenAI and uses the shared budget." data-i18n-zh="每次生成会把以上描述和画风发送给 OpenAI，计入共享预算。">Each generation sends this description and style to OpenAI and uses the shared budget.</p>
+          <button type="submit" data-i18n-en="Generate avatar" data-i18n-zh="生成头像">Generate avatar</button>
+        </form>
+        <p role="status" aria-live="polite" data-avatar-status></p>
+        <form method="post" enctype="multipart/form-data" action="{{ url_for('frontend.user_avatar_update', period=home.period) }}" data-avatar-apply hidden>
+          <img data-avatar-preview alt="Avatar preview" data-i18n-en="Avatar preview" data-i18n-zh="候选头像" data-i18n-attr="alt" width="112" height="112">
+          <input type="hidden" name="csrf_token" value="{{ avatar_csrf }}">
+          <input type="file" name="avatar" hidden>
+          <button type="submit" data-i18n-en="Use this avatar" data-i18n-zh="设为我的头像">Use this avatar</button>
+          <button type="button" data-avatar-discard data-i18n-en="Discard" data-i18n-zh="放弃这张">Discard</button>
+        </form>
+      </div>
+      <script defer src="{{ url_for('static', filename='js/profile-avatar.js') }}"></script>
+      {% endif %}
       <form action="{{ url_for('frontend.user_avatar_update', period=home.period) }}" method="post" enctype="multipart/form-data" class="listening-avatar-upload">
         <input type="hidden" name="csrf_token" value="{{ avatar_csrf }}">
         <label for="listening-avatar-file" data-i18n-en="Choose an image" data-i18n-zh="选择图片">Choose an image</label>

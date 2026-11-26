@@ -139,6 +139,7 @@ class DefaultConfig:
         "provider": "compatible",
         "profile_enabled": False,
         "profile_model": "gpt-6.2-sol",
+        "avatar_generation_enabled": True,
         "daily_selection_enabled": False,
         "profile_refresh_interval_seconds": 21600,
         "profile_batch_size": 2,

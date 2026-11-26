@@ -7,12 +7,14 @@ import secrets
 import tempfile
 from pathlib import Path
 
-from flask import abort, current_app, flash, redirect, request, send_file, session, url_for
+from flask import Response, abort, current_app, flash, jsonify, redirect, request, send_file, session, url_for
 from PIL import Image, ImageOps
 from werkzeug.exceptions import RequestEntityTooLarge
 
+from ..avatar_generation import AvatarGenerationError, generate_avatar
 from ..db import User
 from ..managers.user import UserManager
+from ..openai_recommendations import OpenAIRecommendationError, recommendation_lease
 from ..profile_home import PROFILE_PERIODS
 from . import frontend
 
@@ -129,6 +131,32 @@ def user_avatar_update():
     else:
         flash("Avatar updated.", "success")
     return _profile_redirect()
+
+
+@frontend.route("/user/me/avatar/generate", methods=["POST"])
+def user_avatar_generate():
+    if request.content_length is None or request.content_length > 8192:
+        abort(413)
+    _check_avatar_csrf()
+    try:
+        with recommendation_lease(f"avatar-image:{request.user.id}") as acquired:
+            if not acquired:
+                return jsonify(error="busy"), 409
+            raw = generate_avatar(current_app.config, request.form.get("style", ""),
+                                  request.form.get("description", ""))
+            with _avatar_image(raw) as image, io.BytesIO() as output:
+                image.save(output, format="PNG")
+                return Response(output.getvalue(), mimetype="image/png", headers={
+                    "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
+                })
+    except AvatarGenerationError as exc:
+        reason = str(exc)
+        status = {"budget": 429, "description": 400, "disabled": 403}.get(reason, 502)
+        return jsonify(error=reason), status
+    except OpenAIRecommendationError:
+        return jsonify(error="accounting"), 503
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
+        return jsonify(error="response"), 502
 
 
 @frontend.route("/user/me/avatar/remove", methods=["POST"])

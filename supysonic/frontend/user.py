@@ -10,6 +10,7 @@ import logging
 from flask import current_app, flash, jsonify, redirect, render_template, request, session, url_for
 from functools import wraps
 
+from ..avatar_generation import generation_enabled
 from ..db import ClientPrefs, User
 from ..lastfm import LastFm, is_configured
 from ..listenbrainz import ListenBrainz
@@ -160,6 +161,7 @@ def user_profile(uid, user):
         profile_home=build_profile_home(user, request.args.get("period", "7")),
         avatar_exists=avatar_path(user).is_file(),
         avatar_csrf=get_avatar_csrf_token() if own_profile else None,
+        avatar_generation_enabled=own_profile and generation_enabled(current_app.config),
         openai_profile_enabled=ai_enabled,
         openai_profile=get_cached_openai_profile(user) if ai_enabled else None,
     )

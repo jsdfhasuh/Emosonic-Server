@@ -171,6 +171,32 @@ html[lang="zh-Hans"] .listening-hero h2 {
   width: min(100%, 270px);
 }
 
+.listening-avatar-generator {
+  width: min(100%, 28rem);
+  padding-bottom: 12px;
+  border-bottom: 1px solid #ffffff42;
+}
+
+.listening-avatar-generator input[type="text"],
+.listening-avatar-generator select {
+  width: 100%;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 6px;
+}
+
+.listening-avatar-generator [data-avatar-preview] {
+  display: block;
+  margin-block: 10px;
+  border-radius: 50%;
+}
+
+.listening-avatar-generator button:disabled {
+  opacity: .65;
+  cursor: wait;
+}
+
 .listening-avatar-editor button,
 .listening-avatar-editor ::file-selector-button {
   border: 0;
