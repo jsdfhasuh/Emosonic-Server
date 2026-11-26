@@ -238,6 +238,16 @@ track_metadata_enrichment_log_payload = off
 ; The interval is 5 minutes in this example. Increase batch size cautiously to
 ; avoid provider rate limits and quota usage.
 
+[album_discovery]
+; Optional JSON settings for both Web confirmation and the background job.
+; Omit settings_file for one new album per day with auto-submit off.
+; Copy docs/examples/album-discovery-settings.json to settings.json in a
+; persistent host directory. Mount that directory into both containers:
+;   ./album-discovery:/var/supysonic/album-discovery:ro
+; Mounting the directory lets an atomic file replacement take effect on the
+; next submission. An invalid or unreadable file pauses new submissions.
+;settings_file = /var/supysonic/album-discovery/settings.json
+
 [musicbrainz]
 ; MusicBrainz is the default structured album enrichment source.
 ; Enrichment only fills empty album/track metadata and may create an

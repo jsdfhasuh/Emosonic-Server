@@ -1,13 +1,22 @@
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import re
 import sqlite3
 import tempfile
+from threading import Barrier
 import unittest
 
 from playhouse.db_url import connect as connect_database
 
 from supysonic import db
+from supysonic.album_discovery_quota import (
+    AlbumReservationResult,
+    get_album_download_quota,
+    mark_album_download_submitted,
+    reserve_album_download,
+)
 from supysonic.emo.ws_store import (
     listCoreStartupRecoveries,
     recoverPendingPlaybackControlsForStartup,
@@ -340,7 +349,8 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             self._assert_external_r11_transaction_schema()
             self._assert_external_r18_broadcast_schema()
             self._assert_external_core_schema_parity(provider)
-            self.assertEqual(db.Meta["schema_version"].value, "20260814")
+            self._assert_external_album_discovery_quota()
+            self.assertEqual(db.Meta["schema_version"].value, db.SCHEMA_VERSION)
             self._record_external_evidence(
                 provider,
                 "clean",
@@ -372,7 +382,8 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             self._assert_external_r11_transaction_schema()
             self._assert_external_r18_broadcast_schema()
             self._assert_external_core_schema_parity(provider)
-            self.assertEqual(db.Meta["schema_version"].value, "20260814")
+            self._assert_external_album_discovery_quota()
+            self.assertEqual(db.Meta["schema_version"].value, db.SCHEMA_VERSION)
             self._record_external_evidence(
                 provider,
                 "upgrade_from_20260708",
@@ -386,6 +397,35 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 db.release_database()
             if database_available:
                 self._reset_external_database(provider, database_uri)
+
+    def _assert_external_album_discovery_quota(self) -> None:
+        self.assertTrue(db.db.table_exists("album_discovery_quota_lock"))
+        self.assertTrue(db.db.table_exists("album_discovery_order"))
+        now = datetime(2026, 11, 26, tzinfo=timezone.utc)
+        start = Barrier(2, timeout=5)
+
+        def reserve(album_id: str) -> AlbumReservationResult:
+            start.wait()
+            return reserve_album_download(
+                "migration-test", album_id, lambda: (1, True), now=now
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(reserve, ("101", "102")))
+        self.assertCountEqual(
+            [result.status for result in results], ["reserved", "limit_reached"]
+        )
+        order = next(result.order for result in results if result.order is not None)
+        self.assertTrue(mark_album_download_submitted(order, "oracle-test"))
+        repeat = reserve_album_download(
+            "migration-test", order.album_id, lambda: (0, True), now=now
+        )
+        self.assertEqual(repeat.status, "existing")
+        self.assertEqual(repeat.order.id, order.id)
+        snapshot = get_album_download_quota("migration-test", 1, now=now)
+        self.assertEqual(
+            (snapshot.reserved, snapshot.submitted, snapshot.remaining), (0, 1, 0)
+        )
 
     def _assert_external_discovery_index(self, provider: str) -> None:
         if provider == "postgres":
@@ -1284,7 +1324,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
                 },
             )
             self._assert_sqlite_core_schema_parity()
-            self.assertEqual(db.Meta["schema_version"].value, "20260814")
+            self.assertEqual(db.Meta["schema_version"].value, db.SCHEMA_VERSION)
         finally:
             db.release_database()
             os.remove(path)
@@ -1601,7 +1641,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
 
             db.init_database(database_uri)
             initialized = True
-            self.assertEqual(db.Meta["schema_version"].value, "20260814")
+            self.assertEqual(db.Meta["schema_version"].value, db.SCHEMA_VERSION)
             self._assert_sqlite_core_schema_parity()
             self.assertEqual(db.EmoFollowSafetyLease.select().count(), 0)
         finally:
@@ -1627,7 +1667,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
 
             db.init_database(database_uri)
             initialized = True
-            self.assertEqual(db.Meta["schema_version"].value, "20260814")
+            self.assertEqual(db.Meta["schema_version"].value, db.SCHEMA_VERSION)
             self._assert_20260728_upgrade_rows()
             context_before = db.db.execute_sql(
                 "SELECT playback_context_id, lifecycle, epoch, version, "
@@ -1662,7 +1702,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
 
             db.init_database(database_uri)
             initialized = True
-            self.assertEqual(db.Meta["schema_version"].value, "20260814")
+            self.assertEqual(db.Meta["schema_version"].value, db.SCHEMA_VERSION)
             self._assert_20260728_recovery_rows()
             replay = recoverPendingPlaybackControlsForStartup(1780000040000)
             self.assertFalse(replay["mutated"])

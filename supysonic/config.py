@@ -152,6 +152,7 @@ class DefaultConfig:
         "cache_ttl_seconds": 900,
     }
     TRACK_METADATA_LLM = {}
+    ALBUM_DISCOVERY = {"settings_file": None}
     TRANSCODING = {}
     MIMETYPES = {}
 
@@ -183,13 +184,20 @@ class IniConfig(DefaultConfig):
         parser.read(paths)
 
         for section in parser.sections():
-            options = {k: self.__try_parse(v) for k, v in parser.items(section)}
-            section = section.upper()
+            attribute = section.upper()
+            options = {
+                key: (
+                    value
+                    if (attribute, key) == ("ALBUM_DISCOVERY", "settings_file")
+                    else self.__try_parse(value)
+                )
+                for key, value in parser.items(section)
+            }
 
-            if hasattr(self, section):
-                getattr(self, section).update(options)
+            if hasattr(self, attribute):
+                getattr(self, attribute).update(options)
             else:
-                setattr(self, section, options)
+                setattr(self, attribute, options)
 
     @staticmethod
     def __try_parse(value):
