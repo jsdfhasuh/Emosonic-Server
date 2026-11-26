@@ -54,7 +54,8 @@ CACHE_TTL_SECONDS = 48 * 60 * 60
 _CACHE_KIND = "__cn_album_discovery_v1__"
 _PROMPT = (
     "Rank these verified Apple Music CN songs for music discovery, using the real "
-    "recent listening seeds and their catalog relation evidence. Prefer artists "
+    "recent listening seeds and their catalog relation evidence. A shared recording "
+    "credit proves collaboration only; never label a collaborator a similar artist. Prefer artists "
     "not already in the library and recordings not recently recommended. Return "
     "only candidate IDs in best-first order, with one or more of their own "
     "evidence IDs explaining each choice. Return an empty ranking if no choice "
@@ -98,6 +99,9 @@ class AlbumDiscoveryEvidence:
     song_id: str
     song_title: str
     selected: bool = False
+    relation: str = "similar"
+    source_song_id: Optional[str] = None
+    source_song_title: str = ""
 
     def to_payload(self) -> Dict[str, object]:
         return asdict(self)
@@ -515,7 +519,10 @@ def _collect_proposals(
         if seed.catalog_artist_id is None:
             continue
         seen_artists = set()
-        for artist in catalog.similar_artists(seed.catalog_artist_id)[:5]:
+        artists = catalog.similar_artists(seed.catalog_artist_id)
+        if not artists and hasattr(catalog, "collaborating_artists"):
+            artists = catalog.collaborating_artists(seed.catalog_artist_id)
+        for artist in artists[:5]:
             if artist.artist_id == seed.catalog_artist_id or artist.artist_id in seen_artists:
                 continue
             seen_artists.add(artist.artist_id)
@@ -537,6 +544,8 @@ def _collect_proposals(
                 item = AlbumDiscoveryEvidence(
                     seed.track_id, seed.title, seed.artist, seed.catalog_artist_id,
                     artist.artist_id, artist.name, track.song_id, track.title,
+                    relation=artist.relation, source_song_id=artist.source_song_id,
+                    source_song_title=artist.source_song_title,
                 )
                 existing = groups.get(key)
                 if existing is not None:
@@ -573,7 +582,9 @@ def _rank_context(
             "recentlyRecommended": proposal.recently_recommended,
             "evidence": [{
                 "id": evidence_id, "seed": seed_numbers[evidence.seed_track_id],
-                "source": "cnCatalogSimilarArtistAndTopSong",
+                "source": ("cnCatalogSharedRecordingCreditAndTopSong"
+                           if evidence.relation == "collaborator" else "cnCatalogSimilarArtistAndTopSong"),
+                "sharedRecording": label(evidence.source_song_title),
                 "relatedArtist": label(evidence.related_artist),
             } for evidence_id, evidence in enumerate(proposal.evidence, 1)],
         } for index, proposal in enumerate(proposals, 1)],

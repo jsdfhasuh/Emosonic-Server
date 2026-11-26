@@ -85,7 +85,10 @@
     {% endfor %}
     <ul class="mb-2">
       {% for evidence in item.candidate.evidence %}
-      <li>《{{ evidence.seed_title }}》 · {{ evidence.seed_artist }} → {{ evidence.related_artist }} · 《{{ evidence.song_title }}》</li>
+      <li>《{{ evidence.seed_title }}》 · {{ evidence.seed_artist }} →
+        {% if evidence.relation == "collaborator" %}合作艺人 {{ evidence.related_artist }}（共同署名录音
+        <a href="https://music.apple.com/cn/song/{{ evidence.source_song_id }}" rel="noreferrer">《{{ evidence.source_song_title }}》</a>）
+        {% else %}相似艺人 {{ evidence.related_artist }}{% endif %} · 《{{ evidence.song_title }}》</li>
       {% endfor %}
     </ul>
     <p>已核实 {{ verified|length }}/{{ album.tracks|length }} 首 · {{ actions[item.action] }}</p>

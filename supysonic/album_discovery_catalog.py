@@ -128,6 +128,9 @@ class CatalogAlbum:
 class CatalogArtist:
     artist_id: str
     name: str
+    relation: str = "similar"
+    source_song_id: Optional[str] = None
+    source_song_title: str = ""
 
 
 @dataclass(frozen=True)

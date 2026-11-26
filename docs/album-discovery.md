@@ -7,7 +7,8 @@
 1. Oracle 下载器需具备 [国区整专控制接口](https://github.com/jsdfhasuh/apple-music-downloader/blob/222e739/docs/album-discovery-control.md)。将控制接口接入已有的 Oracle 鉴权和交付程序，OpenWrt 按现有流程接收。
 2. Supysonic 的 Web 与 daemon 使用同一数据库和同一份配置。两个进程需读取同一设置文件、密钥和 OpenWrt 的收件目录。样例见 [config.sample](../config.sample) 和 [设置 JSON](examples/album-discovery-settings.json)。
 3. 设定 `target_user` 为现有 Supysonic 账号，`library_root` 为容器可见的接收目录，现有 OpenWrt 环境为 `/downloads/music/completed`。启动时 Supysonic 会应用数据库迁移。
-4. 提供 Apple Music 开发者 token、Oracle 控制 token、Oracle 交付 token。用现有密钥机制挂载文件，或配置样例列出的环境变量。先读取已知国区发行和已留存清单，分别确认两份 Oracle 凭据可以使用。
+4. Apple Music 开发者 token 可选。配置自己的开发者 token 后使用国区目录 API。留空时，Supysonic 从 Apple Music 中国大陆公开页面核对歌曲、发行和原始曲序。艺人页有明确的相似艺人时使用该列表，否则仅接受同一首录音共同署名的合作艺人。公开页面可能给出较少候选，缺少可靠依据时会跳过这颗种子。预演会标明关系，合作依据可点开原曲查看。
+5. Oracle 控制 token 和交付 token 用于派单和核对交付清单。用现有密钥机制挂载文件，或配置样例列出的环境变量。先读取已知国区发行和已留存清单，分别确认两份 Oracle 凭据可以使用。
 
 ## 使用
 

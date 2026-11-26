@@ -302,6 +302,26 @@ class AlbumDiscoveryCandidatesTestCase(TestBase):
         self.assertEqual(len(prompt["songs"]), 3)
         self.assertTrue(all("url" not in song for song in prompt["songs"]))
 
+    def test_cooperation_evidence_survives_model_ranking_and_saved_preview(self) -> None:
+        self.configure_discovery()
+        self.catalog.similar_artists.side_effect = lambda _: ()
+        self.catalog.collaborating_artists = lambda _: (
+            CatalogArtist("601", "Catalog Artist", "collaborator", "999", "Joint single"),
+        )
+        with patch(
+            "supysonic.album_discovery_candidates.request_recommendation_json", side_effect=self.rank,
+        ) as model:
+            result = discover_album_candidates(self.config, self.user, self.catalog, now=REFERENCE)
+        prompt = json.loads(model.call_args.args[1][1]["content"])
+        for song in prompt["songs"]:
+            for item in song["evidence"]:
+                self.assertEqual(item["source"], "cnCatalogSharedRecordingCreditAndTopSong")
+                self.assertEqual(item["sharedRecording"], "Joint single")
+        saved = AlbumDiscoveryCandidates.from_payload(json.loads(json.dumps(result.to_payload())))
+        self.assertEqual(len(saved.candidates), 1)
+        for item in saved.candidates[0].evidence:
+            self.assertEqual((item.relation, item.source_song_id), ("collaborator", "999"))
+
     def test_invalid_reasons_cannot_dispatch_or_charge_again_same_day(self) -> None:
         self.configure_discovery()
         with patch(

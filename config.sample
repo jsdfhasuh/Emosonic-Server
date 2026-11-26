@@ -253,7 +253,10 @@ track_metadata_enrichment_log_payload = off
 ;target_user = my-library-user
 ;library_key = main
 ;library_root = /downloads/music/completed
-; Apple developer token and authenticated Oracle control/manifest API secrets.
+; The Apple Music developer token is optional. Leave it unset to use public
+; mainland China Apple Music pages. Public catalog coverage may yield fewer
+; candidates; only documented artist relationships or shared credits qualify.
+; Oracle control/manifest API access uses the two Oracle secrets below.
 ; Mount secret files read-only. Environment alternatives are
 ; APPLE_MUSIC_DEVELOPER_TOKEN, ALBUM_DISCOVERY_ORACLE_ACCESS_TOKEN and
 ; ALBUM_DISCOVERY_ORACLE_DELIVERY_TOKEN.

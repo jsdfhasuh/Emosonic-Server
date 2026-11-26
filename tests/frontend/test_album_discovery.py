@@ -1,4 +1,5 @@
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -31,6 +32,10 @@ class AlbumDiscoveryFrontendTestCase(FrontendTestBase):
             )
 
     def test_authenticated_preview_and_single_album_confirmation(self) -> None:
+        self.item = replace(self.item, evidence=(
+            replace(self.item.evidence[0], relation="collaborator", source_song_id="1590847147",
+                    source_song_title="I Need A Girl"),
+        ))
         url = "/recommendations/discovery"
         self.assertEqual(self.client.get(url).status_code, 302)
         self._login("alice", "Alic3")
@@ -53,6 +58,8 @@ class AlbumDiscoveryFrontendTestCase(FrontendTestBase):
             self.assertEqual(response.status_code, 200)
             self.assertIn("Edition 101", response.data)
             self.assertIn("Track 101", response.data)
+            self.assertIn("合作艺人 Artist 101", response.data)
+            self.assertIn('href="https://music.apple.com/cn/song/1590847147"', response.data)
             self.assertIn("等待收件", response.data)
             self.assertEqual(db.AlbumDiscoveryOrder.select().count(), 0)
             self.assertEqual(db.Playlist.select().count(), 0)

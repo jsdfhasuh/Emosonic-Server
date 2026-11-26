@@ -23,6 +23,7 @@ from .album_discovery_candidates import (
 from .album_discovery_catalog import AppleMusicCatalog, CatalogAlbum, CatalogError
 from .album_discovery_delivery import AlbumReconciliation, reconcile_album
 from .album_discovery_oracle import OracleAlbumClient, OracleAlbumState, cn_album_id
+from .album_discovery_public_catalog import PublicAppleMusicCatalog
 from .album_discovery_quota import (
     RESERVED,
     SHANGHAI,
@@ -142,8 +143,7 @@ class AlbumDiscoveryService:
         catalog = None
         if with_catalog:
             token = load_album_discovery_apple_token(config)
-            if token:
-                catalog = AppleMusicCatalog(token)
+            catalog = AppleMusicCatalog(token) if token else PublicAppleMusicCatalog()
         oracle = None
         if runtime.oracle_url:
             try:
