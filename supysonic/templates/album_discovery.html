@@ -1,0 +1,166 @@
+{% extends "layout.html" %}
+{% block title %}国区专辑发现 · Emosonic Server{% endblock %}
+{% block document_title_en %}China album discovery · Emosonic Server{% endblock %}
+{% block document_title_zh %}国区专辑发现 · Emosonic Server{% endblock %}
+{% block page_title %}<span data-i18n-en="China album discovery" data-i18n-zh="国区专辑发现">国区专辑发现</span>{% endblock %}
+{% block body %}
+{% set reasons = {
+  "no_seeds": "近 14 天暂时没有符合条件的复听记录。",
+  "no_catalog_seeds": "暂时无法在国区确认种子曲的录音版本。",
+  "no_candidates": "国区目录暂时没有核实通过的候选。",
+  "no_selection": "本次没有选出合适的专辑。",
+  "catalog_unavailable": "国区目录暂时不可用。",
+  "ranking_pending": "正在生成候选，稍后可刷新。",
+  "ranking_unavailable": "AI 排序暂时不可用。",
+  "ranking_budget": "共享 AI 预算暂时不足。",
+  "ranking_config": "AI 排序的服务配置不可用。",
+  "ranking_day_used": "今日排序已执行。"
+} %}
+{% set actions = {
+  "reuse_local": "已收齐，可复用",
+  "reuse_oracle": "有可跟踪的 Oracle 任务",
+  "new_order": "需要新的国区整专订单",
+  "wait_oracle": "等待核实 Oracle"
+} %}
+{% set order_states = {
+  "ready": "已收齐", "submitted": "已派单", "associated": "已关联",
+  "pending": "等待入库核对", "absent": "等待接单", "unknown": "Oracle 状态待核实",
+  "rejected": "已拒单"
+} %}
+{% set missing_reasons = {
+  "waiting_for_file": "等待收件",
+  "waiting_for_receipt": "等待交付清单",
+  "waiting_for_index": "等待扫描入库",
+  "path_conflict": "归档路径冲突",
+  "unreadable_audio": "音频无法读取",
+  "edition_conflict": "专辑版本冲突",
+  "track_number_conflict": "曲序冲突",
+  "recording_conflict": "录音信息冲突",
+  "file_changed_during_check": "核对期间文件发生变化",
+  "checksum_conflict": "文件大小或校验值不符",
+  "ambiguous_index": "找到多个索引记录",
+  "index_conflict": "曲库索引信息冲突",
+  "ambiguous_recording": "找到多个相同曲目",
+  "split_or_ambiguous_edition": "曲目分散在不同本地发行"
+} %}
+{% if error %}<p class="alert alert-warning" role="alert">{{ error }}</p>{% endif %}
+{% if preview %}
+{% set quota = preview.availability.quota %}
+<div class="card console-section-spacer">
+  <div class="card-body">
+    <p>{{ quota.quota_date }} · 上海时间 · 曲库 {{ quota.library_key }}</p>
+    <p>每日上限 {{ quota.limit }} 张，已提交 {{ quota.submitted }} 张，预留 {{ quota.reserved }} 张，剩余 {{ quota.remaining }} 张。自动提交{{ "已开启" if preview.availability.auto_submit else "已关闭" }}。</p>
+    {% if preview.availability.settings_error %}
+    <p class="text-warning">{{ preview.availability.settings_error }}</p>
+    {% endif %}
+    <form method="post">
+      <input type="hidden" name="csrf" value="{{ csrf_token }}">
+      <button class="btn btn-primary" type="submit">生成今日预演</button>
+      <a class="btn btn-outline-secondary" href="{{ url_for('frontend.recommendation_index') }}">返回推荐</a>
+    </form>
+  </div>
+</div>
+{% if preview.discovery and preview.discovery.seeds %}
+<div class="card console-section-spacer">
+  <div class="card-header">近期复听依据</div>
+  <ul class="list-group list-group-flush">
+    {% for seed in preview.discovery.seeds %}
+    <li class="list-group-item">{{ seed.title }} · {{ seed.artist }} · {{ seed.play_dates|join("、") }}{% if seed.starred %} · 已收藏{% endif %}</li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+{% if preview.discovery and preview.discovery.reason %}
+<p role="status">{{ reasons.get(preview.discovery.reason, "本次没有可确认的候选。") }}</p>
+{% endif %}
+{% for item in preview.assessments %}
+{% set album = item.candidate.album %}
+{% set matched = item.reconciliation.to_payload().tracks %}
+{% set verified = matched|selectattr("status", "equalto", "verified")|list %}
+<section class="card console-section-spacer">
+  <div class="card-body">
+    <h2 class="h5"><a href="{{ album.url }}" rel="noreferrer">{{ album.title }}</a> · {{ album.artist }}</h2>
+    {% for track in album.tracks if track.song_id == item.candidate.representative_song_id %}
+    <p>代表曲《{{ track.title }}》 · 碟 {{ track.disc_number }} 曲 {{ track.track_number }} · {{ track.song_id }}</p>
+    {% endfor %}
+    <ul class="mb-2">
+      {% for evidence in item.candidate.evidence %}
+      <li>《{{ evidence.seed_title }}》 · {{ evidence.seed_artist }} →
+        {% if evidence.relation == "collaborator" %}合作艺人 {{ evidence.related_artist }}（共同署名录音
+        <a href="https://music.apple.com/cn/song/{{ evidence.source_song_id }}" rel="noreferrer">《{{ evidence.source_song_title }}》</a>）
+        {% else %}相似艺人 {{ evidence.related_artist }}{% endif %} · 《{{ evidence.song_title }}》</li>
+      {% endfor %}
+    </ul>
+    <p>已核实 {{ verified|length }}/{{ album.tracks|length }} 首 · {{ actions[item.action] }}</p>
+    {% if verified|length != album.tracks|length %}
+    <details class="mb-3">
+      <summary>查看待核对曲目</summary>
+      <ul>
+        {% for track in matched if track.status != "verified" %}
+        {% set catalog_track = album.tracks|selectattr("song_id", "equalto", track.song_id)|first %}
+        <li>碟 {{ track.disc_number }} 曲 {{ track.track_number }}{% if catalog_track %} · {{ catalog_track.title }}{% endif %} · {{ missing_reasons.get(track.reason, track.status) }}</li>
+        {% endfor %}
+      </ul>
+    </details>
+    {% endif %}
+    {% if preview.preview_id and (item.action in ("reuse_local", "reuse_oracle") or (item.action == "new_order" and quota.remaining > 0 and not preview.availability.settings_error)) %}
+    <form method="post" action="{{ url_for('frontend.album_discovery_confirm', preview_id=preview.preview_id) }}">
+      <input type="hidden" name="csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="album_id" value="{{ album.album_id }}">
+      {% set alternatives = item.candidate.evidence|selectattr("selected")|map(attribute="song_id")|unique|list %}
+      {% if alternatives|length > 1 %}
+      <div class="mb-2">
+        <label class="form-label" for="representative-{{ album.album_id }}">选择代表曲</label>
+        <select id="representative-{{ album.album_id }}" name="representative_song_id" class="form-select">
+          {% for track in album.tracks if track.song_id in alternatives %}
+          <option value="{{ track.song_id }}"{% if track.song_id == item.candidate.representative_song_id %} selected{% endif %}>{{ track.title }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {% endif %}
+      <button class="btn btn-outline-primary" type="submit">{{ "确认下载整张专辑" if item.action == "new_order" else "确认使用此专辑" }}</button>
+    </form>
+    {% endif %}
+  </div>
+</section>
+{% endfor %}
+{% if tracked %}
+<section class="card console-section-spacer">
+  <div class="card-body">
+    <h2 class="h5">已确认的专辑</h2>
+    {% for item in tracked %}
+    <details class="mb-2">
+      <summary><a href="{{ item.album.url }}" rel="noreferrer">{{ item.album.title }}</a>
+        · {{ order_states.get(item.status, item.status) }}{% if item.reconciliation %} · {{ item.reconciliation.verified|length }}/{{ item.album.tracks|length }} 首{% endif %}
+      </summary>
+      {% if item.order %}<p class="mb-1">订单 {{ item.order.id }} · {{ item.order.quota_date }}（上海时间）{% if item.order.oracle_task_id %} · Oracle {{ item.order.oracle_task_id }}{% endif %}</p>{% endif %}
+      {% if item.detail in ("failed", "cancelled") %}<p>Oracle 任务{{ "失败" if item.detail == "failed" else "已取消" }}，可在 Oracle 面板重试原任务。</p>{% endif %}
+      {% if item.reconciliation and item.reconciliation.missing %}
+      <ul>
+        {% for track in item.reconciliation.missing %}
+        <li>碟 {{ track.disc_number }} 曲 {{ track.track_number }} · {{ missing_reasons.get(track.reason, track.status) }}</li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </details>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+{% if metrics %}
+<section class="card console-section-spacer">
+  <div class="card-body">
+    <h2 class="h5">最近 {{ metrics.days }} 天</h2>
+    <p>派单 {{ metrics.submittedAlbums }} 张 · 收齐 {{ metrics.readyAlbums }} 张 · 日推投放 {{ metrics.placements|length }} 首</p>
+    {% if metrics.placements %}
+    <ul>
+      {% for placement in metrics.placements %}
+      <li>{{ placement.day }} · 第 {{ placement.position }} 位 · {% if placement.firstObservedAt %}观察到播放{% if placement.representativeReplayObserved %}及 7 天内复听{% endif %}{% else %}暂无播放记录{% endif %} · 播放来源未知</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </div>
+</section>
+{% endif %}
+{% endif %}
+{% endblock %}

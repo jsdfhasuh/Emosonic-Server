@@ -152,6 +152,17 @@ class DefaultConfig:
         "cache_ttl_seconds": 900,
     }
     TRACK_METADATA_LLM = {}
+    ALBUM_DISCOVERY = {
+        "settings_file": None,
+        "target_user": None,
+        "library_key": "main",
+        "library_root": None,
+        "apple_music_developer_token_file": None,
+        "oracle_url": None,
+        "oracle_access_token_file": None,
+        "oracle_delivery_token_file": None,
+        "auto_submit_hour": 20,
+    }
     TRANSCODING = {}
     MIMETYPES = {}
 
@@ -183,13 +194,20 @@ class IniConfig(DefaultConfig):
         parser.read(paths)
 
         for section in parser.sections():
-            options = {k: self.__try_parse(v) for k, v in parser.items(section)}
-            section = section.upper()
+            attribute = section.upper()
+            options = {
+                key: (
+                    value
+                    if attribute == "ALBUM_DISCOVERY" and key != "auto_submit_hour"
+                    else self.__try_parse(value)
+                )
+                for key, value in parser.items(section)
+            }
 
-            if hasattr(self, section):
-                getattr(self, section).update(options)
+            if hasattr(self, attribute):
+                getattr(self, attribute).update(options)
             else:
-                setattr(self, section, options)
+                setattr(self, attribute, options)
 
     @staticmethod
     def __try_parse(value):
