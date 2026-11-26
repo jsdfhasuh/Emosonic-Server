@@ -28,7 +28,7 @@ class AvatarGenerationError(Exception):
 
 
 def generation_enabled(config) -> bool:
-    settings = config["RECOMMENDATION_AGENT"]
+    settings = recommendation_settings(config)
     return (settings.get("enabled") is True and settings.get("provider") == "openai"
             and settings.get("avatar_generation_enabled") is True
             and str(settings.get("api_base_url")).rstrip("/") == ENDPOINT)

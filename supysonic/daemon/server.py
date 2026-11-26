@@ -18,6 +18,7 @@ from ..album_discovery_settings import (
     album_discovery_target_user,
     load_album_discovery_settings,
 )
+from ..daily_avatar import rotate_daily_avatar
 from ..db import Folder, open_connection, close_connection
 from ..jukebox import Jukebox
 from ..logging_utils import format_log_event
@@ -223,6 +224,10 @@ class Daemon:
             self.__get_recommend_refresh_interval(),
             enabled=openai_profile_enabled(self.__config),
         )
+        self.__scheduler.register(
+            "daily-profile-avatar", self.__rotate_daily_avatar, 300,
+            enabled=bool(getattr(self.__config, "RECOMMENDATION_AGENT", {}).get("daily_avatar_username")),
+        )
         discovery_configured = bool(album_discovery_target_user(self.__config))
         self.__scheduler.register(
             "album-discovery-nightly",
@@ -255,6 +260,14 @@ class Daemon:
         except (AlbumDiscoveryError, AlbumDiscoverySettingsError) as exc:
             logger.warning("Album discovery reconciliation unavailable: %s", exc)
             return {"status": "unavailable"}
+
+    def __rotate_daily_avatar(self):
+        opened = open_connection(True)
+        try:
+            return rotate_daily_avatar(self.__config)
+        finally:
+            if opened:
+                close_connection()
 
     def __run_review_task_maintenance(self):
         return runReviewTaskMaintenance()

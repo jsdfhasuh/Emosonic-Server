@@ -358,6 +358,9 @@ profile_enabled = off
 profile_model = gpt-6.2-sol
 ; Allow signed-in users to generate an avatar on demand using the shared OpenAI budget.
 avatar_generation_enabled = on
+; One account can opt into automatic application after 08:00 Asia/Shanghai.
+; daily_avatar_username = listener
+; daily_avatar_subject = a music listener wearing headphones
 daily_selection_enabled = off
 profile_refresh_interval_seconds = 21600
 profile_batch_size = 2

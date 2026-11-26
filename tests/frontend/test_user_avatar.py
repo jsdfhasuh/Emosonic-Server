@@ -3,7 +3,7 @@ import io
 from PIL import Image, PngImagePlugin
 
 from supysonic.db import User
-from supysonic.frontend.user_avatar import AVATAR_SIZE
+from supysonic.account_avatars import AVATAR_SIZE
 
 from .frontendtestbase import FrontendTestBase
 

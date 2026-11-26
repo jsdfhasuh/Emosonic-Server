@@ -1,4 +1,39 @@
 (() => {
+  const portrait = document.querySelector("[data-daily-avatar]");
+  if (portrait) {
+    const url = portrait.dataset.dailyAvatar;
+    let version = "";
+    let checking = false;
+    const refresh = async () => {
+      if (document.hidden || checking) return;
+      checking = true;
+      try {
+        const response = await fetch(url, {method: "HEAD", cache: "no-store",
+          headers: version ? {"If-None-Match": version} : {}});
+        if (response.status === 404) {
+          portrait.textContent = portrait.dataset.initial;
+          version = "";
+        } else if (response.ok && response.headers.get("Content-Type") === "image/png") {
+          const next = response.headers.get("ETag");
+          if (next && next !== version) {
+            const img = new Image(56, 56);
+            img.alt = "";
+            img.src = url + "?v=" + encodeURIComponent(next);
+            await img.decode();
+            portrait.replaceChildren(img);
+            version = next;
+          }
+        }
+      } catch {
+        // Keep showing the current portrait until the connection returns.
+      } finally {
+        checking = false;
+      }
+    };
+    refresh();
+    window.setInterval(refresh, 60000);
+    document.addEventListener("visibilitychange", refresh);
+  }
   const editor = document.querySelector(".listening-avatar-generator");
   if (!editor) return;
   const generate = editor.querySelector("[data-avatar-generate]");

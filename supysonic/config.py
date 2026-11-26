@@ -140,6 +140,8 @@ class DefaultConfig:
         "profile_enabled": False,
         "profile_model": "gpt-6.2-sol",
         "avatar_generation_enabled": True,
+        "daily_avatar_username": "",
+        "daily_avatar_subject": "a music listener wearing headphones",
         "daily_selection_enabled": False,
         "profile_refresh_interval_seconds": 21600,
         "profile_batch_size": 2,

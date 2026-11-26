@@ -1,6 +1,9 @@
 {% set is_owner = request.user.id == user.id %}
 {% set profile_uid = 'me' if is_owner else user.id %}
 {% set home = profile_home %}
+{% if daily_avatar_enabled or avatar_generation_enabled %}
+<script defer src="{{ url_for('static', filename='js/profile-avatar.js') }}"></script>
+{% endif %}
 
 {% macro number(value) -%}
 {{ '{:,}'.format(value) }}
@@ -29,7 +32,7 @@
 <section class="listening-hero" aria-labelledby="listening-profile-title">
   <div class="listening-hero-copy">
     <div class="listening-identity">
-      <span class="listening-avatar" aria-hidden="true">
+      <span class="listening-avatar" aria-hidden="true"{% if daily_avatar_enabled %} data-daily-avatar="{{ url_for('frontend.user_avatar', uid=profile_uid) }}" data-initial="{{ user.name[:1]|upper }}"{% endif %}>
         {% if avatar_exists %}
         <img src="{{ url_for('frontend.user_avatar', uid=profile_uid) }}" width="56" height="56" alt="">
         {% else %}
@@ -42,6 +45,9 @@
     {% if is_owner and avatar_csrf %}
     <details class="listening-avatar-editor"{% if request.args.get('avatar') %} open{% endif %}>
       <summary data-i18n-en="Edit avatar" data-i18n-zh="编辑头像">Edit avatar</summary>
+      {% if daily_avatar_enabled %}
+      <p data-i18n-en="A new music portrait is applied daily after 08:00 Shanghai time. Previous portraits are saved on the server." data-i18n-zh="每天北京时间 08:00 后自动换上新的音乐头像，旧头像保存在服务器本地。">A new music portrait is applied daily after 08:00 Shanghai time. Previous portraits are saved on the server.</p>
+      {% endif %}
       {% if avatar_generation_enabled %}
       <div class="listening-avatar-generator" hidden>
         <form class="listening-avatar-upload" method="post" action="{{ url_for('frontend.user_avatar_generate') }}" data-avatar-generate>
@@ -66,7 +72,6 @@
           <button type="button" data-avatar-discard data-i18n-en="Discard" data-i18n-zh="放弃这张">Discard</button>
         </form>
       </div>
-      <script defer src="{{ url_for('static', filename='js/profile-avatar.js') }}"></script>
       {% endif %}
       <form action="{{ url_for('frontend.user_avatar_update', period=home.period) }}" method="post" enctype="multipart/form-data" class="listening-avatar-upload">
         <input type="hidden" name="csrf_token" value="{{ avatar_csrf }}">
