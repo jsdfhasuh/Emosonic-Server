@@ -1,0 +1,38 @@
+# Temporary deployment only, after the owner verifies the host audio device.
+name: emosonic-player
+services:
+  player:
+    image: ${PLAYER_IMAGE:-emosonic-player:local}
+    platform: linux/arm64
+    user: "10001:10001"
+    group_add:
+      - "${AUDIO_GID:?Set the numeric group of the selected ALSA device nodes}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    # No privileged, host networking, public ports, or Docker socket.
+    devices:
+      - "${ALSA_PCM_DEVICE:?Set selected playback PCM path}:${ALSA_PCM_DEVICE}:rw"
+      - "${ALSA_CONTROL_DEVICE:?Set matching control path}:${ALSA_CONTROL_DEVICE}:rw"
+    volumes:
+      - type: bind
+        source: ${PLAYER_CONFIG:?Set absolute path to reviewed non-secret config}
+        target: /etc/emosonic-player/config.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PLAYER_PASSWORD_FILE:?Set absolute path to restricted password file}
+        target: /run/secrets/player_password
+        read_only: true
+        bind:
+          create_host_path: false
+      - player_state:/var/lib/emosonic-player
+    tmpfs:
+      - /run/emosonic-player:rw,nosuid,nodev,noexec,size=4m,mode=0700,uid=10001,gid=10001
+      - /tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777
+    # Deliberately no automatic startup until physical acceptance.
+    restart: "no"
+    stop_grace_period: 20s
+volumes:
+  player_state:
