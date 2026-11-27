@@ -181,9 +181,18 @@ def get_playlist_discovery_reason(
                 and item.get("selected") is True
                 and item.get("song_id") == selection.representative_song_id
                 and isinstance(item.get("seed_title"), str)
-                and item["seed_title"] not in titles
             ):
-                titles.append(item["seed_title"])
+                if (
+                    item.get("relation") == "style"
+                    and item.get("style") and item.get("supporting_seed_title")
+                ):
+                    reason = (
+                        f"「为你新发现」你最近常听《{item['seed_title']}》和《{item['supporting_seed_title']}》，"
+                        f"这首也收录在 Apple Music 国区的{item['style']}编辑精选中。"
+                    )
+                    return {str(placement.track_id): reason}
+                if item["seed_title"] not in titles:
+                    titles.append(item["seed_title"])
 
     if titles:
         seeds = "和".join(f"《{title}》" for title in titles[:2])

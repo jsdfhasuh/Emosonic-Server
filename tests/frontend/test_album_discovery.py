@@ -35,6 +35,9 @@ class AlbumDiscoveryFrontendTestCase(FrontendTestBase):
         self.item = replace(self.item, evidence=(
             replace(self.item.evidence[0], relation="collaborator", source_song_id="1590847147",
                     source_song_title="I Need A Girl"),
+            replace(self.item.evidence[0], relation="style", style="K-Pop",
+                    supporting_seed_artist="Second artist", supporting_seed_title="Second seed",
+                    style_source_url="https://music.apple.com/cn/curator/1019399551"),
         ))
         url = "/recommendations/discovery"
         self.assertEqual(self.client.get(url).status_code, 302)
@@ -59,6 +62,7 @@ class AlbumDiscoveryFrontendTestCase(FrontendTestBase):
             self.assertIn("Edition 101", response.data)
             self.assertIn("Track 101", response.data)
             self.assertIn("合作艺人 Artist 101", response.data)
+            self.assertIn("Second artist《Second seed》同属K-Pop", response.data)
             self.assertIn('href="https://music.apple.com/cn/song/1590847147"', response.data)
             self.assertIn("等待收件", response.data)
             self.assertEqual(db.AlbumDiscoveryOrder.select().count(), 0)
@@ -82,3 +86,24 @@ class AlbumDiscoveryFrontendTestCase(FrontendTestBase):
             self._login("bob", "B0b")
             self.assertEqual(self.client.get(url).status_code, 404)
             self.assertEqual(self.client.post(confirm, data={"csrf": token, "album_id": "101"}).status_code, 404)
+
+    def test_preview_shows_candidates_when_model_abstains(self) -> None:
+        url = "/recommendations/discovery"
+        self._login("alice", "Alic3")
+        discovery = AlbumDiscoveryCandidates(reason="no_selection", diagnostics={
+            "proposals": [{"artist": "太阳", "album_title": "Solar", "song_title": "I Need A Girl"}],
+            "ranking_count": 0,
+        })
+        with patch("supysonic.frontend.album_discovery.AlbumDiscoveryService.from_config",
+                   return_value=self.service), patch(
+                       "supysonic.album_discovery_service.discover_album_candidates",
+                       return_value=discovery,
+                   ):
+            self.client.get(url)
+            with self.client.session_transaction() as session:
+                token = session["album_discovery_csrf"]
+            self.client.post(url, data={"csrf": token})
+            page = self.client.get(url)
+            self.assertIn("模型选中 0 首", page.data)
+            self.assertIn("《I Need A Girl》 · 专辑《Solar》", page.data)
+            self.assertFalse(self.oracle.attempts)

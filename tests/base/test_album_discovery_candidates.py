@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import Mock, patch
@@ -196,6 +197,19 @@ class AlbumDiscoveryCandidatesTestCase(TestBase):
         self.assertEqual(result.reason, "no_seeds")
         self.assertEqual(self.catalog.mock_calls, [])
 
+    def test_twelve_distinct_artists_include_less_frequent_genres(self) -> None:
+        for number in range(12):
+            track = self.track(f"Repeat {number}", f"Song {number}")
+            Track.update(genre="K-Pop").where(Track.id == track.id).execute()
+            self.play(track, 2, 26, 50, 74)
+        track = self.track("Another Artist", "Rare Style")
+        Track.update(genre="Mandopop").where(Track.id == track.id).execute()
+        self.play(track, 2, 26, 50)
+        seeds = select_discovery_seeds(self.user, now=REFERENCE)
+        self.assertEqual(len(seeds), 12)
+        self.assertEqual(len({seed.artist for seed in seeds}), 12)
+        self.assertIn(str(track.id), {seed.track_id for seed in seeds})
+
     def test_seed_rejects_same_name_ambiguity_and_verifies_collaborations(self) -> None:
         seed = self.track("Local Singer", "Distinct Seed")
         self.play(seed, 2, 26, 50)
@@ -373,3 +387,136 @@ class AlbumDiscoveryCandidatesTestCase(TestBase):
         self.assertTrue(album_discovery_candidate_allowed(self.user, candidate))
         set_recommendation_feedback(self.user, "Pop", "not_this_style")
         self.assertFalse(album_discovery_candidate_allowed(self.user, candidate))
+
+    def configure_editorial(self):
+        tracks = [self.track("Korean Act A", "Repeat A"), self.track("Korean Act B", "Repeat B")]
+        for track, genre in zip(tracks, ("K-Pop", "韩国流行乐")):
+            Track.update(genre=genre).where(Track.id == track.id).execute()
+            self.play(track, 2, 26, 50)
+        self.catalog.search_seed_songs.return_value = ()
+        song = replace(
+            catalog_song("401", "Editorial Song", "Catalog Artist", "Editorial Album", "501", "601"),
+            genres=("K-Pop",),
+        )
+        album = catalog_release("501", song.album_name, song.track)
+        self.catalog.get_release.side_effect = {"501": album}.get
+        self.catalog.style_songs.return_value = (song,)
+        return tracks, song
+
+    def test_editorial_style_without_catalog_seed_requires_two_artists_and_song_genre(self) -> None:
+        _, song = self.configure_editorial()
+        self.catalog.style_songs.return_value = (
+            replace(song, genres=("Pop",)), song, replace(song, album_ids=("999",)),
+        )
+        with patch("supysonic.album_discovery_candidates.request_recommendation_json",
+                   side_effect=self.rank) as model:
+            found = discover_album_candidates(self.config, self.user, self.catalog, now=REFERENCE)
+        self.catalog.style_songs.assert_called_once_with("K-Pop")
+        self.catalog.similar_artists.assert_not_called()
+        self.assertEqual([c.album.album_id for c in found.candidates], ["501"])
+        self.assertEqual(found.diagnostics["styles"][0]["verified"], 1)
+        self.assertEqual(found.diagnostics["proposals"][0]["sources"], ["style"])
+        self.assertEqual(set(found.diagnostics["proposals"][0]["seed_track_ids"]),
+                         {seed.track_id for seed in found.seeds})
+        self.assertEqual(found.diagnostics["ranking_count"], 1)
+        proof = found.candidates[0].evidence[0]
+        self.assertEqual({proof.seed_title, proof.supporting_seed_title}, {"Repeat A", "Repeat B"})
+        self.assertEqual(proof.style, "K-Pop")
+        self.assertIn("/cn/curator/", proof.style_source_url)
+        context = json.loads(model.call_args.args[1][1]["content"])
+        source = context["songs"][0]["evidence"][0]
+        self.assertEqual(source["source"], "cnEditorialStyleAndSongGenre")
+        self.assertNotEqual(source["seed"], source["supportingSeed"])
+        self.assertEqual(AlbumDiscoveryCandidates.from_payload(found.to_payload()), found)
+        self.assertTrue(album_discovery_candidate_allowed(self.user, found.candidates[0]))
+        set_recommendation_feedback(self.user, proof.supporting_seed_track_id, "dislike")
+        self.assertFalse(album_discovery_candidate_allowed(self.user, found.candidates[0]))
+
+    def test_editorial_search_caps_and_one_artist_cannot_establish_a_style(self) -> None:
+        for style in ("K-Pop", "Mandopop", "J-Pop", "Cantopop"):
+            for variant in ("A", "B"):
+                track = self.track(f"{style} Act {variant}", f"{style} {variant}")
+                Track.update(genre=style).where(Track.id == track.id).execute()
+                self.play(track, 2, 26, 50)
+        single = self.track("Only Rock Act", "One Rock Recording")
+        Track.update(genre="Rock").where(Track.id == single.id).execute()
+        self.play(single, 2, 26, 50, 74)
+        self.catalog.search_seed_songs.return_value = ()
+        def many_songs(style):
+            return tuple(replace(
+                catalog_song(str(n), "Editorial " + str(n), "Artist", "Record", "700", "800"),
+                genres=(style,),
+            ) for n in range(1, 7))
+        self.catalog.style_songs.side_effect = many_songs
+        self.catalog.get_release.return_value = None
+        with patch("supysonic.album_discovery_candidates.request_recommendation_json") as model:
+            found = discover_album_candidates(self.config, self.user, self.catalog, now=REFERENCE)
+        self.assertEqual(found.reason, "no_candidates")
+        self.assertEqual(len(found.diagnostics["styles"]), 3)
+        self.assertTrue(all(s["songs"] == 3 and s["support"] == 2 for s in found.diagnostics["styles"]))
+        self.assertNotIn("摇滚", [r["style"] for r in found.diagnostics["styles"]])
+        self.assertEqual(self.catalog.get_release.call_count, 9)
+        model.assert_not_called()
+
+    def test_editorial_style_removed_during_ranking_and_hidden_genre_alias(self) -> None:
+        self.configure_editorial()
+        def rank_then_hide(*args, **kwargs):
+            set_recommendation_feedback(self.user, "韩国流行乐", "not_this_style")
+            return self.rank(*args, **kwargs)
+        with patch("supysonic.album_discovery_candidates.request_recommendation_json",
+                   side_effect=rank_then_hide) as model:
+            found = discover_album_candidates(self.config, self.user, self.catalog, now=REFERENCE)
+            later = discover_album_candidates(self.config, self.user, self.catalog,
+                                             now=REFERENCE + timedelta(days=1))
+        self.assertEqual(found.reason, "no_selection")
+        self.assertEqual(found.diagnostics["ranking_count"], 1)
+        self.assertFalse(later.candidates)
+        self.assertIsNone(later.diagnostics["ranking_count"])
+        self.catalog.style_songs.assert_called_once()
+        model.assert_called_once()
+
+    def test_style_and_artist_sources_merge_same_recording_across_verified_versions(self) -> None:
+        self.configure_discovery()
+        Track.update(genre="K-Pop").where(Track.title.in_(("Seed A", "Seed B"))).execute()
+        original = self.catalog.top_songs("601")[0]
+        original = replace(original, track=replace(original.track, isrc=ISRC))
+        edition = replace(original, track=replace(original.track, song_id="777"),
+                          album_name="Discovery One (Reissue)", album_ids=("999",), genres=("K-Pop",))
+        original_release = catalog_release("401", original.album_name, original.track)
+        later = catalog_release("999", edition.album_name, edition.track, release_date="2025-01-01")
+        releases = {"401": replace(original_release, release_date="2020-01-01"), "999": later}
+        self.catalog.get_release.side_effect = releases.get
+        self.catalog.top_songs.side_effect = lambda artist: (original,) if artist == "601" else ()
+        self.catalog.style_songs.return_value = (edition,)
+        with patch("supysonic.album_discovery_candidates.request_recommendation_json", side_effect=self.rank):
+            found = discover_album_candidates(self.config, self.user, self.catalog, now=REFERENCE)
+        self.assertEqual(len(found.candidates), 1)
+        chosen = found.candidates[0]
+        self.assertEqual(chosen.album.album_id, "401")
+        self.assertEqual({proof.song_id for proof in chosen.evidence}, {"301"})
+        self.assertEqual(set(found.diagnostics["proposals"][0]["sources"]), {"similar", "style"})
+        legacy = found.to_payload()
+        legacy.pop("diagnostics")
+        self.assertEqual(AlbumDiscoveryCandidates.from_payload(legacy).diagnostics, {})
+
+    def test_catalog_errors_are_isolated_and_fully_empty_failures_can_retry(self) -> None:
+        self.configure_discovery()
+        Track.update(genre="K-Pop").where(Track.title.in_(("Seed A", "Seed B"))).execute()
+        self.catalog.style_songs.side_effect = CatalogError("editorial page unavailable")
+        def similar(artist_id):
+            if artist_id == "501":
+                raise CatalogError("artist page unavailable")
+            return (CatalogArtist("601", "Catalog Artist"),)
+        self.catalog.similar_artists.side_effect = similar
+        with patch("supysonic.album_discovery_candidates.request_recommendation_json",
+                   side_effect=self.rank) as model:
+            found = discover_album_candidates(self.config, self.user, self.catalog, now=REFERENCE)
+            self.catalog.search_seed_songs.side_effect = CatalogError("seed search unavailable")
+            empty = discover_album_candidates(self.config, self.user, self.catalog,
+                                             now=REFERENCE + timedelta(days=1))
+        self.assertEqual([v.album.album_id for v in found.candidates], ["401"])
+        self.assertEqual(found.diagnostics["styles"][0]["errors"], 1)
+        self.assertEqual(sum(s["errors"] for s in found.diagnostics["seeds"]), 1)
+        self.assertEqual(empty.reason, "catalog_unavailable")
+        self.assertEqual(sum(s["errors"] for s in empty.diagnostics["seeds"]), 2)
+        model.assert_called_once()

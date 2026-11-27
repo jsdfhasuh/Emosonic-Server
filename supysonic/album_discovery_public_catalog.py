@@ -10,12 +10,14 @@ import requests
 
 from .album_discovery_catalog import (
     CatalogAlbum, CatalogArtist, CatalogError, CatalogSong, CatalogTrack,
-    catalog_identifier, normalize_cn_album_url, normalize_music_name,
+    catalog_identifier, discovery_style_curator_url, normalize_cn_album_url,
+    normalize_discovery_style, normalize_music_name,
 )
 
 
 _ORIGIN = "https://music.apple.com"
 _SONG_COUNT = re.compile(r"(\d[\d,]*)\s*(?:首歌曲|首歌|songs?\b)", re.IGNORECASE)
+_STYLE_SONG_LIMIT = 3
 
 
 def _object(value):
@@ -136,6 +138,8 @@ def _parse_page(html, kind, identifier):
                 return identifier == "track-section - song"
             if kind == "artist":
                 return ".TopSongs-" in identifier or _similar_section(section)
+            if kind == "curator":
+                return identifier.startswith("copper-track-swoosh - ") and section.get("itemKind") == "trackLockup"
             return identifier.startswith(("track-list -", "track-list-section -", "other-versions -"))
 
         sections = {section["id"]: section for section in content["sections"] if required(section)}
@@ -157,11 +161,13 @@ class PublicAppleMusicCatalog:
         self._pages = {}
         self._albums = {}
 
-    def _page(self, kind, identifier):
+    def _page(self, kind, identifier, *, canonical_url=None):
         key = kind, identifier
         if key in self._pages:
             return self._pages[key]
-        if kind == "search":
+        if canonical_url and _identity(canonical_url, kind) == identifier:
+            url = canonical_url
+        elif kind == "search":
             url = _ORIGIN + "/cn/search?" + urlencode({"term": identifier})
         elif catalog_identifier(identifier):
             url = f"{_ORIGIN}/cn/{kind}/{identifier}"
@@ -269,8 +275,17 @@ class PublicAppleMusicCatalog:
         if (not artists or _identity(recording.get("url"), "song") != song_id
                 or recording.get("@type") != "MusicRecording"):
             return None
-        album_id = _identity(_object(recording.get("inAlbum")).get("url"), "album")
-        release = self.get_release(album_id) if album_id else None
+        album_url = _object(recording.get("inAlbum")).get("url")
+        album_id = _identity(album_url, "album")
+        if not album_id:
+            return None
+        # The song already supplies the canonical CN release URL, saving a redirect.
+        try:
+            album_url = normalize_cn_album_url(album_url, album_id)
+        except ValueError:
+            return None
+        self._page("album", album_id, canonical_url=album_url)
+        release = self.get_release(album_id)
         if release is None:
             return None
         track = next((track for track in release.tracks if track.song_id == song_id), None)
@@ -282,6 +297,45 @@ class PublicAppleMusicCatalog:
     def songs_by_isrc(self, isrc):
         # Public storefront search does not supply an ISRC-identity lookup.
         return ()
+
+    def style_songs(self, style, *, resolve_song=None):
+        style = normalize_discovery_style(style)
+        if not style:
+            return ()
+        url = discovery_style_curator_url(style)
+        page = self._page("curator", _identity(url, "curator"), canonical_url=url)
+        if not page:
+            return ()
+
+        # The public curator page supplies playable song IDs and the CN album
+        # they belong to. Plain-text names, search hits and playlist cards do not.
+        recordings = {}
+        for section in page.sections:
+            for row in page.rows(section):
+                row = _object(row)
+                song_id = _descriptor(row, "song")
+                album_id = _identity(_object(row.get("contentDescriptor")).get("url"), "album")
+                play = _object(row.get("playAction"))
+                if (not song_id or not album_id or row.get("isDisabled") is True
+                        or play.get("$kind") != "playAction"
+                        or not any(_descriptor(item, "song") == song_id for item in _items(play.get("items")))):
+                    continue
+                recordings.setdefault(song_id, album_id)
+        songs = []
+        error = None
+        resolve_song = resolve_song or self.get_song
+        for song_id, album_id in list(recordings.items())[:_STYLE_SONG_LIMIT]:
+            try:
+                song = resolve_song(song_id)
+            except CatalogError as exc:
+                error = exc
+                continue
+            if (song and song.track.song_id == song_id and album_id in song.album_ids and song.artist_ids
+                    and any(normalize_discovery_style(genre) == style for genre in song.genres)):
+                songs.append(song)
+        if not songs and error:
+            raise error
+        return tuple(songs)
 
     def search_seed_songs(self, title, artist):
         page = self._page("search", f"{title} {artist}")

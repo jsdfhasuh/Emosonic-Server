@@ -5,7 +5,10 @@ from unittest.mock import Mock, patch
 
 from requests import Response
 
-from supysonic.album_discovery_catalog import AppleMusicCatalog, CatalogError
+from supysonic.album_discovery_catalog import (
+    AppleMusicCatalog, CatalogError, CatalogSong, CatalogTrack,
+    discovery_style_curator_url, normalize_discovery_style,
+)
 from supysonic.album_discovery_public_catalog import PublicAppleMusicCatalog
 from supysonic.album_discovery_service import AlbumDiscoveryService
 
@@ -24,14 +27,15 @@ def artist_link(name, identifier):
     return {"title": name, "segue": {"destination": descriptor("artist", identifier)}}
 
 
-def response(url, sections, schema=None, schema_id="schema:music-album", status=200, redirect=None):
+def response(url, sections, schema=None, schema_id="schema:music-album", status=200, redirect=None,
+             section_fields=None):
     result = Response()
     result.status_code = status
     result._content_consumed = True
     if redirect:
         result.headers["Location"] = redirect
     model = {"data": [{"data": {"canonicalURL": url, "sections": [
-        {"id": key, "items": value} for key, value in sections.items()
+        {"id": key, "items": value, **(section_fields or {}).get(key, {})} for key, value in sections.items()
     ]}}]}
     result._content = (
         '<script id="serialized-server-data" type="application/json">' + json.dumps(model) + "</script>"
@@ -53,6 +57,18 @@ def album_response(tracks, count):
         "track-list-section - 900": [{"description": f"2026年。\n{count} 首歌曲、12 分钟"}],
     }, {"@type": "MusicAlbum", "url": CN + "album/test/900", "name": "Release",
         "byArtist": [{"name": "Singer", "url": CN + "artist/singer/10"}]})
+
+
+def curator_response(rows):
+    shelf = "copper-track-swoosh - 88"
+    return response(discovery_style_curator_url("K-Pop"), {
+        "hero-list-shelf - 22": [track("700", 1)], shelf: rows,
+    }, section_fields={shelf: {"itemKind": "trackLockup"}})
+
+
+def classified_song(identifier, genres, album_id="900"):
+    return CatalogSong(CatalogTrack(identifier, "Song", "Singer", 1, 1, 213408),
+                       "Release", (album_id,), ("10",), genres)
 
 
 class PublicAppleMusicCatalogTestCase(unittest.TestCase):
@@ -127,6 +143,47 @@ class PublicAppleMusicCatalogTestCase(unittest.TestCase):
         self.assertEqual([(a.artist_id, a.name, a.relation, a.source_song_id, a.source_song_title)
                           for a in artists], [("11", "Other", "collaborator", "101", "Duet")])
 
+    def test_styles_require_exact_specific_aliases(self):
+        for value, style in ((" K pop ", "K-Pop"), ("Mandopop", "国语流行"), ("粵語流行", "粤语流行"),
+                             ("Alternative", "另类音乐"), ("R&B/Soul", "R&B"), ("Rock", "摇滚")):
+            self.assertEqual(normalize_discovery_style(value), style)
+            self.assertTrue(discovery_style_curator_url(style).startswith(CN + "curator/"))
+        for value in ("Pop", "Chinese", "音乐", "音乐 / K-Pop", None):
+            self.assertIsNone(normalize_discovery_style(value))
+            self.assertEqual(self.catalog.style_songs(value), ())
+        self.session.get.assert_not_called()
+
+    def test_curator_requires_cn_playable_rows_song_genre_and_same_edition(self):
+        foreign = track("110", 1)
+        foreign["contentDescriptor"]["url"] = "https://music.apple.com/hk/album/900?i=110"
+        rows = [foreign, {**track("109", 1), "isDisabled": True}, track("111", 1), track("111", 1),
+                track("112", 2), track("113", 3), track("114", 4)]
+        self.session.get.return_value = curator_response(rows)
+        valid = classified_song("111", ("K-Pop", "音乐"))
+        with patch.object(self.catalog, "get_song", side_effect=[
+            valid, classified_song("112", ("国际流行", "嘻哈/说唱")),
+            classified_song("113", ("K-Pop",), album_id="901"),
+        ]) as resolve:
+            self.assertEqual(self.catalog.style_songs("Kpop"), (valid,))
+            self.assertEqual([call.args[0] for call in resolve.call_args_list], ["111", "112", "113"])
+        self.assertEqual(self.session.get.call_args.args[0], discovery_style_curator_url("K-Pop"))
+
+    def test_one_unavailable_recording_preserves_other_verified_style_songs(self):
+        self.session.get.return_value = curator_response([track("111", 1), track("112", 2)])
+        valid = classified_song("112", ("K Pop",))
+        with patch.object(self.catalog, "get_song", side_effect=[CatalogError("unavailable"), valid]):
+            self.assertEqual(self.catalog.style_songs("K-Pop"), (valid,))
+
+    def test_authorized_reader_uses_separate_public_source_and_own_song_resolver(self):
+        api = AppleMusicCatalog("own-token", session=Mock())
+        self.session.get.return_value = curator_response([track("111", 1)])
+        valid = classified_song("111", ("K-Pop",))
+        with patch("supysonic.album_discovery_public_catalog.PublicAppleMusicCatalog",
+                   return_value=self.catalog), patch.object(api, "get_song", return_value=valid) as resolve:
+            self.assertEqual(api.style_songs("K-Pop"), (valid,))
+        resolve.assert_called_once_with("111")
+        self.assertNotIn("Authorization", self.session.get.call_args.kwargs["headers"])
+
     def test_search_uses_playable_album_metadata_and_exact_song_credits(self):
         song_id = "111"
         self.session.get.side_effect = [
@@ -137,7 +194,7 @@ class PublicAppleMusicCatalogTestCase(unittest.TestCase):
             response(CN + "song/111", {"songDetail": [{
                 "title": "Song 111", **descriptor("song", song_id), "artistLinks": [artist_link("Singer", "10")],
             }]}, {"audio": {"@type": "MusicRecording", "url": CN + "song/111",
-                            "inAlbum": {"url": CN + "album/900"}, "genre": ["Pop"]}}, schema_id="schema:song"),
+                            "inAlbum": {"url": CN + "album/test/900"}, "genre": ["Pop"]}}, schema_id="schema:song"),
             album_response([track("111", 1)], 1),
         ]
         songs = self.catalog.search_seed_songs("Song 111", "Singer")
@@ -147,6 +204,7 @@ class PublicAppleMusicCatalogTestCase(unittest.TestCase):
         self.assertEqual(songs[0].track.song_id, song_id)
         self.assertFalse(self.catalog.songs_by_isrc("USABC1200001"))
         self.assertEqual(self.session.get.call_count, 3)
+        self.assertEqual(self.session.get.call_args.args[0], CN + "album/test/900")
 
     def test_from_config_selects_public_or_authorized_catalog_only_when_needed(self):
         config = {"ALBUM_DISCOVERY": {"target_user": "alice", "library_root": tempfile.gettempdir()}}

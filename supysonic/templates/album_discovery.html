@@ -73,6 +73,17 @@
 {% if preview.discovery and preview.discovery.reason %}
 <p role="status">{{ reasons.get(preview.discovery.reason, "本次没有可确认的候选。") }}</p>
 {% endif %}
+{% if preview.discovery and preview.discovery.diagnostics and preview.discovery.diagnostics.proposals %}
+{% set diagnostics = preview.discovery.diagnostics %}
+<details class="mb-3">
+  <summary>查看送入 AI 的 {{ diagnostics.proposals|length }} 首候选录音{% if diagnostics.ranking_count is number %}，模型选中 {{ diagnostics.ranking_count }} 首{% endif %}</summary>
+  <ul>
+    {% for proposal in diagnostics.proposals %}
+    <li>{{ proposal.artist }}《{{ proposal.song_title }}》 · 专辑《{{ proposal.album_title }}》{% for seed in preview.discovery.seeds if seed.track_id in proposal.seed_track_ids|default([]) %}{{ " · 来自" if loop.first else "、" }}《{{ seed.title }}》{% endfor %}</li>
+    {% endfor %}
+  </ul>
+</details>
+{% endif %}
 {% for item in preview.assessments %}
 {% set album = item.candidate.album %}
 {% set matched = item.reconciliation.to_payload().tracks %}
@@ -86,7 +97,9 @@
     <ul class="mb-2">
       {% for evidence in item.candidate.evidence %}
       <li>《{{ evidence.seed_title }}》 · {{ evidence.seed_artist }} →
-        {% if evidence.relation == "collaborator" %}合作艺人 {{ evidence.related_artist }}（共同署名录音
+        {% if evidence.relation == "style" %}与 {{ evidence.supporting_seed_artist }}《{{ evidence.supporting_seed_title }}》同属{{ evidence.style }}，来自
+        <a href="{{ evidence.style_source_url }}" rel="noreferrer">Apple Music 国区编辑精选</a> · {{ evidence.related_artist }}
+        {% elif evidence.relation == "collaborator" %}合作艺人 {{ evidence.related_artist }}（共同署名录音
         <a href="https://music.apple.com/cn/song/{{ evidence.source_song_id }}" rel="noreferrer">《{{ evidence.source_song_title }}》</a>）
         {% else %}相似艺人 {{ evidence.related_artist }}{% endif %} · 《{{ evidence.song_title }}》</li>
       {% endfor %}

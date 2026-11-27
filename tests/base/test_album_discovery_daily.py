@@ -285,6 +285,22 @@ class AlbumDiscoveryDailyTestCase(TestBase):
         unrelated = buildRecommendationReasonMap(self.user, [representative], playlist=existing)
         self.assertNotIn("Seed title", unrelated[str(representative.id)])
 
+    def test_daily_style_explanation_uses_both_listened_songs(self) -> None:
+        representative = self._track("New recording")
+        selection = self._store_ready_selection("401", representative, seed_titles=("Song A",))
+        evidence = json.loads(selection.evidence)
+        evidence.append(dict(evidence[0], relation="style", style="K-Pop", supporting_seed_title="Song B"))
+        selection.evidence = json.dumps(evidence)
+        selection.save()
+        playlist = self._previous_playlist(self.FIRST_DAY, [representative])
+        AlbumDiscoveryPlacement.create(
+            selection=selection, user=self.user, playlist_id=playlist.id,
+            day=date.fromisoformat(self.FIRST_DAY), track_id=representative.id, position=1,
+        )
+        reasons = buildRecommendationReasonMap(self.user, [representative], playlist=playlist)
+        self.assertIn("《Song A》和《Song B》", reasons[str(representative.id)])
+        self.assertIn("K-Pop编辑精选", reasons[str(representative.id)])
+
     def test_skips_played_disliked_recent_and_not_ready_representatives(self) -> None:
         ordinary = self._ordinary(3)
         unavailable, played, disliked, recent, allowed = [

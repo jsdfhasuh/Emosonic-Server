@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 import re
 from typing import Dict, Iterable, Mapping, Optional, Tuple
 import unicodedata
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 import requests
 
@@ -39,6 +39,36 @@ def normalize_isrc(value: object) -> Optional[str]:
 
 def normalize_music_name(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+# Official curator identities from the mainland storefront's category browser.
+_STYLE_CURATORS = {
+    "K-Pop": ("apple-music-k-pop/1019399551", ("K Pop", "Kpop", "韩国流行乐")),
+    "国语流行": ("apple-music-国语流行/1019400042", ("Mandopop", "国语流行乐", "國語流行")),
+    "粤语流行": ("apple-music-粤语流行/1019398918", ("Cantopop", "粤语流行乐", "粵語流行")),
+    "另类音乐": ("apple-music-另类音乐/1019397973", ("Alternative", "另类", "另類音樂")),
+    "嘻哈/说唱": ("apple-music-嘻哈-说唱/989061415", ("Hip-Hop/Rap", "Hip Hop", "嘻哈/說唱")),
+    "R&B": ("apple-music-r-b/1019400044", ("R&B/Soul", "R&B/灵魂乐", "R&B/靈魂樂")),
+    "J-Pop": ("apple-music-j-pop/1019399547", ("J Pop", "Jpop", "日本流行乐")),
+    "摇滚": ("摇滚/1019400046", ("Rock", "搖滾")),
+}
+_STYLE_NAMES = {
+    normalize_music_name(alias): style
+    for style, (_, aliases) in _STYLE_CURATORS.items()
+    for alias in (style, *aliases)
+}
+
+
+def normalize_discovery_style(value: object) -> Optional[str]:
+    """Return a supported, specific editorial style only for an exact known tag."""
+    return _STYLE_NAMES.get(normalize_music_name(value)) if isinstance(value, str) else None
+
+
+def discovery_style_curator_url(style: str) -> Optional[str]:
+    canonical = normalize_discovery_style(style)
+    if not canonical:
+        return None
+    return "https://music.apple.com/cn/curator/" + quote(_STYLE_CURATORS[canonical][0])
 
 
 def normalize_cn_album_url(value: str, album_id: str) -> str:
@@ -256,6 +286,7 @@ class AppleMusicCatalog:
         self._session = session or requests
         self._responses = {}
         self._albums = {}
+        self._public_curators = None
 
     def _get(self, path: str, **parameters: object) -> Optional[Mapping[str, object]]:
         parsed = urlsplit(path)
@@ -320,6 +351,15 @@ class AppleMusicCatalog:
                 if song is not None and song.track.song_id == song_id:
                     return song
         return None
+
+    def style_songs(self, style: str) -> Tuple[CatalogSong, ...]:
+        # The source stays the same in both modes. Resolve the editorial rows
+        # with this account's catalog API, keeping its token off public pages.
+        from .album_discovery_public_catalog import PublicAppleMusicCatalog
+
+        if self._public_curators is None:
+            self._public_curators = PublicAppleMusicCatalog()
+        return self._public_curators.style_songs(style, resolve_song=self.get_song)
 
     def songs_by_isrc(self, isrc: str) -> Tuple[CatalogSong, ...]:
         code = normalize_isrc(isrc)
