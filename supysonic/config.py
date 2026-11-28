@@ -172,6 +172,7 @@ class DefaultConfig:
     BILIBILI_DISCOVERY = {
         "enabled": False,
         "auto_download": False,
+        "auto_subscribe_artists": False,
         "history_api_url": "",
         "history_api_token_file": "",
         "start_time": "04:30",

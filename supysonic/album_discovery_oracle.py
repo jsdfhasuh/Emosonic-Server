@@ -11,12 +11,38 @@ from urllib.parse import unquote, urlsplit
 
 import requests
 
+from .album_discovery_catalog import CatalogArtist, catalog_identifier, normalize_music_name
+
 
 _ALBUM_ID = re.compile(r"[1-9][0-9]{0,63}")
 _TASK_ID = re.compile(r"[A-Za-z0-9_-]{1,100}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _STATES = {"absent", "submitted", "associated", "unknown", "rejected"}
 _TASK_STATUSES = {"queued", "running", "completed", "failed", "cancelled", "unknown"}
+
+
+class OracleSubscriptionUnavailable(RuntimeError):
+    """Oracle could not verify a mainland artist subscription or its identity."""
+
+
+def _subscription_artist(row: dict) -> CatalogArtist:
+    identifier = catalog_identifier(row.get("artistId"))
+    name, url = row.get("artistName"), row.get("artistUrl")
+    if (not identifier or row.get("storefront") != "cn"
+            or not isinstance(name, str) or not name.strip() or any(ord(c) < 32 for c in name)
+            or not isinstance(url, str) or any(ord(c) <= 32 for c in url)):
+        raise OracleSubscriptionUnavailable("oracle_subscription_artist_invalid")
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        raise OracleSubscriptionUnavailable("oracle_subscription_artist_invalid") from None
+    parts = parsed.path.rstrip("/").split("/")
+    slug = unquote(parts[3]) if len(parts) == 5 else "-"
+    if (parsed.scheme != "https" or parsed.netloc != "music.apple.com" or parsed.fragment
+            or len(parts) not in (4, 5) or parts[:3] != ["", "cn", "artist"]
+            or parts[-1] != identifier or slug in ("", ".", "..") or "/" in slug or "\\" in slug):
+        raise OracleSubscriptionUnavailable("oracle_subscription_artist_invalid")
+    return CatalogArtist(identifier, name.strip())
 
 
 def cn_album_id(url: object) -> Optional[str]:
@@ -152,6 +178,72 @@ class OracleAlbumClient:
             return response.status_code, response.json()
         except (requests.RequestException, ValueError):
             return None
+
+    def search_subscription_artists(self, name: str) -> list[CatalogArtist]:
+        response = self._request("POST", "/api/subscriptions/search", self._token,
+                                 json={"term": name})
+        if not response or response[0] != 200 or not isinstance(response[1], dict):
+            raise OracleSubscriptionUnavailable("oracle_subscription_search_unavailable")
+        results = response[1].get("results")
+        if not isinstance(results, list) or any(not isinstance(row, dict) for row in results):
+            raise OracleSubscriptionUnavailable("oracle_subscription_search_invalid")
+        artists = {}
+        for row in results:
+            artist = _subscription_artist(row)
+            previous = artists.setdefault(artist.artist_id, artist)
+            if normalize_music_name(previous.name) != normalize_music_name(artist.name):
+                raise OracleSubscriptionUnavailable("oracle_subscription_artist_conflict")
+        return list(artists.values())
+
+    def _read_artist_subscription(self, artist: CatalogArtist) -> Optional[dict]:
+        response = self._request("GET", "/api/subscriptions", self._token)
+        if not response or response[0] != 200 or not isinstance(response[1], list):
+            raise OracleSubscriptionUnavailable("oracle_subscription_list_unavailable")
+        matched = None
+        for row in response[1]:
+            if (not isinstance(row, dict) or not catalog_identifier(row.get("artistId"))
+                    or not isinstance(row.get("storefront"), str)
+                    or not re.fullmatch("[a-z]{2}", row["storefront"])):
+                raise OracleSubscriptionUnavailable("oracle_subscription_list_invalid")
+            if row["artistId"] != artist.artist_id or row["storefront"] != "cn":
+                continue
+            confirmed = _subscription_artist(row)
+            if (matched is not None or type(row.get("enabled")) is not bool
+                    or normalize_music_name(confirmed.name) != normalize_music_name(artist.name)):
+                raise OracleSubscriptionUnavailable("oracle_subscription_identity_conflict")
+            matched = row
+        return matched
+
+    def ensure_artist_subscription(self, artist: CatalogArtist) -> str:
+        if not catalog_identifier(artist.artist_id) or not isinstance(artist.name, str) or not artist.name.strip():
+            raise OracleSubscriptionUnavailable("oracle_subscription_artist_invalid")
+        existing = self._read_artist_subscription(artist)
+        if existing is not None:
+            return "artist_subscription_existing" if existing["enabled"] else "artist_subscription_disabled"
+        # Send only the CN URL so Oracle independently resolves identity and applies its confirm policy.
+        response = self._request("POST", "/api/subscriptions", self._token,
+                                 json={"artistUrl": "https://music.apple.com/cn/artist/-/" + artist.artist_id})
+        # A synchronous scan can time out after the insert has already committed.
+        actual = self._read_artist_subscription(artist)
+        if actual is None:
+            raise OracleSubscriptionUnavailable("oracle_subscription_unconfirmed")
+        if not actual["enabled"]:
+            return "artist_subscription_disabled"
+        if response and response[0] in (200, 201):
+            body = response[1]
+            if (not isinstance(body, dict) or not isinstance(body.get("subscription"), dict)
+                    or type(body.get("created")) is not bool):
+                raise OracleSubscriptionUnavailable("oracle_subscription_receipt_invalid")
+            receipt = _subscription_artist(body["subscription"])
+            if (receipt.artist_id != artist.artist_id
+                    or normalize_music_name(receipt.name) != normalize_music_name(artist.name)):
+                raise OracleSubscriptionUnavailable("oracle_subscription_receipt_invalid")
+            if not body["created"]:
+                return "artist_subscription_existing"
+        if actual.get("newAlbumPolicy") != "confirm":
+            raise OracleSubscriptionUnavailable("oracle_subscription_confirm_policy_unverified")
+        return ("artist_subscription_created" if response and response[0] in (200, 201)
+                else "artist_subscription_existing")
 
     def _state(
         self, response: Optional[Tuple[int, object]], album_id: str,

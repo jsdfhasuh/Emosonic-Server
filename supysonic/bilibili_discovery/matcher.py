@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 _VERSION_PATTERNS = {
     "studio": re.compile(r"录音室(?:版|录音)|錄音室(?:版|錄音)|原(?:始)?录音|原(?:始)?錄音|"
                          r"\bstudio(?: version| recording)?\b|\boriginal recording\b", re.I),
-    "live": re.compile(r"现场(?:版|录音)?|現場(?:版|錄音)?|演唱会版|演唱會版|\blive\b", re.I),
+    "live": re.compile(r"现场(?:版|录音)?|現場(?:版|錄音)?|演唱会版|演唱會版|(?<![a-z0-9])live(?![a-z0-9])", re.I),
     "cover": re.compile(r"翻唱|\bcover(?: version)?\b", re.I),
     "remix": re.compile(r"混音(?:版)?|\bremix(?:ed)?\b", re.I),
     "acoustic": re.compile(r"原声版|原聲版|\bacoustic\b", re.I),

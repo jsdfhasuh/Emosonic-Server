@@ -37,6 +37,9 @@ from .matcher import (
     resolve_catalog_recording,
 )
 from .settings import BilibiliDiscoverySettings, load_bilibili_discovery_settings
+from .subscriptions import (
+    SubscriptionUnavailable, build_subscription_plan, record_performance, subscribe_performer,
+)
 
 logger = logging.getLogger(__name__)
 SOURCE_WINDOW_DAYS = 14
@@ -146,9 +149,11 @@ def _extract(run: Run, config: object, now: datetime, snapshot: list, progress: 
     for row in extracted:
         reference = _record_evidence(row, batch[row.number - 1], offset + row.number)
         _reason_count(progress, row.reason)
+        if row.performer:
+            record_performance(progress, row.performer, batch[row.number - 1])
         if row.kind == "song":
             direct.append((row, {"kind": "direct", **reference}))
-        if row.kind in ("style_lead", "collaboration_lead") or row.collaborator:
+        if row.kind in ("style_lead", "work_lead", "collaboration_lead") or row.collaborator:
             progress.setdefault("leads", []).append({**asdict(row), **reference})
     with connection_scope() as database, database.atomic():
         _run_update(
@@ -184,6 +189,8 @@ def _explore(run: Run, config: object, now: datetime, progress: dict) -> dict:
     if "plan" not in progress:
         cutoff = datetime.combine(run.source_day + timedelta(days=1), time.min, SHANGHAI) - timedelta(microseconds=1)
         plan, skipped = build_exploration_plan(run.user, progress.pop("leads", []), cutoff)
+        if load_bilibili_discovery_settings(config).auto_subscribe_artists:
+            plan.extend(build_subscription_plan(run, progress, SOURCE_WINDOW_DAYS))
         for reason, count in skipped.items():
             _reason_count(progress, reason, count)
         progress["plan"], progress["exploration_offset"] = plan, 0
@@ -195,8 +202,21 @@ def _explore(run: Run, config: object, now: datetime, progress: dict) -> dict:
         return {"status": status, "planned_probes": len(plan)}
     plan = progress["plan"]
     offset = progress["exploration_offset"]
-    service = AlbumDiscoveryService.from_config(config)
-    suggestions, reason = explore_task(service.catalog, plan[offset], progress)
+    task = plan[offset]
+    if task["kind"] == "subscribe_artist":
+        suggestions = []
+        if load_bilibili_discovery_settings(config).auto_subscribe_artists:
+            oracle = AlbumDiscoveryService.from_config(config, with_catalog=False).oracle
+            reason = subscribe_performer(run.user, oracle, task)
+        else:
+            reason = "artist_subscriptions_disabled"
+        task["outcome"] = reason
+    else:
+        service = AlbumDiscoveryService.from_config(config)
+        suggestions, reason = explore_task(service.catalog, task, progress)
+        if task["kind"] == "work" and task.get("retryable") and not task.get("retry"):
+            # Give other works their turn before retrying an unavailable catalog page.
+            plan.append({**task, "retry": True})
     if reason:
         _reason_count(progress, reason)
     else:
@@ -239,6 +259,8 @@ def _resume_run(
             deadline = max(deadline, _utc_naive(datetime.fromtimestamp(exc.retry_at, tz=timezone.utc)))
     except CatalogError:
         reason, deadline = "catalog_unavailable", now + _RETRY
+    except SubscriptionUnavailable:
+        reason, deadline = "artist_subscription_unavailable", now + _RETRY
     except AlbumDiscoverySettingsError:
         reason, deadline = "album_discovery_configuration_unavailable", now + _LONG_RETRY
     _run_update(run, now, next_attempt_at=deadline, last_error=reason)

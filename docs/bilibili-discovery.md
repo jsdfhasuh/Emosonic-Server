@@ -9,6 +9,7 @@ time and resumes unfinished work on the recommendation check interval.
 [bilibili_discovery]
 enabled = off
 auto_download = off
+auto_subscribe_artists = off
 history_api_url = https://history.example.invalid
 history_api_token_file = /run/secrets/bili-history-token
 start_time = 04:30
@@ -18,6 +19,17 @@ Set the history server URL and mount the existing `X-Auth-Token` secret file
 when server authentication is enabled. The daemon uses the existing
 `[album_discovery]` user, library key, received music directory and CN catalog.
 Extraction uses the existing OpenAI album discovery workload and shared budget.
+The history extractor requests high reasoning effort. A stage or medley title
+can supply every explicitly named song. The source records the stage performer
+separately from the original artist. A verified China studio release can enter
+discovery as a work from the stage set. Conflicting recordings remain reviewable
+in the run's work results.
+
+Set `auto_subscribe_artists = on` to follow an explicitly identified performer
+after two distinct videos in a rolling 14-day window. Songs in a single medley
+count as one viewing signal for the performer. The service checks hidden artists
+and resolves a unique China catalog artist before creating an Oracle subscription.
+New subscriptions use Oracle's confirmation policy for future releases.
 Review the `bilibili-discovery` job under `/admin/tasks` for progress and short
 error reasons. History sync happens through the history service before the normal
 daily fetch. The snapshot covers the rows currently visible at that service.

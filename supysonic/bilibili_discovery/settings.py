@@ -10,6 +10,7 @@ class BilibiliDiscoverySettings:
     history_api_url: str
     history_api_token_file: str
     start_time: time
+    auto_subscribe_artists: bool = False
 
 
 class BilibiliDiscoverySettingsError(ValueError):
@@ -37,6 +38,7 @@ def load_bilibili_discovery_settings(config: object) -> BilibiliDiscoverySetting
     return BilibiliDiscoverySettings(
         enabled=bilibili_discovery_enabled(config),
         auto_download=section.get("auto_download") is True,
+        auto_subscribe_artists=section.get("auto_subscribe_artists") is True,
         history_api_url=str(section.get("history_api_url") or "").strip(),
         history_api_token_file=str(section.get("history_api_token_file") or "").strip(),
         start_time=start_time,

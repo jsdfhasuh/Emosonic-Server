@@ -337,7 +337,7 @@ class PublicAppleMusicCatalog:
             raise error
         return tuple(songs)
 
-    def search_seed_songs(self, title, artist):
+    def search_seed_song_ids(self, title: str, artist: str) -> tuple:
         page = self._page("search", f"{title} {artist}")
         rows = page.rows("track-section - song") if page else []
         matches = [
@@ -352,13 +352,11 @@ class PublicAppleMusicCatalog:
         ids = dict.fromkeys(_descriptor(row, "song") for row in matches)
         if len(ids) > 8:
             return ()
-        songs = []
-        for identifier in ids:
-            if identifier:
-                song = self.get_song(identifier)
-                if song:
-                    songs.append(song)
-        return tuple(songs)
+        return tuple(identifier for identifier in ids if identifier)
+
+    def search_seed_songs(self, title, artist):
+        return tuple(song for identifier in self.search_seed_song_ids(title, artist)
+                     if (song := self.get_song(identifier)))
 
     def _top_rows(self, artist_id):
         page = self._page("artist", artist_id)

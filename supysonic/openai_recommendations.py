@@ -188,6 +188,14 @@ def _pause(
 
 def _validate_json(value: object, schema: Mapping[str, object]) -> None:
     """Validate the deliberately small schema vocabulary used by these prompts."""
+    if "anyOf" in schema:
+        for variant in schema["anyOf"]:
+            try:
+                _validate_json(value, variant)
+                return
+            except ValueError:
+                continue
+        raise ValueError("No structured output variant matched.")
     kind = schema.get("type")
     valid = {
         "object": isinstance(value, dict), "array": isinstance(value, list),
@@ -207,7 +215,7 @@ def _validate_json(value: object, schema: Mapping[str, object]) -> None:
             if key in properties:
                 _validate_json(child, properties[key])
     elif kind == "array":
-        if not schema.get("minItems", 0) <= len(value) <= schema.get("maxItems", 256):
+        if not schema.get("minItems", 0) <= len(value) <= schema.get("maxItems", math.inf):
             raise ValueError("Invalid structured array length.")
         for child in value:
             _validate_json(child, schema["items"])
@@ -260,7 +268,8 @@ def _structured_response_text(result: dict) -> str:
 
 
 def request_recommendation_json(config: object, messages: list, schema: dict, *,
-                                workload: str, max_output_tokens: int = 4096) -> dict:
+                                workload: str, max_output_tokens: int = 4096,
+                                reasoning_effort: Optional[str] = None) -> dict:
     """Authorize one generation and settle before parsing or exposing its content."""
     if workload not in ("profile", "daily", "chat", "album_discovery"):
         raise OpenAIRecommendationError("Invalid recommendation workload.", reason="config")
@@ -272,7 +281,9 @@ def request_recommendation_json(config: object, messages: list, schema: dict, *,
     discovery = workload == "album_discovery"
     use_responses = model == PROFILE_MODEL and workload in ("album_discovery", "daily")
     kind = "responses" if use_responses else "text"
-    effort = settings.get("reasoning_effort", "low")
+    effort = settings.get("reasoning_effort", "low") if reasoning_effort is None else reasoning_effort
+    if effort not in ("none", "low", "medium", "high"):
+        raise OpenAIRecommendationError("Invalid recommendation reasoning effort.", reason="config")
     payload = {"model": model, "service_tier": "default", "store": False}
     if use_responses:
         endpoint = "https://api.openai.com/v1/responses"
@@ -357,6 +368,10 @@ def request_recommendation_json(config: object, messages: list, schema: dict, *,
                 Meta.delete().where(Meta.key == state_key, Meta.value == state_version).execute()
             logger.info("openai_recommendation_accounted workload=%s cost_micro_usd=%s model=%s",
                         workload, cost, model)
+            if (use_responses and result.get("status") == "incomplete"
+                    and isinstance(result.get("incomplete_details"), dict)
+                    and result["incomplete_details"].get("reason") == "max_output_tokens"):
+                raise OpenAIRecommendationError("OpenAI output token limit reached.", reason="output_limit")
             try:
                 if use_responses:
                     content = _structured_response_text(result)

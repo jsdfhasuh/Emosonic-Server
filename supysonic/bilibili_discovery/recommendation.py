@@ -19,7 +19,7 @@ from ..recommendation_feedback import track_matches_negative_recommendation_feed
 
 logger = logging.getLogger(__name__)
 READY_WINDOW = timedelta(days=14)
-SOURCE_KINDS = ("direct", "collaboration", "style")
+SOURCE_KINDS = ("direct", "work", "collaboration", "style")
 
 
 @dataclass(frozen=True)
