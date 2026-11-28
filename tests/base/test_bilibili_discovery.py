@@ -14,7 +14,7 @@ from supysonic.album_discovery_settings import load_album_discovery_runtime
 from supysonic.bilibili_discovery.extractor import BATCH_SIZE, extract_history
 from supysonic.bilibili_discovery.history import BilibiliHistoryClient, HistoryError, HistoryObservation
 from supysonic.bilibili_discovery.matcher import (
-    MatchError, find_local_recording, resolve_catalog_recording,
+    MatchError, find_local_recording, local_track_matches_candidate, resolve_catalog_recording,
 )
 from supysonic.bilibili_discovery.service import run_bilibili_discovery
 from supysonic.openai_recommendations import OpenAIRecommendationError
@@ -333,6 +333,19 @@ class DiscoveryServiceTestCase(unittest.TestCase):
         self.assertEqual(find_local_recording(self.user, self.root, "Sea", "Aria", "studio").reason, "negative_feedback")
         Path(live.path).unlink()
         self.assertEqual(find_local_recording(self.user, self.root, "Sea", "Aria", "live").reason, "local_unreadable")
+
+    def test_sibling_artist_alias_survives_ready_revalidation(self) -> None:
+        track = self.track("Recorded Alias", "Sea", "Album")
+        canonical = db.Artist.create(name="Canonical Artist")
+        db.Artist.update(real_artist=canonical).where(db.Artist.id == track.artist_id).execute()
+        db.Artist.create(name="Source Alias", real_artist=canonical)
+        run = db.BilibiliDiscoveryRun.create(user=self.user, source_day=DAY, status="done")
+        row = db.BilibiliDiscoveryCandidate.create(
+            run=run, identity_key="test-alias", title="Sea", artist="Source Alias", version="studio",
+        )
+        outcome = find_local_recording(self.user, self.root, row.title, row.artist, row.version)
+        self.assertEqual(outcome.track.id, track.id)
+        self.assertTrue(local_track_matches_candidate(outcome.track, row))
 
     def test_cn_catalog_target_requires_recording_and_complete_release(self) -> None:
         studio = catalog_song("101", "Sea", "Aria", "10", album="Concert")

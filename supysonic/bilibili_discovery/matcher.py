@@ -131,10 +131,15 @@ def _same_credit(track: Track, artist: str, matching_artist_ids: Optional[set] =
     ):
         return True
     names = dict.fromkeys(credit.get_artist_name() for credit in credits)
-    return any(
+    if any(
         wanted == normalize_music_name(joiner.join(names))
         for joiner in (" & ", ", ", "、", " / ")
-    )
+    ):
+        return True
+    if matching_artist_ids is not None:
+        return False
+    aliases = _artist_matching_ids(artist)
+    return any(credit.id in aliases for credit in credits)
 
 
 def _track_recording_matches(
