@@ -28,7 +28,7 @@ def artist_link(name, identifier):
 
 
 def response(url, sections, schema=None, schema_id="schema:music-album", status=200, redirect=None,
-             section_fields=None):
+             section_fields=None, extra_sections=()):
     result = Response()
     result.status_code = status
     result._content_consumed = True
@@ -36,7 +36,7 @@ def response(url, sections, schema=None, schema_id="schema:music-album", status=
         result.headers["Location"] = redirect
     model = {"data": [{"data": {"canonicalURL": url, "sections": [
         {"id": key, "items": value, **(section_fields or {}).get(key, {})} for key, value in sections.items()
-    ]}}]}
+    ] + list(extra_sections)}}]}
     result._content = (
         '<script id="serialized-server-data" type="application/json">' + json.dumps(model) + "</script>"
         + '<script id="' + schema_id + '" type="application/ld+json">' + json.dumps(schema or {}) + "</script>"
@@ -205,6 +205,26 @@ class PublicAppleMusicCatalogTestCase(unittest.TestCase):
         self.assertFalse(self.catalog.songs_by_isrc("USABC1200001"))
         self.assertEqual(self.session.get.call_count, 3)
         self.assertEqual(self.session.get.call_args.args[0], CN + "album/test/900")
+
+    def test_song_page_with_anonymous_section_still_checks_recording_identity(self):
+        for detail_id in ("111", "999"):
+            with self.subTest(detail_id=detail_id):
+                catalog = PublicAppleMusicCatalog(session=self.session)
+                self.session.get.side_effect = [
+                    response(CN + "song/111", {"songDetail": [{
+                        "title": "Song 111", **descriptor("song", detail_id),
+                        "artistLinks": [artist_link("Singer", "10")],
+                    }]}, {"audio": {"@type": "MusicRecording", "url": CN + "song/111",
+                                    "inAlbum": {"url": CN + "album/test/900"}}},
+                             schema_id="schema:song", extra_sections=[{}, {"id": "performer"}]),
+                    album_response([track("111", 1)], 1),
+                ]
+                song = catalog.get_song("111")
+                if detail_id == "111":
+                    self.assertEqual((song.track.song_id, song.artist_ids, song.album_ids),
+                                     ("111", ("10",), ("900",)))
+                else:
+                    self.assertIsNone(song)
 
     def test_from_config_selects_public_or_authorized_catalog_only_when_needed(self):
         config = {"ALBUM_DISCOVERY": {"target_user": "alice", "library_root": tempfile.gettempdir()}}

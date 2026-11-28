@@ -131,7 +131,9 @@ def _parse_page(html, kind, identifier):
         elif _identity(canonical, kind) != identifier:
             return None
         def required(section):
-            identifier = section["id"]
+            identifier = _object(section).get("id")
+            if not isinstance(identifier, str):
+                return False
             if kind == "song":
                 return identifier == "songDetail"
             if kind == "search":
