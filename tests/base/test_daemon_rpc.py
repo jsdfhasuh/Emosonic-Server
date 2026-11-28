@@ -82,7 +82,8 @@ class DaemonRpcTestCase(unittest.TestCase):
             with patch("supysonic.daemon.client.socket", socket_api):
                 with self.assertRaises(DaemonUnavailableError) as failed:
                     client.get_scanning_progress(timeout=0.08)
-            self.assertIsInstance(failed.exception.__cause__, TimeoutError)
+            # socket.timeout is distinct from TimeoutError on Python 3.9.
+            self.assertIsInstance(failed.exception.__cause__, (TimeoutError, socket.timeout))
             self.assertTrue(tick.ready())
             self.assertEqual(left.fileno(), -1)
             self.assertEqual(right.recv(1), b"")
