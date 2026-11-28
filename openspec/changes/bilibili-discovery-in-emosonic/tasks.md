@@ -30,7 +30,7 @@
 
 - [x] 用同一日、同一用户、同一固定输入与历史快照对照原池和增强池。输出原池数、原池已存在且实际保留的来源、净新增、挤出、合并后数量；至少列一条直接和衍生路径的具体证据、版本、库内命中或 CN 发行、已入库/待处理状态。真实数据没有合格结果时报告 0，另用标明的 fixture 验证成功分支。
 - [x] 预演走只读生产输入或脱敏 fixture，写入隔离存储并使用只读/模拟下载接口。真实历史源只用 GET，不调用 POST /api/history/sync；已确认快照可重放，未验证的同步完整性单独标记。保存前后正式歌单 UUID 与曲序摘要，检查新生产订单数为 0。排名如未执行则标记未测；若单独获得真实模型调用授权，复用一次配置的排序并记录实际模型、输入/输出 token、账本金额与最终入选数。原池与增强池的比较不要求两次付费生成。
-- [ ] 执行定向 unittest，包括受影响的 `tests.base.test_album_discovery_service`、`test_album_discovery_context`、`test_album_discovery_candidates`、`test_album_discovery_daily`、`test_openai_recommendations`、`test_openai_daily_recommendations`、`test_daemon_recommend_refresh`、`test_db_layer_contract`、`test_emo_schema_migration`，以及对应新增用例。跑现有三种数据库的迁移检查，列出实跑引擎与版本；缺失的环境如实记录。
+- [x] 执行定向 unittest，包括受影响的 `tests.base.test_album_discovery_service`、`test_album_discovery_context`、`test_album_discovery_candidates`、`test_album_discovery_daily`、`test_openai_recommendations`、`test_openai_daily_recommendations`、`test_daemon_recommend_refresh`、`test_db_layer_contract`、`test_emo_schema_migration`，以及对应新增用例。跑现有三种数据库的迁移检查，列出实跑引擎与版本；缺失的环境如实记录。
 - [x] 运行 `openspec validate bilibili-discovery-in-emosonic --strict`。更新服务端配置样例与短使用说明，提交变更并记录可复现命令、测试结果、预演证据和未实测项。按用户授权区分代码交付、真实调用和生产启用。
 
 预演采用合成输入和临时曲库。验证结果见 docs/verification/bilibili-discovery-r3-20261128.md。真实历史、排序、下载和交付待另行实测。

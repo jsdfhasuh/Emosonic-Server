@@ -34,6 +34,8 @@ SHA-256 `481e9315c63b5d5cf582754d12265c394b8a4f51886078cb09a209e945468bc3`
 在预演前后相同。预演进程阻断网络连接，历史同步与读取均由同一模拟服务
 返回，生产历史、歌单、账本和订单没有被访问。预演的排名与 token 未测。
 另有模拟排序回归覆盖 150 首排序后选 50 首、池外新增最终入选 0 首的情况。
+整专回归用模拟 Oracle 回执、临时 FLAC 文件和 SQLite 索引，验证已远端完成
+但未收件、只索引 11/12 首、完整入库、多个目标分别映射及已验证文件失效。
 
 完整输入摘要、曲目与证据见同目录的 `bilibili-discovery-r3-20261128.json`。
 
@@ -71,6 +73,29 @@ python -m unittest -v `
 验证新建、旧 schema 升级、索引与约束，并在输出中记录引擎版本。仅在本地
 运行时，需要向 `tests.base.test_emo_schema_migration` 提供专用的空白测试库
 `SUPYSONIC_TEST_MYSQL_URI` 和 `SUPYSONIC_TEST_POSTGRES_URI`。测试会重置这些库。
+
+## 回归结果
+
+- `openspec validate bilibili-discovery-in-emosonic --strict` 通过。复跑的预演
+  JSON 与留存结果逐字节一致。
+- Windows Python 3.11.14 定向回归运行 202 项。200 项通过，MySQL 和
+  PostgreSQL 两项在本地跳过并由 CI 补跑。SQLite 3.51.1 建库与升级通过。
+- [CI 数据库迁移](https://github.com/jsdfhasuh/Emosonic-Server/actions/runs/46103239021/job/140850190066)
+  在提交 `88a525d` 上通过 9 项，实跑 MySQL 8.4.5 和 PostgreSQL 16.9。
+  验证了两种引擎从空库建表和从 `20261127` 升级到 `20261128`。测试包含
+  原账户、曲库、订单及歌单保留、唯一键、外键删除行为和长快照存取。
+- Windows 额外运行 `python -m unittest` 对照基线 `3889e6b` 与初版候选。
+  基线 2606 项，初版候选 2633 项，两次均有 10 项失败、75 项错误、
+  11 项跳过，失败与错误的测试名称完全相同。现象包括临时日志文件锁、
+  测试路径差异和协议文档被检出为 CRLF 后的固定哈希不匹配。
+- Python 3.9 在原基线复现了旧 RPC 断言对 `socket.timeout` 的失败。
+  提交 `88a525d` 将断言限定在两种套接字超时类型，保留其余检查。
+  修正后本地 Python 3.9 定向回归 39 项通过，本地 Python 3.11 RPC
+  回归 4 项通过。
+- [候选 CI](https://github.com/jsdfhasuh/Emosonic-Server/actions/runs/46103239021)
+  全部通过。在 Linux Python 3.9 和 3.12 上各运行全量 2646 项，跳过 4 项。
+  两种版本均另运行 5 项网络回归，跳过 1 项。两种版本的打包和 CI 的
+  Docker 构建以及镜像元数据检查均通过。
 
 ## 真实数据待核对
 
