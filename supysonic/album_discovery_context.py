@@ -135,11 +135,10 @@ def _trends(groups, preferred):
              "distinctTracks": [item.tracks for item in groups[name]]} for name in ordered]
 
 
-def _listening(activity, last, tracks, seeds, proposals, truncated):
+def _listening(activity, last, tracks, seed_ids, priority_artists, truncated):
     coverage, labelled = _windows(), _windows()
     artists, genres = defaultdict(_windows), defaultdict(_windows)
     detail = []
-    seed_ids = {seed.track_id for seed in seeds}
     for identifier, bands in activity.items():
         track = tracks.get(identifier)
         if track is None:
@@ -164,8 +163,7 @@ def _listening(activity, last, tracks, seeds, proposals, truncated):
         })
     detail.sort(key=lambda row: (not row["seed"], -row["playDays"], -row["plays"],
                                  not row["starred"], row["artist"], row["title"], row["album"], row["lastPlayed"]))
-    preferred = {normalize_music_name(proposal.track.artist) for proposal in proposals}
-    preferred.update(normalize_music_name(seed.artist) for seed in seeds)
+    preferred = {normalize_music_name(name) for name in priority_artists}
     rows_read = sum(sum(band.values()) for bands in activity.values() for band in bands)
     return {
         "windowOrder": list(_WINDOWS), "windowUnit": "rolling days; previous23 excludes last7",
@@ -289,6 +287,16 @@ def _release_context(user, reference, proposals, library_key):
             "releases": result}
 
 
+def build_listening_context(user, reference, priority_artists=()) -> dict:
+    """Summarize submitted plays without reading discovery releases or orders."""
+    if reference.utcoffset() is None:
+        raise ValueError("reference must be timezone-aware")
+    with connection_scope():
+        activity, last, truncated = _activity(user, reference.astimezone(SHANGHAI))
+        tracks = _indexed_tracks(user, activity)
+        return _listening(activity, last, tracks, set(), priority_artists, truncated)
+
+
 def build_discovery_listening_context(user, reference, seeds, proposals, *, library_key="main") -> dict:
     if reference.utcoffset() is None:
         raise ValueError("reference must be timezone-aware")
@@ -298,7 +306,9 @@ def build_discovery_listening_context(user, reference, seeds, proposals, *, libr
         playlists = _playlist_dates(user, reference)
         ids = set(activity).union(*playlists.values())
         tracks = _indexed_tracks(user, ids)
+        seed_ids = {seed.track_id for seed in seeds}
+        priority_artists = {proposal.track.artist for proposal in proposals} | {seed.artist for seed in seeds}
         return {"shanghaiDay": reference.date().isoformat(),
-                "listening": _listening(activity, last, tracks, seeds, proposals, truncated),
+                "listening": _listening(activity, last, tracks, seed_ids, priority_artists, truncated),
                 "dailyExposure": _exposure(playlists, tracks, proposals),
                 "catalog": _release_context(user, reference, proposals, library_key)}

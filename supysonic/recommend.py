@@ -870,7 +870,8 @@ def _createRecommendPlaylistForUserUnlocked(
             )
         except OpenAIRecommendationError as exc:
             if not album_discovery_target_user(config) or exc.reason not in {
-                "accounting", "budget", "busy", "invalid_response", "network", "paused", "upstream",
+                "accounting", "budget", "busy", "context_limit", "invalid_response",
+                "network", "paused", "preflight", "upstream",
             }:
                 raise
             recommendedTracks = select_diverse_recommendations(

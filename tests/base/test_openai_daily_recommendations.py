@@ -6,8 +6,11 @@ from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from supysonic.daemon.server import Daemon
-from supysonic.db import Album, Artist, Folder, Playlist, Track, TrackMetadata
-from supysonic.db import User, User_Play_Activity
+from supysonic.db import (
+    Album, Artist, Folder, Playlist, RecommendationAgentCache, Track, TrackArtist,
+    TrackMetadata, User, User_Play_Activity,
+)
+from supysonic.metadata_pricing import MODEL, PROFILE_MODEL
 from supysonic.openai_recommendations import OpenAIRecommendationError
 from supysonic.recommend import (
     RECOMMENDED_PLAYLIST_COMMENT,
@@ -62,7 +65,7 @@ class OpenAIDailyRecommendationsTestCase(TestBase):
         self.reference_time = datetime(2026, 11, 14, 8)
         self.config.RECOMMENDATION_AGENT.update({
             "provider": "openai", "daily_selection_enabled": True,
-            "model": "gpt-6-luna",
+            "model": MODEL, "daily_model": MODEL,
         })
         self.request_patch = patch(
             "supysonic.recommendation_openai_daily.request_recommendation_json",
@@ -86,6 +89,9 @@ class OpenAIDailyRecommendationsTestCase(TestBase):
         )
         self.profile_time_patch.start()
         self.addCleanup(self.profile_time_patch.stop)
+        self.daily_time_patch = patch("supysonic.recommendation_openai_daily.now", return_value=self.reference_time)
+        self.daily_time_patch.start()
+        self.addCleanup(self.daily_time_patch.stop)
 
     @staticmethod
     def _rank_in_order(config, messages, schema, **kwargs):
@@ -209,6 +215,30 @@ class OpenAIDailyRecommendationsTestCase(TestBase):
         self.request.assert_called_once()
         self.assertEqual(Playlist.select().count(), 0)
 
+    def test_target_user_reuses_local_playlist_after_sol_cost_or_context_limit(self):
+        self.config.ALBUM_DISCOVERY["target_user"] = self.user.name
+        self.config.RECOMMENDATION_AGENT["daily_model"] = PROFILE_MODEL
+        self._play(self._track("Seed"))
+        eligible = {str(self._track(f"Candidate {index}").id) for index in range(3)}
+        for day, reason in (("2026-11-14", "preflight"), ("2026-11-15", "context_limit")):
+            with self.subTest(reason=reason):
+                self.request.side_effect = OpenAIRecommendationError(reason, reason=reason)
+                with self.assertLogs("supysonic.recommend", level="INFO") as logs:
+                    self.assertEqual(create_recommend_playlist(2, self.user, day, config=self.config), 1)
+                self.assertTrue(any(f"local ranking for alice: {reason}" in line for line in logs.output))
+                self.assertTrue(any("provider=local" in line for line in logs.output))
+                playlist = Playlist.get(Playlist.name == f"alice's {day} recommend playlist")
+                saved = playlist.tracks
+                self.assertEqual(len(set(saved.split(","))), 2)
+                self.assertTrue(set(saved.split(",")).issubset(eligible))
+                self.assertEqual(create_recommend_playlist(2, self.user, day, config=self.config), 0)
+                self.assertEqual(Playlist.get_by_id(playlist.id).tracks, saved)
+        self.assertEqual(self.request.call_count, 2)
+        self.assertEqual(Playlist.select().count(), 2)
+        self.assertFalse(RecommendationAgentCache.select().where(
+            RecommendationAgentCache.message == "__openai_daily_v1__"
+        ).exists())
+
     def test_duplicates_generate_unique_tracks_despite_old_cooldown(self):
         self._play(self._track("Seed"))
         candidates = [self._track(f"Candidate {index}") for index in range(4)]
@@ -239,6 +269,35 @@ class OpenAIDailyRecommendationsTestCase(TestBase):
             )
             self.assertEqual(len(result), 2)
         self.request.assert_called_once()
+
+    def test_cache_and_prompt_follow_daily_model_independently_of_general_model(self):
+        self._play(self._track("Seed"))
+        candidate = self._track("Candidate")
+        for model in (MODEL, PROFILE_MODEL, MODEL, PROFILE_MODEL):
+            self.config.RECOMMENDATION_AGENT["daily_model"] = model
+            selected = select_openai_daily_tracks(self.config, self.user, [candidate], 1, "2026-11-14")
+            self.assertEqual([item.id for item in selected], [candidate.id])
+        self.assertEqual(self.request.call_count, 2)
+        luna, sol = [json.loads(call.args[1][1]["content"]) for call in self.request.call_args_list]
+        self.assertNotIn("listeningHistory", luna)
+        self.assertIn("listeningHistory", sol)
+        rows = RecommendationAgentCache.select().where(RecommendationAgentCache.message == "__openai_daily_v1__")
+        self.assertEqual({row.model for row in rows}, {MODEL, PROFILE_MODEL})
+        self.assertEqual(len({row.context_hash for row in rows}), 2)
+
+    def test_luna_invalid_result_does_not_pause_sol(self):
+        self._play(self._track("Seed"))
+        candidate = self._track("Candidate")
+        self.request.side_effect = lambda *args, **kwargs: {"ranked_candidate_ids": [999]}
+        for _ in range(2):
+            with self.assertRaises(OpenAIRecommendationError):
+                select_openai_daily_tracks(self.config, self.user, [candidate], 1, "2026-11-14")
+        self.request.assert_called_once()
+        self.config.RECOMMENDATION_AGENT["daily_model"] = PROFILE_MODEL
+        self.request.side_effect = self._rank_in_order
+        result = select_openai_daily_tracks(self.config, self.user, [candidate], 1, "2026-11-14")
+        self.assertEqual([track.id for track in result], [candidate.id])
+        self.assertEqual(self.request.call_count, 2)
 
     def test_transport_schema_failure_also_delays_paid_retry(self):
         self._play(self._track("Seed"))
@@ -330,6 +389,56 @@ class OpenAIDailyRecommendationsTestCase(TestBase):
         context = json.loads(messages[1]["content"])
         self.assertEqual(len(context["candidates"]), DAILY_CANDIDATE_LIMIT)
         self.assertLessEqual(len(messages[1]["content"].encode("utf-8")), DAILY_CONTEXT_MAX_BYTES)
+
+    def test_sol_keeps_multibyte_candidate_details_and_grounded_listening_windows(self):
+        self.config.RECOMMENDATION_AGENT["daily_model"] = PROFILE_MODEL
+        seed = self._track("重复收听的歌曲")
+        self._play(seed, 2, 2)
+        self._play(seed, 10)
+        blocked = self._track("已隐藏的歌曲")
+        self._play(blocked, 1)
+        set_recommendation_feedback(self.user, str(blocked.id), "dislike")
+        artist = self._artist("主唱")
+        duet, _ = self._artist("合作歌手")
+        candidates = [self._track("完整曲名" * 25 + str(index), artist) for index in range(150)]
+        TrackArtist.create(track_id=candidates[-1], artist_id=duet, position=2)
+        tags = ["弦乐", "电吉他", "合成器", "多声部和唱", "带有即兴段落的编配"]
+        TrackMetadata.update(
+            mood_json=json.dumps(["平和", "怀旧", "期待", "振奋"]),
+            scene_json=json.dumps(["通勤", "夜跑"]), tags_json=json.dumps(tags),
+            valence=64, danceability=52, summary="副歌从合成器过渡到和声",
+        ).execute()
+        TrackMetadata.update(track_last_modification=0).where(TrackMetadata.track == candidates[0]).execute()
+        TrackMetadata.update(confidence=0.1).where(TrackMetadata.track == candidates[1]).execute()
+
+        select_openai_daily_tracks(
+            self.config, self.user, candidates, 50, "2026-11-14", recent_track_ids=[candidates[-1].id],
+        )
+        message = self.request.call_args.args[1][1]["content"]
+        self.assertGreater(len(message.encode("utf-8")), DAILY_CONTEXT_MAX_BYTES)
+        self.assertNotIn("/music", message)
+        self.assertNotIn(str(seed.id), message)
+        context = json.loads(message)
+        rows = context["candidates"]
+        self.assertEqual([row["id"] for row in rows], list(range(1, 151)))
+        self.assertEqual(rows[-1]["title"], candidates[-1].title)
+        self.assertEqual(rows[-1]["album"], artist[1].name)
+        self.assertEqual(rows[-1]["creditedArtists"], ["主唱", "合作歌手"])
+        self.assertEqual(rows[-1]["tags"], tags)
+        self.assertEqual(rows[-1]["moods"], ["平和", "怀旧", "期待", "振奋"])
+        self.assertEqual(rows[-1]["scenes"], ["通勤", "夜跑"])
+        self.assertEqual(rows[-1]["summary"], "副歌从合成器过渡到和声")
+        self.assertEqual(rows[-1]["energy"], 50)
+        self.assertEqual(rows[-1]["valence"], 64)
+        self.assertEqual(rows[-1]["danceability"], 52)
+        self.assertTrue(rows[-1]["recentlyRecommended"])
+        self.assertNotIn("tags", rows[0])
+        self.assertNotIn("tags", rows[1])
+        self.assertIn("弦乐", context["weightedSemanticPreferences"]["tags"])
+        history = context["listeningHistory"]
+        self.assertEqual([window["plays"] for window in history["coverage"]], [2, 3, 3, 1])
+        self.assertEqual(history["excludedOrUnindexedRows90"], 1)
+        self.assertEqual([(row["title"], row["playDays"]) for row in history["tracks"]], [(seed.title, 2)])
 
     def test_held_daily_lease_prevents_duplicate_paid_work(self):
         self._play(self._track("Seed"))

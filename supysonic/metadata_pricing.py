@@ -17,6 +17,8 @@ SOL_MAX_OUTPUT_TOKENS = 128_000
 LONG_INPUT_THRESHOLD = 272_000
 WEB_RESERVATION_MICRO_USD = 1000000
 PRICE_VERSION = "gpt-6-luna-standard-2026-11-12"
+# "discovery" remains valid for callers using the original Sol pricing entry point.
+_SOL_RESPONSES_KINDS = ("responses", "discovery")
 
 # Standard rates in micro-USD per token. Input accounts for the most
 # expensive cache-write rate documented for each model.
@@ -39,14 +41,20 @@ def _token_rates(model: str, inputs: int):
     return long_rates if inputs > LONG_INPUT_THRESHOLD else short_rates
 
 
+def _supports_request(kind: str, model: str) -> bool:
+    if kind in _SOL_RESPONSES_KINDS:
+        return model == PROFILE_MODEL
+    if kind == "web":
+        return model == MODEL
+    return kind == "text" and model in _TOKEN_RATES
+
+
 class ContextLimitExceeded(LlmConfigError):
     pass
 
 
 def validated_request_size(payload: Mapping[str, object], kind: str, model: str) -> int:
-    if (model not in _TOKEN_RATES or payload.get("model") != model
-            or kind not in ("text", "web", "discovery") or (kind == "web" and model != MODEL)
-            or (kind == "discovery" and model != PROFILE_MODEL)):
+    if not _supports_request(kind, model) or payload.get("model") != model:
         raise LlmConfigError("Unsupported budgeted model or request type.")
     if payload.get("service_tier") != "default":
         raise LlmConfigError("Budgeted metadata requires standard processing.")
@@ -54,11 +62,11 @@ def validated_request_size(payload: Mapping[str, object], kind: str, model: str)
         size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
     except (TypeError, ValueError):
         raise LlmConfigError("Invalid budgeted metadata request.") from None
-    if kind != "discovery" and size > MAX_REQUEST_BYTES:
+    if kind not in _SOL_RESPONSES_KINDS and size > MAX_REQUEST_BYTES:
         raise LlmConfigError("Budgeted metadata request is too large.")
     name = "max_completion_tokens" if kind == "text" else "max_output_tokens"
     maximum = _integer(payload.get(name), 1)
-    output_limit = SOL_MAX_OUTPUT_TOKENS if kind == "discovery" else MAX_OUTPUT_TOKENS
+    output_limit = SOL_MAX_OUTPUT_TOKENS if kind in _SOL_RESPONSES_KINDS else MAX_OUTPUT_TOKENS
     if maximum is None or maximum > output_limit:
         raise LlmConfigError("Budgeted metadata requires a bounded output limit.")
     if kind == "web":
@@ -88,16 +96,16 @@ def reserve_request_micro_usd(
     # UTF-8 bytes overestimate visible input tokens; leave room for framing and
     # bill all input at the higher 12-hour cache-write price, without discounts.
     tokens = size + 4096
-    output = payload["max_output_tokens" if kind == "discovery" else "max_completion_tokens"]
-    if kind == "discovery":
+    output = payload["max_completion_tokens" if kind == "text" else "max_output_tokens"]
+    if kind in _SOL_RESPONSES_KINDS:
         if measured_input_tokens is not None:
             tokens = _integer(measured_input_tokens, 1)
             if tokens is None:
                 raise LlmConfigError("Invalid input token count.")
         elif size > MAX_REQUEST_BYTES:
-            raise LlmConfigError("Long discovery input requires the model's token count.")
+            raise LlmConfigError("Long Responses input requires the model's token count.")
         if tokens > SOL_MAX_INPUT_TOKENS or tokens + output > SOL_CONTEXT_TOKENS:
-            raise ContextLimitExceeded("Discovery exceeds the Sol context window.")
+            raise ContextLimitExceeded("Recommendation exceeds the Sol context window.")
     input_rate, output_rate = _token_rates(model, tokens)
     return int((tokens * input_rate + output * output_rate).to_integral_value(
         rounding=ROUND_CEILING
@@ -113,9 +121,7 @@ def response_cost_micro_usd(
     ordinary input at the maximum cache-write rate to avoid under-accounting.
     """
     if (
-        model not in _TOKEN_RATES or kind not in ("text", "web", "discovery")
-        or (kind == "web" and model != MODEL)
-        or (kind == "discovery" and model != PROFILE_MODEL)
+        not _supports_request(kind, model)
         or response.get("model") != model
         or response.get("service_tier") != "default"
     ):

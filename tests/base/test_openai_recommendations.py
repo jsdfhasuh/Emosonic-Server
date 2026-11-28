@@ -9,15 +9,16 @@ from supysonic.db_layer.core import Meta, db
 from supysonic.metadata_budget import MetadataBudget
 from supysonic.metadata_pricing import PROFILE_MODEL
 from supysonic.openai_recommendations import (
-    DISCOVERY_STATE_KEY, OpenAIRecommendationError, PROFILE_STATE_KEY, STATE_KEY, recommendation_lease,
-    discovery_request_model, recommendation_settings, request_recommendation_json,
+    DAILY_SOL_STATE_KEY, DISCOVERY_STATE_KEY, OpenAIRecommendationError, PROFILE_STATE_KEY,
+    STATE_KEY, daily_request_model, discovery_request_model, recommendation_lease,
+    recommendation_settings, request_recommendation_json,
 )
 
 
 BUDGET = {"monthly_budget_usd": 60, "budget_safety_buffer_usd": 3,
           "daily_budget_usd": 2, "budget_timezone": "Asia/Shanghai"}
 SETTINGS = {
-    "enabled": True, "provider": "openai", "model": "gpt-6-luna",
+    "enabled": True, "provider": "openai", "model": "gpt-6-luna", "daily_model": "gpt-6-luna",
     "api_base_url": "https://api.openai.com/v1", "api_key": "test-private-key",
     "timeout_seconds": 120, "reasoning_effort": "low", "_budget_config": BUDGET,
 }
@@ -100,6 +101,94 @@ class OpenAIRecommendationsTestCase(unittest.TestCase):
         })
         self.assertEqual(result["_budget_config"], BUDGET)
         self.assertNotIn("do-not-copy", str(result))
+
+    def test_daily_defaults_to_sol_and_explicit_luna_keeps_legacy_transport(self):
+        settings = dict(SETTINGS, reasoning_effort="none")
+        del settings["daily_model"]
+        self.assertEqual(daily_request_model(settings), PROFILE_MODEL)
+        self.post.side_effect = [discovery_response(), self.response, self.response]
+        self.assertTrue(self.call("daily", settings)["ok"])
+        url, payload = self.post.call_args.args[0], self.post.call_args.kwargs["json"]
+        self.assertEqual(url, "https://api.openai.com/v1/responses")
+        self.assertEqual(payload["model"], PROFILE_MODEL)
+        self.assertEqual(payload["reasoning"], {"effort": "low"})
+        self.assertEqual(payload["text"]["format"]["name"], "music_daily")
+        for workload in ("daily", "chat"):
+            self.assertTrue(self.call(workload, SETTINGS)["ok"])
+            self.assertEqual(self.post.call_args.args[0], "https://api.openai.com/v1/chat/completions")
+            self.assertEqual(self.post.call_args.kwargs["json"]["model"], "gpt-6-luna")
+        reservations = [json.loads(row.value) for row in Meta.select().where(Meta.key.startswith("mb:r:"))]
+        self.assertEqual(sorted(row["a"] for row in reservations if row["k"] == "recommendation_daily"),
+                         [35, 700])
+
+    def test_large_daily_sol_uses_official_count_and_full_request_long_price(self):
+        settings = dict(SETTINGS, daily_model=PROFILE_MODEL, _budget_config=dict(BUDGET, daily_budget_usd=10))
+        messages = [{"role": "user", "content": "音乐" * 200_000}]
+        self.post.side_effect = [token_count(272_001), discovery_response(inputs=272_001)]
+        self.assertTrue(request_recommendation_json(settings, messages, SCHEMA, workload="daily")["ok"])
+        count, generate = self.post.call_args_list
+        self.assertEqual(count.args[0], "https://api.openai.com/v1/responses/input_tokens")
+        self.assertEqual(generate.args[0], "https://api.openai.com/v1/responses")
+        self.assertEqual(count.kwargs["json"], {k: generate.kwargs["json"][k]
+                                               for k in ("model", "input", "text", "reasoning")})
+        charge = json.loads(Meta.select().where(Meta.key.startswith("mb:r:")).get().value)
+        self.assertEqual(charge["k"], "recommendation_daily")
+        self.assertEqual(charge["r"], 272_001 * 10 + 4096 * 15)
+        self.assertEqual(charge["a"], 272_001 * 10 + 20 * 15)
+
+    def test_daily_sol_enforces_shared_limits_without_generating(self):
+        settings = dict(SETTINGS, daily_model=PROFILE_MODEL)
+        for tokens, reason in ((272_001, "budget"), (922_001, "context_limit")):
+            with self.subTest(tokens=tokens):
+                self.post.reset_mock()
+                self.post.return_value = token_count(tokens)
+                with self.assertRaises(OpenAIRecommendationError) as caught:
+                    request_recommendation_json(settings, [{"role": "user", "content": "x" * 70_000}],
+                                                SCHEMA, workload="daily")
+                self.assertEqual(caught.exception.reason, reason)
+                self.post.assert_called_once()
+                self.assertTrue(self.post.call_args.args[0].endswith("/input_tokens"))
+                self.assertEqual(self.budget.snapshot()["day_reserved_micro_usd"], 0)
+
+    def test_daily_sol_uses_original_mutex_and_has_its_own_provider_pause(self):
+        settings = dict(SETTINGS, daily_model=PROFILE_MODEL, profile_model=PROFILE_MODEL)
+        with recommendation_lease("provider"), self.assertRaises(OpenAIRecommendationError) as caught:
+            self.call("daily", settings)
+        self.assertEqual(caught.exception.reason, "busy")
+        self.post.assert_not_called()
+        rejected = Mock(status_code=400, headers={})
+        rejected.json.return_value = {"error": {"message": "bad daily request"}}
+        profile = Mock(status_code=200)
+        profile.json.return_value = completion(model=PROFILE_MODEL)
+        self.post.side_effect = [rejected, profile, self.response, discovery_response()]
+        with self.assertRaises(OpenAIRecommendationError):
+            self.call("daily", settings)
+        self.assertTrue(json.loads(Meta.get_by_id(DAILY_SOL_STATE_KEY).value)["hard"])
+        self.assertTrue(self.call("profile", settings)["ok"])
+        self.assertTrue(self.call("chat", settings)["ok"])
+        self.assertTrue(self.call("album_discovery", settings)["ok"])
+        with self.assertRaises(OpenAIRecommendationError) as caught:
+            self.call("daily", settings)
+        self.assertEqual(caught.exception.reason, "paused")
+        self.assertEqual(self.post.call_count, 4)
+
+    def test_daily_sol_ignores_profile_pause_and_honors_shared_accounting_stop(self):
+        settings = dict(SETTINGS, daily_model=PROFILE_MODEL, profile_model=PROFILE_MODEL)
+        Meta.create(key=PROFILE_STATE_KEY, value=json.dumps({"n": 1, "u": 0, "hard": True}))
+        self.post.return_value = discovery_response()
+        self.assertTrue(self.call("daily", settings)["ok"])
+        invalid = discovery_response()
+        invalid.json.return_value["usage"] = None
+        self.post.return_value = invalid
+        with self.assertRaises(OpenAIRecommendationError) as caught:
+            self.call("daily", settings)
+        self.assertEqual(caught.exception.reason, "accounting")
+        self.assertTrue(json.loads(Meta.get_by_id(STATE_KEY).value)["accounting"])
+        for workload in ("daily", "chat", "profile", "album_discovery"):
+            with self.subTest(workload=workload), self.assertRaises(OpenAIRecommendationError) as caught:
+                self.call(workload, settings)
+            self.assertEqual(caught.exception.reason, "paused")
+        self.assertEqual(self.post.call_count, 2)
 
     def test_discovery_defaults_to_sol_and_other_workloads_keep_their_limits(self):
         self.assertEqual(discovery_request_model(SETTINGS), "gpt-6.2-sol")
@@ -300,7 +389,7 @@ class OpenAIRecommendationsTestCase(unittest.TestCase):
 
     def test_bad_configuration_and_oversize_never_send(self):
         for overrides in ({"api_base_url": "https://other.example/v1"},
-                          {"model": "other"}, {"_budget_config": {}},
+                          {"daily_model": "other"}, {"_budget_config": {}},
                           {"timeout_seconds": float("nan")}):
             with self.assertRaises(OpenAIRecommendationError):
                 self.call(settings=dict(SETTINGS, **overrides))

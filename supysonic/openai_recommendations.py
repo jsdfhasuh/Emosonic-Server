@@ -26,6 +26,7 @@ from .track_metadata_config import get_track_metadata_llm_config
 logger = logging.getLogger(__name__)
 STATE_KEY = "openai_recommendation_backoff"
 PROFILE_STATE_KEY = "openai_profile_sol_backoff"
+DAILY_SOL_STATE_KEY = "openai_daily_sol_backoff"
 DISCOVERY_STATE_KEY = "openai_album_discovery_backoff"
 BUDGET_FIELDS = (
     "monthly_budget_usd", "budget_safety_buffer_usd", "daily_budget_usd",
@@ -61,6 +62,10 @@ def profile_request_model(settings: Mapping) -> str:
     return str(settings.get("profile_model") or settings.get("model") or "").strip()
 
 
+def daily_request_model(settings: Mapping) -> str:
+    return str(settings.get("daily_model") or PROFILE_MODEL).strip()
+
+
 def discovery_request_model(settings: Mapping) -> str:
     return str(settings.get("discovery_model") or PROFILE_MODEL).strip()
 
@@ -73,6 +78,9 @@ def validate_recommendation_settings(config: object, *, workload: str = "chat") 
         raise OpenAIRecommendationError("OpenAI recommendations require the official endpoint.", reason="config")
     if workload == "profile":
         settings["model"] = profile_request_model(settings)
+        supported_models = (MODEL, PROFILE_MODEL)
+    elif workload == "daily":
+        settings["model"] = daily_request_model(settings)
         supported_models = (MODEL, PROFILE_MODEL)
     elif workload == "album_discovery":
         settings["model"] = discovery_request_model(settings)
@@ -211,7 +219,7 @@ def _validate_json(value: object, schema: Mapping[str, object]) -> None:
             raise ValueError("Invalid structured number.")
 
 
-def _count_discovery_input(settings: Mapping, payload: dict) -> int:
+def _count_responses_input(settings: Mapping, payload: dict) -> int:
     # These fields define the model input, including the structured output schema.
     count_payload = {key: payload[key] for key in ("model", "input", "text", "reasoning")}
     try:
@@ -225,7 +233,7 @@ def _count_discovery_input(settings: Mapping, payload: dict) -> int:
             if response.status_code == 400:
                 error = result.get("error") if isinstance(result, dict) else None
                 if isinstance(error, dict) and error.get("code") == "context_length_exceeded":
-                    raise ContextLimitExceeded("Discovery exceeds the Sol context window.")
+                    raise ContextLimitExceeded("Recommendation exceeds the Sol context window.")
                 result = None
         finally:
             response.close()
@@ -262,8 +270,8 @@ def request_recommendation_json(config: object, messages: list, schema: dict, *,
         "name": "music_" + workload, "strict": True, "schema": schema,
     }
     discovery = workload == "album_discovery"
-    use_responses = discovery and model == PROFILE_MODEL
-    kind = "discovery" if use_responses else "text"
+    use_responses = model == PROFILE_MODEL and workload in ("album_discovery", "daily")
+    kind = "responses" if use_responses else "text"
     effort = settings.get("reasoning_effort", "low")
     payload = {"model": model, "service_tier": "default", "store": False}
     if use_responses:
@@ -280,6 +288,8 @@ def request_recommendation_json(config: object, messages: list, schema: dict, *,
         state_key = PROFILE_STATE_KEY if model == PROFILE_MODEL else STATE_KEY
         if discovery:
             state_key = DISCOVERY_STATE_KEY
+        elif workload == "daily" and use_responses:
+            state_key = DAILY_SOL_STATE_KEY
         provider_lease = "provider/album-discovery" if discovery else "provider"
         with recommendation_lease(provider_lease) as acquired:
             if not acquired:
@@ -294,7 +304,7 @@ def request_recommendation_json(config: object, messages: list, schema: dict, *,
             )
             if state["hard"] or state["u"] > int(time.time()):
                 raise OpenAIRecommendationError("OpenAI recommendations are paused.", reason="paused", retry_at=state["u"])
-            measured = _count_discovery_input(settings, payload) if use_responses and size > MAX_REQUEST_BYTES else None
+            measured = _count_responses_input(settings, payload) if use_responses and size > MAX_REQUEST_BYTES else None
             allowance = reserve_request_micro_usd(payload, kind, model=model, measured_input_tokens=measured)
             try:
                 reservation = budget.reserve("recommendation_" + workload, allowance)
@@ -302,7 +312,7 @@ def request_recommendation_json(config: object, messages: list, schema: dict, *,
                 if not use_responses or measured is not None:
                     raise
                 # An exact count may fit when the small-request byte estimate did not.
-                measured = _count_discovery_input(settings, payload)
+                measured = _count_responses_input(settings, payload)
                 allowance = reserve_request_micro_usd(payload, kind, model=model, measured_input_tokens=measured)
                 reservation = budget.reserve("recommendation_" + workload, allowance)
             try:
@@ -363,7 +373,7 @@ def request_recommendation_json(config: object, messages: list, schema: dict, *,
             except (ValueError, TypeError, KeyError, IndexError, AttributeError):
                 raise OpenAIRecommendationError("OpenAI returned invalid recommendation JSON.", reason="invalid_response") from None
     except ContextLimitExceeded:
-        raise OpenAIRecommendationError("Discovery exceeds the Sol context window.", reason="context_limit") from None
+        raise OpenAIRecommendationError("Recommendation exceeds the Sol context window.", reason="context_limit") from None
     except BudgetExceeded as exc:
         raise OpenAIRecommendationError("The shared OpenAI spending budget is exhausted.", reason="budget", retry_at=int(exc.reset_at.timestamp())) from None
     except (BudgetUnavailable, DatabaseError, LlmConfigError):

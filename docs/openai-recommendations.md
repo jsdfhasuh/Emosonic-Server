@@ -1,7 +1,7 @@
 # OpenAI music profiles and recommendations
 
 The opt-in `recommendation_agent.provider = openai` path uses the official API.
-Music profiles default to `gpt-6.2-sol`. Daily selection and chat use
+Music profiles and daily selection default to `gpt-6.2-sol`. Chat uses
 `gpt-6-luna`. The analysis and song ordering use playback history, counts,
 favorites and negative feedback from the database.
 
@@ -21,6 +21,7 @@ profile_enabled = on
 profile_model = gpt-6.2-sol
 avatar_generation_enabled = on
 daily_selection_enabled = on
+daily_model = gpt-6.2-sol
 profile_refresh_interval_seconds = 21600
 profile_batch_size = 2
 cache_ttl_seconds = 900
@@ -58,7 +59,10 @@ An interrupted request or an unverifiable usage report retains the reservation.
   back off per user and retain the previous profile. Set
   `profile_model = gpt-6-luna` to use Luna for profiles.
 - Daily playlists first recall at most 150 eligible local tracks. OpenAI ranks
-  request-local IDs. Repeated IDs keep their first position, and omitted IDs
+  request-local IDs. Sol compares the candidates' albums, credited artists and
+  available music tags with up to 90 days of listening history. Setting
+  `daily_model = gpt-6-luna` selects the compact ranking input for daily playlists.
+  Repeated IDs keep their first position, and omitted IDs
   caused by repeats are appended in local candidate order. Wrong lengths and
   unknown IDs are rejected.
   Listening/negative feedback eligibility and diversity are rechecked before save.
@@ -80,11 +84,10 @@ in Asia/Shanghai. Existing counters are not reset; unknown-outcome reservations
 are retained. Prices are conservative software estimates, not a provider invoice.
 
 No hidden retries, repair requests, browsing tools or fallback providers are used
-by the OpenAI recommendation path. A shared recommendation provider lease prevents
-concurrent calls. Transient failures persist a 5/10/20/30-minute backoff for the
-configured model. An accounted success resets that model's streak. The shared
-ledger still limits admission across models. Authentication, quota and accounting
-errors pause the affected model until the cause and persisted state are reviewed.
+by the OpenAI recommendation path. Daily ranking, profiles and chat share a
+provider lease. Album discovery uses a separate lease and draws from the same
+budget. Sol daily ranking has its own 5/10/20/30-minute transient-error backoff.
+An unverifiable charge pauses requests across workloads until reconciled.
 
 Logs use `openai_recommendation_accounted workload=profile|daily|chat` with
 the model and micro-USD cost. Local deterministic tests mock
