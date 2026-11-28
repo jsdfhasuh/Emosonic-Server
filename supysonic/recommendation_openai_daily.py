@@ -5,6 +5,11 @@ import logging
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 
 from .album_discovery_context import build_listening_context
+from .bilibili_discovery.recommendation import (
+    BilibiliDailyPool,
+    BilibiliSignal,
+    load_bilibili_ready_recordings,
+)
 from .db import Album, Artist, Track, TrackArtist, TrackMetadata, User, now
 from .metadata_pricing import MODEL, PROFILE_MODEL
 from .openai_recommendations import (
@@ -39,6 +44,7 @@ DAILY_INVALID_RETRY_SECONDS = 6 * 60 * 60
 DAILY_PROMPT_VERSION = 1
 DAILY_SOL_PROMPT_VERSION = 2
 DAILY_VALIDATION_VERSION = 2
+BILIBILI_SOURCE_PROMPT_VERSION = 1
 
 DAILY_SYSTEM_PROMPT = (
     "Rank local music candidates for a daily discovery playlist. Return every "
@@ -63,6 +69,16 @@ _SOL_GUIDANCE = (
     "Compare candidates' credited artists, release, language and reliable semantic tags with this "
     "history. Balance specific recent interests, lasting preferences, novelty and variety."
 )
+_BILIBILI_GUIDANCE = (
+    " bilibiliSource describes the evidence for a local recording and how many days ago it originated."
+    " Direct means the viewed item's text named the recording. Collaboration and style mean a related"
+    " recording found via verified credits or a style supported by real listening. Views are not music"
+    " plays or favorites. Use the signal as optional context, with no reserved positions for this source."
+)
+
+
+class _DailyContextTooLarge(OpenAIRecommendationError):
+    """The compact input exceeds its local size limit before any paid request."""
 
 
 def _settings(config: Optional[object]) -> Mapping[str, object]:
@@ -145,7 +161,9 @@ def _daily_context(
     day: str,
     recent_ids: set,
     minimum_fresh_tracks: int,
-    *, model: str = MODEL,
+    *,
+    model: str = MODEL,
+    source_signals: Optional[Mapping[str, BilibiliSignal]] = None,
 ) -> Dict[str, object]:
     from .recommendation_openai_profile import (
         build_openai_profile_facts,
@@ -190,29 +208,35 @@ def _daily_context(
             "cautions": _text(cached.get("cautions"), 400),
         },
     }
+    rows = _sol_candidates(candidates, metadata_by_track, recent_ids) if sol else [
+        _candidate_payload(track, index, metadata_by_track.get(track.id), recent_ids)
+        for index, track in enumerate(candidates, 1)
+    ]
+    context["candidates"] = rows
     if sol:
-        context["candidates"] = _sol_candidates(candidates, metadata_by_track, recent_ids)
         context["weightedSemanticPreferences"] = {
             name: dict(sorted((weighted.get(field) or {}).items(), key=lambda pair: (-pair[1], pair[0]))[:20])
             for name, field in (("moods", "mood_counts"), ("scenes", "scene_counts"), ("tags", "tag_counts"))
         }
         context["listeningHistory"] = build_listening_context(
-            user, reference.astimezone(), priority_artists={row["artist"] for row in context["candidates"]},
+            user, reference.astimezone(), priority_artists={row["artist"] for row in rows},
         )
+    if source_signals:
+        for track, row in zip(candidates, rows):
+            signal = source_signals.get(str(track.id))
+            if signal is not None:
+                row["bilibiliSource"] = {"kinds": signal.kinds, "ageDays": signal.age_days}
+    if sol:
         return context
-    context["candidates"] = [
-        _candidate_payload(track, index, metadata_by_track.get(track.id), recent_ids)
-        for index, track in enumerate(candidates, 1)
-    ]
     if len(_encode_context(context).encode("utf-8")) > DAILY_CONTEXT_MAX_BYTES:
         # Retain the complete candidate set and its diversity, reducing only labels.
-        for candidate in context["candidates"]:
+        for candidate in rows:
             candidate["title"] = _text(candidate["title"], 40)
             candidate["artist"] = _text(candidate["artist"], 24)
             candidate["tags"] = []
             candidate["moods"] = candidate["moods"][:1]
     if len(_encode_context(context).encode("utf-8")) > DAILY_CONTEXT_MAX_BYTES:
-        raise OpenAIRecommendationError("Daily recommendation context exceeds input limit")
+        raise _DailyContextTooLarge("Daily recommendation context exceeds input limit")
     return context
 
 
@@ -275,23 +299,41 @@ def select_openai_daily_tracks(
     day: str,
     recent_track_ids: Optional[Iterable[object]] = None,
     minimum_fresh_tracks: int = 0,
+    *,
+    bilibili_pool: Optional[BilibiliDailyPool] = None,
 ) -> List[Track]:
     """Rank once, then enforce current eligibility and local playlist safeguards."""
-    candidates = list(candidates[:DAILY_CANDIDATE_LIMIT])
+    baseline = list(candidates[:DAILY_CANDIDATE_LIMIT])
+    candidates = bilibili_pool.tracks if bilibili_pool is not None else baseline
     if not candidates or num_songs <= 0:
         return []
     recent_ids = {str(track_id) for track_id in recent_track_ids or ()}
     model = daily_request_model(recommendation_settings(config))
-    context = _daily_context(
-        user, candidates, num_songs, day, recent_ids, minimum_fresh_tracks, model=model,
-    )
-    context_hash = build_recommendation_agent_context_hash({
+    try:
+        context = _daily_context(
+            user, candidates, num_songs, day, recent_ids, minimum_fresh_tracks, model=model,
+            source_signals=bilibili_pool.signals if bilibili_pool is not None else None,
+        )
+    except _DailyContextTooLarge:
+        if bilibili_pool is None:
+            raise
+        bilibili_pool = None
+        candidates = baseline
+        if not candidates:
+            return []
+        context = _daily_context(
+            user, candidates, num_songs, day, recent_ids, minimum_fresh_tracks, model=model,
+        )
+    context_key = {
         "workload": "openai_daily",
         "version": DAILY_SOL_PROMPT_VERSION if model == PROFILE_MODEL else DAILY_PROMPT_VERSION,
         "model": model,
         "context": context,
         "candidateTrackIds": [str(track.id) for track in candidates],
-    })
+    }
+    if bilibili_pool is not None:
+        context_key["bilibiliSourceVersion"] = BILIBILI_SOURCE_PROMPT_VERSION
+    context_hash = build_recommendation_agent_context_hash(context_key)
     payload = get_cached_recommendation_agent_payload(user, context_hash)
     if payload is None:
         failure_key = {
@@ -302,10 +344,14 @@ def select_openai_daily_tracks(
         # suppress a run with another configured model.
         if model != MODEL:
             failure_key["model"] = model
+        if bilibili_pool is not None:
+            failure_key["bilibiliSourceVersion"] = BILIBILI_SOURCE_PROMPT_VERSION
         failure_hash = build_recommendation_agent_context_hash(failure_key)
         if get_cached_recommendation_agent_payload(user, failure_hash) is not None:
             raise OpenAIRecommendationError("Daily recommendation validation retry is delayed")
         prompt = DAILY_SYSTEM_PROMPT + (_SOL_GUIDANCE if model == PROFILE_MODEL else "")
+        if bilibili_pool is not None:
+            prompt += _BILIBILI_GUIDANCE
         try:
             payload = request_recommendation_json(
                 config,
@@ -340,10 +386,20 @@ def select_openai_daily_tracks(
     }
     listened_ids = {str(track_id) for track_id in build_recommendation_play_weights(user)}
     preferences = get_recommendation_feedback_preferences(user)
+    invalid_source_ids = set()
+    if bilibili_pool is not None and bilibili_pool.added_ids:
+        current_recordings = load_bilibili_ready_recordings(
+            config, user, listened_ids=listened_ids, preferences=preferences,
+            track_ids=bilibili_pool.added_ids,
+        )
+        invalid_source_ids = set(bilibili_pool.added_ids).difference(
+            str(recording.track.id) for recording in current_recordings
+        )
     ranked_tracks = []
     for index in ranking:
-        track = current_tracks.get(str(candidates[index - 1].id))
-        if track is None or str(track.id) in listened_ids:
+        track_id = str(candidates[index - 1].id)
+        track = current_tracks.get(track_id)
+        if track is None or track_id in listened_ids or track_id in invalid_source_ids:
             continue
         if track_matches_negative_recommendation_feedback(track, preferences):
             continue

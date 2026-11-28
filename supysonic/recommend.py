@@ -18,6 +18,7 @@ from .album_discovery_daily import (
     select_daily_discovery,
 )
 from .album_discovery_settings import album_discovery_target_user
+from .bilibili_discovery.recommendation import build_bilibili_daily_pool
 from .config import DefaultConfig
 from .db import Playlist, Track, TrackMetadata, User, User_Play_Activity, db
 from .recommendation_feedback import (
@@ -859,7 +860,11 @@ def _createRecommendPlaylistForUserUnlocked(
         minimumFreshTracks=_get_minimum_fresh_track_count(candidateCount, config),
         recentRecommendationCounts=recentRecommendationCounts,
     )
-    if useOpenAI and recommendedTracks:
+    bilibili_pool = build_bilibili_daily_pool(
+        config, user, recommendedTracks, candidateCount,
+        listened_ids=trackPlayCounts, preferences=preferences,
+    ) if useOpenAI else None
+    if useOpenAI and (recommendedTracks or bilibili_pool):
         from .openai_recommendations import OpenAIRecommendationError
 
         minimum_fresh = _get_minimum_fresh_track_count(numSongs, config)
@@ -867,6 +872,7 @@ def _createRecommendPlaylistForUserUnlocked(
             recommendedTracks = select_openai_daily_tracks(
                 config, user, recommendedTracks, numSongs, recommendationDay,
                 recent_track_ids=recentTrackIds, minimum_fresh_tracks=minimum_fresh,
+                bilibili_pool=bilibili_pool,
             )
         except OpenAIRecommendationError as exc:
             if not album_discovery_target_user(config) or exc.reason not in {

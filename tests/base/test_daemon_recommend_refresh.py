@@ -262,6 +262,25 @@ class DaemonRecommendRefreshTestCase(unittest.TestCase):
         self.assertEqual(fourth_call.args[2], 180)
         self.assertFalse(fourth_call.kwargs["enabled"])
 
+        discovery = scheduler.register.call_args_list[-1]
+        self.assertEqual(discovery.args[0], "bilibili-discovery")
+        self.assertEqual(discovery.args[2], 120)
+        self.assertFalse(discovery.kwargs["enabled"])
+
+    def test_bilibili_is_independent_of_regular_daily_refresh(self) -> None:
+        config = SimpleNamespace(
+            DAEMON={"recommend_daily_refresh": False},
+            ALBUM_DISCOVERY={"target_user": "alice"},
+            BILIBILI_DISCOVERY={"enabled": True, "auto_download": False},
+        )
+        daemon = Daemon(config)
+        daemon._Daemon__configure_scheduler()
+        jobs = {job["name"]: job for job in daemon.scheduler.list_jobs()}
+        self.assertFalse(jobs["recommend-refresh"]["enabled"])
+        self.assertTrue(jobs["bilibili-discovery"]["enabled"])
+        self.assertTrue(jobs["bilibili-discovery"]["run_immediately"])
+        self.assertTrue(jobs["album-discovery-reconcile"]["enabled"])
+
     def test_track_metadata_enrichment_runs_local_provider(self):
         daemon = self.createDaemon(
             track_metadata_enrichment_provider="local",

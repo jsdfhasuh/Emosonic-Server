@@ -18,6 +18,10 @@ from ..album_discovery_settings import (
     album_discovery_target_user,
     load_album_discovery_settings,
 )
+from ..bilibili_discovery.settings import (
+    BilibiliDiscoverySettingsError,
+    bilibili_discovery_enabled,
+)
 from ..daily_avatar import rotate_daily_avatar
 from ..db import Folder, open_connection, close_connection
 from ..jukebox import Jukebox
@@ -241,6 +245,21 @@ class Daemon:
             self.__get_recommend_refresh_interval(),
             enabled=discovery_configured,
         )
+        self.__scheduler.register(
+            "bilibili-discovery",
+            self.__run_bilibili_discovery,
+            self.__get_recommend_refresh_interval(),
+            enabled=discovery_configured and bilibili_discovery_enabled(self.__config),
+        )
+
+    def __run_bilibili_discovery(self) -> dict:
+        from ..bilibili_discovery.service import run_bilibili_discovery
+
+        try:
+            return run_bilibili_discovery(self.__config)
+        except BilibiliDiscoverySettingsError:
+            logger.warning("Bilibili discovery scheduling unavailable: invalid settings")
+            return {"status": "unavailable"}
 
     def __run_album_discovery(self) -> dict:
         try:

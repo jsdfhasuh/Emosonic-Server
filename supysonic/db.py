@@ -21,6 +21,7 @@ from .db_layer.annotations import (
     StarredFolder,
     StarredTrack,
 )
+from .db_layer.bilibili_discovery import BilibiliDiscoveryCandidate, BilibiliDiscoveryRun
 from .db_layer.client_releases import ClientRelease
 from .db_layer.core import Meta, PathMixin, PrimaryKeyField, db, now, random
 from .db_layer.emo import (

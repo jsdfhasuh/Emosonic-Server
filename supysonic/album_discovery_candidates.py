@@ -557,11 +557,13 @@ def _candidate_song(
 
 def _style_support(
     seeds: Tuple[AlbumDiscoverySeed, ...], preferences: _DiscoveryPreferences,
+    *, allowed_styles: Optional[Set[str]] = None,
 ) -> List[Tuple[str, List[AlbumDiscoverySeed]]]:
     by_style = defaultdict(dict)
     for seed in seeds:
         style = normalize_discovery_style(seed.genre)
-        if style and style not in preferences.hidden_styles:
+        if (style and style not in preferences.hidden_styles
+                and (allowed_styles is None or style in allowed_styles)):
             artist = seed.catalog_artist_id or normalize_music_name(seed.artist)
             by_style[style].setdefault(artist, seed)
     supported = [
@@ -571,6 +573,13 @@ def _style_support(
     # Prefer styles represented by more different artists, then more repeat days.
     supported.sort(key=lambda pair: (-len(pair[1]), -sum(len(s.play_dates) for s in pair[1])))
     return supported[:MAX_STYLES]
+
+
+def discovery_style_support(user: User, styles: Set[str], *, now: datetime) -> list:
+    """Restrict repeat-listen style support to a supplied set of source clues."""
+    with connection_scope():
+        seeds = select_discovery_seeds(user, now=now)
+        return _style_support(seeds, _DiscoveryPreferences(user), allowed_styles=styles)
 
 
 def _collect_proposals(

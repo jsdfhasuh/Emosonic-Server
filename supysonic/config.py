@@ -169,6 +169,13 @@ class DefaultConfig:
         "oracle_delivery_token_file": None,
         "auto_submit_hour": 20,
     }
+    BILIBILI_DISCOVERY = {
+        "enabled": False,
+        "auto_download": False,
+        "history_api_url": "",
+        "history_api_token_file": "",
+        "start_time": "04:30",
+    }
     TRANSCODING = {}
     MIMETYPES = {}
 
@@ -204,7 +211,13 @@ class IniConfig(DefaultConfig):
             options = {
                 key: (
                     value
-                    if attribute == "ALBUM_DISCOVERY" and key != "auto_submit_hour"
+                    if (
+                        (attribute == "ALBUM_DISCOVERY" and key != "auto_submit_hour")
+                        or (
+                            attribute == "BILIBILI_DISCOVERY"
+                            and key in ("history_api_url", "history_api_token_file", "start_time")
+                        )
+                    )
                     else self.__try_parse(value)
                 )
                 for key, value in parser.items(section)

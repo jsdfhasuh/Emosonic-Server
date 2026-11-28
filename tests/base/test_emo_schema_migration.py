@@ -9,6 +9,7 @@ from threading import Barrier
 import unittest
 from uuid import uuid4
 
+from peewee import IntegrityError, Table
 from playhouse.db_url import connect as connect_database
 
 from supysonic import db
@@ -362,6 +363,7 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             self._assert_external_r18_broadcast_schema()
             self._assert_external_core_schema_parity(provider)
             self._assert_external_album_discovery_quota()
+            self._assert_bilibili_schema_behavior(provider)
             self.assertEqual(db.Meta["schema_version"].value, db.SCHEMA_VERSION)
             self._record_external_evidence(
                 provider,
@@ -404,11 +406,108 @@ class EmoSchemaMigrationTestCase(unittest.TestCase):
             db.release_database()
             initialized = False
             self._run_20260728_non_empty_upgrade(provider, database_uri)
+            self._run_bilibili_20261127_upgrade(provider, database_uri)
         finally:
             if initialized:
                 db.release_database()
             if database_available:
                 self._reset_external_database(provider, database_uri)
+
+    def _bilibili_library_track(self, provider: str, path: str) -> db.Track:
+        artist = db.Artist.create(name="Migration artist")
+        album = db.Album.create(name="Migration album", artist=artist)
+        folder = db.Folder.create(root=True, name="Migration folder", path=path)
+        track = db.Track(
+            title="Migration track", artist=artist, album=album, folder=folder,
+            root_folder=folder, path=path + "/example.flac", disc=1, number=1,
+            duration=173, bitrate=1000, last_modification=0,
+        )
+        if provider == "mysql":
+            # The MySQL base includes this older, unmapped required column.
+            fields = db.Track._meta.fields
+            row = {
+                fields[name].column_name: fields[name].db_value(value)
+                for name, value in track.__data__.items()
+            }
+            row["content_hash"] = "0" * 40
+            Table("track", tuple(row)).bind(db.db).insert(row).execute()
+        else:
+            track.save(force_insert=True)
+        return track
+
+    def _assert_bilibili_schema_behavior(self, provider: str) -> None:
+        user = db.User.create(name="migration-bilibili", password="test", salt="test")
+        track = self._bilibili_library_track(provider, "/migration")
+        release = db.AlbumDiscoveryRelease.create(
+            library_key="migration", album_id="876", album_url="https://music.apple.com/cn/album/a/876",
+            title="Migration album", artist="Migration artist", expected_tracks="[]",
+        )
+        source_day = datetime(2026, 11, 27).date()
+        run = db.BilibiliDiscoveryRun.create(user=user, source_day=source_day)
+        self.assertIsNone(run.snapshot_json)
+        with self.assertRaises(IntegrityError), db.db.atomic():
+            db.BilibiliDiscoveryRun.create(user=user, source_day=source_day)
+        snapshot = '[{"title":"' + "歌" * 30000 + '"}]'
+        db.BilibiliDiscoveryRun.update(snapshot_json=snapshot).where(
+            db.BilibiliDiscoveryRun.id == run.id
+        ).execute()
+        self.assertEqual(db.BilibiliDiscoveryRun[run.id].snapshot_json, snapshot)
+        fields = {
+            "run": run, "identity_key": "test", "title": track.title,
+            "artist": track.artist.name, "version": "studio",
+        }
+        candidate = db.BilibiliDiscoveryCandidate.create(**fields, release=release, track=track)
+        with self.assertRaises(IntegrityError), db.db.atomic():
+            db.BilibiliDiscoveryCandidate.create(**fields)
+        track.delete_instance()
+        release.delete_instance()
+        candidate = db.BilibiliDiscoveryCandidate[candidate.id]
+        self.assertIsNone(candidate.track_id)
+        self.assertIsNone(candidate.release_id)
+        run.delete_instance()
+        self.assertFalse(db.BilibiliDiscoveryCandidate.get_or_none(id=candidate.id))
+
+    def _run_bilibili_20261127_upgrade(self, provider: str, database_uri: str) -> None:
+        initialized = False
+        try:
+            db.init_database(database_uri)
+            initialized = True
+            db.db.drop_tables([db.BilibiliDiscoveryCandidate, db.BilibiliDiscoveryRun])
+            db.Meta.update(value="20261127").where(db.Meta.key == "schema_version").execute()
+            user = db.User.create(name="r3-upgrade", password="test", salt="test")
+            track = self._bilibili_library_track(provider, "/preserved")
+            order = db.AlbumDiscoveryOrder.create(
+                library_key="r3-upgrade", storefront="cn", album_id="456",
+                quota_date=datetime(2026, 11, 27).date(), status="submitted", oracle_task_id="test-task",
+            )
+            playlist = db.Playlist.create(user=user, name="Existing playlist", tracks=str(track.id))
+            db.release_database()
+            initialized = False
+
+            db.init_database(database_uri)
+            initialized = True
+            self.assertEqual(db.Meta["schema_version"].value, db.SCHEMA_VERSION)
+            self.assertEqual(db.User[user.id].name, user.name)
+            self.assertEqual(db.Track[track.id].title, track.title)
+            self.assertEqual(db.AlbumDiscoveryOrder[order.id].oracle_task_id, "test-task")
+            self.assertEqual(db.Playlist[playlist.id].tracks, str(track.id))
+            self._assert_bilibili_schema_behavior(provider)
+            self._record_external_evidence(provider, "upgrade_from_20261127", db.SCHEMA_VERSION)
+        finally:
+            if initialized:
+                db.release_database()
+
+    def test_sqlite_bilibili_clean_schema_and_20261127_upgrade(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_uri = "sqlite:///" + (Path(directory) / "clean.sqlite").as_posix()
+            db.init_database(database_uri)
+            try:
+                self._assert_bilibili_schema_behavior("sqlite")
+            finally:
+                db.release_database()
+            self._run_bilibili_20261127_upgrade(
+                "sqlite", "sqlite:///" + (Path(directory) / "upgrade.sqlite").as_posix()
+            )
 
     def _assert_external_album_discovery_quota(self) -> None:
         self.assertTrue(db.db.table_exists("album_discovery_quota_lock"))

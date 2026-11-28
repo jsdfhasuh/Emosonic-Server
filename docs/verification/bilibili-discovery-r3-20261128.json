@@ -1,0 +1,388 @@
+{
+  "added": [
+    {
+      "artist": "渡口乐团",
+      "genre": "R&B",
+      "title": "夜渡潮汐",
+      "uuid": "00000000-0000-0000-0000-0000000000a1"
+    },
+    {
+      "artist": "海岸乐团",
+      "genre": "另类音乐",
+      "title": "潮痕 (Live)",
+      "uuid": "00000000-0000-0000-0000-0000000000a2"
+    }
+  ],
+  "annotated_inside_baseline": [
+    {
+      "artist": "示例艺人15",
+      "genre": "国语流行",
+      "title": "示例曲105",
+      "uuid": "00000000-0000-0000-0000-000000000069"
+    },
+    {
+      "artist": "示例艺人23",
+      "genre": "国语流行",
+      "title": "示例曲023",
+      "uuid": "00000000-0000-0000-0000-000000000017"
+    },
+    {
+      "artist": "示例艺人04",
+      "genre": "国语流行",
+      "title": "示例曲034",
+      "uuid": "00000000-0000-0000-0000-000000000022"
+    }
+  ],
+  "baseline": {
+    "artists": {
+      "示例艺人00": 5,
+      "示例艺人01": 5,
+      "示例艺人02": 5,
+      "示例艺人03": 5,
+      "示例艺人04": 5,
+      "示例艺人05": 5,
+      "示例艺人06": 5,
+      "示例艺人07": 5,
+      "示例艺人08": 5,
+      "示例艺人09": 5,
+      "示例艺人10": 5,
+      "示例艺人11": 5,
+      "示例艺人12": 5,
+      "示例艺人13": 5,
+      "示例艺人14": 5,
+      "示例艺人15": 5,
+      "示例艺人16": 5,
+      "示例艺人17": 5,
+      "示例艺人18": 5,
+      "示例艺人19": 5,
+      "示例艺人20": 5,
+      "示例艺人21": 5,
+      "示例艺人22": 5,
+      "示例艺人23": 5,
+      "示例艺人24": 5,
+      "示例艺人25": 5,
+      "示例艺人26": 5,
+      "示例艺人27": 5,
+      "示例艺人28": 5,
+      "示例艺人29": 5
+    },
+    "count": 150,
+    "genres": {
+      "国语流行": 150
+    }
+  },
+  "candidates": [
+    {
+      "artist": "北窗乐队",
+      "evidence": [
+        {
+          "evidence": "北窗乐队《北窗的灯》录音室版",
+          "kind": "direct",
+          "source": {
+            "business": "archive",
+            "bvid": "fixture-7",
+            "cid": "8",
+            "event_id": "",
+            "id": "7",
+            "number": 8,
+            "view_time": 1795784407
+          }
+        }
+      ],
+      "local_uuid": null,
+      "reason": "submission_disabled",
+      "status": "pending",
+      "title": "北窗的灯",
+      "version": "studio"
+    },
+    {
+      "artist": "渡口乐团",
+      "evidence": [
+        {
+          "basis": {
+            "editorial_source": "https://music.apple.com/cn/curator/apple-music-r-b/1019400044",
+            "listening_support": [
+              {
+                "artist": "复听艺人1",
+                "play_dates": [
+                  "2026-11-25",
+                  "2026-11-26",
+                  "2026-11-27"
+                ],
+                "track_id": "00000000-0000-0000-0000-0000000000b5"
+              },
+              {
+                "artist": "复听艺人2",
+                "play_dates": [
+                  "2026-11-25",
+                  "2026-11-26",
+                  "2026-11-27"
+                ],
+                "track_id": "00000000-0000-0000-0000-0000000000b6"
+              }
+            ],
+            "style": "R&B"
+          },
+          "evidence": "R&B 编曲赏析",
+          "kind": "style",
+          "recording": {
+            "artist": "渡口乐团",
+            "disc_number": 1,
+            "duration_ms": 1000,
+            "isrc": null,
+            "song_id": "9201",
+            "title": "夜渡潮汐",
+            "track_number": 1
+          },
+          "source": {
+            "business": "archive",
+            "bvid": "fixture-4",
+            "cid": "5",
+            "event_id": "",
+            "id": "4",
+            "number": 5,
+            "view_time": 1795784404
+          }
+        }
+      ],
+      "local_uuid": "00000000-0000-0000-0000-0000000000a1",
+      "reason": "local_verified",
+      "status": "ready",
+      "title": "夜渡潮汐",
+      "version": "studio"
+    },
+    {
+      "artist": "海岸乐团",
+      "evidence": [
+        {
+          "evidence": "海岸乐团《潮痕》现场版",
+          "kind": "direct",
+          "source": {
+            "business": "archive",
+            "bvid": "fixture-3",
+            "cid": "4",
+            "event_id": "",
+            "id": "3",
+            "number": 4,
+            "view_time": 1795784403
+          }
+        }
+      ],
+      "local_uuid": "00000000-0000-0000-0000-0000000000a2",
+      "reason": "local_verified",
+      "status": "ready",
+      "title": "潮痕",
+      "version": "live"
+    },
+    {
+      "artist": "灯塔乐团",
+      "evidence": [
+        {
+          "evidence": "灯塔乐团《灯塔》混音版",
+          "kind": "direct",
+          "source": {
+            "business": "archive",
+            "bvid": "fixture-6",
+            "cid": "7",
+            "event_id": "",
+            "id": "6",
+            "number": 7,
+            "view_time": 1795784406
+          }
+        }
+      ],
+      "local_uuid": null,
+      "reason": "catalog_recording_unverified",
+      "status": "skipped",
+      "title": "灯塔",
+      "version": "remix"
+    },
+    {
+      "artist": "示例艺人23",
+      "evidence": [
+        {
+          "evidence": "示例艺人23《示例曲023》录音室版",
+          "kind": "direct",
+          "source": {
+            "business": "archive",
+            "bvid": "fixture-1",
+            "cid": "2",
+            "event_id": "",
+            "id": "1",
+            "number": 2,
+            "view_time": 1795784401
+          }
+        }
+      ],
+      "local_uuid": "00000000-0000-0000-0000-000000000017",
+      "reason": "local_verified",
+      "status": "ready",
+      "title": "示例曲023",
+      "version": "studio"
+    },
+    {
+      "artist": "示例艺人04",
+      "evidence": [
+        {
+          "evidence": "示例艺人04《示例曲034》录音室版",
+          "kind": "direct",
+          "source": {
+            "business": "archive",
+            "bvid": "fixture-2",
+            "cid": "3",
+            "event_id": "",
+            "id": "2",
+            "number": 3,
+            "view_time": 1795784402
+          }
+        }
+      ],
+      "local_uuid": "00000000-0000-0000-0000-000000000022",
+      "reason": "local_verified",
+      "status": "ready",
+      "title": "示例曲034",
+      "version": "studio"
+    },
+    {
+      "artist": "示例艺人15",
+      "evidence": [
+        {
+          "evidence": "示例艺人15《示例曲105》录音室版",
+          "kind": "direct",
+          "source": {
+            "business": "archive",
+            "bvid": "fixture-0",
+            "cid": "1",
+            "event_id": "",
+            "id": "0",
+            "number": 1,
+            "view_time": 1795784400
+          }
+        }
+      ],
+      "local_uuid": "00000000-0000-0000-0000-000000000069",
+      "reason": "local_verified",
+      "status": "ready",
+      "title": "示例曲105",
+      "version": "studio"
+    },
+    {
+      "artist": "样本乐团",
+      "evidence": [
+        {
+          "evidence": "样本乐团《隐藏样本》录音室版",
+          "kind": "direct",
+          "source": {
+            "business": "archive",
+            "bvid": "fixture-5",
+            "cid": "6",
+            "event_id": "",
+            "id": "5",
+            "number": 6,
+            "view_time": 1795784405
+          }
+        }
+      ],
+      "local_uuid": null,
+      "reason": "negative_feedback",
+      "status": "skipped",
+      "title": "隐藏样本",
+      "version": "studio"
+    }
+  ],
+  "data": "synthetic history, catalog and temporary SQLite library",
+  "discovery_outcomes": {
+    "source_non_music": 1,
+    "source_song": 7,
+    "source_style": 1,
+    "verified_style": 1
+  },
+  "displaced": [
+    {
+      "artist": "示例艺人01",
+      "genre": "国语流行",
+      "title": "示例曲091",
+      "uuid": "00000000-0000-0000-0000-00000000005b"
+    },
+    {
+      "artist": "示例艺人27",
+      "genre": "国语流行",
+      "title": "示例曲117",
+      "uuid": "00000000-0000-0000-0000-000000000075"
+    }
+  ],
+  "fixture_oracle_submissions": 0,
+  "fixture_orders": 0,
+  "fixture_user_uuid": "00000000-0000-0000-0000-0000000002bd",
+  "history_fixture_methods": [
+    "POST",
+    "GET"
+  ],
+  "merged": {
+    "artists": {
+      "海岸乐团": 1,
+      "渡口乐团": 1,
+      "示例艺人00": 5,
+      "示例艺人01": 4,
+      "示例艺人02": 5,
+      "示例艺人03": 5,
+      "示例艺人04": 5,
+      "示例艺人05": 5,
+      "示例艺人06": 5,
+      "示例艺人07": 5,
+      "示例艺人08": 5,
+      "示例艺人09": 5,
+      "示例艺人10": 5,
+      "示例艺人11": 5,
+      "示例艺人12": 5,
+      "示例艺人13": 5,
+      "示例艺人14": 5,
+      "示例艺人15": 5,
+      "示例艺人16": 5,
+      "示例艺人17": 5,
+      "示例艺人18": 5,
+      "示例艺人19": 5,
+      "示例艺人20": 5,
+      "示例艺人21": 5,
+      "示例艺人22": 5,
+      "示例艺人23": 5,
+      "示例艺人24": 5,
+      "示例艺人25": 5,
+      "示例艺人26": 5,
+      "示例艺人27": 4,
+      "示例艺人28": 5,
+      "示例艺人29": 5
+    },
+    "count": 150,
+    "genres": {
+      "R&B": 1,
+      "另类音乐": 1,
+      "国语流行": 148
+    }
+  },
+  "missing_release_fixture": {
+    "album_id": "9100",
+    "indexed": 0,
+    "song_id": "9101",
+    "tracks": 12
+  },
+  "mock_extraction_calls": 1,
+  "model_tokens": "unmeasured",
+  "observations": 9,
+  "playlist_after": {
+    "ordered_tracks_sha256": "481e9315c63b5d5cf582754d12265c394b8a4f51886078cb09a209e945468bc3",
+    "uuid": "00000000-0000-0000-0000-0000000002be"
+  },
+  "playlist_before": {
+    "ordered_tracks_sha256": "481e9315c63b5d5cf582754d12265c394b8a4f51886078cb09a209e945468bc3",
+    "uuid": "00000000-0000-0000-0000-0000000002be"
+  },
+  "playlist_day": "2026-11-28",
+  "plays_after": 17,
+  "plays_before": 17,
+  "production_touched": false,
+  "ranked_selection": "unmeasured",
+  "run_status": "done",
+  "snapshot_sha256": "c9ea929ebf6f6f7a15c20d02469f9b179a17b9bb6110918c449df3f48a9854e1",
+  "source_day_shanghai": "2026-11-27"
+}

@@ -4,7 +4,7 @@ import json
 import logging
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple, Union
 from uuid import UUID
 
 from peewee import SqliteDatabase
@@ -27,7 +27,9 @@ from .album_discovery_public_catalog import PublicAppleMusicCatalog
 from .album_discovery_quota import (
     RESERVED,
     SHANGHAI,
+    STOREFRONT,
     AlbumDownloadOrder,
+    AlbumReservationResult,
     associate_album_download,
     get_album_download_order,
     mark_album_download_submitted,
@@ -50,6 +52,7 @@ from .db import (
     AlbumDiscoveryPreview,
     AlbumDiscoveryRelease,
     AlbumDiscoverySelection,
+    BilibiliDiscoveryCandidate,
     User,
     connection_scope,
     db,
@@ -68,6 +71,13 @@ class AlbumDiscoveryError(ValueError):
 @dataclass(frozen=True)
 class AlbumDiscoveryAssessment:
     candidate: AlbumDiscoveryCandidate
+    action: str
+    reconciliation: AlbumReconciliation
+    remote: Optional[OracleAlbumState]
+
+
+@dataclass(frozen=True)
+class _ReleaseAssessment:
     action: str
     reconciliation: AlbumReconciliation
     remote: Optional[OracleAlbumState]
@@ -121,13 +131,20 @@ def _release_album(release: AlbumDiscoveryRelease) -> CatalogAlbum:
     })
 
 
+def _catalog_for_config(
+    config: AlbumDiscoveryConfig,
+) -> Union[AppleMusicCatalog, PublicAppleMusicCatalog]:
+    token = load_album_discovery_apple_token(config)
+    return AppleMusicCatalog(token) if token else PublicAppleMusicCatalog()
+
+
 class AlbumDiscoveryService:
     def __init__(
         self,
         config: AlbumDiscoveryConfig,
         runtime: AlbumDiscoveryRuntimeSettings,
         *,
-        catalog: Optional[AppleMusicCatalog],
+        catalog: Optional[Union[AppleMusicCatalog, PublicAppleMusicCatalog]],
         oracle: Optional[OracleAlbumClient],
     ) -> None:
         self.config = config
@@ -140,10 +157,7 @@ class AlbumDiscoveryService:
         cls, config: AlbumDiscoveryConfig, *, with_catalog: bool = True
     ) -> "AlbumDiscoveryService":
         runtime = load_album_discovery_runtime(config)
-        catalog = None
-        if with_catalog:
-            token = load_album_discovery_apple_token(config)
-            catalog = AppleMusicCatalog(token) if token else PublicAppleMusicCatalog()
+        catalog = _catalog_for_config(config) if with_catalog else None
         oracle = None
         if runtime.oracle_url:
             try:
@@ -167,6 +181,25 @@ class AlbumDiscoveryService:
             AlbumDiscoveryRelease.library_key == self.library_key,
             AlbumDiscoveryRelease.album_id == album_id,
         )
+
+    def _save_release(
+        self, album: CatalogAlbum, inventory: AlbumReconciliation
+    ) -> AlbumDiscoveryRelease:
+        catalog_payload = album.to_payload()
+        for field in ("album_id", "title", "artist", "url"):
+            del catalog_payload[field]
+        release, _ = AlbumDiscoveryRelease.get_or_create(
+            library_key=self.library_key,
+            album_id=album.album_id,
+            defaults={
+                "album_url": album.url, "title": album.title, "artist": album.artist,
+                "expected_tracks": _json(catalog_payload),
+                "reconciliation": _json(inventory.to_payload()),
+            },
+        )
+        if json.loads(release.expected_tracks)["tracks"] != catalog_payload["tracks"]:
+            raise AlbumDiscoveryError("The confirmed China release track list has changed.")
+        return release
 
     def _previous_tracks(self, release: Optional[AlbumDiscoveryRelease]) -> tuple:
         return tuple(json.loads(release.reconciliation).get("tracks", ())) if release else ()
@@ -200,21 +233,22 @@ class AlbumDiscoveryService:
             require_receipts=require_receipts,
         )
 
-    def _assess(self, candidate: AlbumDiscoveryCandidate) -> AlbumDiscoveryAssessment:
-        album = candidate.album
+    def _assess_release(
+        self, album: CatalogAlbum, song_id: str
+    ) -> _ReleaseAssessment:
         with connection_scope():
             release = self._get_release(album.album_id)
         order = get_album_download_order(self.library_key, album.album_id)
         remote = self._read_oracle(album, order) if order else None
         inventory = self._inventory(
-            album, candidate.representative_song_id, release, remote,
+            album, song_id, release, remote,
             require_receipts=order is not None,
         )
         if not inventory.ready and order is None:
             remote = self._read_oracle(album, None)
             if remote and remote.deliveries:
                 inventory = self._inventory(
-                    album, candidate.representative_song_id, release, remote,
+                    album, song_id, release, remote,
                     require_receipts=False,
                 )
         if inventory.ready:
@@ -225,7 +259,13 @@ class AlbumDiscoveryService:
             action = "new_order"
         else:
             action = "wait_oracle"
-        return AlbumDiscoveryAssessment(candidate, action, inventory, remote)
+        return _ReleaseAssessment(action, inventory, remote)
+
+    def _assess(self, candidate: AlbumDiscoveryCandidate) -> AlbumDiscoveryAssessment:
+        assessed = self._assess_release(candidate.album, candidate.representative_song_id)
+        return AlbumDiscoveryAssessment(
+            candidate, assessed.action, assessed.reconciliation, assessed.remote,
+        )
 
     def _load_preview(
         self, user: User, current: datetime, *, generate: bool
@@ -270,22 +310,7 @@ class AlbumDiscoveryService:
         self, user: User, candidate: AlbumDiscoveryCandidate, priority: int,
         inventory: AlbumReconciliation,
     ) -> None:
-        album = candidate.album
-        catalog_payload = album.to_payload()
-        for field in ("album_id", "title", "artist", "url"):
-            del catalog_payload[field]
-        expected = _json(catalog_payload)
-        release, _ = AlbumDiscoveryRelease.get_or_create(
-            library_key=self.library_key,
-            album_id=album.album_id,
-            defaults={
-                "album_url": album.url, "title": album.title, "artist": album.artist,
-                "expected_tracks": expected,
-                "reconciliation": _json(inventory.to_payload()),
-            },
-        )
-        if json.loads(release.expected_tracks)["tracks"] != catalog_payload["tracks"]:
-            raise AlbumDiscoveryError("The confirmed China release track list has changed.")
+        release = self._save_release(candidate.album, inventory)
         locked_user = User.select(User.id).where(User.id == user.id)
         if not isinstance(db.obj, SqliteDatabase):
             locked_user = locked_user.for_update()
@@ -350,6 +375,9 @@ class AlbumDiscoveryService:
         self, release: AlbumDiscoveryRelease, remote: OracleAlbumState,
         order: Optional[AlbumDownloadOrder],
     ) -> None:
+        if order and remote.status == "absent":
+            # An absent inspect result says nothing about an uncertain POST.
+            return
         if order and remote.task_id:
             if order.status == RESERVED and remote.status == "submitted":
                 mark_album_download_submitted(order, remote.task_id)
@@ -395,26 +423,46 @@ class AlbumDiscoveryService:
         priority: int, *, automatic: bool, preview_day: date, now: Optional[datetime],
     ) -> AlbumDiscoveryConfirmation:
         verified = self._recheck(user, candidate)
-        album = verified.album
-        assessment = self._assess(verified)
 
-        def persist() -> None:
+        def persist(inventory: AlbumReconciliation) -> None:
             if _current_time(now).date() != preview_day:
                 raise AlbumDiscoveryError("The Shanghai date changed. Run a new preview.")
-            self._save_selection(user, verified, priority, assessment.reconciliation)
+            self._save_selection(user, verified, priority, inventory)
+
+        def reserve(persist_release: Callable[[], None]) -> AlbumReservationResult:
+            return reserve_discovered_album(
+                self.config, self.library_key, verified.album.album_id, automatic=automatic,
+                now=now, persist_selection=persist_release,
+            )
+
+        return self._confirm_release(
+            verified.album, verified.representative_song_id, persist, reserve, now=now,
+        )
+
+    def _confirm_release(
+        self, album: CatalogAlbum, song_id: str,
+        persist: Callable[[AlbumReconciliation], None],
+        reserve: Callable[[Callable[[], None]], AlbumReservationResult],
+        *,
+        now: Optional[datetime],
+        can_submit: Optional[Callable[[], bool]] = None,
+    ) -> AlbumDiscoveryConfirmation:
+        assessment = self._assess_release(album, song_id)
+
+        def persist_assessment() -> None:
+            persist(assessment.reconciliation)
 
         order = get_album_download_order(self.library_key, album.album_id)
         remote = assessment.remote
         if order or assessment.action in ("reuse_local", "reuse_oracle"):
             task_id = remote.task_id if remote and remote.status in _REUSABLE_REMOTE else None
             order = record_album_discovery_reuse(
-                self.library_key, album.album_id, persist, oracle_task_id=task_id, now=now
+                self.library_key, album.album_id, persist_assessment, oracle_task_id=task_id, now=now
             )
         elif assessment.action == "new_order":
-            reservation = reserve_discovered_album(
-                self.config, self.library_key, album.album_id, automatic=automatic,
-                now=now, persist_selection=persist,
-            )
+            if can_submit is not None and not can_submit():
+                return AlbumDiscoveryConfirmation(album.album_id, "submission_disabled")
+            reservation = reserve(persist_assessment)
             order = reservation.order
             if order is None:
                 return AlbumDiscoveryConfirmation(album.album_id, reservation.status)
@@ -429,7 +477,7 @@ class AlbumDiscoveryService:
         if remote is not None:
             self._save_remote_state(release, remote, order)
         inventory = self._inventory(
-            album, verified.representative_song_id, release, remote,
+            album, song_id, release, remote,
             require_receipts=order is not None,
         )
         self._save_inventory(release, inventory)
@@ -535,11 +583,20 @@ class AlbumDiscoveryService:
                 break
         return {"status": "complete", **counts}
 
-    def reconcile_orders(self) -> dict:
+    def reconcile_orders(self, *, now: Optional[datetime] = None) -> dict:
+        from .bilibili_discovery.orders import bilibili_recovery_allowed
+
         with connection_scope():
-            reserved = AlbumDiscoveryOrder.select(AlbumDiscoveryOrder.album_id).where(
+            orders = AlbumDiscoveryOrder.select(AlbumDiscoveryOrder.album_id).where(
                 AlbumDiscoveryOrder.library_key == self.library_key,
-                AlbumDiscoveryOrder.status == RESERVED,
+                AlbumDiscoveryOrder.storefront == STOREFRONT,
+            )
+            reserved = orders.where(AlbumDiscoveryOrder.status == RESERVED)
+            selections = AlbumDiscoverySelection.select(AlbumDiscoverySelection.release)
+            bilibili = BilibiliDiscoveryCandidate.select(BilibiliDiscoveryCandidate.release).where(
+                BilibiliDiscoveryCandidate.release.is_null(False),
+                BilibiliDiscoveryCandidate.apple_song_id.is_null(False),
+                BilibiliDiscoveryCandidate.status.in_(("waiting_album", "ready")),
             )
             releases = list(
                 AlbumDiscoveryRelease.select()
@@ -547,6 +604,9 @@ class AlbumDiscoveryService:
                     AlbumDiscoveryRelease.library_key == self.library_key,
                     AlbumDiscoveryRelease.ready_at.is_null(True)
                     | AlbumDiscoveryRelease.album_id.in_(reserved),
+                    AlbumDiscoveryRelease.id.in_(selections)
+                    | AlbumDiscoveryRelease.id.in_(bilibili)
+                    | AlbumDiscoveryRelease.album_id.in_(orders),
                 )
                 .order_by(
                     AlbumDiscoveryRelease.checked_at.is_null(True).desc(),
@@ -556,25 +616,45 @@ class AlbumDiscoveryService:
             )
         checked = ready = 0
         for release in releases:
+            album = _release_album(release)
+            song_ids = {track.song_id for track in album.tracks}
             with connection_scope():
                 selection = (AlbumDiscoverySelection.select()
                              .where(AlbumDiscoverySelection.release == release)
                              .order_by(AlbumDiscoverySelection.created_at).first())
-            if selection is None:
-                continue
-            album = _release_album(release)
+                linked = [] if selection else list(
+                    BilibiliDiscoveryCandidate.select().where(
+                        BilibiliDiscoveryCandidate.release == release,
+                        BilibiliDiscoveryCandidate.apple_song_id.in_(song_ids),
+                    ).order_by(BilibiliDiscoveryCandidate.created_at, BilibiliDiscoveryCandidate.id)
+                )
             order = get_album_download_order(self.library_key, album.album_id)
+            if not (selection or linked or order):
+                continue
             remote = self._read_oracle(album, order) if order else None
             if order and order.status == RESERVED and remote and remote.status == "absent":
                 if release.oracle_status == "unknown":
                     remote = self.oracle.close_if_unaccepted(album.album_id, album.url, str(order.id))
-                else:
+                elif selection:
                     # Recover a reservation interrupted before an outcome was recorded.
                     remote = self.oracle.submit(album.album_id, album.url, str(order.id))
+                else:
+                    recovery_allowed = bilibili_recovery_allowed(self, album, linked, now=now)
+                    if recovery_allowed is True:
+                        remote = self.oracle.submit(album.album_id, album.url, str(order.id))
+                    elif recovery_allowed is False:
+                        remote = self.oracle.close_if_unaccepted(
+                            album.album_id, album.url, str(order.id),
+                        )
+                    # A temporary verification failure retains this reservation.
             if remote:
                 self._save_remote_state(release, remote, order)
+            representative = (
+                selection.representative_song_id if selection else
+                linked[0].apple_song_id if linked else album.tracks[0].song_id
+            )
             inventory = self._inventory(
-                album, selection.representative_song_id, release, remote,
+                album, representative, release, remote,
                 require_receipts=order is not None,
             )
             checked += 1

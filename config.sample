@@ -268,6 +268,14 @@ track_metadata_enrichment_log_payload = off
 ; aiDiscovery.autoSubmit is explicitly true in settings.json.
 ;auto_submit_hour = 20
 
+[bilibili_discovery]
+; Daily discovery for album_discovery.target_user, in Asia/Shanghai.
+enabled = off
+auto_download = off
+;history_api_url = https://history.example.invalid
+;history_api_token_file = /run/secrets/bili-history-token
+start_time = 04:30
+
 [musicbrainz]
 ; MusicBrainz is the default structured album enrichment source.
 ; Enrichment only fills empty album/track metadata and may create an

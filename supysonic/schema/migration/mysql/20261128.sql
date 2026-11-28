@@ -1,0 +1,43 @@
+CREATE TABLE IF NOT EXISTS bilibili_discovery_run (
+    id CHAR(32) PRIMARY KEY,
+    user_id CHAR(32) NOT NULL,
+    source_day DATE NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    sync_confirmed_at DATETIME,
+    snapshot_json MEDIUMTEXT,
+    extract_offset INTEGER NOT NULL DEFAULT 0,
+    discovery_progress_json MEDIUMTEXT NOT NULL,
+    next_attempt_at DATETIME,
+    last_error VARCHAR(128) NOT NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    UNIQUE(user_id, source_day),
+    FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS bilibili_discovery_candidate (
+    id CHAR(32) PRIMARY KEY,
+    run_id CHAR(32) NOT NULL,
+    identity_key VARCHAR(128) COLLATE utf8mb4_bin NOT NULL,
+    title VARCHAR(256) NOT NULL,
+    artist VARCHAR(256) NOT NULL,
+    version VARCHAR(32) NOT NULL,
+    album_hint VARCHAR(256) NOT NULL,
+    source_evidence_json MEDIUMTEXT NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    reason VARCHAR(128) NOT NULL,
+    release_id CHAR(32),
+    apple_song_id VARCHAR(64),
+    track_id CHAR(32),
+    ready_at DATETIME,
+    next_attempt_at DATETIME,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    UNIQUE(run_id, identity_key),
+    INDEX idx_bilibili_candidate_release (release_id),
+    INDEX idx_bilibili_candidate_track (track_id),
+    INDEX idx_bilibili_candidate_ready (status, ready_at),
+    FOREIGN KEY (run_id) REFERENCES bilibili_discovery_run(id) ON DELETE CASCADE,
+    FOREIGN KEY (release_id) REFERENCES album_discovery_release(id) ON DELETE SET NULL,
+    FOREIGN KEY (track_id) REFERENCES track(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;

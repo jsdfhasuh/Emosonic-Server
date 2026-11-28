@@ -78,6 +78,8 @@ class DbLayerContractTestCase(unittest.TestCase):
             "SharedTrackLink",
             "RadioStation",
             "ClientRelease",
+            "BilibiliDiscoveryRun",
+            "BilibiliDiscoveryCandidate",
             "execute_sql_resource_script",
             "init_database",
             "release_database",
