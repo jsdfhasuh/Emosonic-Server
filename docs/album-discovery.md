@@ -4,6 +4,10 @@
 
 搜索会兼顾不同主艺人的复听记录。除了相似艺人和共同署名录音，如果两位不同艺人的复听歌曲都指向同一种具体风格，还会从 Apple Music 国区相应的编辑栏目寻找曲目，核对歌曲自身的风格、曲目 ID 和所属发行。同一发行经多条路径出现时可以保留多份依据。新生成的预演可展开查看交给模型的曲目和选中数量，模型可以空选。
 
+专辑排序使用 `[recommendation_agent] discovery_model`，默认 `gpt-6.2-sol`。Sol 结合近期和长期复听趋势、收藏、候选整张发行及已保存日推的出现记录排序。种子来自最近 14 天，听歌背景可回溯 90 天。曲库索引匹配供排序参考，下单和日推仍按原流程复核整张发行。
+
+Sol 的总上下文为 1,050,000 tokens，单次最多输入 922,000 tokens。材料按实际播放和目录记录生成。服务端对较大的请求先按模型计数，再预留共享预算；超过 272,000 输入 tokens 时整笔按长上下文档计价。共享日、月额度同样适用。技术规格见 [OpenAI 模型说明](https://developers.openai.com/api/docs/models/gpt-6.2-sol)。
+
 ## 接入
 
 1. Oracle 下载器需具备 [国区整专控制接口](https://github.com/jsdfhasuh/apple-music-downloader/blob/222e739/docs/album-discovery-control.md)。将控制接口接入已有的 Oracle 鉴权和交付程序，OpenWrt 按现有流程接收。

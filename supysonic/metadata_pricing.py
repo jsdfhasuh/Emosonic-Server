@@ -11,6 +11,10 @@ MODEL = "gpt-6-luna"
 PROFILE_MODEL = "gpt-6.2-sol"
 MAX_REQUEST_BYTES = 65536
 MAX_OUTPUT_TOKENS = 4096
+SOL_CONTEXT_TOKENS = 1_050_000
+SOL_MAX_INPUT_TOKENS = 922_000
+SOL_MAX_OUTPUT_TOKENS = 128_000
+LONG_INPUT_THRESHOLD = 272_000
 WEB_RESERVATION_MICRO_USD = 1000000
 PRICE_VERSION = "gpt-6-luna-standard-2026-11-12"
 
@@ -30,9 +34,19 @@ def _integer(value: object, minimum: int = 0) -> Optional[int]:
     return value
 
 
-def _validate_request(payload: Mapping[str, object], kind: str, model: str) -> int:
+def _token_rates(model: str, inputs: int):
+    short_rates, long_rates = _TOKEN_RATES[model]
+    return long_rates if inputs > LONG_INPUT_THRESHOLD else short_rates
+
+
+class ContextLimitExceeded(LlmConfigError):
+    pass
+
+
+def validated_request_size(payload: Mapping[str, object], kind: str, model: str) -> int:
     if (model not in _TOKEN_RATES or payload.get("model") != model
-            or kind not in ("text", "web") or (kind == "web" and model != MODEL)):
+            or kind not in ("text", "web", "discovery") or (kind == "web" and model != MODEL)
+            or (kind == "discovery" and model != PROFILE_MODEL)):
         raise LlmConfigError("Unsupported budgeted model or request type.")
     if payload.get("service_tier") != "default":
         raise LlmConfigError("Budgeted metadata requires standard processing.")
@@ -40,11 +54,12 @@ def _validate_request(payload: Mapping[str, object], kind: str, model: str) -> i
         size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
     except (TypeError, ValueError):
         raise LlmConfigError("Invalid budgeted metadata request.") from None
-    if size > MAX_REQUEST_BYTES:
+    if kind != "discovery" and size > MAX_REQUEST_BYTES:
         raise LlmConfigError("Budgeted metadata request is too large.")
-    name = "max_output_tokens" if kind == "web" else "max_completion_tokens"
+    name = "max_completion_tokens" if kind == "text" else "max_output_tokens"
     maximum = _integer(payload.get(name), 1)
-    if maximum is None or maximum > MAX_OUTPUT_TOKENS:
+    output_limit = SOL_MAX_OUTPUT_TOKENS if kind == "discovery" else MAX_OUTPUT_TOKENS
+    if maximum is None or maximum > output_limit:
         raise LlmConfigError("Budgeted metadata requires a bounded output limit.")
     if kind == "web":
         calls = _integer(payload.get("max_tool_calls"), 1)
@@ -59,21 +74,31 @@ def _validate_request(payload: Mapping[str, object], kind: str, model: str) -> i
 
 
 def reserve_request_micro_usd(
-    payload: Mapping[str, object], kind: str = "text", *, model: str = MODEL
+    payload: Mapping[str, object], kind: str = "text", *, model: str = MODEL,
+    measured_input_tokens: Optional[int] = None,
 ) -> int:
     """Reserve before I/O; web allowance is deliberately above sampled costs.
 
     The web allowance is a conservative application limit, not an assertion
     about a provider invoice. Missing usage must never release this allowance.
     """
-    size = _validate_request(payload, kind, model)
+    size = validated_request_size(payload, kind, model)
     if kind == "web":
         return WEB_RESERVATION_MICRO_USD
     # UTF-8 bytes overestimate visible input tokens; leave room for framing and
     # bill all input at the higher 12-hour cache-write price, without discounts.
     tokens = size + 4096
-    output = payload["max_completion_tokens"]
-    input_rate, output_rate = _TOKEN_RATES[model][0]
+    output = payload["max_output_tokens" if kind == "discovery" else "max_completion_tokens"]
+    if kind == "discovery":
+        if measured_input_tokens is not None:
+            tokens = _integer(measured_input_tokens, 1)
+            if tokens is None:
+                raise LlmConfigError("Invalid input token count.")
+        elif size > MAX_REQUEST_BYTES:
+            raise LlmConfigError("Long discovery input requires the model's token count.")
+        if tokens > SOL_MAX_INPUT_TOKENS or tokens + output > SOL_CONTEXT_TOKENS:
+            raise ContextLimitExceeded("Discovery exceeds the Sol context window.")
+    input_rate, output_rate = _token_rates(model, tokens)
     return int((tokens * input_rate + output * output_rate).to_integral_value(
         rounding=ROUND_CEILING
     ))
@@ -88,8 +113,9 @@ def response_cost_micro_usd(
     ordinary input at the maximum cache-write rate to avoid under-accounting.
     """
     if (
-        model not in _TOKEN_RATES or kind not in ("text", "web")
+        model not in _TOKEN_RATES or kind not in ("text", "web", "discovery")
         or (kind == "web" and model != MODEL)
+        or (kind == "discovery" and model != PROFILE_MODEL)
         or response.get("model") != model
         or response.get("service_tier") != "default"
     ):
@@ -97,8 +123,8 @@ def response_cost_micro_usd(
     usage = response.get("usage")
     if not isinstance(usage, Mapping):
         return None
-    input_name = "input_tokens" if kind == "web" else "prompt_tokens"
-    output_name = "output_tokens" if kind == "web" else "completion_tokens"
+    input_name = "prompt_tokens" if kind == "text" else "input_tokens"
+    output_name = "completion_tokens" if kind == "text" else "output_tokens"
     inputs = _integer(usage.get(input_name))
     outputs = _integer(usage.get(output_name))
     if inputs is None or outputs is None:
@@ -128,7 +154,6 @@ def response_cost_micro_usd(
         searches = _integer(search_usage.get("num_requests"))
         if searches is None:
             return None
-    short_rates, long_rates = _TOKEN_RATES[model]
-    input_rate, output_rate = long_rates if inputs > 272000 else short_rates
+    input_rate, output_rate = _token_rates(model, inputs)
     return int((Decimal(inputs) * input_rate + Decimal(outputs) * output_rate +
                 Decimal(searches) * 10000).to_integral_value(rounding=ROUND_CEILING))

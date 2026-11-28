@@ -20,7 +20,7 @@ from supysonic.album_discovery_catalog import (
     CatalogTrack,
 )
 from supysonic.db import (
-    Album, Artist, Folder, StarredTrack, Track, TrackArtist, User, User_Play_Activity,
+    Album, Artist, Folder, RecommendationAgentCache, StarredTrack, Track, TrackArtist, User, User_Play_Activity,
 )
 from supysonic.openai_recommendations import OpenAIRecommendationError
 from supysonic.recommendation_agent_cache import clear_recommendation_agent_cache
@@ -315,6 +315,13 @@ class AlbumDiscoveryCandidatesTestCase(TestBase):
         prompt = json.loads(model.call_args.args[1][1]["content"])
         self.assertEqual(len(prompt["songs"]), 3)
         self.assertTrue(all("url" not in song for song in prompt["songs"]))
+        self.assertTrue(prompt["listeningContext"])
+        self.assertEqual(first.diagnostics["ranking_model"], "gpt-6.2-sol")
+        cached_models = RecommendationAgentCache.select(RecommendationAgentCache.model).where(
+            RecommendationAgentCache.user == self.user,
+            RecommendationAgentCache.message == "__cn_album_discovery_v1__",
+        ).distinct().tuples()
+        self.assertEqual(list(cached_models), [("gpt-6.2-sol",)])
 
     def test_cooperation_evidence_survives_model_ranking_and_saved_preview(self) -> None:
         self.configure_discovery()
@@ -348,6 +355,19 @@ class AlbumDiscoveryCandidatesTestCase(TestBase):
         self.assertEqual(second.reason, "ranking_unavailable")
         self.assertFalse(first.candidates or second.candidates)
         model.assert_called_once()
+
+    def test_token_count_failure_allows_retry_before_paid_generation(self) -> None:
+        self.configure_discovery()
+        with patch("supysonic.album_discovery_candidates.request_recommendation_json", side_effect=[
+            OpenAIRecommendationError("count unavailable", reason="preflight"), {"ranking": []},
+        ]) as model:
+            first = discover_album_candidates(self.config, self.user, self.catalog, now=REFERENCE)
+            second = discover_album_candidates(self.config, self.user, self.catalog, now=REFERENCE)
+            third = discover_album_candidates(self.config, self.user, self.catalog, now=REFERENCE)
+        self.assertEqual(first.reason, "ranking_count_unavailable")
+        self.assertEqual(second.reason, "no_selection")
+        self.assertEqual(third, second)
+        self.assertEqual(model.call_count, 2)
 
     def test_empty_model_and_exhausted_budget_are_safe(self) -> None:
         self.configure_discovery()

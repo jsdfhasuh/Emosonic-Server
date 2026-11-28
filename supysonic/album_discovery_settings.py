@@ -87,14 +87,19 @@ def load_album_discovery_oracle_tokens(
     )
 
 
+def album_discovery_library_key(config: AlbumDiscoveryConfig) -> str:
+    library_key = _text(_section(config), "library_key", "main")
+    if not 1 <= len(library_key) <= 128 or "\0" in library_key:
+        raise AlbumDiscoverySettingsError("[album_discovery] invalid library_key.")
+    return library_key
+
+
 def load_album_discovery_runtime(config: AlbumDiscoveryConfig) -> AlbumDiscoveryRuntimeSettings:
     section = _section(config)
     user = album_discovery_target_user(config)
     if not user:
         raise AlbumDiscoverySettingsError("[album_discovery] target_user is required.")
-    library_key = _text(section, "library_key", "main")
-    if not 1 <= len(library_key) <= 128 or "\0" in library_key:
-        raise AlbumDiscoverySettingsError("[album_discovery] invalid library_key.")
+    library_key = album_discovery_library_key(config)
     library_root = Path(_text(section, "library_root"))
     if not library_root.is_absolute():
         raise AlbumDiscoverySettingsError("[album_discovery] library_root must be an absolute path.")

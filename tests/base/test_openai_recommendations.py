@@ -10,7 +10,7 @@ from supysonic.metadata_budget import MetadataBudget
 from supysonic.metadata_pricing import PROFILE_MODEL
 from supysonic.openai_recommendations import (
     DISCOVERY_STATE_KEY, OpenAIRecommendationError, PROFILE_STATE_KEY, STATE_KEY, recommendation_lease,
-    recommendation_settings, request_recommendation_json,
+    discovery_request_model, recommendation_settings, request_recommendation_json,
 )
 
 
@@ -37,6 +37,23 @@ def completion(content=None, **overrides):
     return result
 
 
+def discovery_response(inputs=100, outputs=20):
+    reply = Mock(status_code=200)
+    reply.json.return_value = {
+        "model": PROFILE_MODEL, "service_tier": "default", "status": "completed",
+        "usage": {"input_tokens": inputs, "output_tokens": outputs, "total_tokens": inputs + outputs},
+        "output": [{"type": "reasoning"}, {"type": "message", "role": "assistant",
+                   "content": [{"type": "output_text", "text": '{"ok":true}'}]}],
+    }
+    return reply
+
+
+def token_count(tokens):
+    response = Mock(status_code=200)
+    response.json.return_value = {"object": "response.input_tokens", "input_tokens": tokens}
+    return response
+
+
 class OpenAIRecommendationsTestCase(unittest.TestCase):
     def setUp(self):
         self.previous = db.obj
@@ -59,10 +76,11 @@ class OpenAIRecommendationsTestCase(unittest.TestCase):
         ], SCHEMA, workload=workload)
 
     def test_each_workload_uses_one_shared_ledger_and_settles(self):
+        self.post.side_effect = lambda url, **kwargs: discovery_response() if url.endswith("/responses") else self.response
         for workload in ("profile", "daily", "chat", "album_discovery"):
             self.assertEqual(self.call(workload), {"ok": True})
         snapshot = self.budget.snapshot()
-        self.assertEqual(snapshot["month_spent_micro_usd"], 140)
+        self.assertEqual(snapshot["month_spent_micro_usd"], 805)
         self.assertEqual(snapshot["month_reserved_micro_usd"], 0)
         kinds = {json.loads(row.value)["k"] for row in Meta.select().where(Meta.key.startswith("mb:r:"))}
         self.assertEqual(kinds, {
@@ -70,8 +88,8 @@ class OpenAIRecommendationsTestCase(unittest.TestCase):
             "recommendation_album_discovery",
         })
         payload = self.post.call_args.kwargs["json"]
-        self.assertEqual(payload["max_completion_tokens"], 4096)
-        self.assertEqual(payload["response_format"]["type"], "json_schema")
+        self.assertEqual(payload["max_output_tokens"], 4096)
+        self.assertEqual(payload["text"]["format"]["type"], "json_schema")
         self.assertNotIn("temperature", payload)
         self.assertFalse(self.post.call_args.kwargs["allow_redirects"])
 
@@ -82,6 +100,89 @@ class OpenAIRecommendationsTestCase(unittest.TestCase):
         })
         self.assertEqual(result["_budget_config"], BUDGET)
         self.assertNotIn("do-not-copy", str(result))
+
+    def test_discovery_defaults_to_sol_and_other_workloads_keep_their_limits(self):
+        self.assertEqual(discovery_request_model(SETTINGS), "gpt-6.2-sol")
+        self.post.return_value = discovery_response()
+        self.assertEqual(self.call("album_discovery", dict(SETTINGS, reasoning_effort="none")), {"ok": True})
+        payload = self.post.call_args.kwargs["json"]
+        self.assertEqual(payload["model"], "gpt-6.2-sol")
+        self.assertEqual(payload["reasoning"], {"effort": "low"})
+        self.assertFalse(payload["store"])
+        self.post.reset_mock()
+        settings = dict(SETTINGS, profile_model=PROFILE_MODEL, discovery_model="gpt-6-luna")
+        for workload in ("profile", "daily", "chat", "album_discovery"):
+            with self.subTest(workload=workload), self.assertRaises(OpenAIRecommendationError):
+                request_recommendation_json(settings, [{"role": "user", "content": "x" * 70_000}],
+                                            SCHEMA, workload=workload)
+        self.post.assert_not_called()
+
+    def test_long_discovery_counts_the_same_model_input_and_reserves_full_long_price(self):
+        messages = [{"role": "user", "content": "音乐" * 200_000}]
+        budget = dict(BUDGET, daily_budget_usd=10)
+        settings = dict(SETTINGS, _budget_config=budget)
+        expected = 272_001 * 10 + 3_072 * 15
+        def request(url, **kwargs):
+            if url.endswith("/input_tokens"):
+                self.assertEqual(MetadataBudget(budget).snapshot()["day_reserved_micro_usd"], 0)
+                return token_count(272_001)
+            self.assertEqual(MetadataBudget(budget).snapshot()["day_reserved_micro_usd"], expected)
+            return discovery_response(272_001, 20)
+        self.post.side_effect = request
+        self.assertEqual(request_recommendation_json(settings, messages, SCHEMA, workload="album_discovery",
+                                                     max_output_tokens=3072), {"ok": True})
+        count, generation = self.post.call_args_list
+        self.assertEqual(count.args[0], "https://api.openai.com/v1/responses/input_tokens")
+        self.assertEqual(generation.args[0], "https://api.openai.com/v1/responses")
+        self.assertEqual(count.kwargs["json"], {key: generation.kwargs["json"][key]
+                                              for key in ("model", "input", "text", "reasoning")})
+        totals = MetadataBudget(budget).snapshot()
+        self.assertEqual(totals["day_reserved_micro_usd"], 0)
+        self.assertEqual(totals["day_spent_micro_usd"], 272_001 * 10 + 20 * 15)
+
+    def test_oversized_invalid_count_and_daily_cap_never_generate(self):
+        messages = [{"role": "user", "content": "x" * 70_000}]
+        for count, reason in ((922_001, "context_limit"), (True, "preflight"), (272_001, "budget")):
+            with self.subTest(count=count):
+                self.post.reset_mock()
+                self.post.return_value = token_count(count)
+                with self.assertRaises(OpenAIRecommendationError) as caught:
+                    request_recommendation_json(SETTINGS, messages, SCHEMA, workload="album_discovery")
+                self.assertEqual(caught.exception.reason, reason)
+                self.post.assert_called_once()
+                self.assertTrue(self.post.call_args.args[0].endswith("/input_tokens"))
+                self.assertEqual(self.budget.snapshot()["day_reserved_micro_usd"], 0)
+
+    def test_small_discovery_can_use_exact_count_near_daily_limit(self):
+        self.budget.reserve("metadata", 1_950_000)
+        self.post.side_effect = [token_count(100), discovery_response()]
+        self.assertEqual(self.call("album_discovery"), {"ok": True})
+        self.assertEqual(self.post.call_count, 2)
+        self.assertEqual(self.budget.snapshot()["day_spent_micro_usd"], 700)
+
+    def test_input_counter_explicit_context_rejection_never_reserves(self):
+        reply = Mock(status_code=400)
+        reply.json.return_value = {"error": {"code": "context_length_exceeded"}}
+        self.post.return_value = reply
+        with self.assertRaises(OpenAIRecommendationError) as caught:
+            request_recommendation_json(SETTINGS, [{"role": "user", "content": "x" * 70_000}],
+                                        SCHEMA, workload="album_discovery")
+        self.assertEqual(caught.exception.reason, "context_limit")
+        self.post.assert_called_once()
+        self.assertEqual(self.budget.snapshot()["day_reserved_micro_usd"], 0)
+
+    def test_incomplete_or_refused_responses_still_settle_usage(self):
+        for refusal in (False, True):
+            reply = discovery_response()
+            if refusal:
+                reply.json.return_value["output"][-1]["content"] = [{"type": "refusal", "refusal": "x"}]
+            else:
+                reply.json.return_value["status"] = "incomplete"
+            self.post.return_value = reply
+            with self.assertRaises(OpenAIRecommendationError) as caught:
+                self.call("album_discovery")
+            self.assertEqual(caught.exception.reason, "invalid_response")
+        self.assertEqual(self.budget.snapshot()["day_spent_micro_usd"], 1400)
 
     def test_profile_model_and_pricing_are_independent_of_daily_and_chat(self):
         settings = dict(SETTINGS, profile_model=PROFILE_MODEL, reasoning_effort="none")
@@ -254,18 +355,18 @@ class OpenAIRecommendationsTestCase(unittest.TestCase):
 
     def test_discovery_inflight_can_overlap_daily_but_not_another_discovery(self):
         def request(*args, **kwargs):
-            name = kwargs["json"]["response_format"]["json_schema"]["name"]
-            if name == "music_album_discovery":
+            if args[0].endswith("/responses"):
                 with self.assertRaises(OpenAIRecommendationError) as caught:
                     self.call("album_discovery")
                 self.assertEqual(caught.exception.reason, "busy")
                 self.assertEqual(self.call("daily"), {"ok": True})
+                return discovery_response()
             return self.response
 
         self.post.side_effect = request
         self.assertEqual(self.call("album_discovery"), {"ok": True})
         self.assertEqual(self.post.call_count, 2)
-        self.assertEqual(self.budget.snapshot()["month_spent_micro_usd"], 70)
+        self.assertEqual(self.budget.snapshot()["month_spent_micro_usd"], 735)
 
     def test_inflight_daily_success_cannot_clear_discovery_accounting_stop(self):
         expired = json.dumps({"n": 1, "u": 0, "hard": False})
@@ -274,8 +375,7 @@ class OpenAIRecommendationsTestCase(unittest.TestCase):
         unverifiable.json.return_value = completion(usage=None)
 
         def request(*args, **kwargs):
-            name = kwargs["json"]["response_format"]["json_schema"]["name"]
-            if name == "music_album_discovery":
+            if args[0].endswith("/responses"):
                 return unverifiable
             with self.assertRaises(OpenAIRecommendationError) as caught:
                 self.call("album_discovery")
@@ -300,8 +400,7 @@ class OpenAIRecommendationsTestCase(unittest.TestCase):
         unverifiable.json.return_value = completion(usage=None)
 
         def request(*args, **kwargs):
-            name = kwargs["json"]["response_format"]["json_schema"]["name"]
-            if name == "music_album_discovery":
+            if args[0].endswith("/responses"):
                 return unverifiable
             with self.assertRaises(OpenAIRecommendationError) as caught:
                 self.call("album_discovery")

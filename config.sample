@@ -356,6 +356,8 @@ provider = compatible
 profile_enabled = off
 ; Only used for OpenAI profile analysis. Set gpt-6-luna to use Luna here.
 profile_model = gpt-6.2-sol
+; Model for China album discovery only. Sol supports up to 922,000 input tokens.
+discovery_model = gpt-6.2-sol
 ; Allow signed-in users to generate an avatar on demand using the shared OpenAI budget.
 avatar_generation_enabled = on
 ; One account can opt into automatic application after 08:00 Asia/Shanghai.

@@ -13,6 +13,8 @@
   "ranking_pending": "正在生成候选，稍后可刷新。",
   "ranking_unavailable": "AI 排序暂时不可用。",
   "ranking_budget": "共享 AI 预算暂时不足。",
+  "ranking_count_unavailable": "暂时无法核实长请求的 token 数，稍后可重试。",
+  "ranking_context_limit": "本次材料超过所选模型的上下文上限。",
   "ranking_config": "AI 排序的服务配置不可用。",
   "ranking_day_used": "今日排序已执行。"
 } %}
@@ -77,6 +79,7 @@
 {% set diagnostics = preview.discovery.diagnostics %}
 <details class="mb-3">
   <summary>查看送入 AI 的 {{ diagnostics.proposals|length }} 首候选录音{% if diagnostics.ranking_count is number %}，模型选中 {{ diagnostics.ranking_count }} 首{% endif %}</summary>
+  {% if diagnostics.ranking_model %}<p>排序模型 <code>{{ diagnostics.ranking_model }}</code></p>{% endif %}
   <ul>
     {% for proposal in diagnostics.proposals %}
     <li>{{ proposal.artist }}《{{ proposal.song_title }}》 · 专辑《{{ proposal.album_title }}》{% for seed in preview.discovery.seeds if seed.track_id in proposal.seed_track_ids|default([]) %}{{ " · 来自" if loop.first else "、" }}《{{ seed.title }}》{% endfor %}</li>

@@ -2,7 +2,7 @@ import unittest
 
 from supysonic.llm_client import LlmConfigError
 from supysonic.metadata_pricing import (
-    PROFILE_MODEL, reserve_request_micro_usd, response_cost_micro_usd,
+    PROFILE_MODEL, ContextLimitExceeded, reserve_request_micro_usd, response_cost_micro_usd,
 )
 
 
@@ -83,6 +83,22 @@ class MetadataPricingTestCase(unittest.TestCase):
     def test_long_context_boundary_and_rounding(self):
         self.assertEqual(response_cost_micro_usd(self.response(inputs=272000, outputs=1)), 68001)
         self.assertEqual(response_cost_micro_usd(self.response(inputs=272001, outputs=1)), 136002)
+
+    def test_discovery_token_windows_and_long_price_apply_to_whole_request(self):
+        payload = {"model": PROFILE_MODEL, "service_tier": "default", "input": "x" * 70_000,
+                   "max_output_tokens": 128_000}
+        for tokens, input_rate, output_rate in ((272_000, 5, 10), (272_001, 10, 15), (922_000, 10, 15)):
+            with self.subTest(tokens=tokens):
+                self.assertEqual(reserve_request_micro_usd(payload, "discovery", model=PROFILE_MODEL,
+                                                          measured_input_tokens=tokens),
+                                 tokens * input_rate + 128_000 * output_rate)
+        with self.assertRaises(ContextLimitExceeded):
+            reserve_request_micro_usd(payload, "discovery", model=PROFILE_MODEL, measured_input_tokens=922_001)
+        with self.assertRaises(LlmConfigError):
+            reserve_request_micro_usd(payload, "discovery", model=PROFILE_MODEL)
+        with self.assertRaises(LlmConfigError):
+            reserve_request_micro_usd(dict(payload, max_output_tokens=128_001), "discovery",
+                                      model=PROFILE_MODEL, measured_input_tokens=922_000)
 
     def test_bad_usage_model_or_tier_does_not_release_reservation(self):
         for update in ({"usage": None}, {"model": "other"}, {"service_tier": "fast"},

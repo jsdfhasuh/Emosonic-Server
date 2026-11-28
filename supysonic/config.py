@@ -139,6 +139,7 @@ class DefaultConfig:
         "provider": "compatible",
         "profile_enabled": False,
         "profile_model": "gpt-6.2-sol",
+        "discovery_model": "gpt-6.2-sol",
         "avatar_generation_enabled": True,
         "daily_avatar_username": "",
         "daily_avatar_subject": "a music listener wearing headphones",
